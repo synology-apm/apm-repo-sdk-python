@@ -89,6 +89,25 @@ async def test_open_raising_isadirectoryerror_raises_not_found(
         await store.read("a.txt")
 
 
+async def test_open_raising_permissionerror_on_a_real_directory_raises_not_found(
+    store: LocalFsStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Windows raises PermissionError (not IsADirectoryError) from
+    os.open() when the target is a directory -- os.path.isdir()
+    disambiguates this from a genuine permission denial (see
+    _read_sync's own comment). Forced here via monkeypatch since this
+    project's own CI runs on Linux/macOS, where os.open() succeeds on a
+    directory instead (see test_open_raising_isadirectoryerror_raises_
+    not_found above), never raising PermissionError for one at all."""
+
+    def raising_open(path: object, *a: object, **k: object) -> int:
+        raise PermissionError()
+
+    monkeypatch.setattr(os, "open", raising_open)
+    with pytest.raises(NotFoundError, match="is a directory"):
+        await store.read("sub")  # "sub" is a real directory in the store fixture
+
+
 class TestPermissionDenied:
     """``PermissionError`` from the underlying OS call, at each of the four
     ``ObjectStore`` methods — forced via ``monkeypatch`` rather than a real
@@ -195,3 +214,20 @@ class TestReadaheadHint:
         )
         local_mod._hint_willneed(7, 100, 200)
         assert calls == [(7, 100, 200, "WILLNEED-sentinel")]
+
+    def test_pread_fallback_reads_the_same_bytes_os_pread_would(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """``os.pread`` doesn't exist on Windows — this project's own CI
+        runs on Linux/macOS, where ``_HAS_PREAD`` is always on; here the
+        ``lseek``+``read`` fallback is exercised directly by forcing
+        ``_HAS_PREAD`` off, proving it reads the same bytes at the same
+        offset ``os.pread`` would."""
+        monkeypatch.setattr(local_mod, "_HAS_PREAD", False)
+        payload = b"0123456789"
+        (tmp_path / "f.bin").write_bytes(payload)
+        fd = os.open(tmp_path / "f.bin", os.O_RDONLY)
+        try:
+            assert local_mod._pread(fd, 4, 3) == payload[3:7]
+        finally:
+            os.close(fd)

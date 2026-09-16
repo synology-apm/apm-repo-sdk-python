@@ -53,6 +53,22 @@ def _create_truncated(dst: Path, size: int) -> None:
         f.truncate(size)
 
 
+_HAS_PWRITE = hasattr(os, "pwrite")
+
+
+def _pwrite(fd: int, data: bytes, offset: int) -> None:
+    """Same shape as ``export_scheduler.py``'s own private helper —
+    ``os.pwrite()`` where available (POSIX); Windows has no positional
+    write, so this falls back to ``lseek``+``write``, safe here because
+    every call is awaited sequentially against this one fd (see the
+    caller below)."""
+    if _HAS_PWRITE:
+        os.pwrite(fd, data, offset)
+    else:
+        os.lseek(fd, offset, os.SEEK_SET)
+        os.write(fd, data)
+
+
 def _write_zeros_at(fd: int, offset: int, length: int) -> None:
     """Same shape as ``export_scheduler.py``'s own private helper — used
     here only for the gaps *between*/around fragments (never covered by
@@ -63,7 +79,7 @@ def _write_zeros_at(fd: int, offset: int, length: int) -> None:
     pos = offset
     while remaining > 0:
         take = min(remaining, len(block))
-        os.pwrite(fd, block[:take], pos)
+        _pwrite(fd, block[:take], pos)
         pos += take
         remaining -= take
 

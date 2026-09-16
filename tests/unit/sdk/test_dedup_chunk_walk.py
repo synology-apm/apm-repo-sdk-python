@@ -1431,3 +1431,21 @@ class TestExportWorkerShutdown:
         with pytest.raises(OSError):
             os.write(fd, b"x")  # the fd still got closed
         chunk_walk._worker_dst_fd = None  # already closed above; the autouse fixture must not double-close it
+
+
+class TestPositionalWriteFallback:
+    """``os.pwrite`` doesn't exist on Windows — this project's own CI runs
+    on Linux, where ``_HAS_PWRITE`` is always on; here the ``lseek``+
+    ``write`` fallback is exercised directly by forcing ``_HAS_PWRITE``
+    off, proving it lands bytes at the same offset ``os.pwrite`` would."""
+
+    def test_fallback_lands_bytes_at_the_given_offset(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(chunk_walk, "_HAS_PWRITE", False)
+        dst = tmp_path / "out.bin"
+        dst.write_bytes(bytes(10))
+        fd = os.open(dst, os.O_WRONLY)
+        try:
+            chunk_walk._pwrite(fd, b"hello", 3)
+        finally:
+            os.close(fd)
+        assert dst.read_bytes() == bytes(3) + b"hello" + bytes(2)

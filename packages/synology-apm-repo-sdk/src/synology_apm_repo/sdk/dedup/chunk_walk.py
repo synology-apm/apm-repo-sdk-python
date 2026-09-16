@@ -748,6 +748,21 @@ _worker_store: ObjectStore | None = None
 _worker_pool: Pool | None = None
 _worker_dst_fd: int | None = None
 
+_HAS_PWRITE = hasattr(os, "pwrite")
+
+
+def _pwrite(fd: int, data: bytes | memoryview, offset: int) -> None:
+    """Same shape as ``export_scheduler.py``'s own private helper —
+    ``os.pwrite()`` where available (POSIX); Windows has no positional
+    write, so this falls back to ``lseek``+``write``, safe here because
+    each worker process owns ``_worker_dst_fd`` exclusively and handles
+    one task at a time (see ``_export_worker_init``'s own docstring)."""
+    if _HAS_PWRITE:
+        os.pwrite(fd, data, offset)
+    else:
+        os.lseek(fd, offset, os.SEEK_SET)
+        os.write(fd, data)
+
 
 def _export_worker_init(pool_descriptor: PoolDescriptor, dst_path: str) -> None:
     """``ProcessPoolExecutor(initializer=...)`` target — builds this
@@ -798,7 +813,7 @@ async def _export_bucket_group_worker_async(args: ExportGroupWorkerArgs) -> int:
 
     async def _on_run(offset: int, payload: bytes | memoryview) -> None:
         nonlocal bytes_written
-        os.pwrite(dst_fd, payload, offset + args.dst_offset)
+        _pwrite(dst_fd, payload, offset + args.dst_offset)
         bytes_written += len(payload)
 
     async def _on_bytes(_flushed: int) -> None:

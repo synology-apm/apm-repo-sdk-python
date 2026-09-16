@@ -86,13 +86,28 @@ def _create_truncated(dst: Path, size: int) -> None:
         f.truncate(size)
 
 
+_HAS_PWRITE = hasattr(os, "pwrite")
+
+
+def _pwrite(fd: int, data: bytes | memoryview, offset: int) -> None:
+    """``os.pwrite()`` where available (POSIX); Windows has no positional
+    write, so this falls back to ``lseek``+``write`` — safe because every
+    caller of this already serializes its own access to ``fd`` (see
+    ``_ExportSink``'s own docstring for why)."""
+    if _HAS_PWRITE:
+        os.pwrite(fd, data, offset)
+    else:
+        os.lseek(fd, offset, os.SEEK_SET)
+        os.write(fd, data)
+
+
 def _write_zeros_at(fd: int, offset: int, length: int) -> None:
     block = bytes(1 << 20)
     remaining = length
     pos = offset
     while remaining > 0:
         take = min(remaining, len(block))
-        os.pwrite(fd, block[:take] if take != len(block) else block, pos)
+        _pwrite(fd, block[:take] if take != len(block) else block, pos)
         pos += take
         remaining -= take
 
@@ -164,7 +179,7 @@ class _ExportSink:
                 # docstring for the actual reason.
                 match item:
                     case _DataJob():
-                        os.pwrite(self._fd, item.payload, item.offset + self._dst_offset)
+                        _pwrite(self._fd, item.payload, item.offset + self._dst_offset)
                     case _GapJob():
                         _write_zeros_at(self._fd, item.offset + self._dst_offset, item.length)
             except BaseException as exc:

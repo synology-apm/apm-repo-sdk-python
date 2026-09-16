@@ -30,6 +30,7 @@ from pathlib import Path
 import pytest
 import zstandard
 
+from synology_apm_repo.sdk.dedup import export_scheduler as export_scheduler_mod
 from synology_apm_repo.sdk.dedup.composition_reader import CompositionReader
 from synology_apm_repo.sdk.dedup.dedup_file import ByteRangeView, DedupFile, ExportResult, ExtentKind
 from synology_apm_repo.sdk.dedup.export_scheduler import _WRITER_QUEUE_SIZE, _ExportSink, export_to
@@ -1076,3 +1077,21 @@ class TestMultiprocessExecutorTeardown:
         ]
         assert shutdown_calls, f"executor.shutdown() was never routed through asyncio.to_thread; saw: {recorded}"
         assert all(isinstance(f.__self__, ProcessPoolExecutor) for f in shutdown_calls)  # type: ignore[attr-defined]
+
+
+class TestPositionalWriteFallback:
+    """``os.pwrite`` doesn't exist on Windows — this project's own CI runs
+    on Linux, where ``_HAS_PWRITE`` is always on; here the ``lseek``+
+    ``write`` fallback is exercised directly by forcing ``_HAS_PWRITE``
+    off, proving it lands bytes at the same offset ``os.pwrite`` would."""
+
+    def test_fallback_lands_bytes_at_the_given_offset(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(export_scheduler_mod, "_HAS_PWRITE", False)
+        dst = tmp_path / "out.bin"
+        dst.write_bytes(bytes(10))
+        fd = os.open(dst, os.O_WRONLY)
+        try:
+            export_scheduler_mod._pwrite(fd, b"hello", 3)
+        finally:
+            os.close(fd)
+        assert dst.read_bytes() == bytes(3) + b"hello" + bytes(2)
