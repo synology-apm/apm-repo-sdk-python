@@ -1,0 +1,46 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "synology-apm-repo-browser"
+version = "0.1.0"
+description = "Textual TUI browser/exporter for Synology APM/APV/Object-Storage dedup repositories, built on synology-apm-repo-sdk"
+readme = "README.md"
+license = "Apache-2.0"
+authors = [
+    { name = "Synology Inc." },
+]
+requires-python = ">=3.11"
+keywords = ["synology", "activeprotect", "backup", "apm", "dedup", "tui"]
+classifiers = [
+    "Environment :: Console :: Curses",
+    "Intended Audience :: System Administrators",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Topic :: System :: Systems Administration",
+]
+dependencies = [
+    "synology-apm-repo-sdk==0.1.0",
+    "textual>=0.60",
+    "rich>=13.0",
+    "icalendar>=5.0",
+]
+
+[project.urls]
+Homepage = "https://www.synology.com/products/ActiveProtectAppliance"
+Repository = "https://github.com/synology-apm/apm-repo-sdk-python"
+"Issue Tracker" = "https://github.com/synology-apm/apm-repo-sdk-python/issues"
+
+[project.scripts]
+synology-apm-repo-browser = "synology_apm_repo.browser.app:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+namespaces = true
+
+[tool.uv.sources]
+synology-apm-repo-sdk = { workspace = true }

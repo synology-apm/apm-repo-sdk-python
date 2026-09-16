@@ -1,0 +1,129 @@
+[tool.uv.workspace]
+members = ["packages/*"]
+
+[dependency-groups]
+dev = [
+    "pytest>=7.4",
+    "mypy>=1.8",
+    "ruff>=0.3",
+    "pytest-cov>=4.1",
+    "pytest-xdist>=3.8.0",
+    "hypothesis>=6.100",
+    "textual-dev>=1.5",
+    "pytest-asyncio>=0.24",
+    "aioboto3>=13.0",
+    "azure-storage-blob>=12.19",
+    "aiohttp>=3.9",
+    "keyring>=25.0",
+    "dissect.volume>=3.18",
+    "dissect.ntfs>=3.16",
+    "dissect.extfs>=3.15",
+    "dissect.xfs>=3.13",
+    "dissect.btrfs>=1.10",
+    "dissect.fat>=3.13",
+    "dissect.apfs>=1.1",
+    "pyyaml>=6.0",
+    "types-pyyaml>=6.0",
+]
+# Separate from dev so `uv sync` doesn't pull Sphinx for ordinary test/lint
+# work — building the docs requires `uv sync --group docs` explicitly.
+docs = [
+    "sphinx>=7.0",
+    "furo>=2024.1",
+]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+# importlib (not the default "prepend") mode: dropping every
+# tests/integration/**/test_*_replay.py file's now-redundant `_replay` suffix
+# (see tests/CLAUDE.md) makes many of them share a basename with their
+# tests/unit/ counterpart (e.g. both trees get a test_units_saas_drive.py) --
+# importlib mode identifies each test file by its own path instead of
+# inserting it into sys.path under its bare module name, so same-basename
+# files in different directories collect without an "import file mismatch"
+# error. mypy needs its own, separate fix for the same collision -- see
+# mypy_path below.
+addopts = ["--import-mode=importlib"]
+
+[tool.mypy]
+python_version = "3.11"
+# Pinned rather than left to follow the host OS: typeshed gates some stdlib
+# symbols (e.g. os.posix_fadvise) by platform, so an unpinned mypy run
+# disagrees with itself between a macOS dev machine and a Linux CI runner —
+# the same `# type: ignore[attr-defined]` is required on darwin and reported
+# as unused-ignore on linux. Pinning to darwin (the strictest of the two
+# platforms this project's platform-conditional code checks against) keeps
+# every environment consistent.
+platform = "darwin"
+strict = true
+explicit_package_bases = true
+namespace_packages = true
+mypy_path = [
+    "packages/synology-apm-repo-sdk/src",
+    "packages/synology-apm-repo-cli/src",
+    "packages/synology-apm-repo-browser/src",
+    # Namespace-package root for tests/ -- explicit_package_bases/
+    # namespace_packages above aren't sufficient by themselves once
+    # tests/unit/ and tests/integration/ share basenames (see addopts'
+    # own comment above): without a common root to derive a dotted path
+    # from, mypy still reports "Duplicate module named". Listing "tests"
+    # here resolves each file to unit.<pkg>.test_x / integration.<pkg>.test_x.
+    "tests",
+]
+# The Makefile invokes bare `uv run mypy` (no command-line path argument), so
+# this list is what `make test`/`make typecheck` actually check — add any new
+# top-level source location here explicitly, or `mypy` silently skips it.
+files = [
+    "packages/synology-apm-repo-sdk/src",
+    "packages/synology-apm-repo-cli/src",
+    "packages/synology-apm-repo-browser/src",
+    "tests",
+    "scripts",
+    "docs/conf.py",
+]
+
+# lz4/boto3/botocore/aioboto3/aiobotocore/dissect.*/smbprotocol/smbclient
+# ship no type stubs or py.typed marker — the standard mypy escape hatch,
+# not a project-wide relaxation (azure-storage-blob, by contrast, ships
+# its own stubs).
+[[tool.mypy.overrides]]
+module = [
+    "lz4.*",
+    "boto3.*",
+    "botocore.*",
+    "aioboto3.*",
+    "aiobotocore.*",
+    "dissect.*",
+    "smbprotocol.*",
+    "smbclient.*",
+]
+ignore_missing_imports = true
+
+[tool.ruff]
+target-version = "py311"
+line-length = 120
+src = [
+    ".",
+    "packages/synology-apm-repo-sdk/src",
+    "packages/synology-apm-repo-cli/src",
+    "packages/synology-apm-repo-browser/src",
+]
+
+[tool.ruff.lint]
+# SLF001 enforces the cross-module private-access boundary (the layering
+# contract in ARCHITECTURE.md); RUF100 keeps "# noqa" comments honest as
+# rule selection changes over time.
+select = ["E", "F", "I", "UP", "B", "ASYNC", "SIM", "PERF", "SLF001", "RUF100"]
+
+[tool.ruff.lint.flake8-bugbear]
+# Typer's convention is to write typer.Option()/typer.Argument() calls directly as
+# parameter defaults; this is not the mutable-default-argument pattern B008 targets.
+extend-immutable-calls = ["typer.Argument", "typer.Option"]
+
+[tool.ruff.lint.per-file-ignores]
+# SLF001/ASYNC240 are legitimate in white-box tests (private-state assertions,
+# blocking-I/O postcondition checks), not real production layering violations.
+"tests/**" = ["E501", "SLF001", "ASYNC240"]
+
+[tool.coverage.report]
+fail_under = 95

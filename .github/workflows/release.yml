@@ -1,0 +1,189 @@
+# Builds and publishes synology-apm-repo-sdk, synology-apm-repo-cli, and
+# synology-apm-repo-browser to PyPI for the pushed tag.
+
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read   # publish-* jobs elevate their own
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  # Same gate as every push — a tag must never ship code that would fail CI.
+  test:
+    uses: ./.github/workflows/ci.yml
+
+  build:
+    needs: test
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        package: [sdk, cli, browser]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@bec219d24cd3e171d82865faccec33120bb574f4 # v10.1.0
+        with:
+          enable-cache: true
+
+      - name: Build synology-apm-repo-${{ matrix.package }}
+        run: uv build --package synology-apm-repo-${{ matrix.package }} -o dist/synology-apm-repo-${{ matrix.package }}
+
+      - name: Upload synology-apm-repo-${{ matrix.package }} dist
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: dist-synology-apm-repo-${{ matrix.package }}
+          path: dist/synology-apm-repo-${{ matrix.package }}/
+
+  # The wheels are installed and exercised before anything reaches PyPI —
+  # PyPI uploads are immutable, so a broken artifact would burn the version.
+  verify-dist:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download synology-apm-repo-sdk dist
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: dist-synology-apm-repo-sdk
+          path: dist/synology-apm-repo-sdk
+
+      - name: Download synology-apm-repo-cli dist
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: dist-synology-apm-repo-cli
+          path: dist/synology-apm-repo-cli
+
+      - name: Download synology-apm-repo-browser dist
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: dist-synology-apm-repo-browser
+          path: dist/synology-apm-repo-browser
+
+      - name: Verify wheel versions match the tag
+        run: |
+          V="${GITHUB_REF_NAME#v}"
+          ls dist/synology-apm-repo-sdk/synology_apm_repo_sdk-"$V"-py3-none-any.whl
+          ls dist/synology-apm-repo-cli/synology_apm_repo_cli-"$V"-py3-none-any.whl
+          ls dist/synology-apm-repo-browser/synology_apm_repo_browser-"$V"-py3-none-any.whl
+
+      - name: Install wheels and smoke-run the CLI
+        run: |
+          python3 -m venv .venv-smoke-cli
+          .venv-smoke-cli/bin/pip install --quiet \
+            dist/synology-apm-repo-sdk/*.whl dist/synology-apm-repo-cli/*.whl
+          .venv-smoke-cli/bin/python -c "import synology_apm_repo.sdk, synology_apm_repo.cli"
+          .venv-smoke-cli/bin/synology-apm-repo-cli --help
+
+      - name: Install wheels and smoke-run the browser TUI
+        run: |
+          python3 -m venv .venv-smoke-browser
+          .venv-smoke-browser/bin/pip install --quiet \
+            dist/synology-apm-repo-sdk/*.whl dist/synology-apm-repo-browser/*.whl
+          .venv-smoke-browser/bin/python -c "import synology_apm_repo.sdk, synology_apm_repo.browser"
+          .venv-smoke-browser/bin/synology-apm-repo-browser --help
+
+  publish-sdk:
+    needs: [build, verify-dist]
+    runs-on: ubuntu-latest
+    environment:
+      name: pypi-synology-apm-repo-sdk
+      url: https://pypi.org/p/synology-apm-repo-sdk
+    permissions:
+      id-token: write
+    steps:
+      - name: Download synology-apm-repo-sdk dist
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: dist-synology-apm-repo-sdk
+          path: dist/synology-apm-repo-sdk
+
+      - name: Publish synology-apm-repo-sdk to PyPI
+        uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # v1.14.2
+        with:
+          packages-dir: dist/synology-apm-repo-sdk
+
+  publish-cli:
+    needs: [build, publish-sdk]
+    runs-on: ubuntu-latest
+    environment:
+      name: pypi-synology-apm-repo-cli
+      url: https://pypi.org/p/synology-apm-repo-cli
+    permissions:
+      id-token: write
+    steps:
+      - name: Download synology-apm-repo-cli dist
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: dist-synology-apm-repo-cli
+          path: dist/synology-apm-repo-cli
+
+      - name: Publish synology-apm-repo-cli to PyPI
+        uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # v1.14.2
+        with:
+          packages-dir: dist/synology-apm-repo-cli
+
+  # publish-browser runs in parallel with publish-cli — both depend only on publish-sdk.
+  publish-browser:
+    needs: [build, publish-sdk]
+    runs-on: ubuntu-latest
+    environment:
+      name: pypi-synology-apm-repo-browser
+      url: https://pypi.org/p/synology-apm-repo-browser
+    permissions:
+      id-token: write
+    steps:
+      - name: Download synology-apm-repo-browser dist
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: dist-synology-apm-repo-browser
+          path: dist/synology-apm-repo-browser
+
+      - name: Publish synology-apm-repo-browser to PyPI
+        uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # v1.14.2
+        with:
+          packages-dir: dist/synology-apm-repo-browser
+
+  # Runs alongside the publish-* jobs (all three depend only on verify-dist) — the
+  # GitHub Release is independent of the PyPI uploads.
+  github-release:
+    needs: [build, verify-dist]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download synology-apm-repo-sdk dist
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: dist-synology-apm-repo-sdk
+          path: dist/synology-apm-repo-sdk
+
+      - name: Download synology-apm-repo-cli dist
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: dist-synology-apm-repo-cli
+          path: dist/synology-apm-repo-cli
+
+      - name: Download synology-apm-repo-browser dist
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: dist-synology-apm-repo-browser
+          path: dist/synology-apm-repo-browser
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3
+        with:
+          files: |
+            dist/synology-apm-repo-sdk/*
+            dist/synology-apm-repo-cli/*
+            dist/synology-apm-repo-browser/*
+          make_latest: true
+          generate_release_notes: false
