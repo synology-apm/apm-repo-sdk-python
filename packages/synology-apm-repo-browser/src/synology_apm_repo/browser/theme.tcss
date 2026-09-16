@@ -1,0 +1,115 @@
+/* Shared styling for the Miller-column layout — every screen that
+   needs the three-column browse view or a status bar imports this one
+   stylesheet instead of redefining the same rules per screen. */
+
+Screen {
+    layout: vertical;
+}
+
+#columns {
+    layout: horizontal;
+    height: 1fr;
+}
+
+#columns DataTable,
+#columns Tree {
+    width: 1fr;
+    height: 1fr;
+    border: solid $panel;
+}
+
+#columns DataTable:focus,
+#columns Tree:focus {
+    border: solid $accent;
+}
+
+/* BrowseScreen's own status line: a fixed one-line status, always
+   visible (unlike the filter/goto boxes below, which only appear on
+   demand). */
+#open-status {
+    height: 1;
+    color: $text-muted;
+    padding: 0 1;
+}
+
+/* UnitScreen's detail pane: wrapped in a VerticalScroll so an inline
+   mail/HTML content preview — potentially many lines — can be scrolled
+   with the mouse wheel rather than being clipped; #detail itself sizes
+   to its own full content height so there's something for the scroll
+   container to actually scroll through. */
+#detail-scroll {
+    width: 1fr;
+    height: 1fr;
+    border: solid $panel;
+    padding: 1;
+}
+
+#detail {
+    width: 100%;
+    height: auto;
+}
+
+/* A SharePoint List overview (unit_screen.py's _load_list_overview) is a
+   pre-rendered table, not prose — it must never be force-wrapped to the
+   pane's width the way #detail's default `width: 100%` wraps ordinary
+   preview text, or every already-fixed-width box-drawing row gets cut
+   mid-cell (misaligned, not gracefully reflowed). `_set_wide_preview()`
+   toggles this class only while a List overview is showing: `width:
+   auto` lets #detail size to the table's own real (possibly wider than
+   the pane) content width, `min-width: 100%` keeps a narrower table
+   filling the pane like today, and `overflow-x: auto` on the scroll
+   container is what actually lets the user pan right to see the rest. */
+#detail-scroll.wide-preview {
+    overflow-x: auto;
+}
+
+#detail.wide-preview {
+    width: auto;
+    min-width: 100%;
+}
+
+#breadcrumb {
+    height: 1;
+    background: $panel;
+    color: $text;
+    padding: 0 1;
+}
+
+#status-bar {
+    height: 1;
+    background: $panel-darken-1;
+    color: $text-muted;
+    padding: 0 1;
+}
+
+/* height:0 (not just empty text) when no job is running — otherwise
+   this reserves a visible, oddly-colored blank row on every screen even
+   when nothing is happening. Toggled by App._refresh_job_status_bar(). */
+#job-status-bar {
+    height: 0;
+}
+
+#job-status-bar.has-jobs {
+    height: 1;
+    background: $warning;
+    color: $text;
+    padding: 0 1;
+}
+
+/* Filter box (`/`) and goto-ref box (`g`) — both hidden until their own
+   action adds "active", then docked to the bottom so neither reflows
+   whatever table/tree is being filtered/navigated above it. Separate
+   widgets (independent modes with different Enter-key semantics: narrow
+   the current list vs. jump elsewhere entirely) but identical in shape,
+   so styled together. */
+#filter-input,
+#goto-input {
+    display: none;
+}
+
+#filter-input.active,
+#goto-input.active {
+    display: block;
+    dock: bottom;
+    height: 1;
+}

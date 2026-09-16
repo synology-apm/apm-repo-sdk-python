@@ -1,0 +1,85 @@
+# smoke_samples.toml -- real sample repositories for the sdk/cli/browser
+# smoke tests.
+#
+# Copy this file to tests/smoke/smoke_samples.toml (gitignored), fill in
+# whichever block(s) below you have real prerequisites for, then run:
+#
+#   make smoke-test
+#
+# Three independently-optional kinds of block, one array-of-tables each --
+# omit or comment out any you don't have available; the smoke tests skip
+# whatever prerequisites are missing, with a reason. `name` is just a label
+# for reports, free to pick. This template deliberately carries no notes on
+# what any specific sample contains or what `skipped`/`degraded` outcome to
+# expect from it -- that's real-sample detail, so keep it in your own
+# (gitignored) `smoke_samples.toml` copy, as a comment on the block it
+# describes, rather than here.
+#
+# `key` (accepted on every kind below) is only needed for an encrypted
+# sample -- that sample's own encryption key, verbatim. Omit it (or leave
+# commented) for a plaintext sample.
+
+# -- [[local]]: a real, on-disk repository root -----------------------------
+
+[[local]]
+name = "sample-plain"
+path = "/path/to/samples/sample-plain"
+
+# [[local]]
+# name = "sample-encrypted"
+# path = "/path/to/samples/sample-encrypted"
+# key = "..."
+
+# -- [[profile]]: a saved sdk.profiles connection ---------------------------
+#
+# Create the profile first: `synology-apm-repo-cli profile add <name>
+# --backend s3|azure|smb ...` -- see that command's own --help. `path`, if
+# given, is a store-relative sub-path/prefix within the profile's own
+# bucket/container/share (not a filesystem path) -- only needed when that
+# bucket/container/share holds more than one repository and you want to
+# narrow to a specific one.
+
+# [[profile]]
+# name = "s3-live-via-profile"
+# profile = "my-s3-profile"
+# path = ""
+# key = "..."
+
+# -- [[remote_storage]]: a live S3/Azure/SMB target, credentials in hand ---
+#
+# No saved profile involved -- `type` picks which set of fields below
+# applies. These raw credentials live only in your own gitignored copy of
+# this file, same as `key` above for a local sample's encryption key.
+
+# [[remote_storage]]
+# name = "s3-direct"
+# type = "s3"
+# bucket = "my-bucket"
+# access_key = "..."
+# secret_key = "..."
+# endpoint = ""       # only for an S3-compatible endpoint, e.g. MinIO
+# region = ""
+# verify_tls = true
+# path = ""
+# key = "..."
+
+# [[remote_storage]]
+# name = "azure-direct"
+# type = "azure"
+# container = "my-container"
+# credential = "..."
+# account_url = ""    # e.g. https://<account>.blob.core.windows.net
+# verify_tls = true
+# path = ""
+# key = "..."
+
+# [[remote_storage]]
+# name = "smb-direct"
+# type = "smb"
+# server = "nas.example.com"
+# share = "my-share"
+# port = 445
+# username = "admin"           # optionally "DOMAIN\\admin" -- omit for an anonymous/guest session
+# password = "..."
+# path = ""
+# key = "..."
