@@ -32,6 +32,8 @@ from __future__ import annotations
 import asyncio
 import functools
 import os
+import re
+import sys
 from collections.abc import Callable
 from pathlib import Path
 from typing import cast
@@ -62,6 +64,31 @@ from synology_apm_repo.sdk.presentation.format import format_bytes, format_durat
 from synology_apm_repo.sdk.presentation.markup import safe
 from synology_apm_repo.sdk.presentation.progress import Progress, ProgressMeter, reading_progress_callback
 from synology_apm_repo.sdk.units.base import RestorableUnit
+
+_WINDOWS_FORBIDDEN_CHARS = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
+_WINDOWS_RESERVED_BASENAMES = frozenset(
+    {"CON", "PRN", "AUX", "NUL", *(f"COM{i}" for i in range(1, 10)), *(f"LPT{i}" for i in range(1, 10))}
+)
+
+
+def _windows_safe_filename(name: str) -> str:
+    """Sanitizes ``name`` for use as the export dialog's *suggested*
+    destination filename. A no-op on any platform but Windows -- this
+    only affects a default the user can freely edit either way, so
+    there's no reason to mangle an otherwise-valid POSIX name when not
+    actually running on Windows. Replaces each Windows-forbidden
+    character (``< > : " / \\ | ? *`` plus ASCII control characters)
+    with ``_``, strips a trailing ``.``/space (also Windows-invalid),
+    and guards against a reserved device basename (``CON``, ``COM1``,
+    ...) recognized regardless of any extension after it.
+    """
+    if sys.platform != "win32":
+        return name
+    sanitized = _WINDOWS_FORBIDDEN_CHARS.sub("_", name)
+    sanitized = sanitized.rstrip(". ") or "_"
+    if sanitized.split(".", 1)[0].upper() in _WINDOWS_RESERVED_BASENAMES:
+        sanitized = f"_{sanitized}"
+    return sanitized
 
 
 class ExportScreen(ModalScreen[None]):
@@ -126,7 +153,11 @@ class ExportScreen(ModalScreen[None]):
                 + (f" ({format_bytes(self._unit.size)})" if self._unit.size else "")
             )
             yield Static(EXPORT_DST_LABEL)
-            yield Input(placeholder=EXPORT_DST_PLACEHOLDER, id="export-dst", value=f"./{self._unit.name}")
+            yield Input(
+                placeholder=EXPORT_DST_PLACEHOLDER,
+                id="export-dst",
+                value=f"./{_windows_safe_filename(self._unit.name)}",
+            )
             with Horizontal(id="export-actions"):
                 yield Button(EXPORT_START_LABEL, id="export-start", variant="primary")
             # show_eta=False: ETA is rendered from our own ProgressMeter below

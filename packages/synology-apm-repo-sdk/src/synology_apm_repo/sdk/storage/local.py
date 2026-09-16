@@ -21,6 +21,18 @@ from ..errors import NotFoundError, PermissionDeniedError
 _FADVISE_MIN_LENGTH = 64 << 10  # 64 KiB — matches the merge gap tolerance
 _HAS_POSIX_FADVISE = hasattr(os, "posix_fadvise")
 _DARWIN_F_RDADVISE = 44  # <fcntl.h>'s F_RDADVISE — not exposed by Python's fcntl module
+_HAS_PREAD = hasattr(os, "pread")
+
+
+def _pread(fd: int, length: int, offset: int) -> bytes:
+    """``os.pread()`` where available (POSIX); Windows has no positional
+    read, so this falls back to ``lseek``+``read`` — safe here because
+    ``fd`` is opened, read once, and closed within a single
+    ``_read_sync`` call, never shared with a concurrent reader."""
+    if _HAS_PREAD:
+        return os.pread(fd, length, offset)
+    os.lseek(fd, offset, os.SEEK_SET)
+    return os.read(fd, length)
 
 
 def _hint_willneed(fd: int, offset: int, length: int) -> None:
@@ -108,6 +120,19 @@ class LocalFsStore:
         except IsADirectoryError as exc:
             raise NotFoundError("is a directory, not a file", ref=path) from exc
         except PermissionError as exc:
+            # On Windows, os.open() on a directory raises PermissionError
+            # directly instead of succeeding (POSIX instead lets os.open()
+            # succeed and fails on the read below, caught by the except
+            # IsADirectoryError case below) -- os.path.isdir() disambiguates
+            # the two on every platform. Deliberately os.path.isdir(), not
+            # Path.is_dir(): the latter re-raises PermissionError from its
+            # own internal stat() on an unsearchable parent (EACCES), which
+            # would let a raw PermissionError escape here uncaught; plain
+            # os.path.isdir() treats any stat failure as "not a directory"
+            # instead, which is the right fallback given os.open() already
+            # told us this path isn't accessible.
+            if os.path.isdir(p):
+                raise NotFoundError("is a directory, not a file", ref=path) from exc
             raise PermissionDeniedError("permission denied", ref=path) from exc
         try:
             if length is None:
@@ -116,7 +141,7 @@ class LocalFsStore:
                 return b""
             if length >= _FADVISE_MIN_LENGTH:
                 _hint_willneed(fd, offset, length)
-            return os.pread(fd, length, offset)
+            return _pread(fd, length, offset)
         except IsADirectoryError as exc:
             # os.open() on a directory succeeds on both Linux and macOS
             # (it's the read that fails) — unlike a missing file, which

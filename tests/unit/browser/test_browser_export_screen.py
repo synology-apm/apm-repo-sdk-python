@@ -14,10 +14,12 @@ convention: each scenario owns exactly one loop for the whole
 from __future__ import annotations
 
 import asyncio
+import sys
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from pathlib import Path
 
+import pytest
 from textual.pilot import Pilot
 from textual.widgets import Button, Input, ProgressBar
 
@@ -44,6 +46,42 @@ async def _open_export_screen(
         await pilot.pause(0.2)
         assert isinstance(app.screen, ExportScreen), app.screen
         yield app, pilot, app.screen
+
+
+def test_export_dialog_suggests_a_windows_sanitized_filename_on_windows(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The suggested destination is sanitized for Windows-invalid
+    characters only when the dialog is actually built while running on
+    Windows -- see _windows_safe_filename's own docstring for why this
+    is gated rather than applied unconditionally."""
+    monkeypatch.setattr(sys, "platform", "win32")
+
+    async def scenario() -> str:
+        unit = RestorableUnit(
+            ref=NodeRef("repo", ("item",)),
+            name='Report: "Q1/Q2" <draft>.pdf',
+            is_leaf=True,
+            size=0,
+        )
+        async with _open_export_screen(unit) as (app, pilot, export_screen):
+            return export_screen.query_one("#export-dst", Input).value
+
+    assert asyncio.run(scenario()) == "./Report_ _Q1_Q2_ _draft_.pdf"
+
+
+def test_export_dialog_does_not_sanitize_the_suggested_filename_off_windows(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The same Windows-invalid name is left untouched when not actually
+    running on Windows -- a valid POSIX filename must not be needlessly
+    mangled just because this machine happens to be macOS/Linux."""
+    monkeypatch.setattr(sys, "platform", "linux")
+
+    async def scenario() -> str:
+        unit = RestorableUnit(ref=NodeRef("repo", ("item",)), name="weird:name.txt", is_leaf=True, size=0)
+        async with _open_export_screen(unit) as (app, pilot, export_screen):
+            return export_screen.query_one("#export-dst", Input).value
+
+    assert asyncio.run(scenario()) == "./weird:name.txt"
 
 
 class _BlockingContentSource:

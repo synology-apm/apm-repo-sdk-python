@@ -38,6 +38,7 @@ from synology_apm_repo.sdk.format.redundancy import redundancy_size
 from synology_apm_repo.sdk.identifiers import BucketId, ChunkIdx, SessionId, StreamId
 from synology_apm_repo.sdk.storage.dircache import DirCache
 from synology_apm_repo.sdk.storage.local import LocalFsStore
+from synology_apm_repo.sdk.units.content import pcps_disk as pcps_disk_mod
 from synology_apm_repo.sdk.units.content.pcps_disk import DiskFragment, VirtualDiskContentSource, _gaps
 
 _HEAD_OFF = 64
@@ -469,3 +470,21 @@ class TestExportTo:
         result = await disk.export_to(dst, sparse=False)
         assert dst.read_bytes() == _PLAINTEXT_A[0] + _PLAINTEXT_A[1]
         assert result.holes == 0
+
+
+class TestPositionalWriteFallback:
+    """``os.pwrite`` doesn't exist on Windows — this project's own CI runs
+    on Linux, where ``_HAS_PWRITE`` is always on; here the ``lseek``+
+    ``write`` fallback is exercised directly by forcing ``_HAS_PWRITE``
+    off, proving it lands bytes at the same offset ``os.pwrite`` would."""
+
+    def test_fallback_lands_bytes_at_the_given_offset(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(pcps_disk_mod, "_HAS_PWRITE", False)
+        dst = tmp_path / "out.bin"
+        dst.write_bytes(bytes(10))
+        fd = os.open(dst, os.O_WRONLY)
+        try:
+            pcps_disk_mod._pwrite(fd, b"hello", 3)
+        finally:
+            os.close(fd)
+        assert dst.read_bytes() == bytes(3) + b"hello" + bytes(2)
