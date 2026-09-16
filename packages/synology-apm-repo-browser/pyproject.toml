@@ -42,5 +42,8 @@ synology-apm-repo-browser = "synology_apm_repo.browser.app:main"
 where = ["src"]
 namespaces = true
 
+[tool.setuptools.package-data]
+"synology_apm_repo.browser" = ["theme.tcss"]
+
 [tool.uv.sources]
 synology-apm-repo-sdk = { workspace = true }

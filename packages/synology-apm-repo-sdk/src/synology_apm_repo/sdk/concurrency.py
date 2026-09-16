@@ -155,8 +155,12 @@ def preload_resource_tracker() -> None:
     isn't. A caller that never replaces ``sys.stderr`` this way has no
     need for this — the tracker's ordinary lazy launch on first use
     already works fine there.
+
+    No-op on non-POSIX platforms: the tracker's helper-process launch
+    relies on POSIX fd inheritance, which doesn't exist on Windows.
     """
-    resource_tracker.ensure_running()
+    if os.name == "posix":
+        resource_tracker.ensure_running()
 
 
 async def dispatch_to_pool(
