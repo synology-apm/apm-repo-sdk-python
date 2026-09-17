@@ -2722,7 +2722,7 @@ wheels = [
 
 [[package]]
 name = "synology-apm-repo-browser"
-version = "0.1.0"
+version = "0.1.1"
 source = { editable = "packages/synology-apm-repo-browser" }
 dependencies = [
     { name = "icalendar" },
@@ -2741,7 +2741,7 @@ requires-dist = [
 
 [[package]]
 name = "synology-apm-repo-cli"
-version = "0.1.0"
+version = "0.1.1"
 source = { editable = "packages/synology-apm-repo-cli" }
 dependencies = [
     { name = "rich" },
@@ -2758,7 +2758,7 @@ requires-dist = [
 
 [[package]]
 name = "synology-apm-repo-sdk"
-version = "0.1.0"
+version = "0.1.1"
 source = { editable = "packages/synology-apm-repo-sdk" }
 dependencies = [
     { name = "aioboto3" },
