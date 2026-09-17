@@ -27,6 +27,7 @@ from __future__ import annotations
 import asyncio
 import dataclasses
 import os
+import sys
 from collections.abc import AsyncIterator, Awaitable, Callable
 from pathlib import Path
 
@@ -40,20 +41,9 @@ from ...dedup.dedup_file import (
 )
 from ...dedup.pool import BucketReaderCache
 from ...dedup.pool_descriptor import PoolDescriptor
+from ...dedup.presized_file import create_presized, open_destination
 
 _ZERO_FILL_BLOCK = 1 << 20
-
-
-def _create_truncated(dst: Path, size: int) -> None:
-    """Create/replace ``dst`` at exactly ``size`` bytes — same one-line
-    shape as ``export_scheduler.py``'s own private helper of the same
-    name, duplicated rather than imported across module boundaries (that
-    module's ``__all__`` is deliberately just ``export_to``)."""
-    with Path(dst).open("wb") as f:
-        f.truncate(size)
-
-
-_HAS_PWRITE = hasattr(os, "pwrite")
 
 
 def _pwrite(fd: int, data: bytes, offset: int) -> None:
@@ -62,7 +52,7 @@ def _pwrite(fd: int, data: bytes, offset: int) -> None:
     write, so this falls back to ``lseek``+``write``, safe here because
     every call is awaited sequentially against this one fd (see the
     caller below)."""
-    if _HAS_PWRITE:
+    if sys.platform != "win32":
         os.pwrite(fd, data, offset)
     else:
         os.lseek(fd, offset, os.SEEK_SET)
@@ -232,8 +222,9 @@ class VirtualDiskContentSource:
         ``max_concurrent_reads`` only add concurrency *within* each
         fragment's own bucket-major walk (the same two knobs a VM's
         ``disk_image`` exposes — see ``chunk_walk.py``). Gaps
-        between/around fragments (``_gaps``) are real holes: left to
-        ``ftruncate()`` when ``sparse=True``, explicitly zero-filled
+        between/around fragments (``_gaps``) are real holes: left
+        unwritten in the pre-sized destination when ``sparse=True``
+        (``presized_file.create_presized``), explicitly zero-filled
         otherwise. Every fragment shares one ``BucketReaderCache`` for
         this call, so bucket-locality reuse persists across them.
 
@@ -255,7 +246,7 @@ class VirtualDiskContentSource:
         every real disk today (every fragment belongs to the same
         repository/pool), checked rather than assumed.
         """
-        await asyncio.to_thread(_create_truncated, dst, self.size)
+        await asyncio.to_thread(create_presized, dst, self.size, sparse=sparse)
         gaps = _gaps(self.fragments, self.size)
         gap_total = sum(end - start for start, end in gaps)
 
@@ -308,7 +299,7 @@ class VirtualDiskContentSource:
                 await asyncio.to_thread(executor.shutdown, wait=True, cancel_futures=True)
 
         if not sparse and gap_total:
-            fd = await asyncio.to_thread(os.open, dst, os.O_WRONLY)
+            fd = await asyncio.to_thread(open_destination, dst)
             try:
                 for start, end in gaps:
                     await asyncio.to_thread(_write_zeros_at, fd, start, end - start)

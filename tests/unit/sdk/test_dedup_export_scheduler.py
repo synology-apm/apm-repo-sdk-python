@@ -22,6 +22,7 @@ from __future__ import annotations
 import asyncio
 import os
 import struct
+import sys
 import threading
 import zlib
 from collections.abc import Awaitable, Callable
@@ -44,6 +45,21 @@ from synology_apm_repo.sdk.format.const import FIXED_CHUNK_LENGTH, SUB_FILE_SIZE
 from synology_apm_repo.sdk.identifiers import BucketId, ChunkIdx, SessionId, StreamId
 from synology_apm_repo.sdk.storage.dircache import DirCache
 from synology_apm_repo.sdk.storage.local import LocalFsStore
+
+_O_BINARY = getattr(os, "O_BINARY", 0)
+
+
+def _oracle_pwrite(fd: int, data: bytes, offset: int) -> None:
+    """The oracle's own positional write — ``os.pwrite()`` where available
+    (POSIX), ``lseek``+``write`` on Windows, which has no positional write.
+    Deliberately this file's own helper rather than the one under test, so
+    the oracle stays independent of ``export_scheduler``'s implementation."""
+    if sys.platform != "win32":
+        os.pwrite(fd, data, offset)
+    else:
+        os.lseek(fd, offset, os.SEEK_SET)
+        os.write(fd, data)
+
 
 _STREAM_ID = StreamId(7)
 _SESSION_ID = SessionId(3)
@@ -248,7 +264,7 @@ async def _naive_export_to(
     # not a performance choice here (this is a test-only oracle, never on
     # a hot path), just the plainest way to hold an fd across the awaits
     # below without a blocking Path method flagging ASYNC230/ASYNC240.
-    fd = os.open(dst, os.O_WRONLY | os.O_CREAT | os.O_TRUNC)
+    fd = os.open(dst, os.O_WRONLY | _O_BINARY | os.O_CREAT | os.O_TRUNC)
     try:
         os.ftruncate(fd, size)
         async for extent in base._extents(window_start, window_end):
@@ -261,12 +277,12 @@ async def _naive_export_to(
             if extent.kind is ExtentKind.HOLE:
                 holes += length
                 if not sparse:
-                    os.pwrite(fd, bytes(length), local_off)
+                    _oracle_pwrite(fd, bytes(length), local_off)
                 continue
             if extent.kind is ExtentKind.ZERO:
                 zeros += length
                 if not sparse:
-                    os.pwrite(fd, bytes(length), local_off)
+                    _oracle_pwrite(fd, bytes(length), local_off)
                 continue
             assert extent.addr is not None and extent.map_num > 0
             first_k = (seg_start - extent.offset) // FIXED_CHUNK_LENGTH
@@ -280,7 +296,7 @@ async def _naive_export_to(
                 hi = min(seg_end, chunk_start + FIXED_CHUNK_LENGTH) - chunk_start
                 dest = max(seg_start, chunk_start) - seg_start
                 buf[dest : dest + (hi - lo)] = chunk[lo:hi]
-            os.pwrite(fd, bytes(buf), local_off)
+            _oracle_pwrite(fd, bytes(buf), local_off)
             bytes_written += length
             if progress is not None:
                 await progress(bytes_written, size)
@@ -600,7 +616,7 @@ class TestPipelinedWriter:
         def _failing_pwrite(fd: int, data: bytes, offset: int) -> int:
             raise OSError("synthetic disk-full for this test")
 
-        monkeypatch.setattr(os, "pwrite", _failing_pwrite)
+        monkeypatch.setattr(export_scheduler_mod, "_pwrite", _failing_pwrite)
         with pytest.raises(OSError, match="synthetic disk-full"):
             await export_to(file, tmp_path / "out.bin")
 
@@ -619,7 +635,7 @@ class TestPipelinedWriter:
         def _failing_pwrite(fd: int, data: bytes, offset: int) -> int:
             raise OSError("synthetic writer failure racing the cancellation")
 
-        monkeypatch.setattr(os, "pwrite", _failing_pwrite)
+        monkeypatch.setattr(export_scheduler_mod, "_pwrite", _failing_pwrite)
 
         async def _arm_on_first_progress(done: int, total: int) -> None:
             store.armed = True
@@ -641,7 +657,7 @@ class TestPipelinedWriter:
         work — exercised directly against a bare ``_ExportSink`` with
         ``_error`` set by hand, not through a real failing write."""
         dst = tmp_path / "out.bin"
-        fd = os.open(dst, os.O_WRONLY | os.O_CREAT, 0o644)
+        fd = os.open(dst, os.O_WRONLY | _O_BINARY | os.O_CREAT, 0o644)
         try:
             sink = _ExportSink(fd, sparse=False, planned_total=0, progress=None)
             sink._error = OSError("synthetic pre-existing failure")
@@ -659,7 +675,7 @@ class TestPipelinedWriter:
         here too, rather than a worker's already-committed byte count
         being silently counted as if the export were still healthy."""
         dst = tmp_path / "out.bin"
-        fd = os.open(dst, os.O_WRONLY | os.O_CREAT, 0o644)
+        fd = os.open(dst, os.O_WRONLY | _O_BINARY | os.O_CREAT, 0o644)
         try:
             sink = _ExportSink(fd, sparse=False, planned_total=0, progress=None)
             sink._error = OSError("synthetic pre-existing failure")
@@ -690,7 +706,8 @@ class TestPipelinedWriter:
         exercised by every other test in this file — this is the rare
         fallback, needing the queue to actually be at its
         ``_WRITER_QUEUE_SIZE`` (8) capacity, which needs the writer
-        thread genuinely stalled (a real ``os.pwrite`` patched to block
+        thread genuinely stalled (``export_scheduler``'s own ``_pwrite``
+        patched to block
         on a controlled event) rather than racing a real disk write."""
         started = threading.Event()
         release = threading.Event()
@@ -700,10 +717,10 @@ class TestPipelinedWriter:
             release.wait()
             return len(data)
 
-        monkeypatch.setattr(os, "pwrite", blocking_pwrite)
+        monkeypatch.setattr(export_scheduler_mod, "_pwrite", blocking_pwrite)
 
         dst = tmp_path / "out.bin"
-        fd = os.open(dst, os.O_WRONLY | os.O_CREAT, 0o644)
+        fd = os.open(dst, os.O_WRONLY | _O_BINARY | os.O_CREAT, 0o644)
         try:
             sink = _ExportSink(fd, sparse=False, planned_total=0, progress=None)
             # This first write is picked up by the writer thread and
@@ -1081,15 +1098,16 @@ class TestMultiprocessExecutorTeardown:
 
 class TestPositionalWriteFallback:
     """``os.pwrite`` doesn't exist on Windows — this project's own CI runs
-    on Linux, where ``_HAS_PWRITE`` is always on; here the ``lseek``+
-    ``write`` fallback is exercised directly by forcing ``_HAS_PWRITE``
-    off, proving it lands bytes at the same offset ``os.pwrite`` would."""
+    on Linux/macOS, where the ``sys.platform != "win32"`` branch is always
+    taken; here the ``lseek``+``write`` fallback is exercised directly by
+    forcing ``sys.platform`` to ``"win32"``, proving it lands bytes at the
+    same offset ``os.pwrite`` would."""
 
     def test_fallback_lands_bytes_at_the_given_offset(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-        monkeypatch.setattr(export_scheduler_mod, "_HAS_PWRITE", False)
+        monkeypatch.setattr(sys, "platform", "win32")
         dst = tmp_path / "out.bin"
         dst.write_bytes(bytes(10))
-        fd = os.open(dst, os.O_WRONLY)
+        fd = os.open(dst, os.O_WRONLY | _O_BINARY)
         try:
             export_scheduler_mod._pwrite(fd, b"hello", 3)
         finally:

@@ -184,11 +184,13 @@ def main() -> int:
         for path in sorted(root.rglob("*.py")):
             module_name = _module_name(path, root, root_package)
             allowed_extra = EXCEPTIONS.get(module_name, ())
-            tree = ast.parse(path.read_text(), filename=str(path))
+            tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
             for lineno, imported in _sdk_imports(tree):
                 if _matches(imported, ALLOWED_SDK_PREFIXES) or _matches(imported, allowed_extra):
                     continue
-                violations.append(f"{path.relative_to(ROOT)}:{lineno}: imports {imported!r}")
+                # as_posix(): this report is read (and asserted on) the same way on
+                # every platform, so it should not switch to backslashes on Windows.
+                violations.append(f"{path.relative_to(ROOT).as_posix()}:{lineno}: imports {imported!r}")
 
     if violations:
         print(

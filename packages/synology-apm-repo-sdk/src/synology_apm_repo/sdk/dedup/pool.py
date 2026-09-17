@@ -780,6 +780,22 @@ class Pool:
         # AllocationTableCache's own docstring.
         self._allocation_cache = AllocationTableCache()
 
+    def release_caches(self) -> None:
+        """Drop everything this pool holds in memory: decoded chunks, open
+        bucket readers, and allocation tables.
+
+        Closing a repository does not, on its own, free any of this — the
+        caches live on the ``Pool``, which a caller can still be holding a
+        reference to. Anything walking several repositories in one process
+        (a smoke run, a TUI session browsing one after another) would
+        otherwise keep every pool it ever opened fully populated. The
+        ``DirCache`` is deliberately untouched: it belongs to the store,
+        not to this pool.
+        """
+        self._buckets.invalidate()
+        self._chunks.invalidate()
+        self._allocation_cache.clear()
+
     @property
     def store(self) -> ObjectStore:
         """Needed by ``dedup.pool_descriptor.PoolDescriptor.from_pool`` to

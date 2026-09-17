@@ -13,13 +13,14 @@ Two paths:
 - **Slow path**: a non-zero ``-wal`` sidecar exists (real observed case:
   ``copy_meta_file/target.db``) -> copy the main file plus any present
   ``-wal``/``-shm`` sidecars into a temp directory and open *that* copy
-  (letting SQLite's own recovery replay the WAL), so the original store's
-  bytes are never touched. Only ``-wal``'s size gates this decision — a
-  non-zero ``-shm`` alone does not trigger it.
+  read-write (letting SQLite's own recovery replay the WAL), so the
+  original store's bytes are never touched. Only ``-wal``'s size gates
+  this decision — a non-zero ``-shm`` alone does not trigger it.
 
-``apply_index_hint`` lives here too, not in ``storage/table.py``: it
-needs to know what a ``mode=ro`` connection does when written to, exactly
-the fast-path mechanic this module already owns.
+The read-only/read-write split between the two is the whole reason
+``apply_index_hint`` lives here rather than in ``storage/table.py``: only
+a connection onto a copy we own can be given an index, and this module is
+where that distinction is made.
 """
 
 from __future__ import annotations
@@ -45,7 +46,9 @@ async def open_sqlite(
     tmp_dir: Path | None = None,
     transform: Callable[[bytes], bytes] | None = None,
 ) -> tuple[aiosqlite.Connection, tempfile.TemporaryDirectory[str] | None]:
-    """Open a read-only ``aiosqlite`` connection to ``path`` within ``store``.
+    """Open an ``aiosqlite`` connection to ``path`` within ``store`` — read-only
+    on the fast path, read-write on the slow path's own private materialized
+    copy (see this module's own docstring for which path a given call takes).
 
     Returns ``(connection, materialized_tmp_dir)``. ``materialized_tmp_dir``
     is ``None`` on the fast path (nothing extra was created); on the slow
@@ -110,7 +113,15 @@ async def open_sqlite(
             if isinstance(result, BaseException):
                 raise result
 
-        conn = await aiosqlite.connect(f"file:{dest_dir / base_name}?mode=ro", uri=True)
+        # Read-*write*, unlike the fast path above: this is our own private
+        # copy in a temp directory this function created and will delete, so
+        # nothing here can reach the store's bytes. Writable is what lets
+        # apply_index_hint() actually build an index instead of silently
+        # doing nothing and leaving every later query a full table scan.
+        # ``rw`` rather than plain (``rwc``): a path SQLite cannot resolve must
+        # still fail here, not open as a brand-new empty database whose
+        # missing tables only surface later as a DataCorruptError.
+        conn = await aiosqlite.connect(f"file:{dest_dir / base_name}?mode=rw", uri=True)
     except Exception:
         tmp.cleanup()
         raise

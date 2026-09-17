@@ -123,6 +123,7 @@ class SaasStream:
         # (AsyncKeyedCache's own presence check, not an ``is not None``
         # check, covers this) -- a genuinely-missing generation isn't
         # re-walked on every repeated reference to it either.
+        self._table_cache: AsyncKeyedCache[tuple[str, tuple[str, ...]], Table] = AsyncKeyedCache()
         self._forward_resolution_cache: AsyncKeyedCache[int, tuple[int, str] | None] = AsyncKeyedCache(
             self._do_resolve_forward
         )
@@ -133,7 +134,14 @@ class SaasStream:
         self._last_open_resolution: tuple[VersionUid, int, int] | None = None
 
     async def close(self) -> None:
-        """Release every sqlite connection this instance opened."""
+        """Release every sqlite connection this instance opened.
+
+        The table cache goes with them: each ``Table`` it holds is bound to one
+        of these connections, so keeping them would turn this instance's
+        documented lazy-reopen (every ``_*_connection()`` getter rebuilds from
+        ``None``) into a failure against a closed connection.
+        """
+        self._table_cache.invalidate()
         if self._snapshot_source is not None:
             await self._snapshot_source.close()
             self._snapshot_source = None
@@ -235,6 +243,33 @@ class SaasStream:
         return self._stream_info_source.connection
 
     async def _open_table_with_fallback(
+        self,
+        table_name: str,
+        columns: list[Column],
+        *,
+        primary: Callable[[], Awaitable[aiosqlite.Connection]],
+        fallback: Callable[[], Awaitable[aiosqlite.Connection]],
+    ) -> Table:
+        """Cached by table name, then ``_do_open_table_with_fallback``.
+
+        The connections underneath are themselves cached for this stream's
+        lifetime, so the ``Table`` bound to one stays valid — and building one
+        costs a ``PRAGMA table_info`` round trip that ``stream_version_for``
+        would otherwise pay twice for every single version it resolves. Same
+        reasoning, and the same ``AsyncKeyedCache`` in-flight de-duplication,
+        as ``dedup.repository.DedupRepo``'s own ``file_meta`` table cache.
+        """
+
+        async def _load(_key: tuple[str, tuple[str, ...]]) -> Table:
+            return await self._do_open_table_with_fallback(table_name, columns, primary=primary, fallback=fallback)
+
+        # Keyed on the columns too, not the table name alone: a second caller
+        # asking for the same table with a different column list must not be
+        # handed the first one's Table, whose own ``columns_present`` was
+        # narrowed to that first list.
+        return await self._table_cache.resolve((table_name, tuple(c.name for c in columns)), _load)
+
+    async def _do_open_table_with_fallback(
         self,
         table_name: str,
         columns: list[Column],

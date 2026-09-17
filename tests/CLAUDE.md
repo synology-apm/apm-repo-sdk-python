@@ -323,11 +323,47 @@ size) — this file doesn't duplicate that here.
 `catalog/version.py`'s `_version_display_name()` deliberately renders a version's
 epoch in the machine's local timezone (see `ARCHITECTURE.md`'s Presentation
 section). `tests/conftest.py`'s session-scoped `_fixed_timezone` fixture
-pins `TZ` to `Asia/Taipei` for the whole suite so an assertion against that
-rendered string reproduces on any machine, CI included — a replay test that
+pins that timezone to `Asia/Taipei` for the whole suite so an assertion against
+that rendered string reproduces on any machine, CI included (via `TZ`/`tzset`
+on POSIX; Windows has neither, so there the fixture pins the one rendering
+call site directly) — a replay test that
 hardcodes a rendered timestamp string never needs to account for the
 timezone itself, but do check a new one against the actual fixed value
 rather than whatever your own machine happens to render.
+
+## Driving a `Pilot` test: wait for the state, never for a duration
+
+A `Pilot` test decides when to take its next step by checking the state that
+step needs, via `tests/conftest.py`'s `wait_until` — never by sleeping and
+assuming. `await pilot.pause(0.03)` between an action and a read is the shape
+that produced most of this suite's flakiness: it passes on an idle machine and
+silently does the wrong thing on a busy one, usually by sending a keypress into
+a widget that is not ready for it.
+
+Three preconditions are easy to assume and must be waited on instead:
+
+- **Focus.** A key goes to whatever *actually* has focus. `UnitScreen` focuses
+  its own tree (`_populate_root`), but that is a request the app grants a turn
+  or two later — until then keys still reach the screen below. Focus the widget
+  and wait for `has_focus` before pressing, the same way
+  `_drill_to_a_real_mail_units_screen` already does for every other widget.
+- **Cursor placement.** `Tree.move_cursor()` only takes effect against an
+  up-to-date line map; force it with `_ = tree._tree_lines` first, then wait for
+  `tree.cursor_node is node`.
+- **A rebuilt tree.** `d` (verbose) and `r` (refresh) both re-dispatch the
+  provider and rebuild the whole tree, so any `TreeNode` picked before them is
+  gone afterwards — re-acquire, don't reuse.
+
+Budgets split by what is being waited for. A UI state transition (focus,
+cursor, a widget appearing, a rendered string changing) settles in a few turns
+and keeps a small budget. A wait on data genuinely being fetched and decoded
+through the SDK — a tree's root children, a folder's children, a versions
+table's rows — is waiting on real work and gets `timeout=3.0`; those are the
+waits that fail first when the machine is busy.
+
+Two cases legitimately keep a fixed `pause`: asserting that something *never*
+happens (there is no readiness signal for an absence), and sampling state at
+intervals on purpose. Both say so in a comment at the call site.
 
 ## Closing a provider built directly against a repository
 

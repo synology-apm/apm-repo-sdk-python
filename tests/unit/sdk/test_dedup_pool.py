@@ -1494,3 +1494,30 @@ class TestSizeStoreParityRepair:
 
         with pytest.raises(DataCorruptError):
             await BucketReader.open(store, "Pool/5/0.buk")
+
+
+class TestReleaseCaches:
+    """``Pool`` holds decoded chunks, open bucket readers and allocation
+    tables for its whole lifetime. Closing a repository has to be able to
+    hand that memory back — otherwise anything walking several repositories
+    in one process keeps every pool it ever opened fully populated."""
+
+    async def test_release_caches_drops_what_real_reads_populated(self, plaintext_pool: Pool) -> None:
+        for chunk_idx in range(len(_PLAINTEXTS)):
+            await plaintext_pool.read_chunk(ChunkAddress(StreamId(5), BucketId(0), ChunkIdx(chunk_idx)))
+        assert len(plaintext_pool._chunks) > 0
+        assert len(plaintext_pool._buckets) > 0
+
+        plaintext_pool.release_caches()
+
+        assert len(plaintext_pool._chunks) == 0
+        assert len(plaintext_pool._buckets) == 0
+        assert len(plaintext_pool._allocation_cache._tables) == 0
+
+    async def test_the_pool_still_works_after_a_release(self, plaintext_pool: Pool) -> None:
+        """Releasing is not closing: the next read just re-opens what it
+        needs, so a caller that releases early is never left with a dead pool."""
+        addr = ChunkAddress(StreamId(5), BucketId(0), ChunkIdx(0))
+        assert await plaintext_pool.read_chunk(addr) == _PLAINTEXTS[0]
+        plaintext_pool.release_caches()
+        assert await plaintext_pool.read_chunk(addr) == _PLAINTEXTS[0]

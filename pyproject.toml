@@ -47,14 +47,15 @@ addopts = ["--import-mode=importlib"]
 
 [tool.mypy]
 python_version = "3.11"
-# Pinned rather than left to follow the host OS: typeshed gates some stdlib
-# symbols (e.g. os.posix_fadvise) by platform, so an unpinned mypy run
-# disagrees with itself between a macOS dev machine and a Linux CI runner —
-# the same `# type: ignore[attr-defined]` is required on darwin and reported
-# as unused-ignore on linux. Pinning to darwin (the strictest of the two
-# platforms this project's platform-conditional code checks against) keeps
-# every environment consistent.
-platform = "darwin"
+# No `platform` pin here: mypy only type-checks one sys.platform per run, and
+# this project ships to Windows/Linux/macOS, so `make test` runs mypy three
+# times (--platform linux/win32/darwin) instead of picking one default here.
+# Platform-conditional stdlib usage (os.pread/os.pwrite/os.posix_fadvise) is
+# gated with `sys.platform ==`/`!=` comparisons, not `hasattr()` -- mypy's
+# reachability analysis skips the non-matching branch entirely under each of
+# the three --platform runs, so no `# type: ignore` is needed at any of those
+# call sites (see storage/local.py's `_pread`/`_hint_willneed` for the
+# pattern to follow for new platform-conditional code).
 strict = true
 explicit_package_bases = true
 namespace_packages = true
@@ -71,8 +72,8 @@ mypy_path = [
     "tests",
 ]
 # The Makefile invokes bare `uv run mypy` (no command-line path argument), so
-# this list is what `make test`/`make typecheck` actually check — add any new
-# top-level source location here explicitly, or `mypy` silently skips it.
+# this list is what `make test` actually checks — add any new top-level
+# source location here explicitly, or `mypy` silently skips it.
 files = [
     "packages/synology-apm-repo-sdk/src",
     "packages/synology-apm-repo-cli/src",

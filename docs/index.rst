@@ -59,6 +59,7 @@ repository formats.
    api/synology_apm_repo.sdk.dedup.pool
    api/synology_apm_repo.sdk.dedup.pool_descriptor
    api/synology_apm_repo.sdk.dedup.export_scheduler
+   api/synology_apm_repo.sdk.dedup.presized_file
    api/synology_apm_repo.sdk.dedup.fingerprint
    api/synology_apm_repo.sdk.dedup.keys
    api/synology_apm_repo.sdk.dedup.verify_checks

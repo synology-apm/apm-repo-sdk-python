@@ -27,6 +27,7 @@ from synology_apm_repo.cli.strings import (
     VERBOSE_HELP,
     VERSION_HELP,
 )
+from synology_apm_repo.sdk.presentation.logging_setup import configure_logging
 
 console = Console()
 
@@ -91,6 +92,14 @@ app.add_typer(profile_cmd.app, name="profile")
 
 
 def main() -> None:  # pragma: no cover - real sys.argv/sys.exit; every test drives ``app`` via CliRunner instead
+    # Stop dependency logging from reaching the terminal -- shared with the
+    # TUI's own call site (browser/app.py::main()), since both must behave
+    # identically here; see configure_logging()'s own module docstring for
+    # the mechanism and the escape hatch (SYNOLOGY_APM_REPO_LOG) for
+    # debugging a backend. Less severe here than in the TUI: a dependency's
+    # warning does not corrupt a rendered screen, but it does interleave
+    # with this tool's own output for no reason the user can act on.
+    configure_logging()
     app()
 
 

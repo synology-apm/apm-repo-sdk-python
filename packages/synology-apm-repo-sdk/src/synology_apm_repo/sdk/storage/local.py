@@ -11,6 +11,8 @@ from pathlib import Path, PurePosixPath
 
 from ..errors import NotFoundError, PermissionDeniedError
 
+_O_BINARY = getattr(os, "O_BINARY", 0)
+
 # Readahead hint (``posix_fadvise(WILLNEED)`` on Linux, ``F_RDADVISE`` on macOS)
 # for the merged multi-chunk reads ``dedup/pool.py::BucketReader``
 # issues — gated on a minimum length so it fires for those
@@ -19,9 +21,7 @@ from ..errors import NotFoundError, PermissionDeniedError
 # reads, header reads, ...), which would cost more than the hint could ever
 # save on this store's overwhelming majority of callers.
 _FADVISE_MIN_LENGTH = 64 << 10  # 64 KiB — matches the merge gap tolerance
-_HAS_POSIX_FADVISE = hasattr(os, "posix_fadvise")
 _DARWIN_F_RDADVISE = 44  # <fcntl.h>'s F_RDADVISE — not exposed by Python's fcntl module
-_HAS_PREAD = hasattr(os, "pread")
 
 
 def _pread(fd: int, length: int, offset: int) -> bytes:
@@ -29,7 +29,7 @@ def _pread(fd: int, length: int, offset: int) -> bytes:
     read, so this falls back to ``lseek``+``read`` — safe here because
     ``fd`` is opened, read once, and closed within a single
     ``_read_sync`` call, never shared with a concurrent reader."""
-    if _HAS_PREAD:
+    if sys.platform != "win32":
         return os.pread(fd, length, offset)
     os.lseek(fd, offset, os.SEEK_SET)
     return os.read(fd, length)
@@ -43,8 +43,8 @@ def _hint_willneed(fd: int, offset: int, length: int) -> None:
     (has ``os.posix_fadvise``) nor macOS.
     """
     try:
-        if _HAS_POSIX_FADVISE:
-            os.posix_fadvise(fd, offset, length, os.POSIX_FADV_WILLNEED)  # type: ignore[attr-defined]
+        if sys.platform == "linux":
+            os.posix_fadvise(fd, offset, length, os.POSIX_FADV_WILLNEED)
         elif sys.platform == "darwin":
             import fcntl
 
@@ -114,7 +114,10 @@ class LocalFsStore:
     def _read_sync(self, path: str, offset: int = 0, length: int | None = None) -> bytes:
         p = self._resolve(path)
         try:
-            fd = os.open(p, os.O_RDONLY)
+            # O_BINARY (0 off Windows) is not optional: Windows opens in text
+            # mode by default, which collapses CRLF and stops the read dead at
+            # the first 0x1A byte -- silently short, mangled repository bytes.
+            fd = os.open(p, os.O_RDONLY | _O_BINARY)
         except FileNotFoundError as exc:
             raise NotFoundError("no such file", ref=path) from exc
         except IsADirectoryError as exc:

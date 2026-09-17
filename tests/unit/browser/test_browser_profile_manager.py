@@ -58,6 +58,25 @@ def _activate_backend(dialog: ConnectDialog, backend: str) -> None:
     dialog.query_one("#connect-backend-tabs", Tabs).active = backend
 
 
+async def _activate_backend_and_settle(
+    dialog: ConnectDialog, backend: str, pilot: Pilot[None], wait_until: Any
+) -> None:
+    """``_activate_backend`` plus the wait its callers all need.
+
+    Setting ``Tabs.active`` only posts ``TabActivated``; the pane swap happens
+    when ``ConnectDialog`` handles it, a later event-loop turn. The pane
+    carrying the ``active`` class is that swap having happened.
+    """
+    _activate_backend(dialog, backend)
+    await wait_until(
+        pilot,
+        lambda: dialog.query_one(f"#connect-{backend}-fields").has_class("active"),
+        timeout=0.6,
+        interval=0.02,
+        message=f"{backend} pane never became active",
+    )
+
+
 def _select_option_values(select: Select[str]) -> list[str]:
     """The real (non-blank) option values currently loaded into a
     ``Select`` — there is no public listing accessor, so this reads the
@@ -172,12 +191,17 @@ class TestProfileManagement:
 
         async def scenario() -> tuple[str, str, str, str, str, bool]:
             async with _open_connect_dialog() as (app, pilot, dialog):
-                _activate_backend(dialog, "s3")
-                await pilot.pause(0.1)
+                await _activate_backend_and_settle(dialog, "s3", pilot, wait_until)
                 await _wait_for_profile_options(dialog, "s3", pilot, wait_until)
                 select = dialog.query_one("#connect-s3-profile-select", Select)
                 select.value = "my-s3"
-                await pilot.pause(0.2)
+                await wait_until(
+                    pilot,
+                    lambda: dialog.query_one("#connect-s3-bucket", Input).value,
+                    timeout=0.6,
+                    interval=0.02,
+                    message="selecting a profile never filled the fields",
+                )
                 return (
                     dialog.query_one("#connect-s3-bucket", Input).value,
                     dialog.query_one("#connect-s3-endpoint", Input).value,
@@ -196,8 +220,7 @@ class TestProfileManagement:
         assert verify_tls is False
 
     def test_connect_dialog_save_profile_validates_fields_before_showing_name_row(
-        self,
-        monkeypatch: pytest.MonkeyPatch,
+        self, monkeypatch: pytest.MonkeyPatch, wait_until: Any
     ) -> None:
         """ "Save as profile..." validates the tab's fields the same no-I/O
         way ``_build_s3_store()`` does before ever showing the name prompt —
@@ -207,10 +230,18 @@ class TestProfileManagement:
 
         async def scenario() -> tuple[bool, str]:
             async with _open_connect_dialog() as (app, pilot, dialog):
-                _activate_backend(dialog, "s3")
-                await pilot.pause(0.1)
+                await _activate_backend_and_settle(dialog, "s3", pilot, wait_until)
                 dialog.query_one("#connect-s3-save-profile-button", Button).press()
-                await pilot.pause(0.1)
+                # The inline warning is the readiness signal here -- this case
+                # asserts the name row *stays hidden*, so waiting for the row
+                # would be waiting for something that must never happen.
+                await wait_until(
+                    pilot,
+                    lambda: str(dialog.query_one("#connect-status", Static).render()),
+                    timeout=0.6,
+                    interval=0.02,
+                    message="validation never reported anything",
+                )
                 row_visible = dialog.query_one("#connect-s3-profile-name-row").has_class("-visible")
                 status = str(dialog.query_one("#connect-status", Static).render())
                 return row_visible, status
@@ -228,12 +259,17 @@ class TestProfileManagement:
 
         async def scenario() -> tuple[bool, bool, str]:
             async with _open_connect_dialog() as (app, pilot, dialog):
-                _activate_backend(dialog, "s3")
-                await pilot.pause(0.1)
+                await _activate_backend_and_settle(dialog, "s3", pilot, wait_until)
                 dialog.query_one("#connect-s3-bucket", Input).value = "bucket-a"
                 dialog.query_one("#connect-s3-access-key", Input).value = "AKIAEXAMPLE"
                 dialog.query_one("#connect-s3-save-profile-button", Button).press()
-                await pilot.pause(0.1)
+                await wait_until(
+                    pilot,
+                    lambda: dialog.query_one("#connect-s3-profile-name-row").has_class("-visible"),
+                    timeout=0.6,
+                    interval=0.02,
+                    message="the profile-name row never appeared",
+                )
                 row_visible_before = dialog.query_one("#connect-s3-profile-name-row").has_class("-visible")
 
                 dialog.query_one("#connect-s3-profile-name-input", Input).value = "new-profile"
@@ -260,12 +296,17 @@ class TestProfileManagement:
 
         async def scenario() -> tuple[bool, list[str]]:
             async with _open_connect_dialog() as (app, pilot, dialog):
-                _activate_backend(dialog, "s3")
-                await pilot.pause(0.1)
+                await _activate_backend_and_settle(dialog, "s3", pilot, wait_until)
                 await _wait_for_profile_options(dialog, "s3", pilot, wait_until)
                 select = dialog.query_one("#connect-s3-profile-select", Select)
                 select.value = "doomed"
-                await pilot.pause(0.1)
+                await wait_until(
+                    pilot,
+                    lambda: not dialog.query_one("#connect-s3-delete-profile-button", Button).disabled,
+                    timeout=0.6,
+                    interval=0.02,
+                    message="delete never became available for the selected profile",
+                )
                 delete_button = dialog.query_one("#connect-s3-delete-profile-button", Button)
                 delete_button_enabled = not delete_button.disabled
                 delete_button.press()
@@ -293,12 +334,17 @@ class TestProfileManagement:
 
         async def scenario() -> tuple[bool, str]:
             async with _open_connect_dialog() as (app, pilot, dialog):
-                _activate_backend(dialog, "s3")
-                await pilot.pause(0.1)
+                await _activate_backend_and_settle(dialog, "s3", pilot, wait_until)
                 await _wait_for_profile_options(dialog, "s3", pilot, wait_until)
                 select = dialog.query_one("#connect-s3-profile-select", Select)
                 select.value = "broken"
-                await pilot.pause(0.2)
+                await wait_until(
+                    pilot,
+                    lambda: str(dialog.query_one("#connect-status", Static).render()),
+                    timeout=0.6,
+                    interval=0.02,
+                    message="a broken profile never reported anything",
+                )
                 status = str(dialog.query_one("#connect-status", Static).render())
                 return isinstance(app.screen, ConnectDialog), status
 
@@ -307,8 +353,7 @@ class TestProfileManagement:
         assert "error" in status.lower(), status
 
     def test_connect_dialog_escape_while_naming_profile_closes_only_the_name_row(
-        self,
-        monkeypatch: pytest.MonkeyPatch,
+        self, monkeypatch: pytest.MonkeyPatch, wait_until: Any
     ) -> None:
         """Esc while the inline name row is open must close only that row —
         the dialog itself (and whatever was already typed in the other
@@ -317,15 +362,26 @@ class TestProfileManagement:
 
         async def scenario() -> tuple[bool, bool, str]:
             async with _open_connect_dialog() as (app, pilot, dialog):
-                _activate_backend(dialog, "s3")
-                await pilot.pause(0.1)
+                await _activate_backend_and_settle(dialog, "s3", pilot, wait_until)
                 dialog.query_one("#connect-s3-bucket", Input).value = "bucket-a"
                 dialog.query_one("#connect-s3-save-profile-button", Button).press()
-                await pilot.pause(0.1)
+                await wait_until(
+                    pilot,
+                    lambda: dialog.query_one("#connect-s3-profile-name-row").has_class("-visible"),
+                    timeout=0.6,
+                    interval=0.02,
+                    message="the profile-name row never appeared",
+                )
                 row_visible_before = dialog.query_one("#connect-s3-profile-name-row").has_class("-visible")
 
                 await pilot.press("escape")
-                await pilot.pause(0.1)
+                await wait_until(
+                    pilot,
+                    lambda: not dialog.query_one("#connect-s3-profile-name-row").has_class("-visible"),
+                    timeout=0.6,
+                    interval=0.02,
+                    message="the profile-name row never went away",
+                )
                 row_visible_after = dialog.query_one("#connect-s3-profile-name-row").has_class("-visible")
                 still_open = isinstance(app.screen, ConnectDialog)
                 bucket_value = dialog.query_one("#connect-s3-bucket", Input).value if still_open else ""
@@ -337,14 +393,13 @@ class TestProfileManagement:
         assert bucket_value == "bucket-a", "the rest of the form must be untouched by that Esc"
 
     def test_connect_dialog_save_profile_empty_name_warns_and_does_not_save(
-        self, monkeypatch: pytest.MonkeyPatch
+        self, monkeypatch: pytest.MonkeyPatch, wait_until: Any
     ) -> None:
         store = _make_fake_profile_store(monkeypatch)
 
         async def scenario() -> str:
             async with _open_connect_dialog() as (app, pilot, dialog):
-                _activate_backend(dialog, "s3")
-                await pilot.pause(0.1)
+                await _activate_backend_and_settle(dialog, "s3", pilot, wait_until)
                 dialog.query_one("#connect-s3-bucket", Input).value = "bucket-a"
                 dialog.query_one("#connect-s3-save-profile-button", Button).press()
                 await pilot.pause(0.1)
@@ -371,8 +426,7 @@ class TestProfileManagement:
 
         async def scenario() -> tuple[bool, str]:
             async with _open_connect_dialog() as (app, pilot, dialog):
-                _activate_backend(dialog, "s3")
-                await pilot.pause(0.1)
+                await _activate_backend_and_settle(dialog, "s3", pilot, wait_until)
                 dialog.query_one("#connect-s3-bucket", Input).value = "bucket-a"
                 dialog.query_one("#connect-s3-save-profile-button", Button).press()
                 await pilot.pause(0.1)
@@ -393,8 +447,7 @@ class TestProfileManagement:
 
         async def scenario() -> None:
             async with _open_connect_dialog() as (app, pilot, dialog):
-                _activate_backend(dialog, "s3")
-                await pilot.pause(0.1)
+                await _activate_backend_and_settle(dialog, "s3", pilot, wait_until)
                 dialog.query_one("#connect-s3-bucket", Input).value = "bucket-a"
                 dialog.query_one("#connect-s3-save-profile-button", Button).press()
                 await pilot.pause(0.1)
@@ -420,8 +473,7 @@ class TestProfileManagement:
 
         async def scenario() -> tuple[bool, str]:
             async with _open_connect_dialog() as (app, pilot, dialog):
-                _activate_backend(dialog, "s3")
-                await pilot.pause(0.1)
+                await _activate_backend_and_settle(dialog, "s3", pilot, wait_until)
                 await _wait_for_profile_options(dialog, "s3", pilot, wait_until)
                 select = dialog.query_one("#connect-s3-profile-select", Select)
                 select.value = "doomed"
@@ -480,8 +532,7 @@ class TestProfileManagement:
 
         async def scenario() -> tuple[str, bool]:
             async with _open_connect_dialog() as (app, pilot, dialog):
-                _activate_backend(dialog, "azure")
-                await pilot.pause(0.1)
+                await _activate_backend_and_settle(dialog, "azure", pilot, wait_until)
                 await _wait_for_profile_options(dialog, "azure", pilot, wait_until)
                 select = dialog.query_one("#connect-azure-profile-select", Select)
                 select.value = "my-azure"
@@ -513,8 +564,7 @@ class TestProfileManagement:
 
         async def scenario() -> tuple[str, str, str, str, str, bool]:
             async with _open_connect_dialog() as (app, pilot, dialog):
-                _activate_backend(dialog, "smb")
-                await pilot.pause(0.1)
+                await _activate_backend_and_settle(dialog, "smb", pilot, wait_until)
                 await _wait_for_profile_options(dialog, "smb", pilot, wait_until)
                 select = dialog.query_one("#connect-smb-profile-select", Select)
                 select.value = "my-smb"
@@ -548,8 +598,7 @@ class TestProfileManagement:
 
         async def scenario() -> tuple[bool, bool, str]:
             async with _open_connect_dialog() as (app, pilot, dialog):
-                _activate_backend(dialog, "azure")
-                await pilot.pause(0.1)
+                await _activate_backend_and_settle(dialog, "azure", pilot, wait_until)
                 dialog.query_one("#connect-azure-container", Input).value = "container-a"
                 # AzureStore's constructor (unlike S3Store's fully-lazy one)
                 # validates account_url synchronously, so an empty one would
@@ -583,8 +632,7 @@ class TestProfileManagement:
 
         async def scenario() -> tuple[bool, bool, str]:
             async with _open_connect_dialog() as (app, pilot, dialog):
-                _activate_backend(dialog, "smb")
-                await pilot.pause(0.1)
+                await _activate_backend_and_settle(dialog, "smb", pilot, wait_until)
                 dialog.query_one("#connect-smb-server", Input).value = "nas.example.com"
                 dialog.query_one("#connect-smb-share", Input).value = "backups"
                 dialog.query_one("#connect-smb-save-profile-button", Button).press()

@@ -271,7 +271,12 @@ class DedupRepo:
         )
 
     async def db(self, name: str) -> aiosqlite.Connection:
-        """Open (and cache) a read-only connection to ``db/<name>``.
+        """Open (and cache) a connection to ``db/<name>``.
+
+        Read-only against the store either way: the fast path opens the real
+        file immutable, and the slow path opens a private materialized copy
+        read-write (see ``storage/sqlite.py``) so an index hint can take
+        effect — writes there never reach the store.
 
         ``name`` is resolved through
         ``PHYSICAL_NAME_ALIASES``
@@ -470,7 +475,8 @@ class DedupRepo:
 
     async def close(self) -> None:
         """Release every cached sqlite connection (and any temp file/
-        directory a slow-path materialization created).
+        directory a slow-path materialization created), then drop this
+        repository's in-memory Pool caches.
 
         Settles every in-flight ``db()`` fetch first, not just what's
         already landed in ``_db_sources`` -- a fetch cancelled mid-flight
@@ -493,6 +499,11 @@ class DedupRepo:
             except Exception as exc:
                 errors.append(exc)
         self._db_sources.invalidate()
+        # Connections are only half of what this repository holds: the Pool's
+        # decoded-chunk/bucket/allocation caches are plain memory that nothing
+        # else ever drops, and a caller still referencing this object (or the
+        # Repository above it) would keep them alive for the whole process.
+        self._pool.release_caches()
         if errors:
             raise ExceptionGroup("DedupRepo.close() failed to close every tracked resource", errors)
 

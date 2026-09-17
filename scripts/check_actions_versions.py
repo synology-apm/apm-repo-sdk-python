@@ -87,7 +87,7 @@ def _discover_pins() -> tuple[list[ActionPin], list[str]]:
     errors: list[str] = []
 
     for wf_path in sorted(WORKFLOWS_DIR.glob("*.yml")):
-        text = wf_path.read_text()
+        text = wf_path.read_text(encoding="utf-8")
         data = yaml.safe_load(text) or {}
         valid_values = _yaml_uses_values(data)
 
@@ -239,7 +239,7 @@ def _evaluate(
 
 def _rewrite_pin(discrepancy: Discrepancy) -> bool:
     path = WORKFLOWS_DIR / discrepancy.pin.workflow_file
-    lines = path.read_text().splitlines(keepends=True)
+    lines = path.read_text(encoding="utf-8").splitlines(keepends=True)
     idx = discrepancy.pin.line_no - 1
     if idx >= len(lines) or not _USES_LINE_RE.match(lines[idx].rstrip("\n")):
         return False
@@ -247,7 +247,7 @@ def _rewrite_pin(discrepancy: Discrepancy) -> bool:
     newline = "\n" if lines[idx].endswith("\n") else ""
     new_value = f"{discrepancy.pin.owner_repo}@{discrepancy.new_sha}"
     lines[idx] = f"{discrepancy.pin.indent}uses: {new_value} # {discrepancy.new_tag}{newline}"
-    path.write_text("".join(lines))
+    path.write_text("".join(lines), encoding="utf-8")
     return True
 
 

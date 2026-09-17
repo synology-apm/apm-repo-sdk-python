@@ -73,6 +73,26 @@ def _activate_backend(dialog: ConnectDialog, backend: str) -> None:
     dialog.query_one("#connect-backend-tabs", Tabs).active = backend
 
 
+async def _activate_backend_and_settle(
+    dialog: ConnectDialog, backend: str, pilot: Pilot[None], wait_until: Any
+) -> None:
+    """``_activate_backend`` plus the wait its callers all need.
+
+    Setting ``Tabs.active`` only posts ``TabActivated``; the pane swap happens
+    when ``ConnectDialog`` handles it, which is a later event-loop turn. The
+    pane carrying the ``active`` class is that swap having happened — waiting
+    on it beats guessing a duration before touching this backend's widgets.
+    """
+    _activate_backend(dialog, backend)
+    await wait_until(
+        pilot,
+        lambda: dialog.query_one(f"#connect-{backend}-fields").has_class("active"),
+        timeout=0.6,
+        interval=0.02,
+        message=f"{backend} pane never became active",
+    )
+
+
 async def _wait_for_status_containing(dialog: ConnectDialog, pilot: Pilot[None], wait_until: Any, needle: str) -> str:
     """Polls ``#connect-status`` until its rendered text contains
     ``needle`` (case-insensitive), returning that final text — same
@@ -155,7 +175,7 @@ class TestDialogMechanics:
         assert smb_active is False
         assert submit_label == "Open"
 
-    def test_connect_dialog_switching_backends_toggles_fields_and_submit_label(self) -> None:
+    def test_connect_dialog_switching_backends_toggles_fields_and_submit_label(self, wait_until: Any) -> None:
         async def scenario() -> list[tuple[bool, bool, bool, bool, str]]:
             snapshots: list[tuple[bool, bool, bool, bool, str]] = []
             async with _open_connect_dialog() as (app, pilot, dialog):
@@ -169,20 +189,16 @@ class TestDialogMechanics:
                         str(dialog.query_one("#connect-submit", Button).label),
                     )
 
-                _activate_backend(dialog, "s3")
-                await pilot.pause(0.1)
+                await _activate_backend_and_settle(dialog, "s3", pilot, wait_until)
                 snapshots.append(snapshot())
 
-                _activate_backend(dialog, "azure")
-                await pilot.pause(0.1)
+                await _activate_backend_and_settle(dialog, "azure", pilot, wait_until)
                 snapshots.append(snapshot())
 
-                _activate_backend(dialog, "smb")
-                await pilot.pause(0.1)
+                await _activate_backend_and_settle(dialog, "smb", pilot, wait_until)
                 snapshots.append(snapshot())
 
-                _activate_backend(dialog, "local")
-                await pilot.pause(0.1)
+                await _activate_backend_and_settle(dialog, "local", pilot, wait_until)
                 snapshots.append(snapshot())
             return snapshots
 
@@ -557,8 +573,7 @@ class TestScanAndSubmit:
                 await pilot.pause(0.2)
                 dialog = app.screen
                 assert isinstance(dialog, ConnectDialog), dialog
-                _activate_backend(dialog, backend)
-                await pilot.pause(0.1)
+                await _activate_backend_and_settle(dialog, backend, pilot, wait_until)
                 set_fields(dialog)
                 dialog.query_one("#connect-submit", Button).press()
                 await wait_until(pilot, lambda: result is not None, timeout=1.5, interval=0.05)
@@ -598,8 +613,7 @@ class TestScanAndSubmit:
 
         async def scenario() -> tuple[int, str]:
             async with _open_connect_dialog() as (app, pilot, dialog):
-                _activate_backend(dialog, "s3")
-                await pilot.pause(0.1)
+                await _activate_backend_and_settle(dialog, "s3", pilot, wait_until)
                 dialog.query_one("#connect-s3-bucket", Input).value = "test-bucket"
                 dialog.query_one("#connect-submit", Button).press()
                 await wait_until(pilot, lambda: isinstance(app.screen, BrowseScreen), timeout=3.0, interval=0.1)
@@ -625,8 +639,7 @@ class TestScanAndSubmit:
 
         async def scenario() -> tuple[bool, str, bool]:
             async with _open_connect_dialog() as (app, pilot, dialog):
-                _activate_backend(dialog, "s3")
-                await pilot.pause(0.1)
+                await _activate_backend_and_settle(dialog, "s3", pilot, wait_until)
                 dialog.query_one("#connect-s3-bucket", Input).value = "test-1"
                 submit = dialog.query_one("#connect-submit", Button)
                 submit.press()
@@ -654,8 +667,7 @@ class TestScanAndSubmit:
 
         async def scenario() -> tuple[bool, str]:
             async with _open_connect_dialog() as (app, pilot, dialog):
-                _activate_backend(dialog, "s3")
-                await pilot.pause(0.1)
+                await _activate_backend_and_settle(dialog, "s3", pilot, wait_until)
                 dialog.query_one("#connect-s3-bucket", Input).value = "test-1"
                 dialog.query_one("#connect-submit", Button).press()
                 status = await _wait_for_status_containing(dialog, pilot, wait_until, "error")
@@ -678,8 +690,7 @@ class TestScanAndSubmit:
 
         async def scenario() -> tuple[bool, str]:
             async with _open_connect_dialog() as (app, pilot, dialog):
-                _activate_backend(dialog, "s3")
-                await pilot.pause(0.1)
+                await _activate_backend_and_settle(dialog, "s3", pilot, wait_until)
                 dialog.query_one("#connect-s3-bucket", Input).value = "test-1"
                 dialog.query_one("#connect-submit", Button).press()
                 status = await _wait_for_status_containing(dialog, pilot, wait_until, "error")

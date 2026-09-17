@@ -72,7 +72,7 @@ async def _drill_to_first_workload_of_type(
     await pilot.press("enter")
 
     wl_tree = app.screen.query_one("#col-workloads", Tree)
-    await wait_until(pilot, lambda: any(wl_tree.root.children), timeout=0.9, interval=0.03)
+    await wait_until(pilot, lambda: any(wl_tree.root.children), timeout=3.0, interval=0.03)
     path = _find_group_node_path(wl_tree.root, type_hint, [])
     assert path is not None, f"no group node with data == {type_hint!r} found"
     for ancestor in path:
@@ -86,7 +86,7 @@ async def _drill_to_first_workload_of_type(
     await pilot.press("enter")
 
     ver_table = app.screen.query_one("#col-versions", DataTable)
-    await wait_until(pilot, lambda: ver_table.row_count, timeout=0.9, interval=0.03)
+    await wait_until(pilot, lambda: ver_table.row_count, timeout=3.0, interval=0.03)
     ver_table.focus()
     await pilot.press("enter")
 
@@ -110,6 +110,8 @@ def test_previewing_a_teams_channel_then_quitting_does_not_leak_threads_replayed
     open_browser_pilot: Any,
     wait_until: Any,
     record_target: Callable[..., Awaitable[ObjectStore]],
+    move_cursor_to: Any,
+    focus_widget: Any,
 ) -> None:
     async def scenario() -> None:
         await _patch_local_store(monkeypatch, record_target)
@@ -128,10 +130,10 @@ def test_previewing_a_teams_channel_then_quitting_does_not_leak_threads_replayed
             unit_screen = app.screen
             assert isinstance(unit_screen, UnitScreen)
             tree = unit_screen.query_one("#unit-tree", Tree)
-            await wait_until(pilot, lambda: tree.root.children, timeout=0.9, interval=0.03)
+            await wait_until(pilot, lambda: tree.root.children, timeout=3.0, interval=0.03)
+            await focus_widget(pilot, tree)
             channel = tree.root.children[0]
-            tree.move_cursor(channel)
-            await pilot.pause(0.02)
+            await move_cursor_to(pilot, tree, channel)
             await pilot.press("enter")
             # A Teams channel's own node carries UnitKind.RAW_OBJECT (see
             # teams_chat.py) -- structural, not a rendered message's own
@@ -140,7 +142,9 @@ def test_previewing_a_teams_channel_then_quitting_does_not_leak_threads_replayed
             await _wait_for_detail_text(unit_screen, pilot, contains="kind: raw_object")
 
             await pilot.press("q")
-            await pilot.pause(0.5)
+            await wait_until(
+                pilot, lambda: not app.is_running, timeout=1.0, interval=0.02, message="app never shut down"
+            )
 
     before = {t.ident for t in threading.enumerate()}
     asyncio.run(scenario())
@@ -149,7 +153,7 @@ def test_previewing_a_teams_channel_then_quitting_does_not_leak_threads_replayed
 
 
 async def _drill_to_site_list_category(
-    app: ApmRepoBrowserApp, pilot: Any, wait_until: Any, *, connection_config_id: int
+    app: ApmRepoBrowserApp, pilot: Any, wait_until: Any, *, connection_config_id: int, move_cursor_to: Any
 ) -> tuple[UnitScreen, TreeNode[object]]:
     await _drill_to_first_workload_of_type(
         app, pilot, wait_until, connection_config_id=connection_config_id, type_hint="SITE"
@@ -157,13 +161,12 @@ async def _drill_to_site_list_category(
     unit_screen = app.screen
     assert isinstance(unit_screen, UnitScreen)
     tree = unit_screen.query_one("#unit-tree", Tree)
-    await wait_until(pilot, lambda: tree.root.children, timeout=0.9, interval=0.03)
+    await wait_until(pilot, lambda: tree.root.children, timeout=3.0, interval=0.03)
     list_category = next((c for c in tree.root.children if str(c.label) == "List"), None)
     assert list_category is not None, [str(c.label) for c in tree.root.children]
-    tree.move_cursor(list_category)
-    await pilot.pause(0.02)
+    await move_cursor_to(pilot, tree, list_category)
     await pilot.press("l")
-    await wait_until(pilot, lambda: list_category.children, timeout=0.9, interval=0.03)
+    await wait_until(pilot, lambda: list_category.children, timeout=3.0, interval=0.03)
     assert list_category.children, "List category never loaded any real lists"
     return unit_screen, list_category
 
@@ -174,6 +177,8 @@ def test_site_list_group_has_no_expand_arrow_and_loads_no_tree_children_replayed
     open_browser_pilot: Any,
     wait_until: Any,
     record_target: Callable[..., Awaitable[ObjectStore]],
+    move_cursor_to: Any,
+    focus_widget: Any,
 ) -> None:
     async def scenario() -> bool:
         await _patch_local_store(monkeypatch, record_target)
@@ -182,15 +187,17 @@ def test_site_list_group_has_no_expand_arrow_and_loads_no_tree_children_replayed
             await pilot.pause()
             await open_browser_pilot(app, pilot, tmp_path)
             unit_screen, list_category = await _drill_to_site_list_category(
-                app, pilot, wait_until, connection_config_id=1
+                app, pilot, wait_until, connection_config_id=1, move_cursor_to=move_cursor_to
             )
             tree = unit_screen.query_one("#unit-tree", Tree)
 
             access_requests = next((c for c in list_category.children if str(c.label) == "Access Requests"), None)
             assert access_requests is not None, [str(c.label) for c in list_category.children]
-            tree.move_cursor(access_requests)
-            await pilot.pause(0.02)
+            await move_cursor_to(pilot, tree, access_requests)
             await pilot.press("l")  # a no-op "expand" attempt — there is nothing to expand
+            # Deliberately a fixed wait, not a wait_until: this asserts an
+            # *absence* (nothing expands), and there is no readiness signal
+            # for something that must never happen.
             await pilot.pause(0.5)
 
             return access_requests.allow_expand
@@ -205,6 +212,8 @@ def test_site_list_group_shows_a_spreadsheet_overview_replayed(
     open_browser_pilot: Any,
     wait_until: Any,
     record_target: Callable[..., Awaitable[ObjectStore]],
+    move_cursor_to: Any,
+    focus_widget: Any,
 ) -> None:
     async def scenario() -> str:
         await _patch_local_store(monkeypatch, record_target)
@@ -213,14 +222,13 @@ def test_site_list_group_shows_a_spreadsheet_overview_replayed(
             await pilot.pause()
             await open_browser_pilot(app, pilot, tmp_path)
             unit_screen, list_category = await _drill_to_site_list_category(
-                app, pilot, wait_until, connection_config_id=1
+                app, pilot, wait_until, connection_config_id=1, move_cursor_to=move_cursor_to
             )
             tree = unit_screen.query_one("#unit-tree", Tree)
 
             access_requests = next((c for c in list_category.children if str(c.label) == "Access Requests"), None)
             assert access_requests is not None, [str(c.label) for c in list_category.children]
-            tree.move_cursor(access_requests)
-            await pilot.pause(0.02)
+            await move_cursor_to(pilot, tree, access_requests)
             await pilot.press("enter")
 
             return await _wait_for_detail_text(unit_screen, pilot, contains="I'd like")
@@ -237,6 +245,8 @@ def test_wide_list_overview_gets_a_pannable_pane_not_a_wrapped_one_replayed(
     open_browser_pilot: Any,
     wait_until: Any,
     record_target: Callable[..., Awaitable[ObjectStore]],
+    move_cursor_to: Any,
+    focus_widget: Any,
 ) -> None:
     async def scenario() -> tuple[str, frozenset[str], bool]:
         await _patch_local_store(monkeypatch, record_target)
@@ -245,14 +255,13 @@ def test_wide_list_overview_gets_a_pannable_pane_not_a_wrapped_one_replayed(
             await pilot.pause()
             await open_browser_pilot(app, pilot, tmp_path)
             unit_screen, list_category = await _drill_to_site_list_category(
-                app, pilot, wait_until, connection_config_id=1
+                app, pilot, wait_until, connection_config_id=1, move_cursor_to=move_cursor_to
             )
             tree = unit_screen.query_one("#unit-tree", Tree)
 
             composed_looks = next((c for c in list_category.children if str(c.label) == "Composed Looks"), None)
             assert composed_looks is not None, [str(c.label) for c in list_category.children]
-            tree.move_cursor(composed_looks)
-            await pilot.pause(0.02)
+            await move_cursor_to(pilot, tree, composed_looks)
             await pilot.press("enter")
 
             detail = unit_screen.query_one("#detail", Static)
@@ -275,6 +284,8 @@ def test_disk_image_leaf_shows_no_preview_just_the_header_block_replayed(
     open_browser_pilot: Any,
     wait_until: Any,
     record_target: Callable[..., Awaitable[ObjectStore]],
+    move_cursor_to: Any,
+    focus_widget: Any,
 ) -> None:
     async def scenario() -> str:
         await _patch_local_store(monkeypatch, record_target)

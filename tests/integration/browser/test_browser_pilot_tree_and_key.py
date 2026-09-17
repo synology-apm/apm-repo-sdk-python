@@ -78,13 +78,13 @@ async def _drill_to_a_real_mail_units_screen(
     await pilot.press("enter")
 
     wl_tree = app.screen.query_one("#col-workloads", Tree)
-    await wait_until(pilot, lambda: any(wl_tree.root.children), timeout=0.6, interval=0.03)
+    await wait_until(pilot, lambda: any(wl_tree.root.children), timeout=3.0, interval=0.03)
     _select_matching_workload(wl_tree, "MAIL")
     wl_tree.focus()
     await pilot.press("enter")
 
     ver_table = app.screen.query_one("#col-versions", DataTable)
-    await wait_until(pilot, lambda: ver_table.row_count, timeout=0.6, interval=0.03)
+    await wait_until(pilot, lambda: ver_table.row_count, timeout=3.0, interval=0.03)
     ver_table.focus()
     await pilot.press("enter")
 
@@ -92,9 +92,12 @@ async def _drill_to_a_real_mail_units_screen(
     assert isinstance(app.screen, UnitScreen), app.screen
 
 
-async def _first_non_leaf_root_child(unit_screen: UnitScreen, pilot: Any, wait_until: Any) -> TreeNode[Any]:
+async def _first_non_leaf_root_child(
+    unit_screen: UnitScreen, pilot: Any, wait_until: Any, focus_widget: Any
+) -> TreeNode[Any]:
     tree = unit_screen.query_one("#unit-tree", Tree)
-    await wait_until(pilot, lambda: tree.root.children, timeout=0.9, interval=0.03)
+    await wait_until(pilot, lambda: tree.root.children, timeout=3.0, interval=0.03)
+    await focus_widget(pilot, tree)
     folder = next((n for n in tree.root.children if n.data is not None and not n.data.is_leaf), None)
     assert folder is not None, "Mail root has no non-leaf folder child to expand"
     return folder
@@ -106,6 +109,8 @@ def test_l_expands_a_second_level_tree_node_and_it_stays_expanded_replayed(
     open_browser_pilot: Any,
     wait_until: Any,
     record_target: Callable[..., Awaitable[ObjectStore]],
+    move_cursor_to: Any,
+    focus_widget: Any,
 ) -> None:
     async def scenario() -> tuple[bool, int]:
         await _patch_local_store(monkeypatch, record_target)
@@ -117,12 +122,11 @@ def test_l_expands_a_second_level_tree_node_and_it_stays_expanded_replayed(
             unit_screen = app.screen
             assert isinstance(unit_screen, UnitScreen)
             tree = unit_screen.query_one("#unit-tree", Tree)
-            folder = await _first_non_leaf_root_child(unit_screen, pilot, wait_until)
+            folder = await _first_non_leaf_root_child(unit_screen, pilot, wait_until, focus_widget)
 
-            tree.move_cursor(folder)
-            await pilot.pause(0.02)
+            await move_cursor_to(pilot, tree, folder)
             await pilot.press("l")
-            await wait_until(pilot, lambda: folder.children, timeout=0.9, interval=0.03)
+            await wait_until(pilot, lambda: folder.children, timeout=3.0, interval=0.03)
             return folder.is_expanded, len(folder.children)
 
     is_expanded, child_count = asyncio.run(scenario())
@@ -136,6 +140,8 @@ def test_enter_expands_a_second_level_tree_node_and_it_stays_expanded_replayed(
     open_browser_pilot: Any,
     wait_until: Any,
     record_target: Callable[..., Awaitable[ObjectStore]],
+    move_cursor_to: Any,
+    focus_widget: Any,
 ) -> None:
     async def scenario() -> tuple[bool, int]:
         await _patch_local_store(monkeypatch, record_target)
@@ -147,12 +153,11 @@ def test_enter_expands_a_second_level_tree_node_and_it_stays_expanded_replayed(
             unit_screen = app.screen
             assert isinstance(unit_screen, UnitScreen)
             tree = unit_screen.query_one("#unit-tree", Tree)
-            folder = await _first_non_leaf_root_child(unit_screen, pilot, wait_until)
+            folder = await _first_non_leaf_root_child(unit_screen, pilot, wait_until, focus_widget)
 
-            tree.move_cursor(folder)
-            await pilot.pause(0.02)
+            await move_cursor_to(pilot, tree, folder)
             await pilot.press("enter")
-            await wait_until(pilot, lambda: folder.children, timeout=0.9, interval=0.03)
+            await wait_until(pilot, lambda: folder.children, timeout=3.0, interval=0.03)
             return folder.is_expanded, len(folder.children)
 
     is_expanded, child_count = asyncio.run(scenario())
@@ -166,6 +171,8 @@ def test_filtering_purges_stale_tree_node_bookkeeping_replayed(
     open_browser_pilot: Any,
     wait_until: Any,
     record_target: Callable[..., Awaitable[ObjectStore]],
+    move_cursor_to: Any,
+    focus_widget: Any,
 ) -> None:
     async def scenario() -> tuple[bool, bool, int]:
         await _patch_local_store(monkeypatch, record_target)
@@ -177,26 +184,44 @@ def test_filtering_purges_stale_tree_node_bookkeeping_replayed(
             unit_screen = app.screen
             assert isinstance(unit_screen, UnitScreen)
             tree = unit_screen.query_one("#unit-tree", Tree)
-            folder = await _first_non_leaf_root_child(unit_screen, pilot, wait_until)
+            folder = await _first_non_leaf_root_child(unit_screen, pilot, wait_until, focus_widget)
 
-            tree.move_cursor(folder)
-            await pilot.pause(0.02)
+            await move_cursor_to(pilot, tree, folder)
             await pilot.press("l")
-            await wait_until(pilot, lambda: folder.children, timeout=0.9, interval=0.03)
+            await wait_until(pilot, lambda: folder.children, timeout=3.0, interval=0.03)
             assert folder.children, "setup: folder never loaded its messages"
             old_folder_id = id(folder)
             assert old_folder_id in unit_screen._loaded_tree_node_ids
 
             needle = str(folder.label)[:3]
-            tree.move_cursor(tree.root)
-            await pilot.pause(0.02)
+            await move_cursor_to(pilot, tree, tree.root)
             await pilot.press("slash")
-            await pilot.pause(0.02)
+            await wait_until(
+                pilot,
+                lambda: unit_screen.query("#filter-input"),
+                timeout=0.4,
+                interval=0.02,
+                message="filter input never opened",
+            )
             filter_input = unit_screen.query_one("#filter-input", Input)
             filter_input.value = needle
-            await pilot.pause(0.03)
+            # Filtering rebuilds the root's children, so the readiness signal
+            # is the tree no longer holding the pre-filter node objects.
+            await wait_until(
+                pilot,
+                lambda: folder not in tree.root.children,
+                timeout=0.4,
+                interval=0.02,
+                message="filter never narrowed the tree",
+            )
             await pilot.press("escape")
-            await pilot.pause(0.03)
+            await wait_until(
+                pilot,
+                lambda: not unit_screen.query("#filter-input.active"),
+                timeout=0.4,
+                interval=0.02,
+                message="filter never closed",
+            )
 
             old_id_still_marked_loaded = old_folder_id in unit_screen._loaded_tree_node_ids
 
@@ -204,11 +229,10 @@ def test_filtering_purges_stale_tree_node_bookkeeping_replayed(
             assert new_folder is not None, "folder missing after filter restore"
             assert new_folder is not folder, "test invariant: filtering must produce a new TreeNode object"
 
-            tree.move_cursor(new_folder)
-            await pilot.pause(0.02)
+            await move_cursor_to(pilot, tree, new_folder)
             await pilot.press("l")
             await wait_until(
-                pilot, lambda: new_folder.children or not new_folder.allow_expand, timeout=0.9, interval=0.03
+                pilot, lambda: new_folder.children or not new_folder.allow_expand, timeout=3.0, interval=0.03
             )
             return old_id_still_marked_loaded, new_folder.is_expanded, len(new_folder.children)
 

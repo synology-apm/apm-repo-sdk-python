@@ -21,9 +21,13 @@ if TYPE_CHECKING:
     from synology_apm_repo.browser.screens._shared import NavigableScreen
 
 _DEFAULT_DELAY = 0.3
-_FRAME_INTERVAL = 0.1
-#: A Braille dot spinner — smooth-looking at 100ms/frame, and (unlike
-#: ASCII fallbacks such as ``|/-\``) never mistaken for real content.
+#: Every tick repaints the breadcrumb, and a repaint is not free — Textual
+#: reapplies the stylesheet per widget, the dominant cost of driving this
+#: app at all. 500ms still reads as "something is running" while costing a
+#: fifth of what 100ms did.
+_FRAME_INTERVAL = 0.5
+#: A Braille dot spinner — unlike ASCII fallbacks such as ``|/-\``, never
+#: mistaken for real content.
 _SPINNER_FRAMES = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
 #: Deliberately loud — this is the one signal telling the user something
 #: is still running, not a subtle status-bar tone.

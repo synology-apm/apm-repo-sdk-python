@@ -18,6 +18,7 @@ import sys
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from pathlib import Path
+from typing import Any
 
 import pytest
 from textual.pilot import Pilot
@@ -121,7 +122,7 @@ class _BlockingContentSource:
         raise AssertionError("unreachable — this export can only end by being cancelled")
 
 
-def test_export_dialog_ux_details(tmp_path: Path) -> None:
+def test_export_dialog_ux_details(tmp_path: Path, wait_until: Any) -> None:
     """Four direct user-reported UX asks against the export dialog
     (button alignment, progress-bar animation, the Enter-key shortcut,
     button relabeling — see the assertions below for each), all verified
@@ -165,10 +166,13 @@ def test_export_dialog_ux_details(tmp_path: Path) -> None:
             # _BlockingContentSource.export_to() cannot return until
             # cancelled, so this state is guaranteed stable to inspect —
             # no race with a real export finishing underneath.
-            for _ in range(40):
-                await pilot.pause(0.02)
-                if str(export_screen.query_one("#export-start", Button).label) == "Cancel":
-                    break
+            await wait_until(
+                pilot,
+                lambda: str(export_screen.query_one("#export-start", Button).label) == "Cancel",
+                timeout=0.8,
+                interval=0.02,
+                message="the start button never flipped to Cancel",
+            )
             label_during = str(export_screen.query_one("#export-start", Button).label)
             variant_during = export_screen.query_one("#export-start", Button).variant
             progress_active_during = export_screen.query_one("#export-progress", ProgressBar).has_class("active")
@@ -176,12 +180,15 @@ def test_export_dialog_ux_details(tmp_path: Path) -> None:
             # Press the button again while running: it must cancel, not
             # silently no-op or re-start.
             export_screen.query_one("#export-start", Button).press()
-            status = ""
-            for _ in range(50):
-                await pilot.pause(0.02)
-                status = str(export_screen.query_one("#export-status").render())
-                if "cancel" in status.lower() and "cancelling" not in status.lower():
-                    break
+
+            def _settled_on_cancelled() -> bool:
+                text = str(export_screen.query_one("#export-status").render()).lower()
+                return "cancel" in text and "cancelling" not in text
+
+            await wait_until(
+                pilot, _settled_on_cancelled, timeout=1.0, interval=0.02, message="export never reported cancelled"
+            )
+            status = str(export_screen.query_one("#export-status").render())
             label_after = str(export_screen.query_one("#export-start", Button).label)
 
             return (
@@ -224,7 +231,7 @@ def test_export_dialog_ux_details(tmp_path: Path) -> None:
     assert label_after == "Export", "the button must relabel back to Export once the export finishes/cancels"
 
 
-def test_export_screen_uses_the_apps_default_sparse_setting() -> None:
+def test_export_screen_uses_the_apps_default_sparse_setting(wait_until: Any) -> None:
     """``ExportScreen`` has no per-export sparse ``Checkbox`` (see
     ``app.py``'s own ``main()`` docstring) — every export uses whatever
     ``ApmRepoBrowserApp.default_sparse`` was set to at launch. Checked
@@ -250,10 +257,13 @@ def test_export_screen_uses_the_apps_default_sparse_setting() -> None:
             dst_input.focus()
             await pilot.press("enter")
 
-            for _ in range(40):
-                await pilot.pause(0.02)
-                if content.received_sparse is not None:
-                    break
+            await wait_until(
+                pilot,
+                lambda: content.received_sparse is not None,
+                timeout=0.8,
+                interval=0.02,
+                message="export_to was never called",
+            )
             received_sparse = content.received_sparse
 
             # Cancel and wait for it to actually finish before this
@@ -264,10 +274,7 @@ def test_export_screen_uses_the_apps_default_sparse_setting() -> None:
             # other test using _BlockingContentSource resolves its job
             # the same way before returning, for the same reason.
             export_screen.query_one("#export-start", Button).press()
-            for _ in range(50):
-                await pilot.pause(0.02)
-                if not app.jobs:
-                    break
+            await wait_until(pilot, lambda: not app.jobs, timeout=1.0, interval=0.02, message="job never finished")
 
             return received_sparse
 

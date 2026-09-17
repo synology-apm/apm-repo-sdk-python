@@ -30,6 +30,7 @@ for what's covered by direct calls instead.
 from __future__ import annotations
 
 import asyncio
+import os
 from collections.abc import Iterator
 
 import pytest
@@ -51,12 +52,15 @@ def _reset_worker_loop() -> Iterator[None]:
 
 
 def test_preload_resource_tracker_starts_the_multiprocessing_tracker(monkeypatch: pytest.MonkeyPatch) -> None:
+    """POSIX-only by contract: the tracker's helper-process launch relies on
+    fd inheritance, so this is deliberately a no-op on Windows — see
+    ``preload_resource_tracker``'s own docstring."""
     calls: list[bool] = []
     monkeypatch.setattr("synology_apm_repo.sdk.concurrency.resource_tracker.ensure_running", lambda: calls.append(True))
 
     concurrency.preload_resource_tracker()
 
-    assert calls == [True]
+    assert calls == ([True] if os.name == "posix" else [])
 
 
 def test_run_in_worker_loop_reuses_the_same_loop_across_calls() -> None:

@@ -154,6 +154,12 @@ async def _process_entry(
         for domain in domains:
             await _PHASES[domain].run_for_repo(ctx, ri)
         await ri.repo.close()
+        # Drop this repository's own entries once every domain has had them:
+        # each one holds the RepoInfo, so leaving them in the shared list
+        # would pin every repository (closed or not) for the whole run, which
+        # is the opposite of closing them one at a time above.
+        workloads: list[tuple[RepoInfo, CatalogId, Workload, list[Version]]] = ctx.data.get("workloads", [])
+        ctx.data["workloads"] = [row for row in workloads if row[0] is not ri]
     return len(found)
 
 

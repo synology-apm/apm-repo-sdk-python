@@ -68,6 +68,34 @@ If a future sample ever contains anything that looks like real customer data
 rather than test-account data, treat that as a real incident, not routine
 sample content — do not commit it into fixtures or docs, and flag it instead.
 
+## Debugging a backend
+
+Neither entry point lets a dependency's logging reach the terminal:
+`cli/main.py::main()` and `browser/app.py::main()` each call the shared
+`synology_apm_repo.sdk.presentation.logging_setup.configure_logging()`
+first thing, which puts a `NullHandler` on the root logger. Without it
+`logging` falls back to its last-resort handler, which
+writes every WARNING and above to stderr — `smbprotocol` alone emits one
+per pooled connection on each session teardown, which for the TUI lands on
+the rendered screen and in the user's shell after it exits.
+
+Set `SYNOLOGY_APM_REPO_LOG` to a file path to get all of it written there
+instead, at `DEBUG`. This is the only way to see a dependency's own view of
+a failing remote backend:
+
+```
+SYNOLOGY_APM_REPO_LOG=./apm-repo.log synology-apm-repo-cli ls "/path/to/repository#..."
+```
+
+The file is written as UTF-8 rather than the machine's locale encoding, so a
+log naming a non-ASCII share or path stays readable when handed to someone
+on another platform. Expect it to be large: `smbprotocol` logs at `DEBUG`
+per SMB message, so a real repository walk produces a lot of it.
+
+The SDK itself configures nothing and filters nothing — a library has no
+business reconfiguring logging for the whole process, and an embedder's own
+configuration is what decides where a dependency's records go.
+
 ## Before every commit
 
 ```

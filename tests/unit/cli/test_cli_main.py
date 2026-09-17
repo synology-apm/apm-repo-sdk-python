@@ -10,6 +10,7 @@ from importlib.metadata import version as pkg_version
 import pytest
 from typer.testing import CliRunner
 
+from synology_apm_repo.cli import main as main_module
 from synology_apm_repo.cli.main import app
 
 runner = CliRunner()
@@ -66,3 +67,18 @@ def test_version_is_eager_and_short_circuits_before_any_subcommand_is_needed() -
 
 
 __all__: list[str] = []
+
+
+def test_main_configures_logging_before_running_the_app(monkeypatch: pytest.MonkeyPatch) -> None:
+    # main() itself is excluded from the coverage gate (real sys.argv/
+    # sys.exit) -- this only proves the ordering that matters:
+    # configure_logging() must run before app() does anything. The
+    # mechanism itself (shared with the TUI's own call site) is proven in
+    # test_presentation_logging_setup.py, once, not here.
+    calls: list[str] = []
+    monkeypatch.setattr(main_module, "configure_logging", lambda: calls.append("configure_logging"))
+    monkeypatch.setattr(main_module, "app", lambda: calls.append("app"))
+
+    main_module.main()
+
+    assert calls == ["configure_logging", "app"]

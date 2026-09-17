@@ -120,7 +120,7 @@ def _build_root_and_children() -> tuple[Node, dict[str, list[Node]]]:
     return root, {str(root_ref): children}
 
 
-async def test_first_expand_loads_only_one_page(wait_until: Any) -> None:
+async def test_first_expand_loads_only_one_page(wait_until: Any, move_cursor_to: Any) -> None:
     root, children_by_ref = _build_root_and_children()
     provider = _PaginatingFakeProvider(root, children_by_ref)
     app = _FakeApp(_version(), _FakeCatalog(provider))
@@ -130,7 +130,7 @@ async def test_first_expand_loads_only_one_page(wait_until: Any) -> None:
         assert len(tree.root.children) == _CHILDREN_PAGE_SIZE
 
 
-async def test_load_more_fetches_the_rest_and_then_reports_exhausted(wait_until: Any) -> None:
+async def test_load_more_fetches_the_rest_and_then_reports_exhausted(wait_until: Any, move_cursor_to: Any) -> None:
     root, children_by_ref = _build_root_and_children()
     provider = _PaginatingFakeProvider(root, children_by_ref)
     app = _FakeApp(_version(), _FakeCatalog(provider))
@@ -146,8 +146,8 @@ async def test_load_more_fetches_the_rest_and_then_reports_exhausted(wait_until:
             (message, severity)
         )
 
-        tree.move_cursor(tree.root.children[0])
-        await pilot.pause(0.05)
+        first = tree.root.children[0]
+        await move_cursor_to(pilot, tree, first)
         await pilot.press("plus")
         await wait_until(pilot, lambda: len(tree.root.children) == _TOTAL_CHILDREN, timeout=1.5, interval=0.05)
         assert len(tree.root.children) == _TOTAL_CHILDREN
@@ -155,12 +155,16 @@ async def test_load_more_fetches_the_rest_and_then_reports_exhausted(wait_until:
 
         notifications.clear()
         await pilot.press("plus")
-        await pilot.pause(0.05)
+        # The warning is what says the keypress was handled; without it there
+        # is nothing to assert about yet.
+        await wait_until(
+            pilot, lambda: notifications, timeout=0.5, interval=0.05, message="no notification for a second plus"
+        )
         assert len(tree.root.children) == _TOTAL_CHILDREN  # nothing more to add
         assert any("already loaded" in msg for msg, sev in notifications if sev == "warning")
 
 
-async def test_filter_on_a_partially_loaded_level_warns_it_is_incomplete(wait_until: Any) -> None:
+async def test_filter_on_a_partially_loaded_level_warns_it_is_incomplete(wait_until: Any, move_cursor_to: Any) -> None:
     root, children_by_ref = _build_root_and_children()
     provider = _PaginatingFakeProvider(root, children_by_ref)
     app = _FakeApp(_version(), _FakeCatalog(provider))
@@ -176,14 +180,16 @@ async def test_filter_on_a_partially_loaded_level_warns_it_is_incomplete(wait_un
             (message, severity)
         )
 
-        tree.move_cursor(tree.root.children[0])
-        await pilot.pause(0.05)
+        first = tree.root.children[0]
+        await move_cursor_to(pilot, tree, first)
         await pilot.press("slash")
         await pilot.pause(0.05)
         assert any(sev == "warning" and str(_CHILDREN_PAGE_SIZE) in msg for msg, sev in notifications)
 
 
-async def test_goto_ref_past_the_root_s_already_loaded_first_page_does_not_crash(wait_until: Any) -> None:
+async def test_goto_ref_past_the_root_s_already_loaded_first_page_does_not_crash(
+    wait_until: Any, move_cursor_to: Any
+) -> None:
     """The root gets marked loaded by the ordinary auto-expand on mount,
     but only up to one ``_CHILDREN_PAGE_SIZE`` page — a goto-ref target
     beyond that page must still be found, not raise ``StopIteration``

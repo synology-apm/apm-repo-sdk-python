@@ -87,7 +87,7 @@ async def _drill_to_unit_screen(app: ApmRepoBrowserApp, pilot: Any, wait_until: 
     await pilot.press("enter")
 
     wl_tree = app.screen.query_one("#col-workloads", Tree)
-    await wait_until(pilot, lambda: wl_tree.root.children, timeout=0.8, interval=0.02)
+    await wait_until(pilot, lambda: wl_tree.root.children, timeout=3.0, interval=0.02)
     fs_group = next(n for n in wl_tree.root.children if str(n.label) == "FS")
     # Only the *first* group auto-expands (BrowseScreen._set_workloads) --
     # "FS" isn't always that one, so its own children aren't visible/
@@ -99,30 +99,42 @@ async def _drill_to_unit_screen(app: ApmRepoBrowserApp, pilot: Any, wait_until: 
     await pilot.press("enter")
 
     versions_table = app.screen.query_one("#col-versions", DataTable)
-    await wait_until(pilot, lambda: versions_table.row_count, timeout=0.8, interval=0.02)
+    await wait_until(pilot, lambda: versions_table.row_count, timeout=3.0, interval=0.02)
     versions_table.focus()
     await pilot.press("enter")
     await wait_until(pilot, lambda: isinstance(app.screen, UnitScreen), timeout=0.6, interval=0.03)
     assert isinstance(app.screen, UnitScreen), app.screen
 
 
-async def _first_leaf(app: ApmRepoBrowserApp, pilot: Any, wait_until: Any) -> Any:
+async def _first_leaf(
+    app: ApmRepoBrowserApp, pilot: Any, wait_until: Any, focus_widget: Any, move_cursor_to: Any
+) -> Any:
     unit_screen = app.screen
     assert isinstance(unit_screen, UnitScreen)
     tree = unit_screen.query_one("#unit-tree", Tree)
-    await wait_until(pilot, lambda: tree.root.data is not None, timeout=1.0, interval=0.02)
+    await wait_until(pilot, lambda: tree.root.data is not None, timeout=3.0, interval=0.02)
+    await focus_widget(pilot, tree)
     node = tree.root
     depth = 0
     while node is not None and node.data is not None and not node.data.is_leaf and depth < 6:
         node.expand()
-        await wait_until(pilot, lambda n=node: n.children, timeout=0.4, interval=0.02)
+        await wait_until(pilot, lambda n=node: n.children, timeout=3.0, interval=0.02)
         if not node.children:
             break
         node = node.children[0]
         depth += 1
     assert node is not None and node.data is not None and node.data.is_leaf, "no leaf found"
+    # move_cursor only takes effect against an up-to-date line map; forcing it
+    # here is the same idiom _select_matching_workload uses.
+    _ = tree._tree_lines
     tree.move_cursor(node)
-    await pilot.pause(0.03)
+    await wait_until(
+        pilot,
+        lambda n=node: tree.cursor_node is n,
+        timeout=0.4,
+        interval=0.02,
+        message="cursor never landed on the chosen leaf",
+    )
     return node
 
 
@@ -132,6 +144,8 @@ def test_hex_preview_blocked_outside_diagnostic_mode_replayed(
     open_browser_pilot: Any,
     wait_until: Any,
     record_target: Callable[..., Awaitable[ObjectStore]],
+    focus_widget: Any,
+    move_cursor_to: Any,
 ) -> None:
     async def scenario() -> bool:
         await _patch_local_store(monkeypatch, record_target)
@@ -140,7 +154,7 @@ def test_hex_preview_blocked_outside_diagnostic_mode_replayed(
             await pilot.pause()
             await open_browser_pilot(app, pilot, tmp_path)
             await _drill_to_unit_screen(app, pilot, wait_until)
-            await _first_leaf(app, pilot, wait_until)
+            await _first_leaf(app, pilot, wait_until, focus_widget, move_cursor_to)
 
             await pilot.press("x")
             await pilot.pause(0.3)
@@ -156,6 +170,8 @@ def test_hex_preview_pages_forward_and_back_replayed(
     open_browser_pilot: Any,
     wait_until: Any,
     record_target: Callable[..., Awaitable[ObjectStore]],
+    focus_widget: Any,
+    move_cursor_to: Any,
 ) -> None:
     """Also covers plain "opens for a leaf in diagnostic mode" on its
     own (the ``initial`` assertion below) -- there is no separate test
@@ -170,22 +186,36 @@ def test_hex_preview_pages_forward_and_back_replayed(
             await pilot.pause()
             await open_browser_pilot(app, pilot, tmp_path)
             await _drill_to_unit_screen(app, pilot, wait_until)
-            await _first_leaf(app, pilot, wait_until)
+            await _first_leaf(app, pilot, wait_until, focus_widget, move_cursor_to)
 
+            def dump() -> str:
+                return str(app.screen.query_one("#hex-dump").render())
+
+            # ``d`` re-dispatches the provider and reloads the whole tree
+            # (UnitScreen.refresh_for_verbose_mode), so the leaf picked above
+            # no longer exists afterwards -- re-acquire one rather than press
+            # ``x`` into a tree that is still being rebuilt.
             await pilot.press("d")
-            await pilot.pause(0.03)
+            await wait_until(pilot, lambda: app.verbose, timeout=0.4, interval=0.02, message="verbose never turned on")
+            await _first_leaf(app, pilot, wait_until, focus_widget, move_cursor_to)
+
             await pilot.press("x")
             await wait_until(pilot, lambda: isinstance(app.screen, HexPreviewScreen), timeout=0.4, interval=0.02)
             assert isinstance(app.screen, HexPreviewScreen), app.screen
-            initial = str(app.screen.query_one("#hex-dump").render())
+            initial = dump()
 
+            # The rendered window changing *is* the readiness signal for a
+            # page turn; there is no state flag that says "the next page has
+            # landed", and a fixed pause would only be guessing at it.
             await pilot.press("x")  # page forward
-            await pilot.pause(0.02)
-            forward = str(app.screen.query_one("#hex-dump").render())
+            await wait_until(
+                pilot, lambda: dump() != initial, timeout=0.4, interval=0.02, message="never paged forward"
+            )
+            forward = dump()
 
             await pilot.press("X")  # page back to the original window
-            await pilot.pause(0.02)
-            back = str(app.screen.query_one("#hex-dump").render())
+            await wait_until(pilot, lambda: dump() != forward, timeout=0.4, interval=0.02, message="never paged back")
+            back = dump()
 
             return initial, forward, back
 
@@ -201,6 +231,8 @@ def test_unit_screen_filter_narrows_then_esc_restores_replayed(
     open_browser_pilot: Any,
     wait_until: Any,
     record_target: Callable[..., Awaitable[ObjectStore]],
+    focus_widget: Any,
+    move_cursor_to: Any,
 ) -> None:
     async def scenario() -> tuple[int, str, list[str], int]:
         await _patch_local_store(monkeypatch, record_target)
@@ -213,15 +245,20 @@ def test_unit_screen_filter_narrows_then_esc_restores_replayed(
             unit_screen = app.screen
             assert isinstance(unit_screen, UnitScreen)
             tree = unit_screen.query_one("#unit-tree", Tree)
-            await wait_until(pilot, lambda: tree.root.children, timeout=0.6, interval=0.03)
+            await wait_until(pilot, lambda: tree.root.children, timeout=3.0, interval=0.03)
             full_count = len(tree.root.children)
             assert full_count > 0, "root has no children to filter"
 
             needle = str(tree.root.children[0].label)[:3]
-            tree.move_cursor(tree.root)
-            await pilot.pause(0.02)
+            await move_cursor_to(pilot, tree, tree.root)
             await pilot.press("slash")
-            await pilot.pause(0.02)
+            await wait_until(
+                pilot,
+                lambda: unit_screen.query("#filter-input"),
+                timeout=0.4,
+                interval=0.02,
+                message="filter input never opened",
+            )
             filter_input = unit_screen.query_one("#filter-input", Input)
             filter_input.value = needle
             await pilot.pause(0.02)
@@ -244,7 +281,12 @@ def test_unit_screen_filter_narrows_then_esc_restores_replayed(
 
 
 def test_browse_screen_filter_narrows_connections_replayed(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, open_browser_pilot: Any, wait_until: Any
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    open_browser_pilot: Any,
+    wait_until: Any,
+    focus_widget: Any,
+    move_cursor_to: Any,
 ) -> None:
     monkeypatch.setattr(
         connect_dialog_module.ConnectDialog,
@@ -268,7 +310,13 @@ def test_browse_screen_filter_narrows_connections_replayed(
             first_name = str(repo_node.children[0].label)
             needle = first_name[:4]
             await pilot.press("slash")
-            await pilot.pause(0.02)
+            await wait_until(
+                pilot,
+                lambda: app.screen.query("#filter-input"),
+                timeout=0.4,
+                interval=0.02,
+                message="filter input never opened",
+            )
             filter_input = app.screen.query_one("#filter-input", Input)
             filter_input.value = needle
             await pilot.pause(0.02)
@@ -291,7 +339,12 @@ def test_browse_screen_filter_narrows_connections_replayed(
 
 
 def test_browse_screen_version_filter_enter_closes_it_replayed(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, open_browser_pilot: Any, wait_until: Any
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    open_browser_pilot: Any,
+    wait_until: Any,
+    focus_widget: Any,
+    move_cursor_to: Any,
 ) -> None:
     monkeypatch.setattr(
         connect_dialog_module.ConnectDialog,
@@ -313,7 +366,7 @@ def test_browse_screen_version_filter_enter_closes_it_replayed(
             workloads_tree.focus()
             await pilot.press("enter")
             versions_table = app.screen.query_one("#col-versions", DataTable)
-            await wait_until(pilot, lambda: versions_table.row_count, timeout=0.8, interval=0.02)
+            await wait_until(pilot, lambda: versions_table.row_count, timeout=3.0, interval=0.02)
             versions_table.focus()
             full_count = versions_table.row_count
             assert full_count >= 1
@@ -321,7 +374,13 @@ def test_browse_screen_version_filter_enter_closes_it_replayed(
             first_name = str(versions_table.get_row_at(0)[0])
             needle = first_name[:4]
             await pilot.press("slash")
-            await pilot.pause(0.02)
+            await wait_until(
+                pilot,
+                lambda: app.screen.query("#filter-input"),
+                timeout=0.4,
+                interval=0.02,
+                message="filter input never opened",
+            )
             filter_input = app.screen.query_one("#filter-input", Input)
             filter_input.value = needle
             await pilot.pause(0.02)
@@ -347,7 +406,12 @@ def test_browse_screen_version_filter_enter_closes_it_replayed(
 
 
 def test_browse_screen_backspace_jumps_cursor_to_parent_and_collapses_it_replayed(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, open_browser_pilot: Any, wait_until: Any
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    open_browser_pilot: Any,
+    wait_until: Any,
+    focus_widget: Any,
+    move_cursor_to: Any,
 ) -> None:
     monkeypatch.setattr(
         connect_dialog_module.ConnectDialog,
@@ -367,16 +431,19 @@ def test_browse_screen_backspace_jumps_cursor_to_parent_and_collapses_it_replaye
             repo_node = tree.root.children[0]
             assert repo_node.children, "expected at least one connection under the repository"
             connection_node = repo_node.children[0]
-            tree.move_cursor(connection_node)
-            await pilot.pause(0.02)
+            await move_cursor_to(pilot, tree, connection_node)
 
             await pilot.press("backspace")
-            await pilot.pause(0.03)
+            await wait_until(
+                pilot, lambda: tree.cursor_node is repo_node, timeout=0.4, interval=0.02, message="never went up"
+            )
             landed_on_repo = tree.cursor_node is repo_node
             repo_collapsed = not repo_node.is_expanded
 
             await pilot.press("backspace")
-            await pilot.pause(0.03)
+            await wait_until(
+                pilot, lambda: tree.cursor_node is tree.root, timeout=0.4, interval=0.02, message="never went up"
+            )
             landed_on_root = tree.cursor_node is tree.root
             root_still_expanded = tree.root.is_expanded
 
@@ -448,12 +515,12 @@ def test_unit_screen_refresh_reloads_the_tree_replayed(
             unit_screen = app.screen
             assert isinstance(unit_screen, UnitScreen)
             tree = unit_screen.query_one("#unit-tree", Tree)
-            await wait_until(pilot, lambda: tree.root.children, timeout=0.6, interval=0.03)
+            await wait_until(pilot, lambda: tree.root.children, timeout=3.0, interval=0.03)
             before_count = len(tree.root.children)
             provider_before = unit_screen._provider
 
             await pilot.press("r")
-            await wait_until(pilot, lambda: tree.root.children, timeout=0.6, interval=0.03)
+            await wait_until(pilot, lambda: tree.root.children, timeout=3.0, interval=0.03)
             after_count = len(tree.root.children)
             provider_replaced = unit_screen._provider is not provider_before
 
@@ -465,7 +532,10 @@ def test_unit_screen_refresh_reloads_the_tree_replayed(
 
 
 def test_loading_indicator_never_appears_for_a_fast_catalog_query_replayed(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, open_browser_pilot: Any, wait_until: Any
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    open_browser_pilot: Any,
+    wait_until: Any,
 ) -> None:
     monkeypatch.setattr(
         connect_dialog_module.ConnectDialog,
@@ -487,7 +557,10 @@ def test_loading_indicator_never_appears_for_a_fast_catalog_query_replayed(
 
 
 def test_loading_indicator_appears_for_an_operation_slower_than_300ms_replayed(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, open_browser_pilot: Any, wait_until: Any
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    open_browser_pilot: Any,
+    wait_until: Any,
 ) -> None:
     monkeypatch.setattr(
         connect_dialog_module.ConnectDialog,

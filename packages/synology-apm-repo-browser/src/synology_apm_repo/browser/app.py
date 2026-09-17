@@ -23,8 +23,10 @@ from textual.worker import Worker
 from synology_apm_repo.browser.keymap import COMMON_BINDINGS, WORKLIST_BINDING
 from synology_apm_repo.browser.screens.browse_screen import BrowseScreen
 from synology_apm_repo.browser.strings import EXPORT_NOTIFY_TITLE
+from synology_apm_repo.browser.worker_drain import drain
 from synology_apm_repo.sdk.api import Repository, Session
 from synology_apm_repo.sdk.concurrency import preload_resource_tracker
+from synology_apm_repo.sdk.presentation.logging_setup import configure_logging
 from synology_apm_repo.sdk.presentation.markup import safe
 
 _CSS_PATH = Path(__file__).with_name("theme.tcss")
@@ -140,12 +142,22 @@ class ApmRepoBrowserApp(App[None]):
 
         # Textual's own shutdown already cancels every outstanding worker
         # before dispatching Unmount — same mechanism as BackgroundJob.worker's
-        # own docstring. Cancelling each job explicitly here is kept anyway:
-        # it holds the "stop the export within 200ms, before
-        # ``session.close()`` can race with it" guarantee without
-        # depending on Textual's internal shutdown ordering.
-        for job in self.jobs.values():
+        # own docstring. Cancelling each job explicitly here is kept anyway, so
+        # the ordering holds without depending on Textual's internals.
+        #
+        # Then *waited for*: cancellation only lands at the job's next await,
+        # and ``session.close()`` closes the providers those jobs are still
+        # reading through — closing one underneath an in-flight read leaks its
+        # connection (see ``UnitScreen.on_unmount``). ``drain()`` bounds the
+        # wait: a job parked inside an already-started ``to_thread`` read does
+        # not come back until that read returns, and quitting must not hang on
+        # it. A job that outlives the bound is left to the cancellation it was
+        # already handed; only the ordering guarantee is given up, not the
+        # cancel.
+        jobs = [job for job in self.jobs.values() if job.worker is not None]
+        for job in jobs:
             job.cancel()
+        await drain([job.worker for job in jobs if job.worker is not None])
         await self.session.close()
 
     def action_quit_app(self) -> None:
@@ -274,6 +286,13 @@ def main(argv: list[str] | None = None) -> None:  # pragma: no cover - opens a r
     ``App.run_test()`` (used everywhere else in this package's tests) is
     the tested path; ``_parse_args()`` right above is pure and already
     covered directly by ``test_browser_app.py``."""
+    # A TUI cannot share its terminal: anything a dependency writes to
+    # stderr lands on top of the rendered screen while the app runs, and
+    # after it exits, in the user's shell. Shared with the CLI's own call
+    # site (cli/main.py::main()), since both must behave identically here
+    # — see configure_logging()'s own module docstring for the mechanism
+    # and the escape hatch (SYNOLOGY_APM_REPO_LOG) for debugging a backend.
+    configure_logging()
     args = _parse_args(argv)
     # Must happen before .run(): once the app is running, Textual redirects
     # sys.stderr to its own capture stream for the whole session, and

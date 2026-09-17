@@ -24,6 +24,7 @@ import asyncio
 import atexit
 import contextlib
 import os
+import sys
 from collections.abc import AsyncIterator, Awaitable, Callable, Iterable, Iterator
 from concurrent.futures import ProcessPoolExecutor
 from dataclasses import dataclass
@@ -36,6 +37,7 @@ from ..storage.base import ObjectStore
 from .dedup_file import DedupFile, Extent, ExtentKind
 from .pool import BucketReaderCache, Pool
 from .pool_descriptor import PoolDescriptor, aclose_worker_store, build_worker_pool
+from .presized_file import open_destination
 
 
 @dataclass(frozen=True)
@@ -748,8 +750,6 @@ _worker_store: ObjectStore | None = None
 _worker_pool: Pool | None = None
 _worker_dst_fd: int | None = None
 
-_HAS_PWRITE = hasattr(os, "pwrite")
-
 
 def _pwrite(fd: int, data: bytes | memoryview, offset: int) -> None:
     """Same shape as ``export_scheduler.py``'s own private helper —
@@ -757,7 +757,7 @@ def _pwrite(fd: int, data: bytes | memoryview, offset: int) -> None:
     write, so this falls back to ``lseek``+``write``, safe here because
     each worker process owns ``_worker_dst_fd`` exclusively and handles
     one task at a time (see ``_export_worker_init``'s own docstring)."""
-    if _HAS_PWRITE:
+    if sys.platform != "win32":
         os.pwrite(fd, data, offset)
     else:
         os.lseek(fd, offset, os.SEEK_SET)
@@ -777,7 +777,7 @@ def _export_worker_init(pool_descriptor: PoolDescriptor, dst_path: str) -> None:
     bucket-group writes safely in the single-process path."""
     global _worker_store, _worker_pool, _worker_dst_fd
     _worker_store, _worker_pool = build_worker_pool(pool_descriptor)
-    _worker_dst_fd = os.open(dst_path, os.O_WRONLY)
+    _worker_dst_fd = open_destination(dst_path)
     # Registered last, only once every worker-global above is actually set,
     # so a shutdown hook never runs against half-initialized state.
     atexit.register(_export_worker_shutdown)

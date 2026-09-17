@@ -63,6 +63,26 @@ def _activate_backend(dialog: ConnectDialog, backend: str) -> None:
     dialog.query_one("#connect-backend-tabs", Tabs).active = backend
 
 
+async def _activate_backend_and_settle(
+    dialog: ConnectDialog, backend: str, pilot: Pilot[None], wait_until: Any
+) -> None:
+    """``_activate_backend`` plus the wait its callers all need.
+
+    Setting ``Tabs.active`` only posts ``TabActivated``; the pane swap happens
+    when ``ConnectDialog`` handles it, which is a later event-loop turn. The
+    pane carrying the ``active`` class is that swap having happened — waiting
+    on it beats guessing a duration before touching this backend's widgets.
+    """
+    _activate_backend(dialog, backend)
+    await wait_until(
+        pilot,
+        lambda: dialog.query_one(f"#connect-{backend}-fields").has_class("active"),
+        timeout=0.6,
+        interval=0.02,
+        message=f"{backend} pane never became active",
+    )
+
+
 async def _wait_for_status_containing(dialog: ConnectDialog, pilot: Pilot[None], wait_until: Any, needle: str) -> str:
     """Polls ``#connect-status`` until its rendered text contains
     ``needle`` (case-insensitive), returning that final text — same
@@ -87,11 +107,10 @@ _BROWSE_PICKER_BACKENDS = [
 
 
 class TestRemoteFields:
-    def test_connect_dialog_empty_bucket_shows_warning_and_does_not_dismiss(self) -> None:
+    def test_connect_dialog_empty_bucket_shows_warning_and_does_not_dismiss(self, wait_until: Any) -> None:
         async def scenario() -> tuple[bool, str]:
             async with _open_connect_dialog() as (app, pilot, dialog):
-                _activate_backend(dialog, "s3")
-                await pilot.pause(0.1)
+                await _activate_backend_and_settle(dialog, "s3", pilot, wait_until)
                 dialog.query_one("#connect-submit", Button).press()
                 await pilot.pause(0.1)
                 status = str(dialog.query_one("#connect-status", Static).render())
@@ -119,8 +138,7 @@ class TestRemoteFields:
 
         async def scenario() -> tuple[str, str]:
             async with _open_connect_dialog() as (app, pilot, dialog):
-                _activate_backend(dialog, backend)
-                await pilot.pause(0.1)
+                await _activate_backend_and_settle(dialog, backend, pilot, wait_until)
                 dialog.query_one(f"#connect-{backend}-browse-{noun}s", Button).press()
                 option_list = dialog.query_one(f"#connect-{backend}-{noun}-list", OptionList)
                 await wait_until(pilot, lambda: option_list.option_count, timeout=1.5, interval=0.05)
@@ -136,7 +154,7 @@ class TestRemoteFields:
 
     @pytest.mark.parametrize(("backend", "noun"), _BROWSE_PICKER_BACKENDS)
     def test_connect_dialog_browse_field_shows_error_without_list_permission(
-        self, monkeypatch: pytest.MonkeyPatch, backend: str, noun: str
+        self, monkeypatch: pytest.MonkeyPatch, backend: str, noun: str, wait_until: Any
     ) -> None:
         """A credential without account-level list permission (or any other
         backend-specific failure) must show an inline error, not crash or
@@ -153,8 +171,7 @@ class TestRemoteFields:
 
         async def scenario() -> tuple[bool, str]:
             async with _open_connect_dialog() as (app, pilot, dialog):
-                _activate_backend(dialog, backend)
-                await pilot.pause(0.1)
+                await _activate_backend_and_settle(dialog, backend, pilot, wait_until)
                 dialog.query_one(f"#connect-{backend}-browse-{noun}s", Button).press()
                 await pilot.pause(0.2)
                 status = str(dialog.query_one("#connect-status", Static).render())
@@ -168,7 +185,7 @@ class TestRemoteFields:
 
     @pytest.mark.parametrize(("backend", "noun"), _BROWSE_PICKER_BACKENDS)
     def test_connect_dialog_browse_field_shows_timeout_error_instead_of_hanging(
-        self, monkeypatch: pytest.MonkeyPatch, backend: str, noun: str
+        self, monkeypatch: pytest.MonkeyPatch, backend: str, noun: str, wait_until: Any
     ) -> None:
         """An endpoint that never responds must surface a clear timeout error
         within the dialog's own network timeout, not hang indefinitely — the
@@ -188,17 +205,19 @@ class TestRemoteFields:
 
         async def scenario() -> str:
             async with _open_connect_dialog() as (app, pilot, dialog):
-                _activate_backend(dialog, backend)
-                await pilot.pause(0.1)
+                await _activate_backend_and_settle(dialog, backend, pilot, wait_until)
                 dialog.query_one(f"#connect-{backend}-browse-{noun}s", Button).press()
-                await pilot.pause(0.3)
-                return str(dialog.query_one("#connect-status", Static).render())
+                # "listing ..." shows first and is replaced by the timeout
+                # error; waiting a fixed 0.3s could read either one.
+                return await _wait_for_status_containing(dialog, pilot, wait_until, "timed out")
 
         status = asyncio.run(scenario())
         assert "error" in status.lower(), status
         assert "timed out" in status.lower(), status
 
-    def test_connect_dialog_azure_unresolvable_account_url_shows_inline_error_instead_of_crashing(self) -> None:
+    def test_connect_dialog_azure_unresolvable_account_url_shows_inline_error_instead_of_crashing(
+        self, wait_until: Any
+    ) -> None:
         """Unlike ``S3Store``'s fully-lazy constructor, ``AzureStore(...)``
         (``BlobServiceClient(...)``) validates its account_url/credential shape
         synchronously and can raise ``ValueError`` for an account URL with no
@@ -210,8 +229,7 @@ class TestRemoteFields:
 
         async def scenario() -> tuple[bool, str]:
             async with _open_connect_dialog() as (app, pilot, dialog):
-                _activate_backend(dialog, "azure")
-                await pilot.pause(0.1)
+                await _activate_backend_and_settle(dialog, "azure", pilot, wait_until)
                 dialog.query_one("#connect-azure-container", Input).value = "my-container"
                 dialog.query_one("#connect-azure-account-url", Input).value = "http://192.0.2.10:10000"
                 dialog.query_one("#connect-azure-credential", Input).value = "some-key"
@@ -224,15 +242,14 @@ class TestRemoteFields:
         assert still_open, "a construction-time ValueError must show inline, not crash the dialog"
         assert "error" in status.lower(), status
 
-    def test_s3_verify_tls_false_actually_reaches_the_constructed_stores_client_kwargs(self) -> None:
+    def test_s3_verify_tls_false_actually_reaches_the_constructed_stores_client_kwargs(self, wait_until: Any) -> None:
         # test_connect_dialog_selecting_s3_profile_refills_fields_including_secret
         # (above) only proves verify_tls round-trips through the Checkbox
         # widget itself -- never that it actually reaches a constructed
         # S3Store's real client kwargs.
         async def scenario() -> bool:
             async with _open_connect_dialog() as (app, pilot, dialog):
-                _activate_backend(dialog, "s3")
-                await pilot.pause(0.1)
+                await _activate_backend_and_settle(dialog, "s3", pilot, wait_until)
                 dialog.query_one("#connect-s3-bucket", Input).value = "my-bucket"
                 dialog.query_one("#connect-s3-verify-tls", Checkbox).value = False
 
@@ -243,7 +260,7 @@ class TestRemoteFields:
         assert asyncio.run(scenario()) is False
 
     def test_browse_buckets_is_a_no_op_while_already_browsing_or_scanning(
-        self, monkeypatch: pytest.MonkeyPatch
+        self, monkeypatch: pytest.MonkeyPatch, wait_until: Any
     ) -> None:
         calls = 0
 
@@ -256,8 +273,7 @@ class TestRemoteFields:
 
         async def scenario() -> int:
             async with _open_connect_dialog() as (app, pilot, dialog):
-                _activate_backend(dialog, "s3")
-                await pilot.pause(0.1)
+                await _activate_backend_and_settle(dialog, "s3", pilot, wait_until)
                 dialog._remote_browser.browsing[_ProfileBackend.S3] = True  # simulate an in-flight browse
                 dialog._browse_buckets()
                 await pilot.pause(0.1)
@@ -273,8 +289,7 @@ class TestRemoteFields:
 
         async def scenario() -> tuple[str, bool]:
             async with _open_connect_dialog() as (app, pilot, dialog):
-                _activate_backend(dialog, "s3")
-                await pilot.pause(0.1)
+                await _activate_backend_and_settle(dialog, "s3", pilot, wait_until)
                 dialog.query_one("#connect-s3-browse-buckets", Button).press()
                 status = await _wait_for_status_containing(dialog, pilot, wait_until, "no bucket")
                 option_list = dialog.query_one("#connect-s3-bucket-list", OptionList)
@@ -284,14 +299,13 @@ class TestRemoteFields:
         assert "no buckets found" in status.lower()
         assert not list_visible
 
-    def test_pressing_enter_in_an_s3_field_submits(self) -> None:
+    def test_pressing_enter_in_an_s3_field_submits(self, wait_until: Any) -> None:
         # Only the local-path field's Enter-submits path was ever exercised
         # above -- on_input_submitted's "any other field" fallthrough
         # (``self._submit()``) for the S3/Azure tabs was untested.
         async def scenario() -> bool:
             async with _open_connect_dialog() as (app, pilot, dialog):
-                _activate_backend(dialog, "s3")
-                await pilot.pause(0.1)
+                await _activate_backend_and_settle(dialog, "s3", pilot, wait_until)
                 submitted = False
 
                 def fake_submit() -> None:
@@ -308,11 +322,10 @@ class TestRemoteFields:
 
         assert asyncio.run(scenario())
 
-    def test_pressing_enter_in_an_azure_field_submits(self) -> None:
+    def test_pressing_enter_in_an_azure_field_submits(self, wait_until: Any) -> None:
         async def scenario() -> bool:
             async with _open_connect_dialog() as (app, pilot, dialog):
-                _activate_backend(dialog, "azure")
-                await pilot.pause(0.1)
+                await _activate_backend_and_settle(dialog, "azure", pilot, wait_until)
                 submitted = False
 
                 def fake_submit() -> None:
@@ -329,11 +342,10 @@ class TestRemoteFields:
 
         assert asyncio.run(scenario())
 
-    def test_connect_dialog_empty_azure_container_shows_warning_and_does_not_dismiss(self) -> None:
+    def test_connect_dialog_empty_azure_container_shows_warning_and_does_not_dismiss(self, wait_until: Any) -> None:
         async def scenario() -> tuple[bool, str]:
             async with _open_connect_dialog() as (app, pilot, dialog):
-                _activate_backend(dialog, "azure")
-                await pilot.pause(0.1)
+                await _activate_backend_and_settle(dialog, "azure", pilot, wait_until)
                 dialog.query_one("#connect-submit", Button).press()
                 await pilot.pause(0.1)
                 status = str(dialog.query_one("#connect-status", Static).render())
@@ -343,11 +355,10 @@ class TestRemoteFields:
         assert still_open, "an empty container name must not dismiss the dialog"
         assert "container" in status.lower(), status
 
-    def test_connect_dialog_empty_smb_server_shows_warning_and_does_not_dismiss(self) -> None:
+    def test_connect_dialog_empty_smb_server_shows_warning_and_does_not_dismiss(self, wait_until: Any) -> None:
         async def scenario() -> tuple[bool, str]:
             async with _open_connect_dialog() as (app, pilot, dialog):
-                _activate_backend(dialog, "smb")
-                await pilot.pause(0.1)
+                await _activate_backend_and_settle(dialog, "smb", pilot, wait_until)
                 dialog.query_one("#connect-submit", Button).press()
                 await pilot.pause(0.1)
                 status = str(dialog.query_one("#connect-status", Static).render())
@@ -357,11 +368,10 @@ class TestRemoteFields:
         assert still_open, "an empty server name must not dismiss the dialog"
         assert "server" in status.lower(), status
 
-    def test_connect_dialog_empty_smb_share_shows_warning_and_does_not_dismiss(self) -> None:
+    def test_connect_dialog_empty_smb_share_shows_warning_and_does_not_dismiss(self, wait_until: Any) -> None:
         async def scenario() -> tuple[bool, str]:
             async with _open_connect_dialog() as (app, pilot, dialog):
-                _activate_backend(dialog, "smb")
-                await pilot.pause(0.1)
+                await _activate_backend_and_settle(dialog, "smb", pilot, wait_until)
                 dialog.query_one("#connect-smb-server", Input).value = "nas.example.com"
                 dialog.query_one("#connect-submit", Button).press()
                 await pilot.pause(0.1)
@@ -372,11 +382,12 @@ class TestRemoteFields:
         assert still_open, "an empty share name must not dismiss the dialog"
         assert "share" in status.lower(), status
 
-    def test_connect_dialog_non_numeric_smb_port_shows_warning_instead_of_a_raw_exception(self) -> None:
+    def test_connect_dialog_non_numeric_smb_port_shows_warning_instead_of_a_raw_exception(
+        self, wait_until: Any
+    ) -> None:
         async def scenario() -> tuple[bool, str]:
             async with _open_connect_dialog() as (app, pilot, dialog):
-                _activate_backend(dialog, "smb")
-                await pilot.pause(0.1)
+                await _activate_backend_and_settle(dialog, "smb", pilot, wait_until)
                 dialog.query_one("#connect-smb-server", Input).value = "nas.example.com"
                 dialog.query_one("#connect-smb-share", Input).value = "backups"
                 dialog.query_one("#connect-smb-port", Input).value = "not-a-number"
@@ -390,11 +401,10 @@ class TestRemoteFields:
         assert "port" in status.lower(), status
         assert "invalid literal" not in status.lower(), "must show a clean message, not the raw ValueError text"
 
-    def test_pressing_enter_in_an_smb_field_submits(self) -> None:
+    def test_pressing_enter_in_an_smb_field_submits(self, wait_until: Any) -> None:
         async def scenario() -> bool:
             async with _open_connect_dialog() as (app, pilot, dialog):
-                _activate_backend(dialog, "smb")
-                await pilot.pause(0.1)
+                await _activate_backend_and_settle(dialog, "smb", pilot, wait_until)
                 submitted = False
 
                 def fake_submit() -> None:

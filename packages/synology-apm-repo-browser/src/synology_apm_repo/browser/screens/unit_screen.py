@@ -27,6 +27,7 @@ from textual.app import ComposeResult
 from textual.containers import VerticalScroll
 from textual.widgets import Input, Static, Tree
 from textual.widgets.tree import TreeNode
+from textual.worker import Worker
 
 from synology_apm_repo.browser.content_preview import (
     render_calendar_event_preview,
@@ -70,6 +71,7 @@ from synology_apm_repo.browser.strings import (
     UNIT_STATUS_BAR,
 )
 from synology_apm_repo.browser.widgets.progress_hint import DebouncedProgress
+from synology_apm_repo.browser.worker_drain import drain
 from synology_apm_repo.sdk.api import Catalog, Version
 from synology_apm_repo.sdk.errors import ApmRepoError
 from synology_apm_repo.sdk.presentation.markup import safe
@@ -137,6 +139,12 @@ class _LoadedChildren:
     children: list[Node]
     next_offset: int
     exhausted: bool
+
+
+#: Workers that release a discarded provider run in their own group: every
+#: other worker on this screen is cancellable at will, but cancelling one of
+#: these mid-``close()`` is exactly the leak the draining exists to prevent.
+_CLOSE_GROUP = "close-provider"
 
 
 class UnitScreen(NavigableScreen):
@@ -210,9 +218,24 @@ class UnitScreen(NavigableScreen):
         one after another would otherwise accumulate one leaked
         connection/thread per version visited. ``async def`` is safe
         here — Textual awaits an ``on_unmount`` coroutine to completion
-        (see ``keymap.py``'s own module docstring)."""
+        (see ``keymap.py``'s own module docstring).
+
+        This screen's own workers are drained *before* that close. Textual's
+        ``Widget._on_unmount`` only requests their cancellation, and a
+        cancelled task still has to reach its next ``await`` before it stops
+        using the provider — closing underneath one still mid-query leaves
+        that provider's ``SqliteSource`` temp file permanently open, which
+        POSIX lets us unlink anyway but Windows refuses outright."""
+        await drain(self._screen_workers(cancel=True))
         if isinstance(self._provider, ClosableUnitProvider):
             await self._provider.close()
+        # Textual's own ``Widget._on_unmount`` runs straight after this handler
+        # and cancels *every* worker on this node, ``_CLOSE_GROUP`` included --
+        # the exemption in ``_screen_workers`` only keeps us from cancelling
+        # them, it cannot stop that. So anything still releasing a discarded
+        # provider has to be waited out here, while it can still finish.
+        # Not cancelled first, unlike the drain above: these must *finish*.
+        await drain([w for w in self.workers if w.node is self and w.group == _CLOSE_GROUP])
 
     def _set_loading_indicator(self, markup: str | None) -> None:
         text = safe(self._version.display_name)
@@ -552,14 +575,26 @@ class UnitScreen(NavigableScreen):
         self._children_by_node_id.clear()
         old_provider, self._provider = self._provider, None
         if old_provider is not None:
-            self._close_provider(old_provider)
+            # Snapshot and cancel synchronously, before `_close_provider` and
+            # the caller's own next `_load_root()` exist: every worker running
+            # right now still holds `old_provider` (each reads `self._provider`
+            # once, then awaits across it), so neither of those two belongs in
+            # the list, and closing underneath one of the others would leak its
+            # connection -- see `on_unmount`'s own docstring.
+            stale = self._screen_workers(cancel=True)
+            self._close_provider(old_provider, stale)
 
-    @work
-    async def _close_provider(self, provider: UnitProvider) -> None:
+    @work(group=_CLOSE_GROUP)
+    async def _close_provider(self, provider: UnitProvider, draining: list[Worker[None]]) -> None:
         """Fire-and-forget close for a provider this screen no longer
         needs, called from the sync ``_reset_tree`` — safe to run
         concurrently with a fresh ``_load_root()`` fetching this screen's
-        *next* provider, since the two never share a connection."""
+        *next* provider, since the two never share a connection.
+
+        ``draining`` is ``_reset_tree``'s already-cancelled snapshot of the
+        workers that were still reading through ``provider``; they are waited
+        out here, off the sync caller, before the close itself."""
+        await drain(draining)
         if isinstance(provider, ClosableUnitProvider):
             await provider.close()
 
@@ -662,6 +697,17 @@ class UnitScreen(NavigableScreen):
             self._close_filter()
         elif event.input.id == "goto-input":
             await self._submit_goto(event.value)
+
+    def _screen_workers(self, *, cancel: bool) -> list[Worker[None]]:
+        """This screen's own workers, minus the ones closing a discarded
+        provider (``_CLOSE_GROUP``) — cancelling one of those would abandon the
+        provider it is halfway through releasing. ``cancel=True`` cancels the
+        ones it returns, so a caller never has to remember to do both."""
+        workers = [w for w in self.workers if w.node is self and w.group != _CLOSE_GROUP]
+        if cancel:
+            for worker in workers:
+                worker.cancel()
+        return workers
 
     def _purge_loaded_ids(self, tree_node: TreeNode[Node]) -> None:
         """Recursively discards every ``id(tree_node)`` bookkeeping entry
