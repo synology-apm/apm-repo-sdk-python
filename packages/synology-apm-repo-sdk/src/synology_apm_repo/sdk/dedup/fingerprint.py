@@ -95,6 +95,11 @@ class AllocationTableCache:
     def __init__(self) -> None:
         self._tables: AsyncKeyedCache[tuple[int, int], tuple[str, str, str, bytes]] = AsyncKeyedCache()
 
+    def clear(self) -> None:
+        """Drop every cached allocation table — for a caller releasing a
+        whole ``Pool``'s memory (see ``Pool.release_caches``)."""
+        self._tables.invalidate()
+
     async def resolve_entry(
         self, store: ObjectStore, dir_cache: DirCache, pool_root: str, stream_id: StreamId, bucket_id: BucketId
     ) -> tuple[str, str, str, int, int]:

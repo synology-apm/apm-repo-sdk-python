@@ -1,13 +1,15 @@
-.PHONY: test test-unit smoke-test record-fixture lint format typecheck check-version-consistency check-sdk-import-boundary bump-external-versions build whl docs clean github-act-simulation help
+.PHONY: test test-unit smoke-test record-fixture check-version-consistency check-sdk-import-boundary bump-external-versions build whl docs clean github-act-simulation help
 .DEFAULT_GOAL := help
 
 help: ## List available targets
 	@grep -E '^[a-z0-9-]+:.*##' $(MAKEFILE_LIST) | awk -F ':.*## ' '{printf "  make %-28s %s\n", $$1, $$2}'
 
-test: ## Run the full pre-commit gate: format check, lint, mypy, pytest with coverage enforced, then version-consistency + import-boundary checks
+test: ## Run the full pre-commit gate: format check, lint, mypy (linux/win32/darwin), pytest with coverage enforced, then version-consistency + import-boundary checks
 	uv run ruff format --check .
 	uv run ruff check .
-	uv run mypy
+	uv run mypy --platform linux --cache-dir .mypy_cache/linux
+	uv run mypy --platform win32 --cache-dir .mypy_cache/win32
+	uv run mypy --platform darwin --cache-dir .mypy_cache/darwin
 	uv run pytest -q -n auto --cov=synology_apm_repo --cov-report=term-missing --cov-report=html
 	@$(MAKE) check-version-consistency
 	@$(MAKE) check-sdk-import-boundary
@@ -25,15 +27,6 @@ smoke-test: ## Run the sdk/cli/browser smoke tests against real, on-disk sample 
 record-fixture: ## Re-record one tests/integration/ fixture against a real sample. TEST accepts multiple space-separated node ids (or a whole file) when several tests share one fixture -- their calls merge automatically.
 	@test -n "$(TARGET)" -a -n "$(TEST)" || (echo "usage: make record-fixture TARGET=local:<path-to-sample-dir>|profile:<name> TEST=tests/integration/.../test_x.py::test_func" >&2 && exit 1)
 	uv run pytest --record-against=$(TARGET) $(TEST)
-
-lint: ## ruff check only
-	uv run ruff check .
-
-format: ## ruff format, in place
-	uv run ruff format .
-
-typecheck: ## mypy only
-	uv run mypy
 
 check-version-consistency: ## Verify the three packages share one lockstep version (and the SDK dependency pin matches it)
 	uv run python scripts/check_version_consistency.py

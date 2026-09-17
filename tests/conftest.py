@@ -8,7 +8,9 @@ from __future__ import annotations
 import os
 import time
 from collections.abc import Awaitable, Callable, Iterator
+from datetime import datetime, timedelta, timezone, tzinfo
 from pathlib import Path
+from typing import Any, Self
 
 import pytest
 from textual.widgets import Button, Input, Tree
@@ -17,31 +19,59 @@ from synology_apm_repo.browser.app import ApmRepoBrowserApp
 from synology_apm_repo.browser.screens.browse_screen import BrowseScreen
 from synology_apm_repo.browser.screens.connect_dialog import ConnectDialog
 
+_FIXED_TZ = "Asia/Taipei"
+
+#: Asia/Taipei has observed no DST since 1979, so a bare +08:00 renders every
+#: backup timestamp exactly as the named zone does — and unlike
+#: ``ZoneInfo(_FIXED_TZ)`` it needs no ``tzdata``, which Windows ships no system
+#: copy of and this workspace only pulls in transitively.
+_FIXED_TZ_OFFSET = timezone(timedelta(hours=8))
+
+
+class _FixedLocalDatetime(datetime):
+    """``datetime`` whose *bare* ``astimezone()`` resolves to ``_FIXED_TZ_OFFSET``
+    rather than to whatever zone the running machine is in. Only used where
+    ``time.tzset()`` is unavailable — see ``_fixed_timezone``."""
+
+    def astimezone(self, tz: tzinfo | None = None) -> Self:
+        return super().astimezone(_FIXED_TZ_OFFSET if tz is None else tz)
+
 
 @pytest.fixture(scope="session", autouse=True)
 def _fixed_timezone() -> Iterator[None]:
-    """Pins the process timezone to Asia/Taipei for the whole test run.
+    """Pins the timezone behind local-time rendering to Asia/Taipei for the whole
+    test run.
 
     ``catalog/version.py``'s ``_version_display_name()`` deliberately renders a
     backup version's epoch in the *local* timezone for display, so any
     replay fixture asserting on that rendered string is only reproducible
-    when replayed in the same timezone it was recorded in. Pinning ``TZ``
-    here — rather than leaving it to whatever timezone the running machine
+    when replayed in the same timezone it was recorded in. Pinning here —
+    rather than leaving it to whatever timezone the running machine
     happens to be in — makes every ``tests/fixtures/*.json.gz`` replay
     assertion built around a rendered timestamp reproducible on any
     machine, including CI.
+
+    Two mechanisms, because ``TZ``/``tzset`` is a POSIX interface: where
+    ``time.tzset()`` exists, pinning the C library covers every local-time
+    call in the process at once. Windows has no ``time.tzset()`` and its CRT
+    ignores ``TZ``, so there the single call site above is pinned directly.
     """
-    previous = os.environ.get("TZ")
-    os.environ["TZ"] = "Asia/Taipei"
-    time.tzset()
-    try:
-        yield
-    finally:
-        if previous is None:
-            del os.environ["TZ"]
-        else:
-            os.environ["TZ"] = previous
+    if hasattr(time, "tzset"):
+        previous = os.environ.get("TZ")
+        os.environ["TZ"] = _FIXED_TZ
         time.tzset()
+        try:
+            yield
+        finally:
+            if previous is None:
+                del os.environ["TZ"]
+            else:
+                os.environ["TZ"] = previous
+            time.tzset()
+    else:
+        with pytest.MonkeyPatch.context() as patch:
+            patch.setattr("synology_apm_repo.sdk.catalog.version.datetime", _FixedLocalDatetime)
+            yield
 
 
 def pytest_configure(config: pytest.Config) -> None:
@@ -102,6 +132,57 @@ def wait_until() -> Callable[..., Awaitable[None]]:
         raise TimeoutError(message)
 
     return _wait
+
+
+@pytest.fixture
+def focus_widget(wait_until: Callable[..., Awaitable[None]]) -> Callable[..., Awaitable[None]]:
+    """``await focus_widget(pilot, widget)`` — focus it, then wait until it
+    genuinely has focus.
+
+    A key goes to whatever *actually* has focus, and ``focus()`` is a request
+    the app grants a turn or two later. A test that focuses and presses in the
+    same breath sends its key to the previous holder instead, which looks like
+    the action silently doing nothing (see ``tests/CLAUDE.md``'s "Driving a
+    ``Pilot`` test").
+    """
+
+    async def _focus(pilot: object, widget: Any) -> None:
+        widget.focus()
+        await wait_until(
+            pilot,
+            lambda: widget.has_focus,
+            timeout=0.6,
+            interval=0.02,
+            message=f"{widget!r} never took focus",
+        )
+
+    return _focus
+
+
+@pytest.fixture
+def move_cursor_to(wait_until: Callable[..., Awaitable[None]]) -> Callable[..., Awaitable[None]]:
+    """``await move_cursor_to(pilot, tree, node)`` — move a ``Tree``'s cursor
+    onto ``node`` and wait until it is actually there.
+
+    Reading ``_tree_lines`` first is load-bearing, not defensive:
+    ``move_cursor()`` resolves the node through the tree's line map, so against
+    a stale one it simply does nothing and the cursor stays where it was. Every
+    caller needs all three steps, so they live together here rather than being
+    re-assembled (and half-remembered) per call site.
+    """
+
+    async def _move(pilot: object, tree: Any, node: Any) -> None:
+        _ = tree._tree_lines  # forces the line map to rebuild; see docstring
+        tree.move_cursor(node)
+        await wait_until(
+            pilot,
+            lambda: tree.cursor_node is node,
+            timeout=0.6,
+            interval=0.02,
+            message=f"cursor never landed on {node!r}",
+        )
+
+    return _move
 
 
 @pytest.fixture

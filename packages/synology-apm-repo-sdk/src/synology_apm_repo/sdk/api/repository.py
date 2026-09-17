@@ -156,6 +156,19 @@ class Repository:
         self._closed = False
 
     async def _open_dedup_catalog(self, index: int) -> DedupRepo:
+        """Build one catalog's ``DedupRepo`` — the ``_dedup_catalogs`` cache's
+        own factory.
+
+        Guarded on ``_closed`` because ``close()`` invalidates that cache: a
+        resolve arriving afterwards would otherwise open a brand-new
+        ``DedupRepo``, with its own sqlite connections and temp directories,
+        that nothing will ever close again. Deliberately a ``RuntimeError``
+        rather than an ``ApmRepoError`` — using a Repository after closing it
+        is a bug in the caller, not a condition of the repository that callers
+        are expected to catch.
+        """
+        if self._closed:
+            raise RuntimeError("Repository is closed; open a new one rather than reusing this instance")
         return await DedupRepo.open(self._store, self._catalog_layouts[index], self._keys)
 
     async def _confirm_real(self) -> bool:
@@ -675,6 +688,12 @@ class Repository:
                 await asyncio.wait_for(dedup_repo.close(), timeout=_RESOURCE_CLOSE_TIMEOUT)
             except Exception as exc:
                 errors.append(exc)
+        # Closing each DedupRepo is not the same as forgetting it: without
+        # this the cache keeps every one of them (and everything they in turn
+        # reference) alive for as long as anything holds this Repository.
+        # ``_closed`` is set before this, so a resolve racing the invalidate
+        # raises instead of building a replacement nothing would ever close.
+        self._dedup_catalogs.invalidate()
         if errors:
             raise ExceptionGroup("Repository.close() failed to close every tracked resource", errors)
 

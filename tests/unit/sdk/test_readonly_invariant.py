@@ -21,6 +21,8 @@ from pathlib import Path
 
 from synology_apm_repo.sdk.storage import LocalFsStore, iter_layouts
 
+_O_BINARY = getattr(os, "O_BINARY", 0)
+
 _WRITE_FLAG_BITS = os.O_WRONLY | os.O_RDWR | os.O_APPEND | os.O_CREAT | os.O_TRUNC | getattr(os, "O_EXCL", 0)
 
 #: Real CPython audit events a filesystem *mutation* fires -- deliberately excludes
@@ -145,7 +147,7 @@ async def test_watch_catches_os_open_with_a_write_flag(tmp_path: Path) -> None:
     target = tmp_path / "y"
 
     with watch(under=tmp_path) as violations:
-        fd = os.open(target, os.O_WRONLY | os.O_CREAT)
+        fd = os.open(target, os.O_WRONLY | _O_BINARY | os.O_CREAT)
         os.close(fd)
 
         found = violations()

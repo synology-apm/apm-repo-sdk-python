@@ -153,11 +153,17 @@ async def test_transform_applied_independently_to_main_file_and_wal(tmp_path: Pa
     def _xor(data: bytes) -> bytes:
         return bytes(b ^ 0xFF for b in data)
 
+    # Snapshot the three files into a directory no connection has open,
+    # and wrap them there: `blocker` has to stay open to keep the WAL from
+    # being checkpointed away, but on Windows it also holds `-shm` memory
+    # mapped, which makes rewriting that file in place fail with EINVAL.
+    wrapped_dir = tmp_path / "wrapped"
+    wrapped_dir.mkdir()
     for candidate in (db_path, wal_path, tmp_path / "test.db-shm"):
         if candidate.exists():
-            candidate.write_bytes(_xor(candidate.read_bytes()))
+            (wrapped_dir / candidate.name).write_bytes(_xor(candidate.read_bytes()))
 
-    store = LocalFsStore(tmp_path)
+    store = LocalFsStore(wrapped_dir)
     conn, materialized = await open_sqlite(store, "test.db", transform=_xor)
     try:
         assert materialized is not None
@@ -386,3 +392,53 @@ class TestApplyIndexHint:
                 await apply_index_hint(conn, "t", ["no_such_column"])
         finally:
             await conn.close()
+
+
+async def _plan(conn: aiosqlite.Connection, sql: str, *params: object) -> str:
+    cursor = await conn.execute(f"EXPLAIN QUERY PLAN {sql}", params)
+    return " ".join(str(row[-1]) for row in await cursor.fetchall())
+
+
+async def test_index_hint_builds_a_real_index_on_a_materialized_copy(tmp_path: Path) -> None:
+    """The slow path's copy is ours to write to, so the hint must actually
+    take effect there — otherwise every hinted query silently degrades to the
+    full table scan a ``mode=ro`` connection would have left it with."""
+    _make_plain_db(tmp_path, name="wrapped.db")
+    wrapped = tmp_path / "wrapped.db"
+
+    def _xor(data: bytes) -> bytes:
+        return bytes(b ^ 0xFF for b in data)
+
+    wrapped.write_bytes(_xor(wrapped.read_bytes()))
+    store = LocalFsStore(tmp_path)
+
+    conn, materialized = await open_sqlite(store, "wrapped.db", transform=_xor)
+    try:
+        assert materialized is not None  # transform forces the slow path
+        await apply_index_hint(conn, "t", ["v"])
+        assert "_synology_apm_repo_idx_t_v" in await _index_names(conn, "t")
+        # "USING INDEX" or "USING COVERING INDEX" depending on the columns
+        # SQLite can answer straight from the index itself.
+        assert "_synology_apm_repo_idx_t_v" in await _plan(conn, "SELECT v FROM t WHERE v = ?", 1)
+    finally:
+        await conn.close()
+        if materialized is not None:
+            materialized.cleanup()
+
+
+async def test_index_hint_is_a_silent_no_op_on_the_fast_path(tmp_path: Path) -> None:
+    """The fast path opens the store's *real* file, read-only and immutable —
+    the hint stays a no-op there rather than raising, and the query still
+    answers correctly (by scanning)."""
+    _make_plain_db(tmp_path)
+    store = LocalFsStore(tmp_path)
+
+    conn, tmp_dir = await open_sqlite(store, "test.db")
+    try:
+        assert tmp_dir is None  # fast path: the real file
+        await apply_index_hint(conn, "t", ["v"])  # must not raise
+        assert await _index_names(conn, "t") == set()
+        cursor = await conn.execute("SELECT v FROM t WHERE v = ?", (1,))
+        assert list(await cursor.fetchall()) == [(1,)]
+    finally:
+        await conn.close()

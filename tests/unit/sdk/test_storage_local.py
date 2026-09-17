@@ -10,6 +10,7 @@ parametrized across all three backends, in
 from __future__ import annotations
 
 import os
+import sys
 from pathlib import Path
 
 import pytest
@@ -17,6 +18,8 @@ import pytest
 from synology_apm_repo.sdk.errors import NotFoundError, PermissionDeniedError
 from synology_apm_repo.sdk.storage import local as local_mod
 from synology_apm_repo.sdk.storage.local import LocalFsStore
+
+_O_BINARY = getattr(os, "O_BINARY", 0)
 
 
 @pytest.fixture
@@ -197,14 +200,14 @@ class TestReadaheadHint:
 
     def test_posix_fadvise_branch_on_a_platform_that_has_it(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """Neither ``os.posix_fadvise`` nor ``os.POSIX_FADV_WILLNEED``
-        exist on macOS at all (only ``hasattr(os, "posix_fadvise")``-gated
-        Linux code reaches either) — this project's own CI runs on
-        Linux, where this branch is exercised for real; here it's
-        exercised by patching in fake attributes and forcing
-        ``_HAS_POSIX_FADVISE`` on, to test the branch's own logic
-        independent of which platform this happens to run on."""
+        exist on macOS at all (only the ``sys.platform == "linux"``-gated
+        branch reaches either) — this project's own CI runs on Linux, where
+        this branch is exercised for real; here it's exercised by patching
+        in fake attributes and forcing ``sys.platform`` to ``"linux"``, to
+        test the branch's own logic independent of which platform this
+        happens to run on."""
         calls: list[tuple[int, int, int, object]] = []
-        monkeypatch.setattr(local_mod, "_HAS_POSIX_FADVISE", True)
+        monkeypatch.setattr(sys, "platform", "linux")
         monkeypatch.setattr(os, "POSIX_FADV_WILLNEED", "WILLNEED-sentinel", raising=False)
         monkeypatch.setattr(
             os,
@@ -219,14 +222,14 @@ class TestReadaheadHint:
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         """``os.pread`` doesn't exist on Windows — this project's own CI
-        runs on Linux/macOS, where ``_HAS_PREAD`` is always on; here the
-        ``lseek``+``read`` fallback is exercised directly by forcing
-        ``_HAS_PREAD`` off, proving it reads the same bytes at the same
-        offset ``os.pread`` would."""
-        monkeypatch.setattr(local_mod, "_HAS_PREAD", False)
+        runs on Linux/macOS, where the ``sys.platform != "win32"`` branch
+        is always taken; here the ``lseek``+``read`` fallback is exercised
+        directly by forcing ``sys.platform`` to ``"win32"``, proving it
+        reads the same bytes at the same offset ``os.pread`` would."""
+        monkeypatch.setattr(sys, "platform", "win32")
         payload = b"0123456789"
         (tmp_path / "f.bin").write_bytes(payload)
-        fd = os.open(tmp_path / "f.bin", os.O_RDONLY)
+        fd = os.open(tmp_path / "f.bin", os.O_RDONLY | _O_BINARY)
         try:
             assert local_mod._pread(fd, 4, 3) == payload[3:7]
         finally:

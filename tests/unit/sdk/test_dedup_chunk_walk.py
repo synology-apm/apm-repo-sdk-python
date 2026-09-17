@@ -14,6 +14,7 @@ import asyncio
 import atexit
 import contextlib
 import os
+import sys
 import zlib
 from collections.abc import Awaitable, Callable, Iterator
 from pathlib import Path
@@ -54,6 +55,8 @@ from synology_apm_repo.sdk.format.redundancy import redundancy_size
 from synology_apm_repo.sdk.identifiers import BucketId, ChunkIdx, SessionId, StreamId
 from synology_apm_repo.sdk.storage.dircache import DirCache
 from synology_apm_repo.sdk.storage.local import LocalFsStore
+
+_O_BINARY = getattr(os, "O_BINARY", 0)
 
 _STREAM_ID = StreamId(7)
 _SESSION_ID = SessionId(3)
@@ -1350,7 +1353,7 @@ class TestExportWorkerLoopReuse:
         dst = tmp_path / "out.bin"
         dst.write_bytes(bytes(4096))
         chunk_walk._worker_pool = pool
-        chunk_walk._worker_dst_fd = os.open(dst, os.O_WRONLY)
+        chunk_walk._worker_dst_fd = os.open(dst, os.O_WRONLY | _O_BINARY)
         args = ExportGroupWorkerArgs(
             stream_id=StreamId(0), bucket_id=BucketId(0), runs=[ChunkRun(0, 1, 0)], size=4096, dst_offset=0
         )
@@ -1404,7 +1407,7 @@ class TestExportWorkerShutdown:
 
         dst = tmp_path / "out.bin"
         dst.write_bytes(b"")
-        fd = os.open(dst, os.O_WRONLY)
+        fd = os.open(dst, os.O_WRONLY | _O_BINARY)
         chunk_walk._worker_store = _FakeAsyncCloseableStore()  # type: ignore[assignment]
         chunk_walk._worker_dst_fd = fd
 
@@ -1422,7 +1425,7 @@ class TestExportWorkerShutdown:
 
         dst = tmp_path / "out.bin"
         dst.write_bytes(b"")
-        fd = os.open(dst, os.O_WRONLY)
+        fd = os.open(dst, os.O_WRONLY | _O_BINARY)
         chunk_walk._worker_store = _FailingAsyncCloseableStore()  # type: ignore[assignment]
         chunk_walk._worker_dst_fd = fd
 
@@ -1435,15 +1438,16 @@ class TestExportWorkerShutdown:
 
 class TestPositionalWriteFallback:
     """``os.pwrite`` doesn't exist on Windows — this project's own CI runs
-    on Linux, where ``_HAS_PWRITE`` is always on; here the ``lseek``+
-    ``write`` fallback is exercised directly by forcing ``_HAS_PWRITE``
-    off, proving it lands bytes at the same offset ``os.pwrite`` would."""
+    on Linux/macOS, where the ``sys.platform != "win32"`` branch is always
+    taken; here the ``lseek``+``write`` fallback is exercised directly by
+    forcing ``sys.platform`` to ``"win32"``, proving it lands bytes at the
+    same offset ``os.pwrite`` would."""
 
     def test_fallback_lands_bytes_at_the_given_offset(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-        monkeypatch.setattr(chunk_walk, "_HAS_PWRITE", False)
+        monkeypatch.setattr(sys, "platform", "win32")
         dst = tmp_path / "out.bin"
         dst.write_bytes(bytes(10))
-        fd = os.open(dst, os.O_WRONLY)
+        fd = os.open(dst, os.O_WRONLY | _O_BINARY)
         try:
             chunk_walk._pwrite(fd, b"hello", 3)
         finally:

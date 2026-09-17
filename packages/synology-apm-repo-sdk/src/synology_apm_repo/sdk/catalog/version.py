@@ -176,7 +176,22 @@ async def versions(repo: DedupRepo, workload: Workload, *, include_deleted: bool
     timestamp can't be resolved sorts last, ties broken by ``version_id``
     descending (the best available recency proxy once the real timestamp
     is unusable)."""
-    table = await Table.create(await repo.db("copy_target_version"), "copy_target_version", _VERSION_COLUMNS)
+    # Hinted on what the WHERE below actually filters by: the schema's own
+    # index is on version_uid, which this query never mentions, so without an
+    # index here every call is a full scan of a table carrying version_spec
+    # blobs, paid once per workload.
+    #
+    # Only takes effect where the connection is onto a materialized copy (a
+    # remote store, or a local one with a live -wal). A plain local repository
+    # takes open_sqlite's fast path onto the real file, immutable and
+    # read-only, where apply_index_hint is documented to do nothing -- that
+    # case still scans.
+    table = await Table.create(
+        await repo.db("copy_target_version"),
+        "copy_target_version",
+        _VERSION_COLUMNS,
+        index_hints=[["workload_id", "deleted"]],
+    )
     where = "workload_id = ?" if include_deleted else "workload_id = ? AND deleted = 0"
     # Two passes: the first collects every row that survives the
     # browsable-status filter, the second batch-resolves their

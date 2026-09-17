@@ -34,8 +34,10 @@ import atexit
 import contextlib
 import os
 import shutil
+import sys
 import tarfile
 import tempfile
+import threading
 from collections.abc import AsyncIterator, Awaitable, Callable
 from functools import cache
 from pathlib import Path
@@ -43,6 +45,23 @@ from pathlib import Path
 import pytest
 
 from synology_apm_repo.sdk.units.content.disk_fs import DiskFilesystem
+
+_O_BINARY = getattr(os, "O_BINARY", 0)
+
+_PREAD_LOCK = threading.Lock()
+
+
+def _pread(fd: int, length: int, offset: int) -> bytes:
+    """Same shape as ``storage/local.py``'s own helper — ``os.pread()``
+    where available (POSIX), ``lseek``+``read`` under a lock on Windows,
+    which has no positional read and whose fd here is shared across
+    concurrent ``to_thread`` reads."""
+    if sys.platform != "win32":
+        return os.pread(fd, length, offset)
+    with _PREAD_LOCK:
+        os.lseek(fd, offset, os.SEEK_SET)
+        return os.read(fd, length)
+
 
 _FIXTURES = Path(__file__).parent.parent.parent / "fixtures"
 
@@ -65,7 +84,7 @@ class _FileBackedAsyncContent:
     supports_concurrent_export = False
 
     def __init__(self, path: Path, size: int) -> None:
-        self._fd = os.open(path, os.O_RDONLY)
+        self._fd = os.open(path, os.O_RDONLY | _O_BINARY)
         self._size = size
 
     def __del__(self) -> None:
@@ -78,7 +97,7 @@ class _FileBackedAsyncContent:
 
     async def read(self, offset: int = 0, length: int | None = None) -> bytes:
         n = length if length is not None else self._size - offset
-        return await asyncio.to_thread(os.pread, self._fd, n, offset)
+        return await asyncio.to_thread(_pread, self._fd, n, offset)
 
     def stream(self, block: int = 8 << 20) -> AsyncIterator[tuple[int, bytes]]:
         raise NotImplementedError("unused by DiskFilesystem.open() — only satisfies the ContentSource Protocol")

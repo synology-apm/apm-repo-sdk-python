@@ -21,6 +21,7 @@ never need to know in advance which of the six they have.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import enum
 import os
 import tempfile
@@ -100,9 +101,8 @@ def peel(
 
 class SqliteSource:
     """Materialize raw SQLite bytes to a private temp file and open a
-    read-only connection to it — the common tail end of all six paths in
-    this module's docstring, once ``peel`` has produced plain SQLite
-    bytes.
+    connection to it — the common tail end of all six paths in this
+    module's docstring, once ``peel`` has produced plain SQLite bytes.
 
     Constructed via ``await SqliteSource.from_bytes(...)`` /
     ``await SqliteSource.from_raw_store(...)``, async classmethod
@@ -111,7 +111,9 @@ class SqliteSource:
     Async-context-manager friendly (``async with``); also safe to just
     ``await`` ``close`` directly once done. The temp file is created
     with a random name in the platform temp dir and unlinked on close —
-    never touches the source repository (read-only invariant).
+    never touches the source repository (read-only invariant). The
+    connection onto that temp file is deliberately writable; see
+    ``from_bytes``.
     """
 
     def __init__(self) -> None:
@@ -122,14 +124,25 @@ class SqliteSource:
 
     @classmethod
     async def from_bytes(cls, data: bytes) -> Self:
-        """Materialize plain (post-``peel``) SQLite ``data`` to a
-        private temp file and open a read-only connection to it."""
+        """Materialize plain (post-``peel``) SQLite ``data`` to a private
+        temp file and open a *writable* connection to it.
+
+        Writable because the file is this instance's own scratch copy,
+        unlinked again by ``close()`` — the store's bytes are already behind
+        us by the time ``data`` exists, so the read-only invariant is upheld
+        by what this never opens, not by the mode of this connection. It is
+        also what lets ``apply_index_hint`` build a real index here instead
+        of leaving every hinted query a full table scan."""
         fd, path = tempfile.mkstemp(suffix=".db")
         try:
             await asyncio.to_thread(_write_fd, fd, data)
             self = cls()
             self._path = path
-            self.connection = await aiosqlite.connect(f"file:{path}?mode=ro", uri=True)
+            # ``rw``, not the default ``rwc`` -- same reasoning as
+            # ``sqlite.py``'s own private WAL-recovery copy: a path SQLite
+            # cannot open here is a real failure too, not a signal to
+            # silently create a new, empty database.
+            self.connection = await aiosqlite.connect(f"file:{path}?mode=rw", uri=True)
         except Exception:
             os.unlink(path)
             raise
@@ -184,6 +197,11 @@ class SqliteSource:
         await self.connection.close()
         if self._path is not None:
             os.unlink(self._path)
+            # A read-write connection can leave sidecars next to the temp
+            # file; best-effort because most closes never produce any.
+            for suffix in ("-wal", "-shm", "-journal"):
+                with contextlib.suppress(OSError):
+                    os.unlink(self._path + suffix)
         if self._tmp_dir is not None:
             self._tmp_dir.cleanup()
 

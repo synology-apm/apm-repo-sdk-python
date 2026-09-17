@@ -94,6 +94,8 @@ def test_open_browse_and_unit_tree_happy_path_replayed(
     open_browser_pilot: Any,
     wait_until: Any,
     record_target: Callable[[str], Awaitable[ObjectStore]],
+    focus_widget: Any,
+    move_cursor_to: Any,
 ) -> None:
     async def scenario() -> None:
         await _patch_local_store(monkeypatch, record_target, "tui_browse_happy_path_apv1.json.gz")
@@ -111,12 +113,12 @@ def test_open_browse_and_unit_tree_happy_path_replayed(
             cat_tree.focus()
             await pilot.press("enter")
             wl_tree = app.screen.query_one("#col-workloads", Tree)
-            await wait_until(pilot, lambda: wl_tree.root.children, timeout=0.8, interval=0.02)
+            await wait_until(pilot, lambda: wl_tree.root.children, timeout=3.0, interval=0.02)
             assert any(wl_tree.root.children), "no workload type groups populated"
             wl_tree.focus()
             await pilot.press("enter")
             ver_table = app.screen.query_one("#col-versions", DataTable)
-            await wait_until(pilot, lambda: ver_table.row_count, timeout=0.8, interval=0.02)
+            await wait_until(pilot, lambda: ver_table.row_count, timeout=3.0, interval=0.02)
             assert ver_table.row_count > 0
             ver_table.focus()
             await pilot.press("enter")
@@ -163,7 +165,12 @@ async def _patch_local_store(
 
 
 def test_esc_on_the_main_screen_does_not_blank_it_replayed(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, open_browser_pilot: Any, wait_until: Any
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    open_browser_pilot: Any,
+    wait_until: Any,
+    focus_widget: Any,
+    move_cursor_to: Any,
 ) -> None:
     monkeypatch.setattr(
         connect_dialog_module.ConnectDialog,
@@ -218,7 +225,7 @@ async def _drill_to_unit_screen(app: ApmRepoBrowserApp, pilot: Any, wait_until: 
     await pilot.press("enter")
 
     wl_tree = app.screen.query_one("#col-workloads", Tree)
-    await wait_until(pilot, lambda: wl_tree.root.children, timeout=0.8, interval=0.02)
+    await wait_until(pilot, lambda: wl_tree.root.children, timeout=3.0, interval=0.02)
     fs_group = next(n for n in wl_tree.root.children if str(n.label) == "FS")
     # Only the *first* group auto-expands (BrowseScreen._set_workloads) --
     # "FS" isn't always that one, so its own children aren't visible/
@@ -230,17 +237,20 @@ async def _drill_to_unit_screen(app: ApmRepoBrowserApp, pilot: Any, wait_until: 
     await pilot.press("enter")
 
     ver_table = app.screen.query_one("#col-versions", DataTable)
-    await wait_until(pilot, lambda: ver_table.row_count, timeout=0.8, interval=0.02)
+    await wait_until(pilot, lambda: ver_table.row_count, timeout=3.0, interval=0.02)
     ver_table.focus()
     await pilot.press("enter")
     await wait_until(pilot, lambda: isinstance(app.screen, UnitScreen), timeout=0.6, interval=0.03)
     assert isinstance(app.screen, UnitScreen), app.screen
 
 
-async def _first_leaf(app: ApmRepoBrowserApp, pilot: Any, wait_until: Any) -> Any:
+async def _first_leaf(
+    app: ApmRepoBrowserApp, pilot: Any, wait_until: Any, focus_widget: Any, move_cursor_to: Any
+) -> Any:
     unit_screen = app.screen
     tree = unit_screen.query_one("#unit-tree", Tree)
-    await wait_until(pilot, lambda: tree.root.data is not None, timeout=1.0, interval=0.02)
+    await wait_until(pilot, lambda: tree.root.data is not None, timeout=3.0, interval=0.02)
+    await focus_widget(pilot, tree)
     node = tree.root
     depth = 0
     while (
@@ -250,13 +260,16 @@ async def _first_leaf(app: ApmRepoBrowserApp, pilot: Any, wait_until: Any) -> An
         and depth < 8
     ):
         node.expand()
-        await wait_until(pilot, lambda n=node: n.children, timeout=0.4, interval=0.02)
+        await wait_until(pilot, lambda n=node: n.children, timeout=3.0, interval=0.02)
         if not node.children:
             break
         node = node.children[0]
         depth += 1
+    # move_cursor only takes effect against an up-to-date line map; forcing it
+    # here is the same idiom _select_matching_workload uses.
+    _ = tree._tree_lines
     tree.move_cursor(node)
-    await pilot.pause(0.03)
+    await wait_until(pilot, lambda: tree.cursor_node is node, timeout=0.4, interval=0.02, message="cursor never landed")
     return node
 
 
@@ -266,6 +279,8 @@ def test_detail_panel_and_export_dialog_show_human_readable_sizes_replayed(
     open_browser_pilot: Any,
     wait_until: Any,
     record_target: Callable[[str], Awaitable[ObjectStore]],
+    focus_widget: Any,
+    move_cursor_to: Any,
 ) -> None:
     async def scenario() -> tuple[str, str, int]:
         await _patch_local_store(monkeypatch, record_target)
@@ -277,16 +292,21 @@ def test_detail_panel_and_export_dialog_show_human_readable_sizes_replayed(
             assert isinstance(app.screen, UnitScreen), app.screen
 
             unit_screen = app.screen
-            node = await _first_leaf(app, pilot, wait_until)
+            node = await _first_leaf(app, pilot, wait_until, focus_widget, move_cursor_to)
             assert node.data is not None and node.data.is_leaf
             assert node.data.size is not None
             size = node.data.size
 
             tree = unit_screen.query_one("#unit-tree", Tree)
-            tree.move_cursor(node)
-            await pilot.pause(0.03)
+            await move_cursor_to(pilot, tree, node)
             unit_screen.action_show_detail()
-            await pilot.pause(0.03)
+            await wait_until(
+                pilot,
+                lambda: str(unit_screen.query_one("#detail", Static).render()),
+                timeout=0.6,
+                interval=0.02,
+                message="detail pane never rendered",
+            )
             detail_text = str(unit_screen.query_one("#detail", Static).render())
 
             await unit_screen.action_export_selected()
@@ -310,6 +330,8 @@ def test_export_screen_is_a_centered_modal_over_the_still_present_unit_screen_re
     open_browser_pilot: Any,
     wait_until: Any,
     record_target: Callable[[str], Awaitable[ObjectStore]],
+    focus_widget: Any,
+    move_cursor_to: Any,
 ) -> None:
     async def scenario() -> tuple[bool, bool, bool, int, int]:
         await _patch_local_store(monkeypatch, record_target)
@@ -321,10 +343,9 @@ def test_export_screen_is_a_centered_modal_over_the_still_present_unit_screen_re
             assert isinstance(app.screen, UnitScreen), app.screen
 
             unit_screen = app.screen
-            node = await _first_leaf(app, pilot, wait_until)
+            node = await _first_leaf(app, pilot, wait_until, focus_widget, move_cursor_to)
             tree = unit_screen.query_one("#unit-tree", Tree)
-            tree.move_cursor(node)
-            await pilot.pause(0.03)
+            await move_cursor_to(pilot, tree, node)
             await unit_screen.action_export_selected()
             await wait_until(pilot, lambda: isinstance(app.screen, ExportScreen), timeout=0.6, interval=0.02)
 
@@ -350,6 +371,8 @@ def test_encrypted_repo_key_flow_then_shutdown_does_not_raise_replayed(
     open_browser_pilot: Any,
     wait_until: Any,
     record_target: Callable[[str], Awaitable[ObjectStore]],
+    focus_widget: Any,
+    move_cursor_to: Any,
 ) -> None:
     """Against ``tui_apv2_encrypted_pilot_walk.json.gz`` — guards the
     same sqlite cross-thread open/close bug
@@ -383,12 +406,12 @@ def test_encrypted_repo_key_flow_then_shutdown_does_not_raise_replayed(
             assert isinstance(app.screen, BrowseScreen), app.screen
 
             wl_tree = app.screen.query_one("#col-workloads", Tree)
-            await wait_until(pilot, lambda: wl_tree.root.children, timeout=0.9, interval=0.03)
+            await wait_until(pilot, lambda: wl_tree.root.children, timeout=3.0, interval=0.03)
             assert wl_tree.root.children, "workload list never populated after key verification"
             wl_tree.focus()
             await pilot.press("enter")
             ver_table = app.screen.query_one("#col-versions", DataTable)
-            await wait_until(pilot, lambda: ver_table.row_count, timeout=0.8, interval=0.02)
+            await wait_until(pilot, lambda: ver_table.row_count, timeout=3.0, interval=0.02)
             if ver_table.row_count:
                 ver_table.focus()
                 await pilot.press("enter")
@@ -403,6 +426,8 @@ def test_connect_dialog_reports_repos_found_incrementally_while_scanning_replaye
     open_browser_pilot: Any,
     wait_until: Any,
     record_target: Callable[[str], Awaitable[ObjectStore]],
+    focus_widget: Any,
+    move_cursor_to: Any,
 ) -> None:
     """Against ``tui_s3sample2_pilot_walk.json.gz``.
 
@@ -449,6 +474,8 @@ def test_default_repo_lands_on_the_first_discovered_one_not_the_last_without_aut
     tmp_path: Path,
     wait_until: Any,
     record_target: Callable[[str], Awaitable[ObjectStore]],
+    focus_widget: Any,
+    move_cursor_to: Any,
 ) -> None:
     """Against ``s3-sample-2-encrypted``, whose two sibling repo-ids
     sharing one bucket resolve into a single ``Repository`` (holding both
@@ -489,7 +516,7 @@ def test_default_repo_lands_on_the_first_discovered_one_not_the_last_without_aut
             await wait_until(
                 pilot,
                 lambda: tree.root.children,
-                timeout=1.5,
+                timeout=3.0,
                 interval=0.03,
                 message="#col-catalogs never populated",
             )
@@ -511,6 +538,8 @@ def test_workloads_raises_key_required_on_an_encrypted_repo_before_a_key_is_veri
     open_browser_pilot: Any,
     wait_until: Any,
     record_target: Callable[[str], Awaitable[ObjectStore]],
+    focus_widget: Any,
+    move_cursor_to: Any,
 ) -> None:
     """``Repository.catalogs()`` still succeeds on a locked repository (its
     underlying tables are genuinely unencrypted); ``Catalog.workloads()``

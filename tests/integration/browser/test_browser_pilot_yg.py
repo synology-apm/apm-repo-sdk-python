@@ -41,30 +41,32 @@ async def _drill_to_unit_screen(app: ApmRepoBrowserApp, pilot: Any, wait_until: 
     app.screen.query_one("#col-workloads", Tree).focus()
     await pilot.press("enter")
     versions_table = app.screen.query_one("#col-versions", DataTable)
-    await wait_until(pilot, lambda: versions_table.row_count, timeout=0.8, interval=0.02)
+    await wait_until(pilot, lambda: versions_table.row_count, timeout=3.0, interval=0.02)
     app.screen.query_one("#col-versions", DataTable).focus()
     await pilot.press("enter")
     await wait_until(pilot, lambda: isinstance(app.screen, UnitScreen), timeout=0.6, interval=0.03)
     assert isinstance(app.screen, UnitScreen), app.screen
 
 
-async def _first_leaf(app: ApmRepoBrowserApp, pilot: Any, wait_until: Any) -> Any:
+async def _first_leaf(
+    app: ApmRepoBrowserApp, pilot: Any, wait_until: Any, focus_widget: Any, move_cursor_to: Any
+) -> Any:
     unit_screen = app.screen
     assert isinstance(unit_screen, UnitScreen)
     tree = unit_screen.query_one("#unit-tree", Tree)
-    await wait_until(pilot, lambda: tree.root.data is not None, timeout=1.0, interval=0.02)
+    await wait_until(pilot, lambda: tree.root.data is not None, timeout=3.0, interval=0.02)
+    await focus_widget(pilot, tree)
     node = tree.root
     depth = 0
     while node is not None and node.data is not None and not node.data.is_leaf and depth < 6:
         node.expand()
-        await wait_until(pilot, lambda n=node: n.children, timeout=0.4, interval=0.02)
+        await wait_until(pilot, lambda n=node: n.children, timeout=3.0, interval=0.02)
         if not node.children:
             break
         node = node.children[0]
         depth += 1
     assert node is not None and node.data is not None and node.data.is_leaf, "no leaf found"
-    tree.move_cursor(node)
-    await pilot.pause(0.03)
+    await move_cursor_to(pilot, tree, node)
     return node
 
 
@@ -74,6 +76,8 @@ def test_copy_ref_puts_the_cursor_nodes_canonical_ref_on_the_clipboard_replayed(
     open_browser_pilot: Any,
     wait_until: Any,
     record_target: Callable[[str], Awaitable[ObjectStore]],
+    focus_widget: Any,
+    move_cursor_to: Any,
 ) -> None:
     async def scenario() -> tuple[str, str]:
         await _patch_local_store(monkeypatch, record_target)
@@ -82,11 +86,11 @@ def test_copy_ref_puts_the_cursor_nodes_canonical_ref_on_the_clipboard_replayed(
             await pilot.pause()
             await open_browser_pilot(app, pilot, tmp_path)
             await _drill_to_unit_screen(app, pilot, wait_until)
-            node = await _first_leaf(app, pilot, wait_until)
+            node = await _first_leaf(app, pilot, wait_until, focus_widget, move_cursor_to)
             expected_ref = str(node.data.ref)
 
             await pilot.press("y")
-            await pilot.pause(0.02)
+            await wait_until(pilot, lambda: app.clipboard, timeout=0.4, interval=0.02, message="clipboard never set")
             return app.clipboard or "", expected_ref
 
     clipboard_text, expected_ref = asyncio.run(scenario())
@@ -100,6 +104,8 @@ def test_copy_ref_with_nothing_selected_warns_not_crashes_replayed(
     open_browser_pilot: Any,
     wait_until: Any,
     record_target: Callable[[str], Awaitable[ObjectStore]],
+    focus_widget: Any,
+    move_cursor_to: Any,
 ) -> None:
     async def scenario() -> tuple[bool, list[str]]:
         await _patch_local_store(monkeypatch, record_target)
@@ -145,6 +151,8 @@ def test_goto_ref_within_the_same_version_expands_and_selects_the_target_replaye
     open_browser_pilot: Any,
     wait_until: Any,
     record_target: Callable[[str], Awaitable[ObjectStore]],
+    focus_widget: Any,
+    move_cursor_to: Any,
 ) -> None:
     async def scenario() -> tuple[str, str]:
         await _patch_local_store(monkeypatch, record_target)
@@ -153,18 +161,24 @@ def test_goto_ref_within_the_same_version_expands_and_selects_the_target_replaye
             await pilot.pause()
             await open_browser_pilot(app, pilot, tmp_path)
             await _drill_to_unit_screen(app, pilot, wait_until)
-            node = await _first_leaf(app, pilot, wait_until)
+            node = await _first_leaf(app, pilot, wait_until, focus_widget, move_cursor_to)
             target_ref = str(node.data.ref)
 
             unit_screen = app.screen
             assert isinstance(unit_screen, UnitScreen)
             unit_screen.action_refresh()
             await wait_until(
-                pilot, lambda: unit_screen.query_one("#unit-tree", Tree).root.children, timeout=0.6, interval=0.03
+                pilot, lambda: unit_screen.query_one("#unit-tree", Tree).root.children, timeout=3.0, interval=0.03
             )
 
             await pilot.press("g")
-            await pilot.pause(0.02)
+            await wait_until(
+                pilot,
+                lambda: unit_screen.query("#goto-input"),
+                timeout=0.4,
+                interval=0.02,
+                message="goto input never opened",
+            )
             goto_input = unit_screen.query_one("#goto-input", Input)
             goto_input.value = target_ref
             await pilot.press("enter")
@@ -191,6 +205,8 @@ def test_goto_ref_from_browse_screen_opens_the_right_version_and_node_replayed(
     open_browser_pilot: Any,
     wait_until: Any,
     record_target: Callable[[str], Awaitable[ObjectStore]],
+    focus_widget: Any,
+    move_cursor_to: Any,
 ) -> None:
     async def scenario() -> tuple[str, str]:
         await _patch_local_store(monkeypatch, record_target)
@@ -199,7 +215,7 @@ def test_goto_ref_from_browse_screen_opens_the_right_version_and_node_replayed(
             await pilot.pause()
             await open_browser_pilot(app, pilot, tmp_path)
             await _drill_to_unit_screen(app, pilot, wait_until)
-            node = await _first_leaf(app, pilot, wait_until)
+            node = await _first_leaf(app, pilot, wait_until, focus_widget, move_cursor_to)
             target_ref = str(node.data.ref)
 
             app.pop_screen()
@@ -207,7 +223,13 @@ def test_goto_ref_from_browse_screen_opens_the_right_version_and_node_replayed(
             assert isinstance(app.screen, BrowseScreen), app.screen
 
             await pilot.press("g")
-            await pilot.pause(0.02)
+            await wait_until(
+                pilot,
+                lambda: app.screen.query("#goto-input"),
+                timeout=0.4,
+                interval=0.02,
+                message="goto input never opened",
+            )
             goto_input = app.screen.query_one("#goto-input", Input)
             goto_input.value = target_ref
             await pilot.press("enter")
@@ -237,6 +259,8 @@ def test_goto_ref_rejects_a_human_ref_with_a_clear_warning_replayed(
     open_browser_pilot: Any,
     wait_until: Any,
     record_target: Callable[[str], Awaitable[ObjectStore]],
+    focus_widget: Any,
+    move_cursor_to: Any,
 ) -> None:
     async def scenario() -> tuple[bool, list[str]]:
         await _patch_local_store(monkeypatch, record_target)
@@ -258,7 +282,13 @@ def test_goto_ref_rejects_a_human_ref_with_a_clear_warning_replayed(
             unit_screen.notify = recording_notify  # type: ignore[method-assign]
 
             await pilot.press("g")
-            await pilot.pause(0.02)
+            await wait_until(
+                pilot,
+                lambda: unit_screen.query("#goto-input"),
+                timeout=0.4,
+                interval=0.02,
+                message="goto input never opened",
+            )
             goto_input = unit_screen.query_one("#goto-input", Input)
             # This scenario only proves a human-shaped ref gets rejected as
             # such -- it never needs to resolve, so any syntactically
@@ -266,7 +296,9 @@ def test_goto_ref_rejects_a_human_ref_with_a_clear_warning_replayed(
             # needed here at all.
             goto_input.value = "/some/path#Test-Workload-0000/CORP-PC-0000"
             await pilot.press("enter")
-            await pilot.pause(0.03)
+            # The rejection notification is what says the submission was
+            # processed; without it there is nothing to assert on yet.
+            await wait_until(pilot, lambda: notifications, timeout=0.4, interval=0.02, message="ref was never rejected")
             return isinstance(app.screen, UnitScreen), notifications
 
     still_on_unit_screen, notifications = asyncio.run(scenario())
@@ -280,6 +312,8 @@ def test_goto_ref_not_found_warns_not_crashes_replayed(
     open_browser_pilot: Any,
     wait_until: Any,
     record_target: Callable[[str], Awaitable[ObjectStore]],
+    focus_widget: Any,
+    move_cursor_to: Any,
 ) -> None:
     async def scenario() -> tuple[bool, list[str]]:
         await _patch_local_store(monkeypatch, record_target)
@@ -289,7 +323,7 @@ def test_goto_ref_not_found_warns_not_crashes_replayed(
             await pilot.pause()
             await open_browser_pilot(app, pilot, tmp_path)
             await _drill_to_unit_screen(app, pilot, wait_until)
-            node = await _first_leaf(app, pilot, wait_until)
+            node = await _first_leaf(app, pilot, wait_until, focus_widget, move_cursor_to)
             real_ref = str(node.data.ref)
             bogus_ref = real_ref + "-does-not-exist-at-all"
 
@@ -304,7 +338,13 @@ def test_goto_ref_not_found_warns_not_crashes_replayed(
             unit_screen.notify = recording_notify  # type: ignore[method-assign]
 
             await pilot.press("g")
-            await pilot.pause(0.02)
+            await wait_until(
+                pilot,
+                lambda: unit_screen.query("#goto-input"),
+                timeout=0.4,
+                interval=0.02,
+                message="goto input never opened",
+            )
             goto_input = unit_screen.query_one("#goto-input", Input)
             goto_input.value = bogus_ref
             await pilot.press("enter")

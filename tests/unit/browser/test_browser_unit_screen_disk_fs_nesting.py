@@ -124,7 +124,9 @@ def _build_root_with_disk_image_and_fs_sibling() -> tuple[Node, dict[str, list[N
     }
 
 
-async def test_filesystem_sibling_nests_under_the_disk_image_node_not_beside_it(wait_until: Any) -> None:
+async def test_filesystem_sibling_nests_under_the_disk_image_node_not_beside_it(
+    wait_until: Any, move_cursor_to: Any
+) -> None:
     root, children_by_ref = _build_root_with_disk_image_and_fs_sibling()
     provider = _FakeProvider(root, children_by_ref)
     app = _FakeApp(_version(), _FakeCatalog(provider))
@@ -153,7 +155,9 @@ async def test_filesystem_sibling_nests_under_the_disk_image_node_not_beside_it(
         assert str(fs_tree_node.label) == "Filesystem"
 
 
-async def test_expanding_the_disk_image_node_reveals_the_nested_filesystem_child(wait_until: Any) -> None:
+async def test_expanding_the_disk_image_node_reveals_the_nested_filesystem_child(
+    wait_until: Any, move_cursor_to: Any
+) -> None:
     root, children_by_ref = _build_root_with_disk_image_and_fs_sibling()
     provider = _FakeProvider(root, children_by_ref)
     app = _FakeApp(_version(), _FakeCatalog(provider))
@@ -162,15 +166,13 @@ async def test_expanding_the_disk_image_node_reveals_the_nested_filesystem_child
         await wait_until(pilot, lambda: len(tree.root.children) > 0, timeout=1.5, interval=0.05)
         image_tree_node = tree.root.children[0]
 
-        tree.move_cursor(image_tree_node)
-        await pilot.pause(0.05)
+        await move_cursor_to(pilot, tree, image_tree_node)
         await pilot.press("enter")
         await wait_until(pilot, lambda: image_tree_node.is_expanded, timeout=1.5, interval=0.05)
         assert image_tree_node.is_expanded
 
         fs_tree_node = image_tree_node.children[0]
-        tree.move_cursor(fs_tree_node)
-        await pilot.pause(0.05)
+        await move_cursor_to(pilot, tree, fs_tree_node)
         await pilot.press("enter")
         await wait_until(pilot, lambda: len(fs_tree_node.children) > 0, timeout=1.5, interval=0.05)
 

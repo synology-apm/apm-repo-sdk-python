@@ -35,6 +35,7 @@ import contextlib
 import dataclasses
 import os
 import queue
+import sys
 import threading
 from collections.abc import Awaitable, Callable
 from concurrent.futures import ProcessPoolExecutor
@@ -54,6 +55,7 @@ from .chunk_walk import (
 from .dedup_file import ByteRangeView, DedupFile, ExportResult
 from .pool import BucketReaderCache, Pool
 from .pool_descriptor import PoolDescriptor
+from .presized_file import create_presized, open_destination
 
 _WRITER_QUEUE_SIZE = 8
 """Bounded backpressure for ``_ExportSink``'s writer thread — sized
@@ -78,23 +80,12 @@ _WriteJob = _DataJob | _GapJob
 _SENTINEL = object()
 
 
-def _create_truncated(dst: Path, size: int) -> None:
-    """Create/replace ``dst`` at exactly ``size`` bytes. Kept as one
-    synchronous helper so a single ``asyncio.to_thread()`` covers the whole
-    open+truncate+close, rather than three separate thread hops."""
-    with Path(dst).open("wb") as f:
-        f.truncate(size)
-
-
-_HAS_PWRITE = hasattr(os, "pwrite")
-
-
 def _pwrite(fd: int, data: bytes | memoryview, offset: int) -> None:
     """``os.pwrite()`` where available (POSIX); Windows has no positional
     write, so this falls back to ``lseek``+``write`` — safe because every
     caller of this already serializes its own access to ``fd`` (see
     ``_ExportSink``'s own docstring for why)."""
-    if _HAS_PWRITE:
+    if sys.platform != "win32":
         os.pwrite(fd, data, offset)
     else:
         os.lseek(fd, offset, os.SEEK_SET)
@@ -403,9 +394,9 @@ async def export_to(
     ``dst_offset``/``create`` (default 0/``True``, the single-file
     behavior every other caller relies on) — see ``_ExportSink``'s own
     docstring for the one real caller and for what ``dst_offset`` shifts.
-    ``create=False`` skips truncating ``dst`` (the caller already created
+    ``create=False`` skips creating ``dst`` (the caller already created
     it at its own, larger, combined size, and calls this once per
-    fragment into the *same* file — truncating again here would destroy
+    fragment into the *same* file — re-creating it here would destroy
     the previous fragment's writes).
     """
     if isinstance(file_like, ByteRangeView):
@@ -433,8 +424,8 @@ async def export_to(
     planned_total = await count_planned_bytes(base, window_start, window_end) if progress else 0
 
     if create:
-        await asyncio.to_thread(_create_truncated, dst, size)
-    fd = await asyncio.to_thread(os.open, dst, os.O_WRONLY)
+        await asyncio.to_thread(create_presized, dst, size, sparse=sparse)
+    fd = await asyncio.to_thread(open_destination, dst)
     sink = _ExportSink(fd, sparse=sparse, planned_total=planned_total, progress=progress, dst_offset=dst_offset)
 
     # A caller-supplied executor is trusted as-is (its own builder already

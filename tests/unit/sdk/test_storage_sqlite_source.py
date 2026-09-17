@@ -109,13 +109,31 @@ class TestSqliteSource:
             row = await _fetchone(src.connection, "SELECT x FROM t")
             assert row == (1,)
 
-    async def test_connection_is_read_only(self) -> None:
+    async def test_connection_is_writable_so_index_hints_can_take_effect(self) -> None:
+        """Deliberately *not* read-only. The connection is onto this
+        instance's own temp copy of already-peeled bytes, which ``close()``
+        unlinks, so nothing written here can reach the store — and writability
+        is the whole reason ``apply_index_hint`` can build a real index rather
+        than silently leaving its caller a full table scan."""
         data = _real_sqlite_bytes()
         async with await SqliteSource.from_bytes(data) as src:
-            # ``pytest.raises`` is a *sync* context manager, so it can no
-            # longer share the ``with`` line with the now-async SqliteSource.
-            with pytest.raises(sqlite3.OperationalError):
-                await src.connection.execute("INSERT INTO t VALUES (2)")
+            await src.connection.execute("INSERT INTO t VALUES (2)")
+            await src.connection.commit()
+            assert await _fetchone(src.connection, "SELECT COUNT(*) FROM t") == (2,)
+
+    async def test_close_removes_the_sidecars_a_writable_connection_can_leave(self) -> None:
+        """A read-write connection can create ``-wal``/``-shm``/``-journal``
+        next to the temp file; none of them may outlive ``close()``."""
+        data = _real_sqlite_bytes()
+        src = await SqliteSource.from_bytes(data)
+        path = src._path
+        assert path is not None
+        await src.connection.execute("PRAGMA journal_mode=WAL")
+        await src.connection.execute("INSERT INTO t VALUES (3)")
+        await src.connection.commit()
+        await src.close()
+        leftovers = [p for p in (path, *(path + s for s in ("-wal", "-shm", "-journal"))) if os.path.exists(p)]
+        assert leftovers == []
 
     async def test_close_removes_the_temp_file(self) -> None:
         data = _real_sqlite_bytes()

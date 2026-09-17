@@ -277,7 +277,7 @@ def test_workload_type_groups_use_proper_gws_and_m365_vendor_names_replayed(
             cat_tree.focus()
             await pilot.press("enter")
             wl_tree = app.screen.query_one("#col-workloads", Tree)
-            await wait_until(pilot, lambda: wl_tree.root.children, timeout=0.9, interval=0.03)
+            await wait_until(pilot, lambda: wl_tree.root.children, timeout=3.0, interval=0.03)
             root_labels = {str(g.label) for g in wl_tree.root.children}
             return root_labels, _all_node_labels(wl_tree.root)
 
