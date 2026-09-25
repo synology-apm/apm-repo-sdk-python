@@ -12,11 +12,11 @@ from __future__ import annotations
 
 from textual.app import ComposeResult
 from textual.binding import Binding
-from textual.widgets import Static
+from textual.widgets import Footer, Static
 
 from synology_apm_repo.browser.keymap import COMMON_BINDINGS
 from synology_apm_repo.browser.screens._shared import NavigableScreen
-from synology_apm_repo.browser.strings import HEX_STATUS_BAR, HEX_WINDOW_SIZE
+from synology_apm_repo.browser.strings import HEX_WINDOW_SIZE
 from synology_apm_repo.sdk.presentation.markup import safe
 from synology_apm_repo.sdk.units.base import ContentSource
 
@@ -49,9 +49,9 @@ class HexPreviewScreen(NavigableScreen):
 
     BINDINGS = [
         *COMMON_BINDINGS,
-        Binding("plus", "page_forward", "Page +", show=False),
+        Binding("plus", "page_forward", "Page +"),
         Binding("equals_sign", "page_forward", "Page +", show=False),  # '+' without shift on most layouts
-        Binding("minus", "page_back", "Page -", show=False),
+        Binding("minus", "page_back", "Page -"),
         Binding("x", "page_forward", "Page +", show=False),
         # Bare "X", not "shift+x": Textual's own ``XTermParser`` reports a
         # shifted letter from a real terminal as that literal capital
@@ -60,7 +60,7 @@ class HexPreviewScreen(NavigableScreen):
         # the bare capital is reachable from an actual keyboard.
         Binding("X", "page_back", "Page -", show=False),
         Binding("h", "go_back", "Back", show=False),
-        Binding("escape", "go_back", "Back", show=False),
+        Binding("escape", "go_back", "Back"),
     ]
 
     def __init__(self, content: ContentSource, name: str) -> None:
@@ -70,15 +70,29 @@ class HexPreviewScreen(NavigableScreen):
         self._offset = 0
 
     def compose(self) -> ComposeResult:
-        yield Static(f"hex preview: {safe(self._name)}", id="breadcrumb")
+        # Starts empty, like every other NavigableScreen's own breadcrumb
+        # -- on_mount below fills it via _update_breadcrumb_text, so a
+        # background job's own tasks-hint suffix has real breadcrumb
+        # text to combine with instead of blanking it.
+        yield Static("", id="breadcrumb")
         yield Static("", id="hex-dump")
-        yield Static(HEX_STATUS_BAR, id="status-bar")
+        yield Footer(show_command_palette=False)
 
     # ``on_mount``/``action_*`` are ``async def`` here because
-    # ``ContentSource.read()`` is — see keymap.py's module docstring for
-    # why Textual allows this. This screen reads one small window per
-    # keypress and so has never needed a worker of its own.
-    async def on_mount(self) -> None:
+    # ``ContentSource.read()`` is: Textual awaits a coroutine-returning
+    # handler to completion just like any other, legitimate as long as
+    # the call stays bounded enough to need no separate loading feedback/
+    # cancellation point. This screen reads one small window per
+    # keypress and so has never needed a worker of its own. The
+    # ``type: ignore`` is this same legitimate-async-override shape, just
+    # now also caught statically: NavigableScreen.on_mount is a real,
+    # synchronous method (registering the jobs-watch for the breadcrumb
+    # tasks-hint), so overriding it with an async one is a genuine
+    # ``Coroutine`` vs ``None`` return-type mismatch to mypy -- exactly
+    # the pattern Textual's own runtime dispatch already tolerates.
+    async def on_mount(self) -> None:  # type: ignore[override]
+        super().on_mount()
+        self._update_breadcrumb_text(f"hex preview: {safe(self._name)}")
         await self._render_dump()
 
     async def _render_dump(self) -> None:

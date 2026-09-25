@@ -5,6 +5,8 @@ copy would let them silently drift apart."""
 
 from __future__ import annotations
 
+from datetime import datetime
+
 
 def pluralize(count: int, singular: str, plural: str | None = None) -> str:
     """``singular`` for ``count == 1``, else ``plural`` (default:
@@ -31,6 +33,15 @@ def format_duration(seconds: float) -> str:
     h, rem = divmod(total, 3600)
     m, s = divmod(rem, 60)
     return f"{h:02d}:{m:02d}:{s:02d}" if h else f"{m:02d}:{s:02d}"
+
+
+def format_timestamp(dt: datetime) -> str:
+    """Renders an already timezone-aware ``datetime`` (a ``Node``'s own
+    ``node_modified_time()``, a version's own backup epoch, ...) in the
+    machine's local timezone — shared by ``catalog/version.py``'s own
+    ``_version_display_name()``, so a Modified column and a version's own
+    display name read consistently."""
+    return dt.astimezone().strftime("%Y-%m-%d %H:%M:%S")
 
 
 def format_rate(rate: float, unit: str) -> str:

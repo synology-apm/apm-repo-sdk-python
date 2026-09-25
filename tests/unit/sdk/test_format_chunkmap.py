@@ -1,7 +1,7 @@
 """Unit tests for ``synology_apm_repo.sdk.format.chunkmap``.
 
 Fixture bytes are built directly from the byte-offset table
-(on-disk-format.md §8), independently of ``chunkmap.py``'s own bit-packing
+(FORMAT-SPEC.md: ChunkMapRecord), independently of ``chunkmap.py``'s own bit-packing
 formulas, so a bug shared between the implementation and a naively-mirrored
 test fixture can't hide from these.
 """
@@ -12,7 +12,7 @@ import pytest
 
 from synology_apm_repo.sdk.errors import DataCorruptError, FormatError
 from synology_apm_repo.sdk.format.addressing import ChunkAddress
-from synology_apm_repo.sdk.format.chunkmap import ChunkMapKind, parse_chunk_map_record
+from synology_apm_repo.sdk.format.chunkmap import ChunkMapKind, iter_chunk_map_page, parse_chunk_map_record
 from synology_apm_repo.sdk.identifiers import BucketId, ChunkIdx, StreamId
 
 
@@ -80,9 +80,7 @@ class TestMapping:
     def test_address_with_chunk_idx_past_bucket_capacity_is_not_validated_here(self) -> None:
         # chunk_idx field (low 16 bits of the address word) at 8192 is out
         # of any real bucket's capacity, but ``parse_chunk_map_record()``
-        # trusts it, same as ``ChunkAddress.from_int()`` -- see
-        # ``ChunkAddress``'s own docstring for why range-checking here is
-        # redundant with what already happens downstream / in ``verify``.
+        # trusts it, same as ``ChunkAddress.from_int()``.
         bad_addr_int = (1 << 56) | (0 << 16) | 8192
         data = _record_bytes(type_value=0, inherit=False, file_chunk_idx=0, addr_int=bad_addr_int, tail_u32=1 << 16)
         entry = parse_chunk_map_record(data)
@@ -137,3 +135,27 @@ class TestValidation:
         data = _record_bytes(type_value=1, inherit=False, file_chunk_idx=0, addr_int=0, tail_u32=1) + b"\xff" * 20
         entry = parse_chunk_map_record(data)
         assert entry.kind is ChunkMapKind.ZERO
+
+
+class TestIterChunkMapPage:
+    def test_decodes_several_records_in_order(self) -> None:
+        page_bytes = b"".join(
+            _record_bytes(type_value=1, inherit=False, file_chunk_idx=i, addr_int=0, tail_u32=i + 1) for i in range(4)
+        )
+        entries = list(iter_chunk_map_page(page_bytes, 4))
+        assert [e.file_offset for e in entries] == [i * 4096 for i in range(4)]
+        assert [e.map_num for e in entries] == [1, 2, 3, 4]
+        # Matches parse_chunk_map_record on the same slice, entry by entry.
+        for i, entry in enumerate(entries):
+            assert entry == parse_chunk_map_record(page_bytes[i * 20 : (i + 1) * 20])
+
+    def test_count_less_than_available_only_consumes_the_first_count_records(self) -> None:
+        page_bytes = b"".join(
+            _record_bytes(type_value=1, inherit=False, file_chunk_idx=i, addr_int=0, tail_u32=1) for i in range(4)
+        )
+        entries = list(iter_chunk_map_page(page_bytes, 2))
+        assert len(entries) == 2
+        assert [e.file_offset for e in entries] == [0, 4096]
+
+    def test_zero_count_yields_nothing(self) -> None:
+        assert list(iter_chunk_map_page(b"", 0)) == []

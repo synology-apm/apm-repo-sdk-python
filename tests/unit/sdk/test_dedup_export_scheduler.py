@@ -1,18 +1,18 @@
 """Unit tests for ``synology_apm_repo.sdk.dedup.export_scheduler`` —
 synthetic composition + Pool data written to real files, no sample
-repositories required (see ``tests/integration/sdk/test_dedup_export_scheduler_real.py``
-for the byte-for-byte cross-check against a real 32 GiB VM image).
+repositories required.
 
 ``_naive_export_to`` below is this file's own correctness oracle: a
 deliberately independent, unmerged, one-chunk-at-a-time walk that never
 groups ``DATA`` chunks by bucket — production ``export_to()`` has no
-naive path of its own to compare against (see ``export_scheduler.py``'s
-own module docstring), so this file keeps one purely for the
+naive path of its own to compare against (it exists only as an
+independent correctness oracle in the test suite, never in production),
+so this file keeps one purely for the
 cross-check.
 
 No ``verify_map_crc`` coverage here — chunk-map CRC validation is
-``verify``'s job specifically, not export's; see
-``tests/unit/sdk/test_units_verify_reachable.py`` and
+``verify``'s job specifically, not export's; see the
+``tests/unit/sdk/test_units_verify_reachable_*.py`` files and
 ``format/composition.py``'s primitive-level
 ``tests/unit/sdk/test_format_composition.py``.
 """
@@ -20,22 +20,35 @@ No ``verify_map_crc`` coverage here — chunk-map CRC validation is
 from __future__ import annotations
 
 import asyncio
+import atexit
+import contextlib
 import os
 import struct
 import sys
 import threading
 import zlib
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Iterator
 from pathlib import Path
 
 import pytest
 import zstandard
 
+from synology_apm_repo.sdk import concurrency
 from synology_apm_repo.sdk.dedup import export_scheduler as export_scheduler_mod
+from synology_apm_repo.sdk.dedup.chunk_walk import ChunkRun
 from synology_apm_repo.sdk.dedup.composition_reader import CompositionReader
 from synology_apm_repo.sdk.dedup.dedup_file import ByteRangeView, DedupFile, ExportResult, ExtentKind
-from synology_apm_repo.sdk.dedup.export_scheduler import _WRITER_QUEUE_SIZE, _ExportSink, export_to
+from synology_apm_repo.sdk.dedup.export_scheduler import (
+    _WRITER_QUEUE_SIZE,
+    ExportGroupWorkerArgs,
+    _export_worker_init,
+    _export_worker_shutdown,
+    _ExportSink,
+    export_bucket_group_worker,
+    export_to,
+)
 from synology_apm_repo.sdk.dedup.pool import BucketReaderCache, Pool
+from synology_apm_repo.sdk.dedup.pool_descriptor import PoolDescriptor
 from synology_apm_repo.sdk.errors import DataCorruptError
 from synology_apm_repo.sdk.format.addressing import ChunkAddress
 from synology_apm_repo.sdk.format.bucket import MODE_CHUNK_CRC, MODE_COMPRESS
@@ -591,8 +604,7 @@ class TestWindowing:
 class TestPipelinedWriter:
     """``_ExportSink`` hands writes to a dedicated writer thread through a
     bounded queue rather than doing ``await asyncio.to_thread(os.pwrite,
-    ...)`` inline (see ``export_scheduler.py``'s own module docstring for
-    the measured overlap win this buys) — the one behavior that's genuinely
+    ...)`` inline — the one behavior that's genuinely
     new, not just a rearrangement of the same inline calls, is how a real
     write failure on that background thread reaches the caller."""
 
@@ -756,9 +768,8 @@ class TestPipelinedWriter:
 class _FailingStore:
     """An ``ObjectStore`` wrapper whose ``read()`` raises for one
     chosen path — lets a test construct a bucket-group failure
-    deliberately (see
-    ``TestParallel.test_max_concurrent_reads_surfaces_a_bucket_failure_as_an_exception_group``'s
-    own docstring for what that's used to prove)."""
+    deliberately, to prove it surfaces via ``asyncio.TaskGroup`` as an
+    ``ExceptionGroup`` rather than the original exception type directly."""
 
     def __init__(self, backing: LocalFsStore, *, fail_path_suffix: str) -> None:
         self._backing = backing
@@ -797,8 +808,8 @@ def _two_bucket_file(tmp_path: Path) -> DedupFile:
 
 
 class TestParallel:
-    """``max_concurrent_reads`` (see ``chunk_walk.py``'s own
-    docstring for the mechanism), exercised through the actual public
+    """``max_concurrent_reads``, exercised
+    through the actual public
     entry point (not just ``chunk_walk.py``'s own ``exec_chunks()`` unit
     tests) — the two-bucket fixture here matters for the same reason
     ``TestWindowing``'s own multi-bucket test does: the single-bucket
@@ -840,10 +851,9 @@ class TestParallel:
         self, tmp_path: Path
     ) -> None:
         """Concurrent bucket groups' ``on_bytes`` calls can interleave in
-        wall-clock time, but each one's own increment never spans an
-        ``await`` (see ``chunk_walk.exec_chunks``'s own docstring) — every
-        report should still be the true cumulative total at the moment it
-        fires, so the sequence stays non-decreasing end to end."""
+        wall-clock time, but each report should still be the true
+        cumulative total at the moment it fires, so the sequence stays
+        non-decreasing end to end."""
         file = _two_bucket_file(tmp_path)
         calls: list[tuple[int, int]] = []
         result = await export_to(
@@ -880,9 +890,8 @@ class TestParallel:
 
 
 class TestPrefetchOpens:
-    """``max_concurrent_opens`` (see
-    ``chunk_walk.py``'s own ``_prefetch_bucket_opens`` docstring for the
-    mechanism) — exercised through the actual public entry point, same
+    """``max_concurrent_opens`` — exercised through
+    the actual public entry point, same
     ``_two_bucket_file`` fixture as ``TestParallel`` since a
     single-bucket range has only one bucket to ever prefetch."""
 
@@ -961,7 +970,7 @@ class TestBucketReaderCache:
     """Export's own private, batch-scoped cache (``BucketReaderCache``)
     — never writes into ``Pool``'s shared ``_buckets``, and reuses what
     it already opened across repeated ``export_to()`` calls sharing one
-    instance. See ``BucketReaderCache``'s own docstring for the design."""
+    instance."""
 
     async def test_export_never_writes_into_pool_shared_bucket_cache(self, tmp_path: Path) -> None:
         # 20 buckets — more than Pool's default 16-slot bucket_cache_size,
@@ -1011,7 +1020,7 @@ class TestDstOffsetAndCreate:
     """``dst_offset``/``create`` — added for exactly one caller,
     ``sdk/units/content/pcps_disk.py``'s ``VirtualDiskContentSource``,
     assembling several disk-absolute-addressed fragments into one combined
-    file. See ``_ExportSink``'s own docstring for why the shift happens at
+    file. The shift happens at
     the sink's actual ``pwrite``/zero-fill calls rather than via
     ``plan_chunks_windowed``'s ``window_start`` — not an alignment
     workaround (a fragment's real ``extent()`` start is always
@@ -1067,9 +1076,7 @@ class TestMultiprocessExecutorTeardown:
     blocking call (as slow as whatever a still-running worker takes to
     finish its current bucket group), which would otherwise freeze this
     whole process's event loop — every other ``Task``, not just this one
-    export — for that whole stretch. Measured directly (a scratch script,
-    not this test): ~1.4s of total event-loop freeze for one deliberately
-    slow worker with no ``to_thread()`` hop. ``dedup_file``'s real
+    export — for that whole stretch. ``dedup_file``'s real
     ``LocalFsStore`` is describable, so this exercises the real
     multiprocess path, not the fallback."""
 
@@ -1113,3 +1120,163 @@ class TestPositionalWriteFallback:
         finally:
             os.close(fd)
         assert dst.read_bytes() == bytes(3) + b"hello" + bytes(2)
+
+
+@pytest.fixture(autouse=True)
+def _reset_export_worker_globals() -> Iterator[None]:
+    """``_worker_store``/``_worker_pool``/``_worker_dst_fd`` (this module's
+    own process-global worker state) and ``concurrency``'s own persistent
+    ``_worker_runner`` must not leak between tests — a real worker process
+    only ever sets these once, per its own whole lifetime, but this suite
+    runs every test in the same process."""
+    yield
+    if export_scheduler_mod._worker_dst_fd is not None:
+        with contextlib.suppress(OSError):
+            os.close(export_scheduler_mod._worker_dst_fd)
+    export_scheduler_mod._worker_store = None
+    export_scheduler_mod._worker_pool = None
+    export_scheduler_mod._worker_dst_fd = None
+    if concurrency._worker_runner is not None:
+        concurrency.close_worker_loop()
+
+
+class _LoopCheckingStore:
+    """Reproduces ``S3Store._get_client``'s exact hazard
+    (``storage/s3.py``) — a network client lazily built and cached on
+    first use, bound to whichever event loop happens to be running then —
+    without touching ``aioboto3``/``aiohttp``: caches the running loop on
+    this store's first call and raises if a later call runs on a
+    *different* one, the same observable failure a per-task
+    ``asyncio.run()`` worker produces against a real lazily-cached client
+    once a second task reuses it."""
+
+    def __init__(self, backing: LocalFsStore) -> None:
+        self._backing = backing
+        self._bound_loop: asyncio.AbstractEventLoop | None = None
+
+    def _check_loop(self) -> None:
+        loop = asyncio.get_running_loop()
+        if self._bound_loop is None:
+            self._bound_loop = loop
+        elif self._bound_loop is not loop:
+            raise RuntimeError("Event loop is closed")
+
+    async def read(self, path: str, offset: int = 0, length: int | None = None) -> bytes:
+        self._check_loop()
+        return await self._backing.read(path, offset, length)
+
+    async def size(self, path: str) -> int:
+        self._check_loop()
+        return await self._backing.size(path)
+
+    async def exists(self, path: str) -> bool:
+        self._check_loop()
+        return await self._backing.exists(path)
+
+    async def listdir(self, path: str) -> list[str]:
+        self._check_loop()
+        return await self._backing.listdir(path)
+
+
+class TestExportWorkerLoopReuse:
+    """Regression test for the bug ``concurrency.run_in_worker_loop`` fixes:
+    a ``ProcessPoolExecutor`` worker handles many bucket-group tasks over
+    its lifetime, and its ``ObjectStore`` (built once per worker process
+    by ``_export_worker_init``, not once per task) is meant to survive every
+    one of them, including a lazily-cached, loop-bound client
+    (``S3Store._get_client``, say). Exercised in-process — no real
+    subprocess needed, since the bug is about ``asyncio.run()``'s own
+    per-call loop, not about multiprocessing itself — via
+    ``_LoopCheckingStore``, which reproduces that hazard without a real
+    network backend."""
+
+    def test_second_task_in_the_same_worker_reuses_the_first_ones_loop(self, tmp_path: Path) -> None:
+        _write_standard_composition(tmp_path / "Composition", _standard_entries())
+        _write_bucket(tmp_path / "Pool" / "0" / "0.buk", _CHUNK_PLAINTEXTS)
+        store = _LoopCheckingStore(LocalFsStore(tmp_path))
+        dir_cache = DirCache(store)
+        pool = Pool(store, "Pool", dir_cache)
+        dst = tmp_path / "out.bin"
+        dst.write_bytes(bytes(4096))
+        export_scheduler_mod._worker_pool = pool
+        export_scheduler_mod._worker_dst_fd = os.open(dst, os.O_WRONLY | _O_BINARY)
+        args = ExportGroupWorkerArgs(
+            stream_id=StreamId(0), bucket_id=BucketId(0), runs=[ChunkRun(0, 1, 0)], size=4096, dst_offset=0
+        )
+
+        # First task in this "worker": builds the loop-checking store's
+        # cached loop.
+        export_bucket_group_worker(args)
+        # Second task, same worker (same process-global state, exactly
+        # like a real ProcessPoolExecutor worker handling a second item)
+        # — must reuse the same loop, not open a fresh one that orphans
+        # the first task's cached loop reference. Before this fix, this
+        # raised "Event loop is closed".
+        export_bucket_group_worker(args)
+
+
+class TestExportWorkerShutdown:
+    """``_export_worker_init`` registers ``_export_worker_shutdown`` via
+    ``atexit`` as its very last statement; ``_export_worker_shutdown``
+    itself releases an ``AsyncCloseable`` store and the destination fd,
+    tolerating the store's own ``aclose()`` raising. A real spawned-worker
+    proof that ``atexit`` itself fires isn't possible in this test suite
+    (a test-file-defined target can't be pickled for a ``spawn``-context
+    worker) — this class covers this shutdown function's own
+    logic instead, via direct calls."""
+
+    def test_export_worker_init_registers_the_shutdown_hook(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        _write_standard_composition(tmp_path / "Composition", _standard_entries())
+        _write_bucket(tmp_path / "Pool" / "0" / "0.buk", _CHUNK_PLAINTEXTS)
+        store = LocalFsStore(tmp_path)
+        dir_cache = DirCache(store)
+        pool = Pool(store, "Pool", dir_cache)
+        descriptor = PoolDescriptor.from_pool(pool)
+        assert descriptor is not None
+        dst = tmp_path / "out.bin"
+        dst.write_bytes(b"")
+        registered: list[object] = []
+        monkeypatch.setattr(atexit, "register", registered.append)
+
+        _export_worker_init(descriptor, str(dst))
+
+        assert registered == [_export_worker_shutdown]
+
+    def test_shutdown_acloses_an_asynccloseable_store_and_closes_the_fd(self, tmp_path: Path) -> None:
+        closed: list[bool] = []
+
+        class _FakeAsyncCloseableStore:
+            async def aclose(self) -> None:
+                closed.append(True)
+
+        dst = tmp_path / "out.bin"
+        dst.write_bytes(b"")
+        fd = os.open(dst, os.O_WRONLY | _O_BINARY)
+        export_scheduler_mod._worker_store = _FakeAsyncCloseableStore()  # type: ignore[assignment]
+        export_scheduler_mod._worker_dst_fd = fd
+
+        _export_worker_shutdown()
+
+        assert closed == [True]
+        with pytest.raises(OSError):
+            os.write(fd, b"x")  # the fd was actually closed, not merely dropped
+        export_scheduler_mod._worker_dst_fd = None  # already closed above; the autouse fixture must not double-close it
+
+    def test_shutdown_tolerates_the_store_s_aclose_raising(self, tmp_path: Path) -> None:
+        class _FailingAsyncCloseableStore:
+            async def aclose(self) -> None:
+                raise RuntimeError("synthetic aclose failure")
+
+        dst = tmp_path / "out.bin"
+        dst.write_bytes(b"")
+        fd = os.open(dst, os.O_WRONLY | _O_BINARY)
+        export_scheduler_mod._worker_store = _FailingAsyncCloseableStore()  # type: ignore[assignment]
+        export_scheduler_mod._worker_dst_fd = fd
+
+        _export_worker_shutdown()  # must not raise despite aclose() failing
+
+        with pytest.raises(OSError):
+            os.write(fd, b"x")  # the fd still got closed
+        export_scheduler_mod._worker_dst_fd = None  # already closed above; the autouse fixture must not double-close it

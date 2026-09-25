@@ -32,10 +32,11 @@ from synology_apm_repo.sdk.storage.layout import detect_layout
 from synology_apm_repo.sdk.units.dispatch import raw_fallback_provider_for
 from synology_apm_repo.sdk.units.saas.object_name_index import resolve_object_name_index
 from synology_apm_repo.sdk.units.saas.raw_object import RawObjectProvider
+from synology_apm_repo.sdk.units.saas.stream import SaasStreamCache
 
-# Real values the fixture's recorded stream/version resolve to (see this
-# module's own docstring): stream uvWRSFkGxCcZAMwt, connection_config_id 3,
-# this specific real chat version (workload_id 16).
+# Real values the fixture's recorded stream/version resolve to: stream
+# uvWRSFkGxCcZAMwt, connection_config_id 3, this specific real chat
+# version (workload_id 16).
 _VERSION_UID = "882d6f32-6cab-44e1-9b5c-cbb9d1bddcd3"
 _CONNECTION_CONFIG_ID = 3
 
@@ -63,22 +64,24 @@ async def test_replayed_manual_object_db_id_matches_the_catalog_indexs_own_locat
         assert object_name_index is not None
         assert (object_name_index.offset, object_name_index.length) == (66_564_096, 12_288)
 
-        auto = await raw_fallback_provider_for(repo, version)
-        try:
-            assert isinstance(auto, RawObjectProvider)
-            auto_nodes = await auto.children(auto.root())
-            assert auto_nodes
-        finally:
-            await auto.close()
+        async with SaasStreamCache(repo) as saas_streams:
+            auto = await raw_fallback_provider_for(repo, version, saas_streams)
+            try:
+                assert isinstance(auto, RawObjectProvider)
+                auto_nodes = await auto.children(auto.root())
+                assert auto_nodes
+            finally:
+                await auto.close()
 
         object_db_id = f"{version.saas_stream_uuid}_{object_name_index.offset}_{object_name_index.length}"
         assert object_db_id == "uvWRSFkGxCcZAMwt_66564096_12288"
-        manual = await raw_fallback_provider_for(repo, version, object_db_id=object_db_id)
+        manual = await raw_fallback_provider_for(repo, version, saas_streams, object_db_id=object_db_id)
         try:
             assert isinstance(manual, RawObjectProvider)
             manual_nodes = await manual.children(manual.root())
         finally:
             await manual.close()
+            await saas_streams.close()
 
         auto_locations = {(n.attrs["object_offset"], n.attrs["object_length"]) for n in auto_nodes}
         manual_locations = {(n.attrs["object_offset"], n.attrs["object_length"]) for n in manual_nodes}

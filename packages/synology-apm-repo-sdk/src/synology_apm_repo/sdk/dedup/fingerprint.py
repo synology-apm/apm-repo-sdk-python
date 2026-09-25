@@ -86,7 +86,9 @@ async def _read_full_allocation_table(
 class AllocationTableCache:
     """Caches each distinct ``(stream_id, group's starting bucket id)``'s
     whole, header-validated ``.inf`` allocation table for this cache
-    instance's whole lifetime — see this module's own docstring for why.
+    instance's whole lifetime — since up to ``GROUP_BUCKET_NUM`` (1024)
+    distinct buckets share one group's identical allocation-table bytes,
+    and without this they'd each re-read and re-validate them separately.
     Pure in-memory bookkeeping on top of ``AsyncKeyedCache``; owns no
     store/dir_cache/pool_root of its own, since every call already has
     those in hand (mirrors ``dedup.pool.BucketReaderCache``'s own reason
@@ -140,9 +142,10 @@ async def _resolve_bucket_allocation(
     inf_path, byte_off, rec_num)`` — everything ``fingerprint()``'s own
     per-chunk half (fingerprint offset, segment file, final read) needs.
 
-    ``cache`` (default ``None``: every call resolves fresh, the original
-    behavior, unchanged) delegates to an ``AllocationTableCache`` instead —
-    see its own docstring for what that shares across calls.
+    ``cache`` (default ``None``: every call resolves fresh) delegates
+    instead to an ``AllocationTableCache``, which resolves a group's whole
+    allocation table once and reuses it for every bucket sharing that
+    group instead of re-reading it per bucket.
 
     Raises ``FormatError`` if the ``.inf`` file is truncated, or whatever
     ``parse_index_header`` raises if its header fails validation.
@@ -219,7 +222,7 @@ def _group_contiguous_runs(chunk_indices: Iterable[ChunkIdx], byte_off: int) -> 
     fragmented by reclaimed space; every fixed-length ``.fgp`` record
     is always tightly packed with zero gap, so what matters here instead
     is index adjacency plus never crossing a segment file's own boundary
-    — a constraint pool.py's own runs have no equivalent of.
+    — a constraint ``_bucket_reader.py``'s own runs have no equivalent of.
     """
     ordered = sorted(set(chunk_indices))
     runs: list[list[ChunkIdx]] = []
@@ -249,8 +252,8 @@ async def _read_fingerprint_run(
 ) -> dict[ChunkIdx, bytes]:
     """One contiguous, same-segment run of ``chunk_idx``\\ s, satisfied by
     a single ``store.read()`` spanning the whole run rather than one
-    32-byte read per chunk — see ``fingerprints()``'s own docstring for
-    why this matters."""
+    32-byte read per chunk — the per-run batching ``fingerprints()``
+    needs to keep a bucket-wide sweep fast."""
     last = run[-1]
     if last >= rec_num:
         raise DataCorruptError(
@@ -285,9 +288,8 @@ async def fingerprint(
 ) -> bytes:
     """Look up the stored 32-byte SHA-256 fingerprint for one chunk.
 
-    ``cache``: see ``_resolve_bucket_allocation``'s own docstring —
-    default ``None`` preserves this function's original per-call
-    resolution unchanged.
+    ``cache``, when given, shares one group's already-resolved allocation
+    table across every bucket in it instead of resolving fresh each call.
 
     Raises ``DataCorruptError`` if ``chunk_idx`` is beyond the group's
     recorded fingerprint count for this bucket, or if the ``.inf`` header
@@ -339,9 +341,8 @@ async def fingerprints(
     (no two adjacent) still costs one read per index, same as before —
     grouping never makes an unmergeable case worse.
 
-    ``cache``: see ``_resolve_bucket_allocation``'s own docstring —
-    default ``None`` preserves this function's original per-call
-    resolution unchanged.
+    ``cache``, when given, shares one group's already-resolved allocation
+    table across every bucket in it instead of resolving fresh each call.
 
     Raises the same exceptions ``fingerprint()`` does, for the same
     reasons.

@@ -48,7 +48,7 @@ class _GuardedContentSource:
     test opted in via ``record_target(..., allow_content=True)``.
     ``size``/``supports_concurrent_export`` pass through unguarded -- they
     carry no content, only metadata a provider already resolved without
-    reading real bytes (see ``RestorableUnit``'s own docstring)."""
+    reading real bytes."""
 
     def __init__(self, inner: ContentSource) -> None:
         self._inner = inner
@@ -102,9 +102,10 @@ def _install_content_guard(request: pytest.FixtureRequest) -> None:
     ``DedupRepo.open_file()``, or ``Pool.read_chunk()`` called
     directly) -- neither choke point alone reaches the other layer. A raw
     ``ObjectStore.read()`` call straight on a real backend (this project's
-    lowest-level crypto/format tests, e.g. ``test_crypto.py``'s own
-    docstring) is deliberately left unguarded: it can't be distinguished
-    from a catalog-metadata read without a path heuristic, and by the time
+    lowest-level crypto/format tests, e.g. ``test_crypto.py``'s real-bytes
+    chunk-decrypt regression test) is deliberately left unguarded: it
+    can't be distinguished from a catalog-metadata read without a path
+    heuristic, and by the time
     a test is reaching for the raw store directly it has already made a
     conscious, reviewable choice -- unlike the incidental
     ``.unit(node).open().read()`` this guard exists to catch."""
@@ -131,8 +132,9 @@ _WRITTEN_FIXTURES: set[Path] = set()
 @dataclasses.dataclass
 class _RecordingSession:
     """One fixture name's shared recording state for the whole
-    ``--record-against`` invocation -- see ``record_target`` below for why
-    this needs to be shared across tests rather than built fresh per test."""
+    ``--record-against`` invocation -- shared, not built fresh per test, so
+    multiple tests recording into the same fixture accumulate into the one
+    store instead of each overwriting the other's work."""
 
     store: RecordingStore
     #: AND-reduced across every test that calls record_target() with this
@@ -145,7 +147,7 @@ class _RecordingSession:
 #: any test in this invocation calls record_target(name) -- shared, not
 #: rebuilt per test, so multiple tests recording into the same fixture
 #: accumulate into one RecordingStore instead of each overwriting the
-#: other's work (see record_target's own docstring).
+#: other's work.
 _RECORDING_SESSIONS: dict[Path, _RecordingSession] = {}
 
 
@@ -176,8 +178,10 @@ def pytest_addoption(parser: pytest.Parser) -> None:
 def _load_anonymize_module() -> ModuleType:
     """``scripts/`` isn't an installed package, so this loads it by path --
     the same technique ``tests/unit/scripts/test_anonymize_catalog_metadata.py``
-    already uses (see that file's own ``_load_module`` for why it also
-    needs registering in ``sys.modules`` before executing)."""
+    already uses. Registered in ``sys.modules`` before executing because
+    the module's ``@dataclass`` resolves its ``from __future__ import
+    annotations`` string annotations via ``sys.modules[cls.__module__]``
+    at class-definition time."""
     script_path = Path(__file__).parent.parent.parent / "scripts" / "anonymize_catalog_metadata.py"
     spec = importlib.util.spec_from_file_location("anonymize_catalog_metadata", script_path)
     assert spec is not None and spec.loader is not None
@@ -203,8 +207,7 @@ def pytest_sessionfinish(session: pytest.Session, exitstatus: int) -> None:
     survive as a path segment in *one* fixture while their own owning
     catalog row lives in a *different* fixture recorded in the same run
     -- anonymizing each in isolation as soon as it's written would miss
-    that (see ``scripts/anonymize_catalog_metadata.py``'s own two-phase
-    batch docstring)."""
+    that."""
     for path, recording in _RECORDING_SESSIONS.items():
         if recording.all_passed:
             write_fixture_text(path, recording.store.dump())

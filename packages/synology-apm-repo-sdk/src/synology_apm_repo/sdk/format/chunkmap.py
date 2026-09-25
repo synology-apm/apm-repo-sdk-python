@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import dataclasses
 import enum
+from collections.abc import Iterator
 
 from ..errors import DataCorruptError, FormatError
 from .addressing import ChunkAddress
@@ -81,7 +82,11 @@ def parse_chunk_map_record(data: bytes) -> ChunkMapEntry:
     (``data`` may be longer; only the first 20 bytes are consulted).
 
     A Mapping record's embedded ``ChunkAddress`` is not itself
-    range-checked here — see ``ChunkAddress``'s own docstring for why.
+    range-checked here — an out-of-range field either surfaces naturally
+    downstream (``IndexError``/``NotFoundError``) or is the job of
+    ``units/verify_reachable.py``'s dedicated, verify-only checks; skipping
+    it here matters at scale, since this runs once per real chunk in an
+    export.
 
     Raises:
         FormatError: ``data`` is shorter than 20 bytes.
@@ -128,3 +133,12 @@ def parse_chunk_map_record(data: bytes) -> ChunkMapEntry:
         map_num=zero_num,
         repeat=0,
     )
+
+
+def iter_chunk_map_page(page_bytes: bytes, count: int) -> Iterator[ChunkMapEntry]:
+    """Lazily decode ``count`` consecutive ``ChunkMapRecord``\\ s starting
+    at the front of ``page_bytes`` — the batch form of
+    ``parse_chunk_map_record`` a page-at-a-time cache's caller uses
+    instead of re-deriving the same slice arithmetic itself."""
+    for i in range(count):
+        yield parse_chunk_map_record(page_bytes[i * CHUNK_MAP_RECORD_LENGTH : (i + 1) * CHUNK_MAP_RECORD_LENGTH])

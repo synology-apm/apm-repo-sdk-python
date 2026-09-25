@@ -82,8 +82,9 @@ async def run_for_repo(ctx: SmokeContext, ri: RepoInfo) -> None:
         _ri, _workload, _version, picked_provider, picked_leaf = picked
 
         # The winning candidate is this call's own to close once done --
-        # pick_workload_with_retry only closes rejected ones (see its own
-        # docstring). A SaaS-rich sample can have a dozen-plus distinct
+        # pick_workload_with_retry closes every rejected candidate's provider
+        # immediately as it searches, but returns the winner still open for
+        # its caller to use (and close). A SaaS-rich sample can have a dozen-plus distinct
         # sub_types in one turn, each its own provider materializing its
         # own SqliteSource, so leaving these open across iterations adds
         # up fast.

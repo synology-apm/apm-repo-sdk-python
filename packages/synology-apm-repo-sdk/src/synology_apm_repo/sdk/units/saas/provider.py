@@ -7,24 +7,29 @@ connector's own object-name index (see ``object_name_index.py``), build a
 ``root()``/``children()``/``unit()`` purely by delegating to it — so
 ``SaasWorkloadProvider`` is the only place those three methods are
 implemented; each concrete workload supplies only a
-``SaasWorkloadConfig`` (see its own docstring for the fields) plus
-whatever helpers its ``assemble()`` needs.
+``SaasWorkloadConfig`` (which tables to open, a ``tree_factory``, an
+``assemble()`` callback, plus optional per-row/per-group attrs hooks)
+plus whatever helpers its ``assemble()`` needs.
 
 **No schema-classification discovery scan, anywhere, for any table**:
 every table is resolved by a direct object-name-index lookup (see
 ``SaasWorkloadProvider._open_table_via_index``); a table simply
 isn't found when the index doesn't name it. A schema-only scan could
 never safely replace this anyway — Archive Mail's ``mail_table`` is one
-such case (``mail.py``'s own module docstring), where only the
-index's own naming can tell two schema-identical tables apart.
+such case: its schema is byte-for-byte identical to regular Mail's, so
+only the index's own naming (not the schema) can tell the two
+mailboxes apart.
 
-``TeamsChatProvider`` is **not** built on this base — see
-``units/saas/teams_chat.py``'s own module docstring for why.
+``TeamsChatProvider`` is **not** built on this base — its discovery
+mechanism (one shared channel/chat INDEX-object lookup, not per-table
+``object_names``) doesn't fit the config-driven ``tables``/
+``object_names`` model this class assumes.
 """
 
 from __future__ import annotations
 
 import dataclasses
+import json
 import sqlite3
 from collections.abc import Awaitable, Callable
 from types import TracebackType
@@ -36,20 +41,19 @@ from ...catalog.version import Version
 from ...catalog.workload import TargetType
 from ...dedup.dedup_file import DedupFile
 from ...dedup.repository import DedupRepo
-from ...errors import DataCorruptError, UnsupportedDataFormatError
+from ...errors import DataCorruptError, NotFoundError, UnsupportedDataFormatError
 from ...storage.sqlite_source import SqliteSource
+from ...storage.table import Column, Table
 from ..base import (
-    ClosableUnitProvider,
     Node,
     RestorableUnit,
     UnitKind,
     not_restorable,
-    paginate,
 )
 from ..node_ref import NodeRef, canonical_ref_for
 from .object_name_index import ObjectNameIndex, resolve_object_name_index, resolve_service_db
 from .objectdb import ObjectDb
-from .stream import SaasStream
+from .stream import SaasStreamCache
 from .tree_strategy import RecursiveTree, TreeStrategy
 
 _Row = dict[str, object | None]
@@ -71,30 +75,28 @@ class SharedSaasContext:
 
     Neither field needs closing: ``DedupFile`` has no ``close()`` at
     all (a stateless, explicit-offset read view), and ``ObjectNameIndex``
-    is a plain, connection-free dataclass. Only the resolution
-    machinery itself (a throwaway ``SaasStream``) owns anything that
-    needs releasing, and ``resolve_shared_saas_context`` already does
-    that before returning."""
+    is a plain, connection-free dataclass. The stream this was resolved
+    through (the caller's shared ``SaasStreamCache``) is borrowed, not
+    owned, by ``resolve_shared_saas_context`` either — there is nothing
+    left for this dataclass itself to release."""
 
     dedup_file: DedupFile
     object_name_index: ObjectNameIndex | None
 
 
-async def resolve_shared_saas_context(repo: DedupRepo, version: Version) -> SharedSaasContext:
+async def resolve_shared_saas_context(
+    repo: DedupRepo, version: Version, saas_streams: SaasStreamCache
+) -> SharedSaasContext:
     """Resolve the one ``(dedup_file, object_name_index)`` pair every
     candidate for a multi-candidate ``sub_type`` would otherwise
-    resolve independently for itself — see ``SharedSaasContext``'s own
-    docstring for why sharing it needs no ownership/refcounting scheme.
-    The ``SaasStream`` used here is closed immediately after
-    ``open_saas_obj`` returns:
-    the two ``SqliteSource`` connections it owns
-    (``stream_version_for``'s snapshot/version lookups) are unrelated
-    to the returned ``DedupFile``, which is built from the repository's
-    own long-lived ``Pool``/``CompositionReader`` instead (see
-    ``DedupRepo.open_composition``) — so this stream has nothing
-    left to do once the ``DedupFile`` is in hand."""
-    async with SaasStream(repo, version.connection_config_id, version.saas_stream_uuid) as stream:
-        dedup_file = await stream.open_saas_obj(version)
+    resolve independently for itself (see ``SharedSaasContext`` for why
+    neither field needs closing). ``saas_streams`` is borrowed, not
+    owned — the caller's shared ``SaasStreamCache`` opens (and keeps
+    open, for reuse by other versions of the same stream) the
+    ``SaasStream`` this resolves ``dedup_file`` through, rather than a
+    throwaway instance this function would otherwise need to close
+    itself."""
+    dedup_file = await saas_streams.open_saas_obj(version)
     object_name_index = await resolve_object_name_index(repo, version)
     return SharedSaasContext(dedup_file=dedup_file, object_name_index=object_name_index)
 
@@ -102,11 +104,11 @@ async def resolve_shared_saas_context(repo: DedupRepo, version: Version) -> Shar
 @dataclasses.dataclass(frozen=True)
 class SaasWorkloadConfig:
     """What one workload needs beyond the shared skeleton: which
-    ``tables`` to open (resolved via ``object_names`` — see that
-    field's own docstring), a ``tree_factory`` that builds the single
-    ``TreeStrategy`` ``children()``/``unit()`` delegate to once every
-    table is open, and an ``assemble()`` callback turning one leaf row
-    into a ``RestorableUnit``.
+    ``tables`` to open (resolved via ``object_names`` — see that field
+    for the alias-mapping shape), a ``tree_factory`` that builds the
+    single ``TreeStrategy`` ``children()``/``unit()`` delegate to once
+    every table is open, and an ``assemble()`` callback turning one leaf
+    row into a ``RestorableUnit``.
 
     ``tree_factory``/``assemble`` are ``async def`` because some
     workloads' implementations genuinely need I/O (Drive's
@@ -130,7 +132,10 @@ class SaasWorkloadConfig:
     is tried in order; the first one the index has *and* validates
     wins. A table with no entry here — or a stream with no usable
     object-name index at all — is simply not found: ``UnsupportedDataFormatError``,
-    never a scan (see this module's own docstring for why)."""
+    never a scan — a schema-only scan can't safely replace direct
+    lookup, since some tables (Archive Mail's ``mail_table`` vs. regular
+    Mail's) are schema-identical and only the index's own naming can
+    tell them apart."""
     extra_attrs: Callable[[SaasWorkloadProvider, _Row], dict[str, object]] = dataclasses.field(
         default=lambda provider, row: {}
     )
@@ -148,9 +153,10 @@ class SaasWorkloadConfig:
     """Same idea as ``extra_attrs``, for a non-leaf (group) node's own
     ``attrs``: no row exists at group level, so this reads whatever
     ``tree_factory`` stashed in ``provider.extras`` keyed by the
-    group's own key. Only Site needs this today (flagging which
-    List-shaped groups get a spreadsheet-style overview); every other
-    workload leaves it at the default no-op."""
+    group's own key. Site uses this to flag which List-shaped groups get
+    a spreadsheet-style overview; Calendar uses it to mark shallow
+    "My"/"Other Calendars" category groups with their own ``leaf_kind``.
+    Every other workload leaves it at the default no-op."""
     leaf_size: Callable[[_Row], int | None] = dataclasses.field(default=lambda row: None)
     """Populates a leaf listing ``Node``'s own ``size`` (not the
     ``RestorableUnit`` ``assemble()`` builds separately) — only Drive's
@@ -163,8 +169,9 @@ class SaasWorkloadConfig:
 
 class SaasWorkloadProvider:
     """``UnitProvider`` shared by every config-driven SaaS
-    application-layer workload. See this module's own docstring for
-    what's shared vs supplied.
+    application-layer workload — the only place ``root()``/``children()``/
+    ``unit()`` are implemented, driven by whichever ``SaasWorkloadConfig``
+    a concrete workload (Mail, Drive, ...) supplies.
 
     Build one with ``create``, never ``SaasWorkloadProvider(...)``
     directly: everything ``create`` does — opening the ``saas_obj``,
@@ -184,11 +191,11 @@ class SaasWorkloadProvider:
         self._repo = repo
         self._version = version
         self._config = config
-        self._stream = SaasStream(repo, version.connection_config_id, version.saas_stream_uuid)
         #: Scratch space a config's ``tree_factory`` populates once
         #: (up front, with I/O) for its ``extra_attrs`` to read later
-        #: (per row, no I/O) — see ``SaasWorkloadConfig.extra_attrs``'s
-        #: own docstring for why this exists at all.
+        #: (per row, no I/O) — lets ``extra_attrs`` stay a synchronous,
+        #: I/O-free function even when the data it exposes (GWS mail
+        #: labels, GWS contact groups) needed an upfront async fetch.
         self.extras: dict[str, object] = {}
         #: Populated by ``create``; initialized here (rather than there)
         #: so ``close()`` is always safe to call even if ``create`` fails
@@ -203,41 +210,43 @@ class SaasWorkloadProvider:
         repo: DedupRepo,
         version: Version,
         config: SaasWorkloadConfig,
+        saas_streams: SaasStreamCache,
         *,
         shared: SharedSaasContext | None = None,
     ) -> Self:
-        """``shared``, when given, is a ``SharedSaasContext`` a caller
+        """``saas_streams`` is borrowed, not owned — the version's
+        ``saas_obj`` is opened via the caller's shared ``SaasStreamCache``,
+        reused across every other version of the same stream, rather than
+        a private ``SaasStream`` this provider would otherwise need to
+        close itself.
+
+        ``shared``, when given, is a ``SharedSaasContext`` a caller
         (``units/dispatch.py::saas_provider_for``, for a multi-candidate
         ``sub_type``) already resolved once for this exact ``(repo,
         version)`` — skips this instance's own
-        ``self._stream.open_saas_obj``/``resolve_object_name_index`` calls
-        in favor of reusing it directly. ``self._stream`` is then never
-        used to open anything, so ``close``'s existing
-        ``await self._stream.close()`` call stays a safe no-op with no
-        special-casing needed — ``SaasStream.close`` only ever releases
-        connections it actually opened, and neither
-        ``_snapshot_source`` nor ``_version_source`` is opened on this
-        path."""
+        ``saas_streams.open_saas_obj``/``resolve_object_name_index`` calls
+        in favor of reusing it directly."""
         self = cls(repo, version, config)
         try:
             if shared is not None:
                 self._dedup_file = shared.dedup_file
                 object_name_index = shared.object_name_index if config.object_names else None
             else:
-                self._dedup_file = await self._stream.open_saas_obj(version)
+                self._dedup_file = await saas_streams.open_saas_obj(version)
 
-                # The sole location-resolution mechanism — see this module's own
-                # docstring for why there's no schema-classification scan as a
-                # fallback. None whenever config.object_names is empty (no workload here
-                # is configured without it), or this version simply has no index
-                # at all (see
-                # object_name_index.resolve_object_name_index's own docstring for every
-                # such case) — either way every table below is then unsupported.
-                # Stashed on self (see the object_name_index property below) so a
-                # config's own tree_factory/assemble callbacks can reuse this
-                # exact resolution — same repository, same version, guaranteed
-                # byte-identical to whatever a second call would produce —
-                # instead of each independently re-resolving it.
+                # The sole location-resolution mechanism — a schema-only
+                # scan can't safely replace it, since some tables (e.g.
+                # Archive Mail's mail_table vs. regular Mail's) are
+                # schema-identical and only the index's own naming tells
+                # them apart. None whenever config.object_names is empty (no workload here
+                # is configured without it), or resolve_object_name_index simply
+                # found no index for this version (an old repository, or a
+                # connector version predating this bookkeeping) — either way
+                # every table below is then unsupported.
+                # Stashed on self (see the object_name_index property below)
+                # so a config's own tree_factory/assemble callbacks can
+                # reuse this exact resolution instead of each independently
+                # re-resolving it.
                 object_name_index = await resolve_object_name_index(repo, version) if config.object_names else None
             self._object_name_index = object_name_index
 
@@ -262,9 +271,9 @@ class SaasWorkloadProvider:
                     f"tree construction failed for version {version.version_uid!r}: {exc}", ref=version.version_uid
                 ) from exc
         except Exception:
-            # Nothing opened above (self._stream, self._sources,
-            # self._object_db_cache) must leak on any failure here,
-            # including a tree_factory failure — same shape as
+            # Nothing opened above (self._sources, self._object_db_cache)
+            # must leak on any failure here, including a tree_factory
+            # failure — same shape as
             # RawObjectProvider.create()/TeamsChatProvider.create().
             await self.close()
             raise
@@ -279,8 +288,9 @@ class SaasWorkloadProvider:
         object before trusting it (decompresses, is really SQLite,
         defines ``table_name``). Tries every alias in
         ``object_names[table_name]`` in order (mutually-exclusive
-        product-variant names, not scan guesses — see that field's own
-        docstring) against the same loaded object, via
+        product-variant names, e.g. ``mail_table`` is ``mail_db`` for
+        ``USER_EXCHANGE`` but ``group_mail_db`` for ``GROUP_EXCHANGE`` —
+        not scan guesses) against the same loaded object, via
         ``resolve_service_db`` — the same alias-resolution loop
         ``read_indexed_table`` uses, except the resolved
         ``SqliteSource`` is returned to the caller rather than read
@@ -363,22 +373,22 @@ class SaasWorkloadProvider:
         return source.connection
 
     async def close(self) -> None:
-        """Release every sqlite connection this provider owns: ``_sources``,
-        ``_object_db_cache``, and ``_stream`` — ``SaasStream`` holds
-        two more ``SqliteSource``s of its own. Any unclosed aiosqlite
-        connection hangs interpreter shutdown (see
-        ``ARCHITECTURE.md``'s "Async-native, by design"). Closes
-        ``_object_db_cache`` rather than ``_object_dbs``: a multi-table
-        config can have several ``_object_dbs`` keys pointing at the
-        same cached instance (see ``_open_table_via_index``), and
-        ``_object_db_cache``'s own ``(offset, length)`` keying already
-        de-duplicates that for us.
+        """Release every sqlite connection this provider owns: ``_sources``
+        and ``_object_db_cache``. Any unclosed aiosqlite connection hangs
+        interpreter shutdown (see ``ARCHITECTURE.md``'s "Async-native, by
+        design"). Closes ``_object_db_cache`` rather than ``_object_dbs``:
+        a multi-table config can have several ``_object_dbs`` keys
+        pointing at the same cached instance (see
+        ``_open_table_via_index``), and ``_object_db_cache``'s own
+        ``(offset, length)`` keying already de-duplicates that for us.
+        The version's own stream is borrowed from the caller's
+        ``SaasStreamCache``, not owned here, so there's nothing of its
+        own to release.
         """
         for source in self._sources.values():
             await source.close()
         for object_db in self._object_db_cache.values():
             await object_db.close()
-        await self._stream.close()
 
     async def __aenter__(self) -> Self:
         return self
@@ -426,9 +436,10 @@ class SaasWorkloadProvider:
         """Whether this provider's version is an M365 (Microsoft 365)
         workload rather than GWS (Google Workspace) — the only two
         ``target_type`` values a SaaS workload provider's ``version`` can
-        ever carry (device workloads never reach this class). Shared by
-        ``mail.py``/``contact.py``'s config-specific ``assemble``
-        callbacks, which each need this same check."""
+        ever carry (device workloads never reach this class). Read
+        directly by ``mail.py``'s and ``contact.py``'s own
+        ``tree_factory`` implementations, and by ``contact.py``'s
+        ``assemble``, to branch M365-vs-GWS behavior."""
         return self.version.target_type == TargetType.M365
 
     @property
@@ -448,7 +459,12 @@ class SaasWorkloadProvider:
     def root(self) -> Node:
         """Pure construction — no I/O, so this stays synchronous (see
         ``UnitProvider``)."""
-        return Node(ref=self.ref_for(()), name=self._config.root_name, is_leaf=False, attrs={"key": ()})
+        return Node(
+            ref=self.ref_for(()),
+            name=self._config.root_name,
+            is_leaf=False,
+            attrs={"key": (), "leaf_kind": self._config.leaf_kind, **self._config.group_attrs(self, ())},
+        )
 
     async def children(self, node: Node, offset: int = 0, limit: int | None = None) -> list[Node]:
         # A node with no "key" attr at all is not one this provider ever
@@ -461,8 +477,7 @@ class SaasWorkloadProvider:
         key = tuple(node.attrs["key"])
         # offset/limit are threaded straight into children_of() itself —
         # a real SQL-level window, not a post-hoc Python slice of an
-        # eagerly-fetched full list; see tree_strategy.py's own module
-        # docstring for why.
+        # eagerly-fetched full list.
         entries = await self._tree.children_of(key, offset=offset, limit=limit)
         return [self._node_for(child_key, name, is_leaf) for child_key, name, is_leaf in entries]
 
@@ -474,7 +489,17 @@ class SaasWorkloadProvider:
         # in ``provider.extras`` keyed by this same key) — none of them do
         # I/O of their own.
         if not is_leaf:
-            group_attrs: dict[str, object] = {"key": key, **self._config.group_attrs(self, key)}
+            # Same "key"/"leaf_kind"/group_attrs shape root() builds above,
+            # for every deeper container -- leaf_kind is set at every
+            # depth, not just the root, so a caller can resolve what kind
+            # of leaf a given folder holds directly from that folder's own
+            # Node, with no child inspection needed and no ambiguity for a
+            # folder with zero children.
+            group_attrs: dict[str, object] = {
+                "key": key,
+                "leaf_kind": self._config.leaf_kind,
+                **self._config.group_attrs(self, key),
+            }
             return Node(ref=self.ref_for(key), name=name, is_leaf=False, attrs=group_attrs)
         row = self._tree.row_for(key)
         attrs: dict[str, object] = {"key": key}
@@ -533,10 +558,10 @@ def group_display_name_resolver(names: dict[str, str] | None) -> Callable[[str],
     """Builds a ``group_display_name`` callable for
     ``SyntheticGroupedTree``: looks a group key up in ``names`` when
     one resolved, falls back to the raw key otherwise — the same
-    "costs a label, never correctness" degradation ``mail.py``/
-    ``contact.py``'s own folder/group name resolvers document. Shared
-    since both build this identical closure around their own,
-    differently-sourced ``names`` map."""
+    degrade-to-raw-key posture ``mail.py``'s/``contact.py``'s own
+    folder/group name resolvers document. Shared since both build this
+    identical closure around their own, differently-sourced ``names``
+    map."""
 
     def _group_display_name(group_id: str) -> str:
         return names[group_id] if names is not None and group_id in names else group_id
@@ -560,6 +585,30 @@ def extras_attr(provider: SaasWorkloadProvider, extras_key: str, row_id: object,
     return {attr_name: found} if found else {}
 
 
+async def owning_account_user_info(repo: DedupRepo, version: Version) -> dict[str, object] | None:
+    """The backed-up account's own real profile (``email``, ``name``,
+    ...), read directly off the owning workload's ``workload_spec
+    .status.entity_meta.spec.user_info`` -- a narrow ``workload_config``
+    read by ``workload_id``, skipping ``workloads``'s unneeded joins.
+    ``None``, never raises, if not found. Shared since ``teams_chat.py``
+    (email only, for an unnamed chat's own member-exclusion) and
+    ``calendar.py`` (email *and* name, for a primary calendar's own
+    display name) each need the identical lookup."""
+    try:
+        table = await Table.create(
+            await repo.db("workload_config"), "workload_config", [Column("workload_id"), Column("workload_spec")]
+        )
+        row = await table.select_one("workload_id = ?", (version.workload_id,))
+        if row is None:
+            return None
+        spec = json.loads(str(row["workload_spec"]))
+        entity_spec = ((spec.get("status") or {}).get("entity_meta") or {}).get("spec") or {}
+        user_info = entity_spec.get("user_info")
+        return user_info if isinstance(user_info, dict) else None
+    except (NotFoundError, ValueError, DataCorruptError, sqlite3.DatabaseError):
+        return None
+
+
 def make_saas_provider(
     config: SaasWorkloadConfig, *, name: str, provider_cls: type[SaasWorkloadProvider] = SaasWorkloadProvider
 ) -> Callable[..., Awaitable[SaasWorkloadProvider]]:
@@ -567,8 +616,9 @@ def make_saas_provider(
     exactly like a constructor (``await XProvider(repo, version)``),
     matching ``units/dispatch.py``'s ``_ProviderFactory`` calling
     convention. Opens the ``saas_obj`` and resolves the service DB via
-    the connector's own object-name index, never a scan — see
-    ``units/saas/raw_object.py``'s own module docstring. ``shared``, when
+    the connector's own object-name index — the same index-driven
+    resolution every SaaS provider (including the raw diagnostic
+    fallback) uses, never a scan of the stream's content. ``shared``, when
     given (M365 ``USER_EXCHANGE``/``GROUP_EXCHANGE``'s multi-candidate
     dispatch — see ``units/dispatch.py::saas_provider_for``), is passed
     straight through to ``SaasWorkloadProvider.create``.
@@ -586,89 +636,10 @@ def make_saas_provider(
     """
 
     async def _provider(
-        repo: DedupRepo, version: Version, *, shared: SharedSaasContext | None = None
+        repo: DedupRepo, version: Version, saas_streams: SaasStreamCache, *, shared: SharedSaasContext | None = None
     ) -> SaasWorkloadProvider:
-        return await provider_cls.create(repo, version, config, shared=shared)
+        return await provider_cls.create(repo, version, config, saas_streams, shared=shared)
 
     _provider.__name__ = name
     _provider.__qualname__ = name
     return _provider
-
-
-class CompositeSaasProvider:
-    """``UnitProvider`` for the one shape no single-app provider covers:
-    M365's ``USER_EXCHANGE``/
-    ``GROUP_EXCHANGE`` sub_types bundle Mail, Contacts and Calendars as
-    three independently-populated services within the same version, all
-    reachable at once — not alternatives to pick between. Every other
-    SaaS sub_type maps 1:1 to one provider; this class is what a caller
-    gets instead when more than one sub-provider recognizes the same
-    version: a synthetic root (``"Exchange"``) whose children are each
-    sub-provider's own root as siblings, with every deeper
-    ``children()``/``unit()`` call routed back to whichever
-    sub-provider owns that node.
-
-    **Ref/key prefixing, not object identity**: every ``Node`` handed
-    out gets ``attrs["key"]`` rewritten to ``(tag, *original_key)``
-    (and its ``ref`` rebuilt to match), with the ``tag`` segment
-    stripped back off before a node reaches the sub-provider that built
-    it — a ``NodeRef`` round-tripped through ``str()``/``parse()``
-    carries this prefix as an ordinary extra segment, so it resolves
-    correctly on a fresh lookup like any other multi-segment ref."""
-
-    def __init__(
-        self,
-        repo: DedupRepo,
-        version: Version,
-        sub_providers: dict[str, ClosableUnitProvider],
-    ) -> None:
-        self._repo = repo
-        self._version = version
-        self._sub_providers = sub_providers
-
-    async def close(self) -> None:
-        for provider in self._sub_providers.values():
-            await provider.close()
-
-    async def __aenter__(self) -> Self:
-        return self
-
-    async def __aexit__(
-        self,
-        exc_type: type[BaseException] | None,
-        exc: BaseException | None,
-        tb: TracebackType | None,
-    ) -> None:
-        await self.close()
-
-    def _ref_for(self, extra: tuple[str, ...]) -> NodeRef:
-        return canonical_ref_for(self._repo, self._version, extra)
-
-    def _tag_node(self, node: Node, tag: str, rest: tuple[str, ...]) -> Node:
-        key = (tag, *rest)
-        return dataclasses.replace(node, ref=self._ref_for(key), attrs={**node.attrs, "key": key})
-
-    def root(self) -> Node:
-        return Node(ref=self._ref_for(()), name="Exchange", is_leaf=False, attrs={"key": ()})
-
-    async def children(self, node: Node, offset: int = 0, limit: int | None = None) -> list[Node]:
-        key = tuple(node.attrs.get("key", ()))
-        if key == ():
-            tops = [self._tag_node(provider.root(), tag, ()) for tag, provider in self._sub_providers.items()]
-            return paginate(tops, offset, limit)
-        tag, *rest = key
-        provider = self._sub_providers.get(tag)
-        if provider is None:
-            return []
-        sub_node = dataclasses.replace(node, attrs={**node.attrs, "key": tuple(rest)})
-        children = await provider.children(sub_node, offset, limit)
-        return [self._tag_node(child, tag, tuple(child.attrs.get("key", ()))) for child in children]
-
-    async def unit(self, node: Node) -> RestorableUnit:
-        key = tuple(node.attrs.get("key", ()))
-        if not key:
-            not_restorable("node", node.name)
-        tag, *rest = key
-        provider = self._sub_providers[tag]
-        sub_node = dataclasses.replace(node, attrs={**node.attrs, "key": tuple(rest)})
-        return await provider.unit(sub_node)

@@ -7,9 +7,8 @@ from __future__ import annotations
 
 import csv
 import io
-import json
 
-from ...errors import DataCorruptError
+from .saas_artifact import parse_meta_json
 
 # M365 Outlook-compatible CSV column order (FORMAT-SPEC.md: m365-contact).
 _CSV_HEADER = [
@@ -36,10 +35,7 @@ def build_contact_csv(meta_bytes: bytes) -> bytes:
     ``client_metadata`` (Graph API contact fields, camelCase) JSON
     object (FORMAT-SPEC.md: m365-contact — column set is this module's own
     reasonable subset of the fields that table documents)."""
-    try:
-        meta = json.loads(meta_bytes)
-    except json.JSONDecodeError as exc:
-        raise DataCorruptError(f"contact META did not parse as JSON: {exc}") from exc
+    meta = parse_meta_json(meta_bytes, "contact META")
     client_metadata = meta.get("client_metadata") or {}
     emails = client_metadata.get("emailAddresses") or []
     business_phones = client_metadata.get("businessPhones") or []

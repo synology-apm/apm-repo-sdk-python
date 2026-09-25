@@ -1,6 +1,6 @@
 """Regression test for ``synology-apm-repo-cli key``'s wrong-key and correct-key
 scenarios — replayed from a committed fixture, same
-``monkeypatch.setattr(cli.browse, "resolve_profile_store", ...)`` seam as
+``monkeypatch.setattr(cli.repo_session, "resolve_profile_store", ...)`` seam as
 this file's siblings.
 
 The wrong key string here (``wrongkeyid00@AAA...``) is a
@@ -28,7 +28,7 @@ from types import ModuleType
 
 from typer.testing import CliRunner
 
-import synology_apm_repo.cli.browse as browse_mod
+import synology_apm_repo.cli.repo_session as repo_session_mod
 from synology_apm_repo.cli.main import app
 
 runner = CliRunner()
@@ -40,14 +40,14 @@ _APV2_ENCRYPTED_KEY_STRING = "n0wohSZahiKc@fHKnM74RWUBQnfgv4DWhXGmmEzV3GGwFpiHt9
 
 
 def test_wrong_key_reports_invalid_replayed(patch_profile_store: Callable[[str, ModuleType], None]) -> None:
-    patch_profile_store("cli_key_apv2_vault.json.gz", browse_mod)
+    patch_profile_store("cli_key_apv2_vault.json.gz", repo_session_mod)
     result = runner.invoke(app, ["key", "--profile", "anything", "--key", _WRONG_KEY])
     assert result.exit_code == 0, result.output
     assert "invalid" in result.output
 
 
 def test_correct_key_reports_verified_replayed(patch_profile_store: Callable[[str, ModuleType], None]) -> None:
-    patch_profile_store("cli_key_apv2_vault.json.gz", browse_mod)
+    patch_profile_store("cli_key_apv2_vault.json.gz", repo_session_mod)
     result = runner.invoke(app, ["key", "--profile", "anything", "--key", _APV2_ENCRYPTED_KEY_STRING])
     assert result.exit_code == 0, result.output
     assert "verified" in result.output
@@ -56,7 +56,7 @@ def test_correct_key_reports_verified_replayed(patch_profile_store: Callable[[st
 
 
 def test_json_output_replayed(patch_profile_store: Callable[[str, ModuleType], None]) -> None:
-    patch_profile_store("cli_key_apv2_vault.json.gz", browse_mod)
+    patch_profile_store("cli_key_apv2_vault.json.gz", repo_session_mod)
     result = runner.invoke(app, ["--json", "key", "--profile", "anything", "--key", _APV2_ENCRYPTED_KEY_STRING])
     assert result.exit_code == 0, result.output
     report = json.loads(result.stdout)

@@ -13,8 +13,10 @@ from typing import Any
 
 from textual.widgets import Button, Checkbox, Input, Select, Tabs, Tree
 
+from synology_apm_repo.browser.core.browse.select import CatalogTreeKey
 from synology_apm_repo.browser.screens.browse_screen import BrowseScreen
 from synology_apm_repo.browser.screens.connect_dialog import ConnectDialog
+from synology_apm_repo.browser.view.reconcile import Binding
 from synology_apm_repo.sdk import AzureProfileConfig, BackendKind, S3ProfileConfig, SmbProfileConfig
 
 
@@ -44,10 +46,10 @@ async def connect_local(app: Any, pilot: Any, path: str) -> None:
     tree to gain the new repository's node. Callers only ever use this once per
     session: reconnecting a second source the same way (whether via ``c``
     or another auto-opened dialog) *replaces* the current scan's repositories/
-    tree rather than adding to it (``BrowseScreen._reset_for_new_scan``) --
-    confirmed empirically, not assumed -- so a second sample needs its own
-    fresh session (see ``key_dialog``'s/``remote_connect``'s own reasoning
-    in ``__main__.py``), not a second call to this function in the same
+    tree rather than adding to it (``BrowseScreen._reset_for_new_scan``),
+    so a second sample needs its own fresh session (see
+    ``key_dialog``'s/``remote_connect``'s own reasoning in
+    ``__main__.py``), not a second call to this function in the same
     one."""
     await wait_until(pilot, lambda: isinstance(app.screen, ConnectDialog), message="ConnectDialog never appeared")
     dialog = app.screen
@@ -86,8 +88,10 @@ async def connect_remote(
     (``profile_name`` omitted -- the same manual-entry path a first-time
     user goes through before ever saving a profile). Waits for
     ``BrowseScreen``'s ``#col-catalogs`` tree to gain the new repository's
-    node. One connect per session, same as ``connect_local`` -- see its
-    own docstring for why."""
+    node. One connect per session, same as ``connect_local``: reconnecting
+    a second source the same way *replaces* the current scan's
+    repositories/tree rather than adding to it
+    (``BrowseScreen._reset_for_new_scan``)."""
     await wait_until(pilot, lambda: isinstance(app.screen, ConnectDialog), message="ConnectDialog never appeared")
     dialog = app.screen
     assert isinstance(dialog, ConnectDialog), dialog
@@ -142,7 +146,7 @@ async def connect_remote(
     )
 
 
-async def expand_first_repo(app: Any, pilot: Any) -> Tree[Any]:
+async def expand_first_repo(app: Any, pilot: Any) -> Tree[Binding[CatalogTreeKey]]:
     """Focuses ``#col-catalogs``, moves the cursor to the *last* repository
     node added (the one ``connect_local`` just connected -- earlier
     connects, if any, stay above it) and presses Enter, waiting for its

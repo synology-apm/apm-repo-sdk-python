@@ -29,9 +29,10 @@ def _not_found(operation: str, code: str = "NoSuchKey") -> ClientError:
 
 class _FakeStreamingBody:
     """Stands in for ``get_object``'s ``Body`` — a real response body is
-    an async-``read``-once stream with a synchronous ``close()`` (see
-    ``S3Store.read``'s own comment on why a cancelled read closes rather
-    than releases it)."""
+    an async-``read``-once stream with a synchronous ``close()``: on a
+    cancelled read, ``S3Store.read`` calls this rather than letting the
+    connection return to the pool, since a mid-stream release would leave
+    unread bytes on the wire for the next pooled request to desync on."""
 
     def __init__(self, data: bytes) -> None:
         self._data = data
@@ -250,10 +251,10 @@ class TestCancellation:
     unwind — a fresh request issued right after "cancelling..." can race
     a still-in-flight one on the same keep-alive connection pool) must
     not let the partially-read response quietly return its connection to
-    the pool, which can otherwise hand a later request a broken
-    connection (``ClientError("SlowDownRead", ...)``). Uses a fake client
-    with deterministic control over exactly when the cancellation lands,
-    not real, inherently racy network timing."""
+    the pool, which can otherwise hand a later request a connection left
+    in a corrupted state. Uses a fake client with deterministic control
+    over exactly when the cancellation lands, not real, inherently racy
+    network timing."""
 
     async def test_a_cancelled_read_closes_the_response_body_rather_than_letting_it_be_pooled(self) -> None:
         class _FakeBody:
@@ -368,8 +369,9 @@ class TestListBuckets:
     async def test_list_buckets_returns_every_bucket_visible_to_these_credentials(
         self, monkeypatch: pytest.MonkeyPatch, client: _FakeS3Client
     ) -> None:
-        """``list_buckets()`` builds its own transient client rather than
-        accepting an injected one (see its own docstring) — monkeypatching
+        """``list_buckets()`` is a bucket-less operation with no ``S3Store``
+        instance to scope it, so it builds and closes its own transient
+        client rather than accepting an injected one — monkeypatching
         ``aioboto3.Session`` itself to hand back this fixture's fake
         client is the same shape ``test_storage_azure.py``'s own
         ``TestListContainers`` test uses for ``AzureStore``'s equivalent
@@ -445,8 +447,7 @@ class TestRepr:
 class TestDefaultTimeouts:
     """Interactive callers (the TUI's connect dialog, in particular)
     building a client against an unreachable endpoint must not inherit
-    botocore's own 60s connect/60s read defaults — see the module
-    docstring."""
+    botocore's own 60s connect/60s read defaults."""
 
     def test_fills_in_short_connect_and_read_timeouts_when_caller_passes_no_config(self) -> None:
         merged = _with_default_timeouts({"endpoint_url": "http://example.invalid"})

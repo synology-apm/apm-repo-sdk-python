@@ -42,13 +42,14 @@ from synology_apm_repo.sdk.storage.base import ObjectStore
 from synology_apm_repo.sdk.storage.layout import detect_layout
 from synology_apm_repo.sdk.units.saas.mail import MailProvider
 from synology_apm_repo.sdk.units.saas.provider import SaasWorkloadProvider
+from synology_apm_repo.sdk.units.saas.stream import SaasStreamCache
 
 
-async def _open_provider(repo: DedupRepo, workload_id: int) -> SaasWorkloadProvider:
+async def _open_provider(repo: DedupRepo, saas_streams: SaasStreamCache, workload_id: int) -> SaasWorkloadProvider:
     all_workloads = [w for c in await connections(repo) for w in await workloads(repo, c)]
     workload = next(w for w in all_workloads if w.workload_id == workload_id)
     version = (await versions(repo, workload))[-1]  # latest
-    return await MailProvider(repo, version)
+    return await MailProvider(repo, version, saas_streams)
 
 
 async def test_replayed_gws_mail_workload_resolves_to_its_mail_bucket(
@@ -56,8 +57,8 @@ async def test_replayed_gws_mail_workload_resolves_to_its_mail_bucket(
 ) -> None:
     store = await record_target("units_saas_mail_gws_apv1.json.gz", allow_content=True)
     layout = await detect_layout(store)
-    async with await DedupRepo.open(store, layout) as repo:
-        provider = await _open_provider(repo, workload_id=5)
+    async with await DedupRepo.open(store, layout) as repo, SaasStreamCache(repo) as saas_streams:
+        provider = await _open_provider(repo, saas_streams, workload_id=5)
         try:
             top = await provider.children(provider.root())
             assert [n.name for n in top] == ["Mail"]
@@ -70,13 +71,12 @@ async def test_replayed_m365_mail_workload_resolves_to_its_real_folder_hierarchy
 ) -> None:
     store = await record_target("units_saas_mail_m365_apv1.json.gz", allow_content=True)
     layout = await detect_layout(store)
-    async with await DedupRepo.open(store, layout) as repo:
-        provider = await _open_provider(repo, workload_id=19)
+    async with await DedupRepo.open(store, layout) as repo, SaasStreamCache(repo) as saas_streams:
+        provider = await _open_provider(repo, saas_streams, workload_id=19)
         try:
             top = await provider.children(provider.root())
-            # The real mail_folder_table hierarchy resolves now -- more
-            # than the single flat bucket the old item-driven listing
-            # showed, and every one of them is a real folder, not a leaf.
+            # The real mail_folder_table hierarchy resolves to more than one
+            # top-level bucket, and every one of them is a real folder, not a leaf.
             assert len(top) > 1
             assert all(n.is_leaf is False for n in top)
             # At least one top-level folder has a real nested subfolder

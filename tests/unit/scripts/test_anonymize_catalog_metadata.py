@@ -41,9 +41,8 @@ def _load_module() -> ModuleType:
 
 @pytest.fixture
 def anon() -> ModuleType:
-    # A fresh module load already gives a fresh, empty module-level
-    # ``_VAULT_KEY_CACHE`` (see the module docstring) -- nothing to reset
-    # by hand.
+    # Nothing to reset by hand: a fresh module load already zeroes the
+    # module-level _VAULT_KEY_CACHE.
     return _load_module()
 
 
@@ -162,10 +161,9 @@ def test_same_real_value_stable_across_separate_runs(anon: ModuleType) -> None:
 def test_same_real_value_under_different_categories_gets_correlated_not_reshaped(anon: ModuleType) -> None:
     """A real string reused across two differently-categorized fields (here:
     a display name that's also a site name) intentionally gets the *same*
-    placeholder for both -- see ``_placeholder_for``'s own docstring for why
-    cross-reference correlation (the same real value reads as "the same
-    thing" everywhere) wins over each field's placeholder matching its own
-    category's shape exactly."""
+    placeholder for both -- cross-reference correlation (the same real
+    value reads as "the same thing" everywhere) wins over each field's
+    placeholder matching its own category's shape exactly."""
     resolved: dict[str, str] = {}
     data = _workload_config_db(
         {

@@ -5,9 +5,17 @@ not twice)."""
 
 from __future__ import annotations
 
+from datetime import UTC, datetime
+
 import pytest
 
-from synology_apm_repo.sdk.presentation.format import format_bytes, format_duration, format_rate, pluralize
+from synology_apm_repo.sdk.presentation.format import (
+    format_bytes,
+    format_duration,
+    format_rate,
+    format_timestamp,
+    pluralize,
+)
 
 
 def test_singular_count_returns_the_singular_form() -> None:
@@ -72,6 +80,15 @@ def test_format_duration(seconds: float, expected: str) -> None:
 )
 def test_format_rate(rate: float, unit: str, expected: str) -> None:
     assert format_rate(rate, unit) == expected
+
+
+def test_format_timestamp_renders_in_the_pinned_local_timezone() -> None:
+    # tests/conftest.py's session-scoped _fixed_timezone fixture pins the
+    # process to Asia/Taipei (+08:00, no DST observed since 1979) — same
+    # fixture catalog/version.py's _version_display_name relies on for its
+    # own local-time rendering.
+    dt = datetime.fromtimestamp(0, UTC)
+    assert format_timestamp(dt) == "1970-01-01 08:00:00"
 
 
 __all__: list[str] = []

@@ -3,8 +3,7 @@ prefix-guided descent behind ``Repository.resolve``
 and the TUI's goto-ref, plus the
 ``SupportsDirectRefLookup`` dispatch
 for a provider whose ``extra_segments`` don't grow with depth (Drive's
-shape — exercised here against a fake, not the real ``RecursiveTree``; see
-``test_units_saas_tree_strategy.py`` for that)."""
+shape — exercised here against a fake, not the real ``RecursiveTree``)."""
 
 from __future__ import annotations
 

@@ -8,8 +8,11 @@ The connector records, at backup-completion time, exactly which object
 holds each named service DB and exactly which physical location
 (``<stream_uuid>_<offset>_<length>``, the shape ``parse_object_db_id``
 parses) holds all of them — a lookup into fixed, connector-written
-bookkeeping, never a schema-scanning guess (see ``provider.py``'s own
-module docstring for why no scan fallback exists anywhere behind it).
+bookkeeping, never a schema-scanning guess: a schema-only scan could
+never safely replace this anyway, since some tables are byte-for-byte
+identical in schema across workload variants (Archive Mail's
+``mail_table`` vs. regular Mail's) and only the index's own naming, not
+the schema, can tell them apart.
 ``version_spec`` may be vault-key encrypted — see
 ``catalog.version.parse_version_spec``, the shared decrypt-then-parse
 entry point for this column. Every function here resolves to ``None``
@@ -193,11 +196,11 @@ async def read_indexed_table(
                 return await reader(source.connection)
             except (sqlite3.DatabaseError, DataCorruptError):
                 # A schema-drifted table (reader's Table.create finding
-                # a required column missing) is exactly the same "no
-                # index recorded here" shape this function's own
-                # docstring promises to degrade on, not a reason to
-                # crash the caller (or, worse, a sibling SaaS provider
-                # sharing the same version — see units/dispatch.py).
+                # a required column missing) is enrichment-grade, same as
+                # "no index recorded here": return None so the caller
+                # degrades to showing less, not a reason to crash the
+                # caller (or, worse, a sibling SaaS provider sharing the
+                # same version — see units/dispatch.py).
                 return None
         finally:
             await source.close()

@@ -1,14 +1,16 @@
 """Unit tests for ``synology_apm_repo.sdk.units.saas.tree_strategy``'s
-``SyntheticGroupedTree`` — a few of its own branches are genuinely
-unreachable through either real caller (``mail.py``/``contact.py``):
-both always supply a ``group_display_name`` resolver, so the class's own
-documented "falls back to the raw group value" default never runs via
-them; and neither ever calls ``children_of()`` with a leaf's own
-(already-2-segment) key directly. Exercised here via a minimal fake
-provider and a real, small SQLite table (through ``SqliteSource``),
-bypassing the full SaaS-provider/repository machinery this class's own
-real callers need only for unrelated reasons (META resolution, object-name
-indexing, ...) that don't affect this class's own listing logic."""
+``SyntheticGroupedTree`` and ``RecursiveGroupFlatTree`` (plus their shared
+``_resolve_order_by`` helper) — a few of ``SyntheticGroupedTree``'s own
+branches are genuinely unreachable through either real caller
+(``mail.py``/``contact.py``): both always supply a ``group_display_name``
+resolver, so the class's own documented "falls back to the raw group
+value" default never runs via them; and neither ever calls
+``children_of()`` with a leaf's own (already-2-segment) key directly.
+Exercised here via a minimal fake provider and a real, small SQLite table
+(through ``SqliteSource``), bypassing the full SaaS-provider/repository
+machinery this class's own real callers need only for unrelated reasons
+(META resolution, object-name indexing, ...) that don't affect this
+class's own listing logic."""
 
 from __future__ import annotations
 
@@ -23,11 +25,8 @@ import pytest
 from synology_apm_repo.sdk.storage.sqlite_source import SqliteSource
 from synology_apm_repo.sdk.storage.table import Column, Table
 from synology_apm_repo.sdk.units.saas.provider import SaasWorkloadProvider
-from synology_apm_repo.sdk.units.saas.tree_strategy import (
-    RecursiveGroupFlatTree,
-    SyntheticGroupedTree,
-    _resolve_order_by,
-)
+from synology_apm_repo.sdk.units.saas.tree_strategy import RecursiveGroupFlatTree, SyntheticGroupedTree
+from synology_apm_repo.sdk.units.saas.tree_strategy._base import _resolve_order_by
 
 _COLUMNS = [Column("item_id"), Column("name"), Column("folder_id", required=False)]
 
@@ -166,13 +165,21 @@ class TestResolveOrderBy:
         finally:
             await source.close()
 
+    async def test_dir_first_sql_wraps_the_resolved_clause_in_a_leading_case(self) -> None:
+        table, source = await self._table()
+        try:
+            resolved = _resolve_order_by(table, ["name"], dir_first_sql="is_folder = 1")
+            assert resolved == "(CASE WHEN is_folder = 1 THEN 0 ELSE 1 END), name, rowid"
+        finally:
+            await source.close()
+
 
 _FOLDER_COLUMNS = [Column("folder_id"), Column("folder_name"), Column("parent_folder_id")]
 _ITEM_COLUMNS = [Column("item_id"), Column("name"), Column("folder_id")]
 
 # The synthetic root anchor -- no real folder row has this as its own
 # folder_id, matching RecursiveTree's own root_id convention (see
-# tree_strategy.py's RecursiveTree docstring).
+# tree_strategy/recursive.py's RecursiveTree docstring).
 _ROOT = ""
 
 

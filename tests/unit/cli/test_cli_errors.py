@@ -1,12 +1,18 @@
 """Unit tests for ``synology_apm_repo.cli.errors``'s ``friendly_message()``
-— synthetic ``ApmRepoError``/``KeyRequiredError``/``KeyMismatchError`` instances, no
-real repository needed (see
-``tests/integration/cli/test_cli_doctor.py::test_doctor_fails_cleanly_for_an_encrypted_repo_given_no_key_replayed``
-for the real-data cross-check via `doctor`)."""
+and ``fail_from_apm_error()`` — synthetic ``ApmRepoError``/
+``KeyRequiredError``/``KeyMismatchError`` instances, no real repository
+needed."""
 
 from __future__ import annotations
 
-from synology_apm_repo.cli.errors import friendly_message
+import io
+from contextlib import redirect_stderr
+
+import pytest
+import typer
+
+from synology_apm_repo.cli.errors import fail_from_apm_error, friendly_message
+from synology_apm_repo.cli.state import CliState, ProgressMode
 from synology_apm_repo.sdk.errors import ApmRepoError, KeyMismatchError, KeyRequiredError, NotFoundError
 
 
@@ -66,6 +72,53 @@ def test_an_unrelated_apm_repo_error_strips_ref_by_default_and_restores_it_verbo
 def test_returned_message_is_a_plain_str_not_the_exception_itself() -> None:
     exc: ApmRepoError = KeyRequiredError("this repository is encrypted; call set_key() before browsing")
     assert isinstance(friendly_message(exc), str)
+
+
+# -- fail_from_apm_error() -- the shared tail every open/store skeleton uses --
+
+
+def test_fail_from_apm_error_raises_typer_exit_code_1() -> None:
+    exc = NotFoundError("nothing readable at this location", ref="/some/internal/path")
+    buf = io.StringIO()
+    with redirect_stderr(buf), pytest.raises(typer.Exit) as excinfo:
+        fail_from_apm_error(exc, CliState())
+    assert excinfo.value.exit_code == 1
+    assert excinfo.value.__cause__ is exc
+
+
+def test_fail_from_apm_error_respects_the_same_verbose_gate_as_friendly_message() -> None:
+    exc = NotFoundError("nothing readable at this location", ref="/some/internal/path")
+
+    buf = io.StringIO()
+    with redirect_stderr(buf), pytest.raises(typer.Exit):
+        fail_from_apm_error(exc, CliState(verbose=False))
+    assert "/some/internal/path" not in buf.getvalue()
+
+    buf = io.StringIO()
+    with redirect_stderr(buf), pytest.raises(typer.Exit):
+        fail_from_apm_error(exc, CliState(verbose=True))
+    assert "/some/internal/path" in buf.getvalue()
+
+
+def test_fail_from_apm_error_applies_its_own_prefix() -> None:
+    exc = ApmRepoError("connection refused")
+    buf = io.StringIO()
+    with redirect_stderr(buf), pytest.raises(typer.Exit):
+        fail_from_apm_error(exc, CliState(), prefix="connectivity check failed: ")
+    assert "connectivity check failed: connection refused" in buf.getvalue()
+
+
+def test_fail_from_apm_error_clears_a_live_progress_line_first() -> None:
+    """The clear must land *before* ``fail()``'s own error print — a
+    ``finally``-only clear would run after that print, too late to stop
+    the error message from landing on top of a dangling progress line."""
+    exc = ApmRepoError("boom")
+    buf = io.StringIO()
+    with redirect_stderr(buf), pytest.raises(typer.Exit):
+        fail_from_apm_error(exc, CliState(progress=ProgressMode.ALWAYS))
+    output = buf.getvalue()
+    assert "\x1b[2K" in output
+    assert output.index("\x1b[2K") < output.index("error:")
 
 
 __all__: list[str] = []

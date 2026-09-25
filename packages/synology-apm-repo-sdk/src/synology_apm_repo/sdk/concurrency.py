@@ -7,9 +7,8 @@ site needs and must never re-derive independently: how many worker
 processes to use, and how to dispatch a batch of independent work items to
 them with real dynamic load balancing.
 
-See ``ARCHITECTURE.md``'s "Async-native, by design" section for the
-measurement this is based on, and its "Cross-cutting shared mechanisms"
-section for this module's place alongside ``storage.store_descriptor``/
+See ``ARCHITECTURE.md``'s "Cross-cutting shared mechanisms" section for
+this module's place alongside ``storage.store_descriptor``/
 ``dedup.pool_descriptor`` (the two things a worker process needs to
 rebuild its own repository state — this module knows nothing about either).
 """
@@ -28,8 +27,9 @@ _T = TypeVar("_T")
 _R = TypeVar("_R")
 
 _MAX_WORKERS = 8
-"""Ceiling on ``default_worker_count()``'s own clamp — a starting value,
-not a universally measured one; see that function's own docstring."""
+"""Ceiling on ``default_worker_count()``'s clamp — a starting value, not a
+universally measured one (see that function's docstring for the ceiling's
+rationale)."""
 
 
 def default_worker_count() -> int:
@@ -96,7 +96,7 @@ reason: a ``ProcessPoolExecutor`` worker built by ``new_process_pool()``
 handles many work items over its lifetime, not one. ``Runner`` (stdlib,
 3.11+, this project's own floor) is exactly "an ``asyncio.run()`` whose
 ``run()`` can be called more than once against the same embedded loop" —
-its own docstring names this precise use case ("everywhere ... the
+the stdlib docstring itself names this precise use case ("everywhere ... the
 preferred single ``asyncio.run()`` call doesn't work"), so this reuses it
 rather than hand-rolling the same lazily-created-loop/cancel-pending-
 tasks/``shutdown_asyncgens``/``shutdown_default_executor``/close sequence
@@ -161,6 +161,50 @@ def preload_resource_tracker() -> None:
     """
     if os.name == "posix":
         resource_tracker.ensure_running()
+
+
+async def bounded_gather(
+    items: Iterable[_T],
+    worker: Callable[[_T], Awaitable[None]],
+    *,
+    max_concurrent: int,
+    on_done: Callable[[_T], Awaitable[None]] | None = None,
+) -> None:
+    """Runs ``worker(item)`` for every item in ``items``, concurrently,
+    bounded to at most ``max_concurrent`` in flight at once via an
+    ``asyncio.Semaphore``, inside one ``asyncio.TaskGroup`` — the shared
+    "bounded concurrent async fan-out" shape ``units.verify_reachable``'s
+    two per-bucket passes and the Browser's own per-item SharePoint
+    List-overview fetch each independently hand-rolled before this
+    existed.
+
+    ``on_done(item)``, when given, is awaited once per item *after*
+    ``worker(item)`` completes and the semaphore has already been
+    released — same reasoning as ``dispatch_to_pool``'s own
+    ``on_result`` below: a caller's own post-completion bookkeeping (a
+    progress-tick callback that may itself await, say) must not hold up
+    the next item's own dispatch by running while still counted against
+    ``max_concurrent``.
+
+    Distinct from ``dispatch_to_pool`` below: that one dispatches
+    CPU-bound work across a real ``ProcessPoolExecutor``; this one is for
+    I/O-bound async work that never leaves the event loop, so there's no
+    executor/worker-count/result-collection machinery here — ``worker``
+    owns its own error handling and result recording (typically a
+    closure over the caller's own state), and this function owns only
+    the dispatch mechanics.
+    """
+    semaphore = asyncio.Semaphore(max_concurrent)
+
+    async def _bounded(item: _T) -> None:
+        async with semaphore:
+            await worker(item)
+        if on_done is not None:
+            await on_done(item)
+
+    async with asyncio.TaskGroup() as tg:
+        for item in items:
+            tg.create_task(_bounded(item))
 
 
 async def dispatch_to_pool(

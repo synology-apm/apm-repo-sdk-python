@@ -3,9 +3,13 @@ muscle-memory, and so the whole keymap is a single place to check against
 rather than re-derived per screen.
 
 Several handlers/actions across this package (lifecycle handlers like
-``on_input_submitted``/``on_unmount``, actions like
-``action_export_selected``) are declared ``async def`` purely so they can
-``await`` an SDK call. This is legal because Textual dispatches both
+``UnitScreen.on_unmount``, actions like
+``HexPreviewScreen.action_page_forward``) are declared ``async def``
+purely so they can ``await`` an SDK call directly, in place, rather than
+dispatching to a ``@work`` method — legitimate only for a call bounded
+enough that no separate loading feedback/cancellation point is needed
+(see ``browser/README.md``'s Screen and Worker Conventions). This is
+legal because Textual dispatches both
 through ``textual._callback.invoke()``, which does ``result =
 callback(...)`` then ``if isawaitable(result): result = await result`` —
 so a coroutine function is awaited to completion rather than left as an
@@ -27,16 +31,14 @@ from textual.binding import Binding, BindingType
 #: automatically when ``Repository.key_status`` says one is needed.
 COMMON_BINDINGS: list[BindingType] = [
     Binding("q", "quit_app", "Quit"),
-    Binding("d", "toggle_verbose", "Verbose"),
+    Binding("d", "toggle_verbose", "Verbose mode"),
     Binding("question_mark", "show_help", "Help", key_display="?"),
 ]
 
 #: Navigation within a list/tree/table — ↑↓/jk + Enter/l + Esc/h
 #: (vim-style left/right doubling as back/forward). "backspace" ->
 #: "jump to parent node" is a ``Tree``-only concept (a no-op forward on
-#: ``DataTable``, which has no such action) — see `NavigableScreen.
-#: action_cursor_to_parent``/``_shared.move_cursor_to_parent`'s own
-#: docstrings for why this exists and how it behaves.
+#: ``DataTable``, which has no such action).
 NAV_BINDINGS: list[BindingType] = [
     Binding("j", "cursor_down", "Down", show=False),
     Binding("k", "cursor_up", "Up", show=False),

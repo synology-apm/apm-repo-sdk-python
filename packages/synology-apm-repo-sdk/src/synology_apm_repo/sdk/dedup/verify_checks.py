@@ -62,18 +62,22 @@ class Symptom(enum.Enum):
     DATA_MISSING = "DataMissing"
     KEY_MISSING = "KeyMissing"
     REPAIRED_VIA_PARITY = "RepairedViaParity"
-    """Not a problem left unresolved: a CRC mismatch that this SDK's own
-    Redundancy-blob self-repair (``format.redundancy.attempt_repair``) was
-    able to reconstruct and byte-for-byte confirm correct — see
-    ``check_map_and_attr_crc``'s own docstring. Reported (not silently
-    dropped) since repeated repairs against the same bucket group over
-    time is itself a signal of failing underlying storage, even though the
-    check the caller actually cared about (is this data readable) passed."""
+    """A CRC mismatch that this SDK's own Redundancy-blob self-repair
+    (``format.redundancy.attempt_repair``) was able to reconstruct and
+    byte-for-byte confirm correct. Not a problem left unresolved, but still reported (not
+    silently dropped) since repeated repairs against the same bucket
+    group over time is itself a signal of failing underlying storage,
+    even though the check the caller actually cared about (is this data
+    readable) passed."""
 
 
 class VerifyLevel(enum.Enum):
-    """How thorough a ``verify`` run is — see ``units/verify_reachable.py``'s
-    own module docstring for exactly what ``QUICK``/``FULL`` mean."""
+    """How thorough a ``verify`` run is. ``FULL`` reads and checks every
+    live chunk in a touched bucket — both its ciphertext CRC32 and, once a
+    vault key is available, its decrypt+decompress+SHA-256 fingerprint —
+    as costly as a real full export of the whole repository. ``QUICK``
+    reads no chunk content at all, only each touched bucket's own
+    structural checks; there is deliberately no sampled middle tier."""
 
     QUICK = "quick"
     FULL = "full"
@@ -142,10 +146,10 @@ async def check_repo_info(repo: DedupRepo) -> list[Finding]:
 
 async def check_composition_header(reader: CompositionReader, *, path: str) -> Finding | None:
     """The session's own ``subID=0`` sub-file header
-    (``CompositionReader.verify_header``) — "the stricter of
-    FORMAT-SPEC.md's two validation tiers", meant to be called once per
-    distinct ``(stream_id, session_id)``, not once per row/extent that
-    happens to share it."""
+    (``CompositionReader.verify_header``) — the stricter, opt-in check
+    ``CompositionReader`` itself normally skips. Meant to be called once
+    per distinct ``(stream_id, session_id)``, not once per row/extent
+    that happens to share it."""
     try:
         await reader.verify_header()
     except NotFoundError as exc:
@@ -174,7 +178,7 @@ async def check_record_head(
 async def verify_chunk_map_crc_threaded(map_array_bytes: bytes, expected_crc: int) -> None:
     """``format.composition.verify_chunk_map_crc``, with the thread-hop
     decision folded in — ``map_array_bytes`` can be a multi-hundred-MB
-    chunk-map array (see that function's own docstring), so this keeps
+    chunk-map array, so this keeps
     that rare case's ``zlib.crc32`` pass off the event loop the same way
     every other large-payload synchronous computation in this codebase
     does (``catalog/version.py::open_target_db``, ``units/fs.py``'s own
@@ -233,8 +237,8 @@ async def check_map_and_attr_crc(
     (``_attempt_map_crc_repair``), since every current-format record
     carries one (``RecordHead.has_redundancy``, checked by
     ``parse_record_head`` itself). A confirmed-correct repair is reported
-    as ``Symptom.REPAIRED_VIA_PARITY`` — see that symptom's own docstring
-    for why a successful repair still gets reported.
+    as ``Symptom.REPAIRED_VIA_PARITY`` (see that symptom for why a
+    successful repair still gets reported) rather than dropped silently.
 
     Nothing is checked when ``record_head.map_num == 0`` — an empty
     chunk-map array has nothing to CRC.
@@ -390,8 +394,7 @@ async def check_chunk_ciphertext_crcs(reader: BucketReader, chunk_indices: Seque
     """Batched ``check_chunk_ciphertext_crc``: every one of
     ``chunk_indices``'s stored bytes is fetched via
     ``reader.read_raw_chunks`` — one merged ``store.read()`` per
-    contiguous run instead of one per chunk (see that method's own
-    docstring) — before checking each against its own ``ChunkCrcStore``
+    contiguous run instead of one per chunk — before checking each against its own ``ChunkCrcStore``
     entry via ``check_raw_chunk_ciphertext_crc``. Reports each chunk that
     fails on its own, the same granularity looping
     ``check_chunk_ciphertext_crc`` would.

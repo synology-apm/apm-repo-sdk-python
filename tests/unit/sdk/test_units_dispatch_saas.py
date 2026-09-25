@@ -46,8 +46,10 @@ from synology_apm_repo.sdk.identifiers import (
 from synology_apm_repo.sdk.storage.layout import RepoKind, RepoLayout
 from synology_apm_repo.sdk.storage.local import LocalFsStore
 from synology_apm_repo.sdk.units.dispatch import SUPPORTED_SAAS_SUB_TYPES, is_supported, saas_provider_for
-from synology_apm_repo.sdk.units.saas.provider import CompositeSaasProvider, SaasWorkloadProvider, SharedSaasContext
+from synology_apm_repo.sdk.units.saas.composite_provider import CompositeSaasProvider
+from synology_apm_repo.sdk.units.saas.provider import SaasWorkloadProvider, SharedSaasContext
 from synology_apm_repo.sdk.units.saas.raw_object import RawObjectProvider
+from synology_apm_repo.sdk.units.saas.stream import SaasStreamCache
 from synology_apm_repo.sdk.units.saas.teams_chat import TeamsChatProvider
 
 _STREAM_ID = 17
@@ -134,13 +136,12 @@ def _write_copy_target_version_db(
 ) -> None:
     """The connector's own index bookkeeping
     (``synology_apm_repo.sdk.units.saas.object_name_index``) — every
-    ``SaasWorkloadProvider``/``TeamsChatProvider`` construction now
-    resolves its service DB(s) *only* through this table, with no
-    scan-based fallback, so a fixture repository that wants a table found
-    must record it here rather than merely embedding the bytes
-    somewhere in ``saas_obj``. Plain, unencrypted JSON — these fixture
-    repositories never configure a vault_key, matching every other db this
-    file writes."""
+    ``SaasWorkloadProvider``/``TeamsChatProvider`` construction resolves
+    its service DB(s) *only* through this table, with no scan-based
+    fallback, so a fixture repository that wants a table found must
+    record it here rather than merely embedding the bytes somewhere in
+    ``saas_obj``. Plain, unencrypted JSON — these fixture repositories
+    never configure a vault_key, matching every other db this file writes."""
     path.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(path)
     conn.execute("CREATE TABLE copy_target_version(version_uid TEXT PRIMARY KEY, version_spec TEXT)")
@@ -273,10 +274,10 @@ def _build_empty_saas_repo(tmp_path: Path, *, session_id: int = 20) -> None:
     """A saas_obj with no embedded ObjectDB and no ``copy_target_version``
     index bookkeeping at all (see ``_write_copy_target_version_db``
     for how these fixtures normally record that bookkeeping) — every
-    provider's location resolution must find nothing for this version,
-    the "never had one" shape
-    ``resolve_object_name_index``'s
-    own docstring lists as expected-and-safe."""
+    provider's location resolution must find nothing for this version.
+    A missing ``copy_target_version`` table is one of several
+    unrecorded-index shapes ``resolve_object_name_index`` treats as
+    expected, not corruption."""
     _write_repo_info(tmp_path / "repo_info")
     _write_vault_encryption_key_db(tmp_path / "db" / "vault_encryption_key")
     _write_connection_config(tmp_path / "db" / "connection_config", [(_CCID, _CONNECTION_ID)])
@@ -311,8 +312,8 @@ def _build_mail_and_calendar_repo(tmp_path: Path, *, session_id: int = 22) -> No
     object-name index can find the table at all, see
     ``SaasWorkloadProvider.create()``) ``mail_table`` and a real
     populated calendar service-DB pair exist in the same version — the
-    shape ``units/dispatch.py``'s own docstring says is real for M365's
-    ``USER_EXCHANGE``/``GROUP_EXCHANGE``: more than one application-layer
+    shape that's genuinely real for M365's ``USER_EXCHANGE``/
+    ``GROUP_EXCHANGE``: more than one application-layer
     candidate recognizes the same version at once, not as alternatives.
 
     Also writes real ``copy_target_version`` index bookkeeping naming
@@ -420,8 +421,7 @@ def _build_calendar_only_repo(tmp_path: Path, *, session_id: int = 21) -> None:
 
 
 def _build_contact_db(contacts: list[tuple[str, str, str, str]]) -> bytes:
-    """GWS-shaped ``contact_table`` — no folder column (see
-    ``units/saas/contact.py``'s own module docstring); each entry is
+    """GWS-shaped ``contact_table`` — no folder column; each entry is
     ``(contact_id, first_name, last_name, meta_object_id)``."""
     with tempfile.TemporaryDirectory() as td:
         path = Path(td) / "contact.db"
@@ -714,17 +714,17 @@ class TestSupportedSaasSubTypes:
     def test_genuinely_unrecognized_sub_types_are_excluded(self) -> None:
         # A made-up sub_type this connector has never heard of — not to
         # be confused with TEAM_DRIVE/GROUP_EXCHANGE, which are real,
-        # supported sub_types (DriveProvider / Mail+Contact+CalendarProvider;
-        # see units/dispatch.py's own comment).
+        # supported sub_types (DriveProvider / Mail+Contact+CalendarProvider).
         assert "SOME_FUTURE_CONNECTOR_TYPE" not in SUPPORTED_SAAS_SUB_TYPES
 
 
 class TestIsSupported:
     """``is_supported()`` is the one plain, no-I/O check
     ``api.repository.Repository.workload_is_supported()`` wraps for the CLI's
-    ``doctor`` command — see that method's own docstring for why nothing
-    outside ``sdk.api``/``sdk.units`` should import
-    ``SUPPORTED_TARGET_TYPES``/``SUPPORTED_SAAS_SUB_TYPES`` directly."""
+    ``doctor`` command — that facade method is the one place the CLI needs
+    this, so CLI/TUI code should go through it rather than importing
+    ``units.dispatch``'s ``SUPPORTED_TARGET_TYPES``/
+    ``SUPPORTED_SAAS_SUB_TYPES`` directly."""
 
     @pytest.mark.parametrize("workload_type", ["VM", "PC", "PS", "FS"])
     def test_device_and_fs_workload_types_are_supported_regardless_of_sub_type(self, workload_type: str) -> None:
@@ -756,10 +756,9 @@ class TestSaasProviderForDegradation:
             "CALENDAR",
             "TEAMS",
             "SOME_FUTURE_CONNECTOR_TYPE",  # unrecognized — degrades without attempting anything
-            "TEAM_DRIVE",  # a real, now-supported sub_type (see TestSupportedSaasSubTypes) —
-            # this is the ordinary per-version degradation every other recognized
-            # sub_type already gets when its own service DB isn't found, not a
-            # TEAM_DRIVE-specific gap.
+            "TEAM_DRIVE",  # a real, supported sub_type — this is the ordinary per-version
+            # degradation every other recognized sub_type already gets when its own
+            # service DB isn't found, not a TEAM_DRIVE-specific gap.
             "GROUP_EXCHANGE",
             None,
             "CONTACT",
@@ -776,7 +775,8 @@ class TestSaasProviderForDegradation:
         _build_empty_saas_repo(tmp_path)
         async with (
             await _open_repo(tmp_path) as repo,
-            await saas_provider_for(repo, _workload(sub_type), _version()) as provider,
+            SaasStreamCache(repo) as saas_streams,
+            await saas_provider_for(repo, _workload(sub_type), _version(), saas_streams) as provider,
         ):
             assert isinstance(provider, RawObjectProvider)
 
@@ -796,7 +796,8 @@ class TestSaasProviderForUserExchangeCandidates:
         _build_calendar_only_repo(tmp_path)
         async with (
             await _open_repo(tmp_path) as repo,
-            await saas_provider_for(repo, _workload("USER_EXCHANGE"), _version()) as provider,
+            SaasStreamCache(repo) as saas_streams,
+            await saas_provider_for(repo, _workload("USER_EXCHANGE"), _version(), saas_streams) as provider,
         ):
             assert isinstance(provider, SaasWorkloadProvider)
             assert provider.root().name == "Calendars"
@@ -805,7 +806,8 @@ class TestSaasProviderForUserExchangeCandidates:
         _build_calendar_only_repo(tmp_path)
         async with (
             await _open_repo(tmp_path) as repo,
-            await saas_provider_for(repo, _workload("CALENDAR"), _version()) as provider,
+            SaasStreamCache(repo) as saas_streams,
+            await saas_provider_for(repo, _workload("CALENDAR"), _version(), saas_streams) as provider,
         ):
             assert isinstance(provider, SaasWorkloadProvider)
             assert provider.root().name == "Calendars"
@@ -818,7 +820,8 @@ class TestSaasProviderForUserExchangeCandidates:
         _build_calendar_only_repo(tmp_path)
         async with (
             await _open_repo(tmp_path) as repo,
-            await saas_provider_for(repo, _workload("GROUP_EXCHANGE"), _version()) as provider,
+            SaasStreamCache(repo) as saas_streams,
+            await saas_provider_for(repo, _workload("GROUP_EXCHANGE"), _version(), saas_streams) as provider,
         ):
             assert isinstance(provider, SaasWorkloadProvider)
             assert provider.root().name == "Calendars"
@@ -834,20 +837,21 @@ class TestSaasProviderForUserExchangeMultipleMatches:
         _build_mail_and_calendar_repo(tmp_path)
         async with (
             await _open_repo(tmp_path) as repo,
-            await saas_provider_for(repo, _workload("USER_EXCHANGE"), _version()) as provider,
+            SaasStreamCache(repo) as saas_streams,
+            await saas_provider_for(repo, _workload("USER_EXCHANGE"), _version(), saas_streams) as provider,
         ):
             assert isinstance(provider, CompositeSaasProvider)
             groups = await provider.children(provider.root())
             assert {g.name for g in groups} == {"Mail", "Calendars"}
 
     async def test_exactly_one_match_is_returned_unwrapped(self, tmp_path: Path) -> None:
-        # Single-match behavior (see TestSaasProviderForUserExchangeCandidates
-        # above) stays unwrapped — composite wrapping is for
-        # genuinely-plural matches only.
+        # Single-match behavior stays unwrapped — composite wrapping is
+        # for genuinely-plural matches only.
         _build_calendar_only_repo(tmp_path)
         async with (
             await _open_repo(tmp_path) as repo,
-            await saas_provider_for(repo, _workload("USER_EXCHANGE"), _version()) as provider,
+            SaasStreamCache(repo) as saas_streams,
+            await saas_provider_for(repo, _workload("USER_EXCHANGE"), _version(), saas_streams) as provider,
         ):
             assert isinstance(provider, SaasWorkloadProvider)
             assert not isinstance(provider, CompositeSaasProvider)
@@ -856,7 +860,8 @@ class TestSaasProviderForUserExchangeMultipleMatches:
         _build_mail_and_calendar_repo(tmp_path)
         async with (
             await _open_repo(tmp_path) as repo,
-            await saas_provider_for(repo, _workload("USER_EXCHANGE"), _version()) as provider,
+            SaasStreamCache(repo) as saas_streams,
+            await saas_provider_for(repo, _workload("USER_EXCHANGE"), _version(), saas_streams) as provider,
         ):
             assert isinstance(provider, CompositeSaasProvider)
             with pytest.raises(ValueError, match="not a restorable unit"):
@@ -870,11 +875,17 @@ class TestSaasProviderForUserExchangeMultipleMatches:
         _build_mail_and_calendar_repo(tmp_path)
         async with (
             await _open_repo(tmp_path) as repo,
-            await saas_provider_for(repo, _workload("USER_EXCHANGE"), _version()) as provider,
+            SaasStreamCache(repo) as saas_streams,
+            await saas_provider_for(repo, _workload("USER_EXCHANGE"), _version(), saas_streams) as provider,
         ):
             assert isinstance(provider, CompositeSaasProvider)
             [calendar_group] = [g for g in await provider.children(provider.root()) if g.name == "Calendars"]
-            [calendar] = await provider.children(calendar_group)
+            # Calendar's own My/Other Calendars split sits above the
+            # calendar group itself -- this fixture's calendar has no
+            # calendar_type column at all, so it lands under the sole
+            # "My Calendars" category.
+            [my_calendars] = await provider.children(calendar_group)
+            [calendar] = await provider.children(my_calendars)
             [event] = await provider.children(calendar)
             unit = await provider.unit(event)
             data = await unit.open().read()
@@ -887,18 +898,11 @@ class TestSaasProviderForUserExchangeMultipleMatches:
         successfully before Calendar raises something other than the
         routine ``UnsupportedDataFormatError`` degrade signal — the already-built
         Mail provider must not leak; nothing else tracks it until
-        saas_provider_for actually returns. Spies on the one Mail instance
-        specifically (an instance-attribute override, found first by
-        ``getattr(provider, "close", None)``) rather than the whole
-        ``SaasWorkloadProvider`` class, since Contact — the middle
-        candidate — legitimately self-closes on its own routine
-        ``UnsupportedDataFormatError`` miss (``SaasWorkloadProvider.create()``'s
-        own, pre-existing cleanup), which would otherwise be
-        indistinguishable from the leak this test targets."""
+        saas_provider_for actually returns."""
         _build_mail_and_calendar_repo(tmp_path)
 
         async def raising_candidate(
-            repo: DedupRepo, version: Version, *, shared: SharedSaasContext | None = None
+            repo: DedupRepo, version: Version, saas_streams: SaasStreamCache, *, shared: SharedSaasContext | None = None
         ) -> SaasWorkloadProvider:
             raise RuntimeError("synthetic unexpected failure")
 
@@ -906,10 +910,16 @@ class TestSaasProviderForUserExchangeMultipleMatches:
         mail_factory = next(factory for tag, factory in candidates if tag == "mail")
         mail_close_calls: list[SaasWorkloadProvider] = []
 
+        # Spies on the one Mail instance specifically (an instance-attribute
+        # override) rather than the whole SaasWorkloadProvider class, since
+        # Contact — the middle candidate — legitimately self-closes on its
+        # own routine UnsupportedDataFormatError miss
+        # (SaasWorkloadProvider.create()'s own cleanup), which would
+        # otherwise be indistinguishable from the leak this test targets.
         async def spying_mail(
-            repo: DedupRepo, version: Version, *, shared: SharedSaasContext | None = None
+            repo: DedupRepo, version: Version, saas_streams: SaasStreamCache, *, shared: SharedSaasContext | None = None
         ) -> SaasWorkloadProvider:
-            instance = cast(SaasWorkloadProvider, await mail_factory(repo, version, shared=shared))
+            instance = cast(SaasWorkloadProvider, await mail_factory(repo, version, saas_streams, shared=shared))
             original_close = instance.close
 
             async def spy_close() -> None:
@@ -925,9 +935,9 @@ class TestSaasProviderForUserExchangeMultipleMatches:
         )
         monkeypatch.setitem(dispatch_module._SAAS_SUB_TYPE_CANDIDATES, "USER_EXCHANGE", patched)
 
-        async with await _open_repo(tmp_path) as repo:
+        async with await _open_repo(tmp_path) as repo, SaasStreamCache(repo) as saas_streams:
             with pytest.raises(RuntimeError, match="synthetic unexpected failure"):
-                await saas_provider_for(repo, _workload("USER_EXCHANGE"), _version())
+                await saas_provider_for(repo, _workload("USER_EXCHANGE"), _version(), saas_streams)
             assert len(mail_close_calls) == 1
 
     async def test_children_of_a_node_with_an_unrecognized_tag_is_empty(self, tmp_path: Path) -> None:
@@ -938,7 +948,8 @@ class TestSaasProviderForUserExchangeMultipleMatches:
         _build_mail_and_calendar_repo(tmp_path)
         async with (
             await _open_repo(tmp_path) as repo,
-            await saas_provider_for(repo, _workload("USER_EXCHANGE"), _version()) as provider,
+            SaasStreamCache(repo) as saas_streams,
+            await saas_provider_for(repo, _workload("USER_EXCHANGE"), _version(), saas_streams) as provider,
         ):
             assert isinstance(provider, CompositeSaasProvider)
             [mail_group] = [g for g in await provider.children(provider.root()) if g.name == "Mail"]
@@ -951,13 +962,14 @@ class TestSaasProviderForSingleCandidateSubTypes:
     ``_SAAS_SUB_TYPE_CANDIDATES`` gets its own resolution proof here,
     mirroring ``TestSaasProviderForUserExchangeCandidates``'s own
     ``root().name`` pattern for CALENDAR — a real match must land on the
-    *right* provider, not just "some SaaS provider."."""
+    *right* provider, not just "some SaaS provider"."""
 
     async def test_contact_sub_type_resolves_to_contact_provider(self, tmp_path: Path) -> None:
         _build_contact_repo(tmp_path)
         async with (
             await _open_repo(tmp_path) as repo,
-            await saas_provider_for(repo, _workload("CONTACT"), _version()) as provider,
+            SaasStreamCache(repo) as saas_streams,
+            await saas_provider_for(repo, _workload("CONTACT"), _version(), saas_streams) as provider,
         ):
             assert isinstance(provider, SaasWorkloadProvider)
             assert provider.root().name == "Contacts"
@@ -971,7 +983,8 @@ class TestSaasProviderForSingleCandidateSubTypes:
         _build_drive_repo(tmp_path)
         async with (
             await _open_repo(tmp_path) as repo,
-            await saas_provider_for(repo, _workload(sub_type), _version()) as provider,
+            SaasStreamCache(repo) as saas_streams,
+            await saas_provider_for(repo, _workload(sub_type), _version(), saas_streams) as provider,
         ):
             assert isinstance(provider, SaasWorkloadProvider)
             assert provider.root().name == "/"
@@ -980,7 +993,8 @@ class TestSaasProviderForSingleCandidateSubTypes:
         _build_site_repo(tmp_path)
         async with (
             await _open_repo(tmp_path) as repo,
-            await saas_provider_for(repo, _workload("SITE"), _version()) as provider,
+            SaasStreamCache(repo) as saas_streams,
+            await saas_provider_for(repo, _workload("SITE"), _version(), saas_streams) as provider,
         ):
             assert isinstance(provider, SaasWorkloadProvider)
             assert provider.root().name == "Lists"
@@ -992,7 +1006,8 @@ class TestSaasProviderForSingleCandidateSubTypes:
         _build_mail_only_repo(tmp_path)
         async with (
             await _open_repo(tmp_path) as repo,
-            await saas_provider_for(repo, _workload("MAIL"), _version()) as provider,
+            SaasStreamCache(repo) as saas_streams,
+            await saas_provider_for(repo, _workload("MAIL"), _version(), saas_streams) as provider,
         ):
             assert isinstance(provider, SaasWorkloadProvider)
             assert provider.root().name == "Mail"
@@ -1004,7 +1019,8 @@ class TestSaasProviderForSingleCandidateSubTypes:
         _build_teams_channel_repo(tmp_path)
         async with (
             await _open_repo(tmp_path) as repo,
-            await saas_provider_for(repo, _workload("TEAMS"), _version()) as provider,
+            SaasStreamCache(repo) as saas_streams,
+            await saas_provider_for(repo, _workload("TEAMS"), _version(), saas_streams) as provider,
         ):
             assert isinstance(provider, TeamsChatProvider)
             assert provider.root().name == "Channels"
@@ -1013,7 +1029,8 @@ class TestSaasProviderForSingleCandidateSubTypes:
         _build_teams_chat_repo(tmp_path)
         async with (
             await _open_repo(tmp_path) as repo,
-            await saas_provider_for(repo, _workload("USER_CHAT"), _version()) as provider,
+            SaasStreamCache(repo) as saas_streams,
+            await saas_provider_for(repo, _workload("USER_CHAT"), _version(), saas_streams) as provider,
         ):
             assert isinstance(provider, TeamsChatProvider)
             assert provider.root().name == "Chats"

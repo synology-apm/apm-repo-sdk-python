@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "synology-apm-repo-sdk"
-version = "0.1.1"
+version = "0.2.0"
 description = "Offline, read-only Python SDK for Synology APM/APV/Object-Storage dedup repository formats"
 readme = "README.md"
 license = "Apache-2.0"

@@ -2,7 +2,7 @@
 keyring-backed secret storage scheme (one item per profile, every secret
 field merged into it) and the "no plaintext fallback, ever" guarantee.
 Exercised against the in-memory ``fake_keyring`` fixture
-(``tests/conftest.py``), never the real OS keyring."""
+(``tests/unit/conftest.py``), never the real OS keyring."""
 
 from __future__ import annotations
 

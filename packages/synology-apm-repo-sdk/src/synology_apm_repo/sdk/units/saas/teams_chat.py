@@ -3,16 +3,37 @@
 ``render_channel_html`` renders each channel/chat as one self-contained
 HTML page — the unit's only exported form. The raw message DB is
 still reachable via ``RawObjectProvider`` (the CLI's ``--verbose`` / TUI's
-diagnostic mode), listed like any other unrecognized SaaS object; this
-makes the provider's own tree unusually shallow, one flat level instead
-of two.
+diagnostic mode), listed like any other unrecognized SaaS object.
+
+Channel's own tree wraps a flat, one-level listing of every channel
+(``_TeamsEntityFlatTree``) in ``tree_strategy.CategorizedGroupTree`` for
+its Standard/Private/Shared split (keyed off the real
+``channel_info_table.channel_type`` column) -- the same ``TreeStrategy``
+machinery Site/Calendar use for their own synthetic category level.
+Chat has no such concept and uses the bare, unwrapped flat tree
+directly. ``root()``/``children()`` delegate to whichever of the two
+``self._tree`` is uniformly, via that shared protocol, the same shape
+``SaasWorkloadProvider`` uses for every other SaaS workload -- this
+class still isn't built on that class itself, since its own discovery
+mechanism (below) doesn't fit the config-driven
+``tables``/``object_names`` model that class assumes. ``unit()`` needs
+no such delegation: everything it reads (``object_id``, ``degraded``)
+already lives on the ``Node`` ``children()`` built.
 
 Unlike every other SaaS provider here, Teams and Chat locate their
-service-level DBs via one shared discovery mechanism — see
-``_resolve_message_index``'s own docstring for why. Chat's own rendering
+service-level DBs via one shared discovery mechanism: the index entry
+points at an INDEX object rather than naming one service DB directly,
+since the number of channels/chats is only known at backup time.
+Chat's own rendering
 path is implemented generically from the docs' description of that
 shared mechanism (FORMAT-SPEC.md: teams-chat-containers) rather than
 from an observed instance.
+
+Every leaf this provider builds carries ``kind=UnitKind.TEAMS_CHAT_MESSAGE``
+directly, and every container (root and each channel category alike)
+declares the same value as its own ``attrs["leaf_kind"]`` — the browser
+resolves both its column set and its content-preview renderer straight off
+``UnitKind``, with no provider-specific ``attrs`` marker needed.
 """
 
 from __future__ import annotations
@@ -30,20 +51,24 @@ from ...dedup.dedup_file import DedupFile
 from ...dedup.repository import DedupRepo
 from ...errors import DataCorruptError, NotFoundError, UnsupportedDataFormatError
 from ...storage.sqlite_source import SqliteSource
-from ...storage.table import Column, Table
-from ..base import Node, RestorableUnit, UnitKind, not_restorable, paginate
+from ...storage.table import Column, Table, as_int
+from ..base import Node, RestorableUnit, UnitKind, mtime_attrs, not_restorable, paginate
 from ..content.saas_artifact import LazyArtifact
 from ..content.saas_teams_chat import render_channel_html
 from ..node_ref import NodeRef, canonical_ref_for
 from .object_name_index import ObjectNameIndex, resolve_object_name_index
 from .objectdb import ObjectDb
-from .provider import SharedSaasContext
+from .provider import SharedSaasContext, owning_account_user_info
 from .services import (
     ServiceKind,
     decompress_service_db,
     inspect_object,
 )
-from .stream import SaasStream
+from .stream import SaasStreamCache
+from .tree_strategy import CategorizedGroupTree, TreeStrategy
+
+_Key = tuple[str, ...]
+_Row = dict[str, object | None]
 
 # The two "this index entry is the channel/chat *list*" table names —
 # whichever of these appears in an index entry's own sniffed tables
@@ -59,7 +84,27 @@ _CONTAINER_TABLE_NAMES = frozenset({"channel_info_table", "chat_info_table"})
 # see _resolve_message_index's docstring.
 _CONTAINER_DB_NAMES = frozenset({"teams_channel_db", "chat_db"})
 
-_CHANNEL_COLUMNS = [Column("channel_id"), Column("name", required=False)]
+_CHANNEL_COLUMNS = [
+    Column("channel_id"),
+    Column("name", required=False),
+    Column("channel_type", required=False),
+    Column("create_time", required=False),
+]
+
+#: Real ``channel_type`` values — also Microsoft Graph's own
+#: ``membershipType`` enum, which additionally has a ``"shared"`` value
+#: never observed in real data. Each gets its own tree category
+#: (``_CHANNEL_CATEGORY_LABELS``); an unrecognized or missing value
+#: defaults to Standard.
+_CHANNEL_CATEGORY_STANDARD = "standard"
+_CHANNEL_CATEGORY_PRIVATE = "private"
+_CHANNEL_CATEGORY_SHARED = "shared"
+_CHANNEL_CATEGORIES = (_CHANNEL_CATEGORY_STANDARD, _CHANNEL_CATEGORY_PRIVATE, _CHANNEL_CATEGORY_SHARED)
+_CHANNEL_CATEGORY_LABELS = {
+    _CHANNEL_CATEGORY_STANDARD: "Standard Channels",
+    _CHANNEL_CATEGORY_PRIVATE: "Private Channels",
+    _CHANNEL_CATEGORY_SHARED: "Shared Channels",
+}
 
 # A sibling of chat_info_table inside the same decompressed chat-list
 # DB — the connector's real member list, not just the (almost always
@@ -68,7 +113,7 @@ _CHANNEL_COLUMNS = [Column("channel_id"), Column("name", required=False)]
 # ``visibleHistoryStartDateTime``, ``membershipId``, ``display_name``)
 # populated from a live Microsoft Graph membership call. This is
 # exactly where a real Microsoft Teams client itself gets an unnamed
-# chat's own display name from — see ``_chat_labels``'s own docstring.
+# chat's own display name from.
 _CHAT_MEMBERS_TABLE = "chat_members_table"
 _CHAT_MEMBERS_COLUMNS = [Column("chat_id"), Column("members")]
 
@@ -86,7 +131,9 @@ class _ChatType(enum.IntEnum):
 
 # A real Microsoft Teams client's own literal label for a MEETING chat
 # with no subject set anywhere — never derived from the attendee list,
-# see _ChatType.MEETING's own comment above.
+# even when that list is non-empty, since a MEETING chat's display name
+# always comes from the meeting's own subject, unlike an ordinary
+# group/1:1 chat's member-list fallback.
 _NO_TITLE_MEETING_LABEL = "(no title)"
 # A ONE_ON_ONE chat whose chat_members_table row lists only the
 # backed-up account itself, with no second entry at all. The other side
@@ -164,8 +211,9 @@ async def _resolve_message_index(
     # The connector's own additional_meta.db_object_ids.db_objects always
     # has exactly one "db_infos_in_snapshot" entry; its object_id is the
     # INDEX object itself, not a named service DB — resolved via the
-    # connector's own object-name index, never a scan (see provider.py's
-    # module docstring).
+    # connector's own object-name index, never a scan of the stream's
+    # content, the same direct-lookup convention every SaaS provider
+    # follows.
     object_id = object_name_index.object_ids.get("db_infos_in_snapshot")
     if object_id is None:
         return None
@@ -205,38 +253,48 @@ async def _resolve_message_index(
     return object_db, container_tables, container_object_id, entity_object_ids
 
 
-async def _channel_labels(container_bytes: bytes) -> dict[str, str]:
-    """``channel_id -> name`` from a decompressed ``channel_info_table``."""
+def _mtime_attr(create_times: dict[str, int], entity_id: str) -> dict[str, object]:
+    """``mtime_attrs(...)`` from ``create_times``'s own real create-time
+    for ``entity_id`` (see ``_channel_info``/``_chat_labels``) -- ``{}``
+    when that entity has no entry at all, or when ``units/base.py``'s
+    own ``mtime_attr`` degrades a present-but-out-of-range value (a
+    corrupt-catalog value must blank this one entity's Created cell, not
+    fail the whole listing)."""
+    return mtime_attrs(create_times.get(entity_id))
+
+
+async def _channel_info(container_bytes: bytes) -> tuple[dict[str, str], dict[str, str], dict[str, int]]:
+    """``channel_id -> name``, ``channel_id -> category``
+    (``_CHANNEL_CATEGORIES``), and ``channel_id -> create_time`` (real,
+    epoch-seconds, later turned into ``attrs["mtime"]`` by
+    ``_mtime_attr``) from one scan of a decompressed
+    ``channel_info_table``."""
     async with await SqliteSource.from_bytes(container_bytes) as src:
         table = await Table.create(src.connection, "channel_info_table", _CHANNEL_COLUMNS)
-        return {str(row["channel_id"]): str(row["name"]) async for row in table.select() if row.get("name")}
+        labels: dict[str, str] = {}
+        categories: dict[str, str] = {}
+        create_times: dict[str, int] = {}
+        async for row in table.select():
+            channel_id = str(row["channel_id"])
+            if row.get("name"):
+                labels[channel_id] = str(row["name"])
+            channel_type = row.get("channel_type")
+            categories[channel_id] = (
+                str(channel_type) if channel_type in _CHANNEL_CATEGORIES else _CHANNEL_CATEGORY_STANDARD
+            )
+            raw_create_time = row.get("create_time")
+            if raw_create_time is not None:
+                create_times[channel_id] = as_int(raw_create_time)
+        return labels, categories, create_times
 
 
 async def _owning_account_email(repo: DedupRepo, version: Version) -> str | None:
-    """The backed-up account's own email, read directly off the owning
-    ``USER_CHAT`` workload's ``workload_spec.status.entity_meta.spec
-    .user_info.email`` rather than via ``_saas_display_name`` (whose
-    bare-email fallback is untyped). A narrow ``workload_config`` read
-    by ``workload_id``, skipping ``workloads``'s unneeded joins.
-    ``None``, never raises, if not found."""
-    try:
-        table = await Table.create(
-            await repo.db("workload_config"), "workload_config", [Column("workload_id"), Column("workload_spec")]
-        )
-        row = await table.select_one("workload_id = ?", (version.workload_id,))
-        if row is None:
-            return None
-        spec = json.loads(str(row["workload_spec"]))
-        entity_spec = ((spec.get("status") or {}).get("entity_meta") or {}).get("spec") or {}
-        user_info = entity_spec.get("user_info")
-        return str(user_info["email"]) if user_info and user_info.get("email") else None
-    except (NotFoundError, ValueError, DataCorruptError, sqlite3.DatabaseError):
-        # Synthetic single-workload test repositories often have no
-        # workload_config table at all; a schema-drifted
-        # workload_config (missing workload_spec) is the same
-        # "nothing to read" shape, not a reason to crash chat/channel
-        # name resolution over an enrichment-only lookup.
-        return None
+    """The backed-up account's own email, via ``provider.py``'s shared
+    ``owning_account_user_info`` -- used instead of ``_saas_display_name``
+    (whose bare-email fallback is untyped) for an unnamed chat's own
+    member-exclusion."""
+    user_info = await owning_account_user_info(repo, version)
+    return str(user_info["email"]) if user_info and user_info.get("email") else None
 
 
 def _chat_display_name_from_members(members_json: object, self_email: str | None) -> str | None:
@@ -260,17 +318,20 @@ def _chat_display_name_from_members(members_json: object, self_email: str | None
     return ", ".join(others) if others else None
 
 
-async def _chat_labels(container_bytes: bytes, self_email: str | None) -> dict[str, str]:
+async def _chat_labels(container_bytes: bytes, self_email: str | None) -> tuple[dict[str, str], dict[str, int]]:
     """Best-effort ``chat_id -> label`` map: a chat's own ``topic``
     when set, else the same member-list-derived name a real Teams
     client synthesizes for an unnamed chat (see
     ``_chat_display_name_from_members``), sourced from
     ``chat_info_table``/``_CHAT_MEMBERS_TABLE``. Two chat shapes get a
     literal label instead — see ``_NO_TITLE_MEETING_LABEL`` and
-    ``_BOT_CHAT_LABEL``."""
+    ``_BOT_CHAT_LABEL``. Also returns ``chat_id -> create_time`` (real,
+    epoch-seconds) when present — presence-checked like every other
+    column here, not assumed fixed, since ``chat_info_table``'s real
+    schema is unconfirmed against an observed instance."""
     async with await SqliteSource.from_bytes(container_bytes) as src:
         if not await Table.exists_in(src.connection, "chat_info_table"):
-            return {}
+            return {}, {}
         cols = (await Table.create(src.connection, "chat_info_table", [])).columns_present
         # Column names are presence-checked, not assumed fixed, so a
         # future connector version's schema drift loses a label instead
@@ -278,16 +339,20 @@ async def _chat_labels(container_bytes: bytes, self_email: str | None) -> dict[s
         id_col = next((c for c in cols if c.endswith("chat_id") or c == "id"), None)
         label_col = next((c for c in cols if c in ("topic", "name", "title")), None)
         type_col = "chat_type" if "chat_type" in cols else None
+        create_time_col = "create_time" if "create_time" in cols else None
         if id_col is None:
-            return {}
+            return {}, {}
         labels: dict[str, str] = {}
         chat_type_by_id: dict[str, int] = {}
+        create_times: dict[str, int] = {}
         try:
             select_columns = [Column(id_col)]
             if label_col is not None:
                 select_columns.append(Column(label_col))
             if type_col is not None:
                 select_columns.append(Column(type_col))
+            if create_time_col is not None:
+                select_columns.append(Column(create_time_col))
             info_table = await Table.create(src.connection, "chat_info_table", select_columns)
             async for row in info_table.select():
                 chat_id = str(row[id_col])
@@ -298,8 +363,11 @@ async def _chat_labels(container_bytes: bytes, self_email: str | None) -> dict[s
                     labels[chat_id] = str(row[label_col])
                 elif chat_type == _ChatType.MEETING:
                     labels[chat_id] = _NO_TITLE_MEETING_LABEL
+                raw_create_time = row.get(create_time_col) if create_time_col is not None else None
+                if raw_create_time is not None:
+                    create_times[chat_id] = as_int(raw_create_time)
         except sqlite3.Error:
-            return {}
+            return {}, {}
 
         if await Table.exists_in(src.connection, _CHAT_MEMBERS_TABLE):
             members_table = await Table.create(src.connection, _CHAT_MEMBERS_TABLE, _CHAT_MEMBERS_COLUMNS)
@@ -313,7 +381,7 @@ async def _chat_labels(container_bytes: bytes, self_email: str | None) -> dict[s
                     continue
                 if name is not None:
                     labels[chat_id] = name
-        return labels
+        return labels, create_times
 
 
 async def _read_stickers(connection: aiosqlite.Connection) -> dict[str, dict[str, str]]:
@@ -328,6 +396,43 @@ async def _read_stickers(connection: aiosqlite.Connection) -> dict[str, dict[str
     async for row in table.select():
         result.setdefault(str(row["msg_id"]), {})[str(row["url"])] = str(row["base64_content"])
     return result
+
+
+class _TeamsEntityFlatTree:
+    """A flat ``TreeStrategy`` over one already-resolved channel/chat
+    listing -- no I/O of its own, since ``TeamsChatProvider.create``
+    already parsed the whole index up front. Every entity is a leaf at
+    key ``(entity_id,)``; there is nothing deeper to descend into.
+    Wrapped in ``CategorizedGroupTree`` for Channel's own Standard/
+    Private/Shared split (``TeamsChatProvider.create``); used bare for
+    Chat, which has no such concept."""
+
+    def __init__(self, entity_object_ids: dict[str, str], labels: dict[str, str]) -> None:
+        self._entity_object_ids = entity_object_ids
+        self._labels = labels
+
+    async def children_of(
+        self, key: _Key, *, offset: int = 0, limit: int | None = None
+    ) -> list[tuple[_Key, str, bool]]:
+        if key != ():
+            return []  # a leaf's own key -- genuinely has no children
+        entries = [
+            ((entity_id,), self._labels.get(entity_id, entity_id), True) for entity_id in self._entity_object_ids
+        ]
+        # Alphabetical by name -- the channel/chat index's own on-disk
+        # order isn't otherwise meaningful, and this is the only level
+        # this tree ever has.
+        entries.sort(key=lambda entry: entry[1])
+        return paginate(entries, offset, limit)
+
+    def row_for(self, key: _Key) -> _Row | None:
+        if len(key) != 1:
+            return None
+        (entity_id,) = key
+        object_id = self._entity_object_ids.get(entity_id)
+        if object_id is None:
+            return None
+        return {"entity_id": entity_id, "object_id": object_id}
 
 
 class TeamsChatProvider:
@@ -346,28 +451,54 @@ class TeamsChatProvider:
     _is_channel: bool
     _chat_schema_found: bool
     _labels: dict[str, str]
+    #: ``entity_id -> create_time`` (real, epoch-seconds) for whichever
+    #: entity this provider lists (channels or chats) — the browser's own
+    #: "Created" column, via each container's own
+    #: ``attrs["leaf_kind"] = UnitKind.TEAMS_CHAT_MESSAGE``. Possibly
+    #: missing entries even when non-empty (Chat's own schema is
+    #: presence-checked, not guaranteed — see ``_chat_labels``).
+    _create_times: dict[str, int]
+    #: Channel's own ``_TeamsEntityFlatTree`` wrapped in
+    #: ``CategorizedGroupTree`` for the Standard/Private/Shared split;
+    #: Chat's own bare ``_TeamsEntityFlatTree`` -- ``root()``/
+    #: ``children()`` delegate uniformly to whichever this is, via the
+    #: shared ``TreeStrategy`` protocol both shapes implement.
+    _tree: TreeStrategy
 
     def __init__(self, repo: DedupRepo, version: Version) -> None:
         """Pure field initialization; ``create`` does the real work."""
         self._repo = repo
         self._version = version
-        self._stream = SaasStream(repo, version.connection_config_id, version.saas_stream_uuid)
 
     @classmethod
-    async def create(cls, repo: DedupRepo, version: Version, *, shared: SharedSaasContext | None = None) -> Self:
-        """``shared`` is accepted only for calling-convention uniformity
+    async def create(
+        cls,
+        repo: DedupRepo,
+        version: Version,
+        saas_streams: SaasStreamCache,
+        *,
+        shared: SharedSaasContext | None = None,
+    ) -> Self:
+        """``saas_streams`` is borrowed, not owned — the version's
+        ``saas_obj`` is opened via the caller's shared ``SaasStreamCache``
+        rather than a private ``SaasStream`` this provider would otherwise
+        need to close itself.
+
+        ``shared`` is accepted only for calling-convention uniformity
         with ``units/dispatch.py``'s ``_ProviderFactory`` — ``TEAMS``/
         ``USER_CHAT`` never offer more than this one candidate, so it
         is always ``None`` in practice and unused here: Teams/Chat's
-        channel/chat index discovery is its own mechanism (see this
-        module's own docstring), not the ``saas_obj``/object-name-index
-        resolution ``SharedSaasContext`` carries."""
+        channel/chat index discovery resolves its own INDEX object (see
+        ``_resolve_message_index``) rather than the
+        ``saas_obj``/object-name-index resolution ``SharedSaasContext``
+        carries."""
         self = cls(repo, version)
         try:
-            self._dedup_file = await self._stream.open_saas_obj(version)
+            self._dedup_file = await saas_streams.open_saas_obj(version)
 
-            # The sole discovery mechanism — see _resolve_message_index's own
-            # docstring.
+            # The sole discovery mechanism — resolves the object-name
+            # index, then locates and validates the channel/chat INDEX
+            # object within it.
             object_name_index = await resolve_object_name_index(repo, version)
             found = await _resolve_message_index(self._dedup_file, object_name_index)
             if found is None:
@@ -382,29 +513,44 @@ class TeamsChatProvider:
             offset, length = await self._db.get(container_object_id)
             container_bytes = await decompress_service_db(await self._dedup_file.read(offset, length))
             if self._is_channel:
-                self._labels = await _channel_labels(container_bytes)
+                self._labels, channel_categories, self._create_times = await _channel_info(container_bytes)
+                inner = _TeamsEntityFlatTree(self._entity_object_ids, self._labels)
+                # Every real leaf entity gets a category, defaulting to
+                # Standard when channel_info_table's own row is missing
+                # one (or the entity has no row there at all) --
+                # CategorizedGroupTree's own categories dict must cover
+                # every member it's asked to place, unlike
+                # channel_categories above, which is scoped to whatever
+                # channel_info_table itself contains.
+                categories_for_tree = {
+                    entity_id: channel_categories.get(entity_id, _CHANNEL_CATEGORY_STANDARD)
+                    for entity_id in self._entity_object_ids
+                }
+                self._tree = CategorizedGroupTree(
+                    inner, categories=categories_for_tree, labels=_CHANNEL_CATEGORY_LABELS
+                )
             else:
                 self_email = await _owning_account_email(repo, version)
-                self._labels = await _chat_labels(container_bytes, self_email)
+                self._labels, self._create_times = await _chat_labels(container_bytes, self_email)
+                self._tree = _TeamsEntityFlatTree(self._entity_object_ids, self._labels)
         except Exception:
             # No index found (the routine degrade-to-RawObjectProvider case,
             # not just a corrupt-data one) or any later failure — either way
-            # self._stream (and, once assigned, self._db) must not leak.
+            # self._db, once assigned, must not leak.
             await self.close()
             raise
         return self
 
     async def close(self) -> None:
-        """Release every sqlite connection this provider owns: ``_db``
-        and ``_stream`` — ``SaasStream`` holds two more ``SqliteSource``s
-        of its own (``saas_snapshot``/
-        ``saas_version``). Tolerates ``_db`` never having been assigned
-        (``create()`` failing before it resolved an index), so it's safe
-        to call from ``create()``'s own failure path."""
+        """Release every sqlite connection this provider owns: ``_db``.
+        Tolerates ``_db`` never having been assigned (``create()`` failing
+        before it resolved an index), so it's safe to call from
+        ``create()``'s own failure path. The version's own stream is
+        borrowed from the caller's ``SaasStreamCache``, not owned here, so
+        there's nothing of its own to release."""
         db = getattr(self, "_db", None)
         if db is not None:
             await db.close()
-        await self._stream.close()
 
     async def __aenter__(self) -> Self:
         return self
@@ -425,32 +571,52 @@ class TeamsChatProvider:
     def root(self) -> Node:
         """Pure construction — no I/O, so this stays synchronous (see
         ``UnitProvider``)."""
-        return Node(ref=self._ref(), name="Channels" if self._is_channel else "Chats", is_leaf=False)
+        return Node(
+            ref=self._ref(),
+            name="Channels" if self._is_channel else "Chats",
+            is_leaf=False,
+            attrs={"key": (), "leaf_kind": UnitKind.TEAMS_CHAT_MESSAGE},
+        )
 
     async def children(self, node: Node, offset: int = 0, limit: int | None = None) -> list[Node]:
         # This one body genuinely does no I/O — ``create`` already read
         # the whole channel/chat index — but ``children()`` is async
         # across every provider (see ``units/base.py``'s ``UnitProvider``).
-        nodes = [
-            Node(
-                ref=self._ref(entity_id),
-                name=self._labels.get(entity_id, entity_id),
-                is_leaf=True,
-                kind=UnitKind.RAW_OBJECT,
-                attrs={"entity_id": entity_id, "object_id": object_id, "degraded": self._degraded_reason(entity_id)},
+        # A node with no "key" attr at all is not one this provider ever
+        # built -- same guard, same rationale, as SaasWorkloadProvider's
+        # own ``children()``.
+        if "key" not in node.attrs:
+            return []
+        key = tuple(node.attrs["key"])
+        entries = await self._tree.children_of(key, offset=offset, limit=limit)
+        return [self._node_for(child_key, name, is_leaf) for child_key, name, is_leaf in entries]
+
+    def _node_for(self, key: _Key, name: str, is_leaf: bool) -> Node:
+        if not is_leaf:
+            return Node(
+                ref=self._ref(*key),
+                name=name,
+                is_leaf=False,
+                attrs={"key": key, "leaf_kind": UnitKind.TEAMS_CHAT_MESSAGE},
             )
-            for entity_id, object_id in self._entity_object_ids.items()
-        ]
-        return paginate(nodes, offset, limit)
+        row = self._tree.row_for(key)
+        attrs: dict[str, object] = {"key": key}
+        if row is not None:
+            entity_id = str(row["entity_id"])
+            attrs["entity_id"] = entity_id
+            attrs["object_id"] = row["object_id"]
+            attrs["degraded"] = self._degraded_reason(entity_id)
+            attrs.update(_mtime_attr(self._create_times, entity_id))
+        return Node(ref=self._ref(*key), name=name, is_leaf=True, kind=UnitKind.TEAMS_CHAT_MESSAGE, attrs=attrs)
 
     def _degraded_reason(self, entity_id: str) -> str | None:
         # The resilience principle, applied at leaf granularity rather
         # than provider granularity: Chat's list is real (we did find and
         # parse the index) — most real chats resolve to a real,
         # member-list-derived name (_chat_labels), but two real cases
-        # still don't (_chat_labels's own docstring): a real Meet chat
-        # with no subject set, or a 1:1 chat whose own member list has no
-        # real counterpart to name it from. The two "no label" causes are
+        # still don't: a real Meet chat with no subject set, or a 1:1
+        # chat whose own member list has no real counterpart to name it
+        # from. The two "no label" causes are
         # distinguished for a diagnostic-mode caller: schema genuinely
         # absent (id shown because nothing here was even parseable) vs
         # schema present but this specific chat's own topic/member list

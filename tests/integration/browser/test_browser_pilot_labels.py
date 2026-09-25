@@ -27,9 +27,10 @@ from textual.widgets.tree import TreeNode
 
 import synology_apm_repo.browser.screens.connect_dialog as connect_dialog_module
 from synology_apm_repo.browser.app import ApmRepoBrowserApp
-from synology_apm_repo.browser.screens.browse_screen import BrowseScreen, CatalogEntry
+from synology_apm_repo.browser.screens.browse_screen import BrowseScreen
 from synology_apm_repo.browser.screens.connect_dialog import ConnectDialog
 from synology_apm_repo.browser.screens.key_dialog import KeyDialog
+from synology_apm_repo.sdk.api import Catalog
 from synology_apm_repo.sdk.storage.base import ObjectStore
 
 
@@ -121,6 +122,8 @@ def test_selecting_a_connection_on_an_encrypted_repo_blocks_workloads_and_auto_p
     open_browser_pilot: Any,
     wait_until: Any,
     record_target: Callable[[str], Awaitable[ObjectStore]],
+    focus_widget: Any,
+    sdk_timeout: float,
 ) -> None:
     async def scenario() -> bool:
         await _patch_local_store(
@@ -131,9 +134,9 @@ def test_selecting_a_connection_on_an_encrypted_repo_blocks_workloads_and_auto_p
             await pilot.pause()
             await open_browser_pilot(app, pilot, tmp_path)
             cat_tree = app.screen.query_one("#col-catalogs", Tree)
-            cat_tree.focus()
+            await focus_widget(pilot, cat_tree)
             await pilot.press("enter")
-            await wait_until(pilot, lambda: isinstance(app.screen, KeyDialog), timeout=0.4, interval=0.02)
+            await wait_until(pilot, lambda: isinstance(app.screen, KeyDialog), timeout=sdk_timeout, interval=0.02)
             return isinstance(app.screen, KeyDialog)
 
     assert asyncio.run(scenario()), "selecting an encrypted connection never auto-popped KeyDialog"
@@ -145,6 +148,8 @@ def test_label_updates_to_key_verified_after_a_real_key_is_provided_replayed(
     open_browser_pilot: Any,
     wait_until: Any,
     record_target: Callable[[str], Awaitable[ObjectStore]],
+    focus_widget: Any,
+    sdk_timeout: float,
 ) -> None:
     #: apv-sample-2-encrypted's real vault key — see
     #: ``tests/integration/sdk/test_units_disk_fs.py``'s own
@@ -166,9 +171,9 @@ def test_label_updates_to_key_verified_after_a_real_key_is_provided_replayed(
             before = str(tree.root.children[0].label)
 
             cat_tree = browse_screen.query_one("#col-catalogs", Tree)
-            cat_tree.focus()
+            await focus_widget(pilot, cat_tree)
             await pilot.press("enter")
-            await wait_until(pilot, lambda: isinstance(app.screen, KeyDialog), timeout=0.4, interval=0.02)
+            await wait_until(pilot, lambda: isinstance(app.screen, KeyDialog), timeout=sdk_timeout, interval=0.02)
             assert isinstance(app.screen, KeyDialog), app.screen
 
             wl_tree_before = browse_screen.query_one("#col-workloads", Tree)
@@ -176,14 +181,14 @@ def test_label_updates_to_key_verified_after_a_real_key_is_provided_replayed(
 
             key_input = app.screen.query_one("#key-input", Input)
             key_input.value = key_string
-            key_input.focus()
+            await focus_widget(pilot, key_input)
             await pilot.press("enter")
-            await wait_until(pilot, lambda: isinstance(app.screen, BrowseScreen), timeout=0.9, interval=0.03)
+            await wait_until(pilot, lambda: isinstance(app.screen, BrowseScreen), timeout=sdk_timeout, interval=0.03)
             assert isinstance(app.screen, BrowseScreen), app.screen
             assert app.screen is browse_screen
 
             wl_tree_after = browse_screen.query_one("#col-workloads", Tree)
-            await wait_until(pilot, lambda: wl_tree_after.root.children, timeout=0.9, interval=0.03)
+            await wait_until(pilot, lambda: wl_tree_after.root.children, timeout=sdk_timeout, interval=0.03)
 
             after = str(tree.root.children[0].label)
             return before, after, blocked_child_count
@@ -200,6 +205,9 @@ def test_cancelling_the_key_dialog_leaves_the_workload_list_blocked_replayed(
     open_browser_pilot: Any,
     wait_until: Any,
     record_target: Callable[[str], Awaitable[ObjectStore]],
+    focus_widget: Any,
+    ui_timeout: float,
+    sdk_timeout: float,
 ) -> None:
     async def scenario() -> tuple[bool, int]:
         await _patch_local_store(
@@ -210,13 +218,13 @@ def test_cancelling_the_key_dialog_leaves_the_workload_list_blocked_replayed(
             await pilot.pause()
             await open_browser_pilot(app, pilot, tmp_path)
             cat_tree = app.screen.query_one("#col-catalogs", Tree)
-            cat_tree.focus()
+            await focus_widget(pilot, cat_tree)
             await pilot.press("enter")
-            await wait_until(pilot, lambda: isinstance(app.screen, KeyDialog), timeout=0.4, interval=0.02)
+            await wait_until(pilot, lambda: isinstance(app.screen, KeyDialog), timeout=sdk_timeout, interval=0.02)
             assert isinstance(app.screen, KeyDialog), app.screen
 
             await pilot.press("escape")
-            await wait_until(pilot, lambda: isinstance(app.screen, BrowseScreen), timeout=0.4, interval=0.02)
+            await wait_until(pilot, lambda: isinstance(app.screen, BrowseScreen), timeout=ui_timeout, interval=0.02)
             assert isinstance(app.screen, BrowseScreen), app.screen
 
             wl_tree = app.screen.query_one("#col-workloads", Tree)
@@ -256,6 +264,8 @@ def test_workload_type_groups_use_proper_gws_and_m365_vendor_names_replayed(
     open_browser_pilot: Any,
     wait_until: Any,
     record_target: Callable[[str], Awaitable[ObjectStore]],
+    focus_widget: Any,
+    sdk_timeout: float,
 ) -> None:
     async def scenario() -> tuple[set[str], set[str]]:
         await _patch_local_store(monkeypatch, record_target, "tui_labels_apv1_pilot.json.gz", "apv-sample-1")
@@ -271,13 +281,16 @@ def test_workload_type_groups_use_proper_gws_and_m365_vendor_names_replayed(
             jy_node = next(
                 n
                 for n in repo_node.children
-                if isinstance(n.data, CatalogEntry) and n.data.catalog.connection.connection_config_id == 1
+                if n.data is not None
+                and isinstance(n.data.payload, Catalog)
+                and n.data.payload.connection.connection_config_id == 1
             )
+            _ = cat_tree._tree_lines  # forces the line map to rebuild; see move_cursor_to's docstring
             cat_tree.move_cursor(jy_node)
-            cat_tree.focus()
+            await focus_widget(pilot, cat_tree)
             await pilot.press("enter")
             wl_tree = app.screen.query_one("#col-workloads", Tree)
-            await wait_until(pilot, lambda: wl_tree.root.children, timeout=3.0, interval=0.03)
+            await wait_until(pilot, lambda: wl_tree.root.children, timeout=sdk_timeout, interval=0.03)
             root_labels = {str(g.label) for g in wl_tree.root.children}
             return root_labels, _all_node_labels(wl_tree.root)
 

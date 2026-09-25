@@ -116,7 +116,7 @@ class TestResolveCatalogIndexMissingLocation:
     ) -> None:
         """The decrypt+parse step itself is ``catalog.version.parse_version_spec``
         (shared with ``catalog/version.py``'s own status filter) — this
-        module no longer has its own decrypt/detect logic to fail
+        module has no decrypt/detect logic of its own to fail
         independently, so any failure there (wrong key, corrupt ciphertext,
         ...) is exercised here by monkeypatching that shared function
         directly rather than re-deriving one of its own failure modes."""
@@ -284,16 +284,14 @@ class TestResolveCatalogIndexHappyPath:
     async def test_plaintext_version_spec_under_a_vault_key_now_returns_none(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """Regression for the intentional behavior change from unifying on
-        ``catalog.version.parse_version_spec``'s unconditional-decrypt-
-        when-vault_key-present rule: the identical, otherwise-well-formed
-        plaintext ``version_spec`` from
+        """``catalog.version.parse_version_spec`` decrypts unconditionally
+        whenever a vault_key is present, never probing whether a row is
+        already plaintext first — production never lands a plaintext row
+        under an encrypted connection anyway. So the identical,
+        otherwise-well-formed plaintext ``version_spec`` from
         ``test_well_formed_spec_resolves_a_real_object_name_index`` above
-        now resolves to ``None`` once a vault_key is present, rather than
-        being parsed as plaintext first — production never lands a
-        plaintext row under an encrypted connection (see
-        ``parse_version_spec``'s own docstring), so this is the intended
-        new behavior, not a regression to walk back."""
+        resolves to ``None`` here once a vault_key is present, instead of
+        being parsed as plaintext."""
         additional_meta = json.dumps(
             {
                 "object_db_id": "stream-abc_100_200",
@@ -310,8 +308,8 @@ class TestResolveCatalogIndexHappyPath:
     async def test_vault_key_decrypt_success_resolves_a_real_object_name_index(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """Distinct from ``test_a_decrypt_failure_returns_none`` above: here
-        ``decrypt_version_spec`` is NOT monkeypatched — real AES-256-CTR
+        """Distinct from ``test_a_parse_version_spec_failure_returns_none``
+        above: here ``decrypt_version_spec`` is NOT monkeypatched — real AES-256-CTR
         ciphertext, built the same way ``test_format_crypto.py``'s own
         ``TestDecryptVersionSpec`` round-trip test does (encrypt side of the
         same primitives, never by calling back into the decrypt helper under
@@ -544,7 +542,7 @@ class TestReadGroupedNames:
     async def test_happy_path_falls_back_to_the_raw_id_for_an_unresolved_group(self) -> None:
         """A real definitions table plus a real membership table, resolved
         end to end through the object-name index (no monkeypatching) — exercises
-        object_name_index.py:282's own fallback (``names.get(group_id,
+        object_name_index.py's own fallback (``names.get(group_id,
         group_id)``) for a membership row whose ``group_id`` has no matching
         definition."""
         def_blob = _build_zstd_sqlite_blob_with_rows(

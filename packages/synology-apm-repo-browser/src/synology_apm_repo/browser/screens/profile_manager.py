@@ -1,17 +1,17 @@
 """``SavedProfileManager``: ``ConnectDialog``'s saved-connection-profile
 CRUD (list/load/save/delete), split out for the same reason
-``goto_walker.py``'s ``GotoChainWalker`` is split out of ``UnitScreen`` —
-see that module's own docstring for the convention this follows. Held by
-``ConnectDialog`` as a private collaborator, reaching back into it only
-through the small public surface it exposes for this
-(``validated_store_for``, ``refresh_profile_lists``, plus Textual's own
-``query_one``).
+``goto_walker.py``'s ``GotoChainWalker`` is split out of ``UnitScreen``:
+held privately, reaching back into the screen that owns it only through
+the small public surface it exposes for this
+(``validated_store_for``, ``refresh_profile_lists``, the ``naming_profile``
+reactive, ``post_message``, plus Textual's own ``query_one``).
 
 Also owns the S3/Azure/SMB backend vocabulary (``_ProfileBackend``) —
 nothing outside profile persistence and ``ConnectDialog``'s own backend
 dispatch needs it. The per-backend field table itself is owned by
 ``sdk.profiles`` (``ProfileFieldSpec``/``form_fields_for``), not this
-module — see that module's own docstring.
+module: it's shared, identically, by the CLI and TUI, so keeping it in
+the SDK avoids each surface maintaining its own copy.
 """
 
 from __future__ import annotations
@@ -20,6 +20,7 @@ import enum
 from collections.abc import Mapping
 from typing import TYPE_CHECKING
 
+from textual.message import Message
 from textual.widgets import Checkbox, Input, Select, Static
 
 from synology_apm_repo.browser.screens._shared import show_error
@@ -67,12 +68,18 @@ _BACKEND_KIND: dict[_ProfileBackend, BackendKind] = {
 
 
 class SavedProfileManager:
+    class ProfilesRefreshed(Message):
+        """Posted after ``refresh_lists`` re-reads ``profiles.json`` --
+        handled by ``ConnectDialog.on_saved_profile_manager_profiles_refreshed``,
+        the sole place that writes the three per-backend ``Select``
+        widgets this carries the data for."""
+
+        def __init__(self, profiles: list[ProfileSummary]) -> None:
+            self.profiles = profiles
+            super().__init__()
+
     def __init__(self, dialog: ConnectDialog) -> None:
         self._dialog = dialog
-        # Which tab's inline "save as profile" name row is currently
-        # open, if any — Esc while it's open must close only that row,
-        # not the whole dialog (see ConnectDialog.action_cancel).
-        self.naming_profile: _ProfileBackend | None = None
 
     @staticmethod
     def _field_widget_id(prefix: str, field: ProfileFieldSpec) -> str:
@@ -108,24 +115,10 @@ class SavedProfileManager:
         prompt — a successful live connection is never required."""
         if await self._dialog.validated_store_for(backend) is None:
             return
-        self.naming_profile = backend
-        name_input = self._dialog.query_one(f"#connect-{backend}-profile-name-input", Input)
-        name_input.value = ""
-        self._dialog.query_one(f"#connect-{backend}-profile-name-row").add_class("-visible")
-        name_input.focus()
+        self._dialog.naming_profile = backend
 
     def hide_name_row(self) -> None:
-        if self.naming_profile is None:
-            return
-        self._dialog.query_one(f"#connect-{self.naming_profile}-profile-name-row").remove_class("-visible")
-        self.naming_profile = None
-
-    def populate_select(self, backend: _ProfileBackend, profiles: list[ProfileSummary]) -> None:
-        kind = _BACKEND_KIND[backend]
-        names = [p.name for p in profiles if p.kind is kind]
-        self._dialog.query_one(f"#connect-{backend}-profile-select", Select).set_options(
-            [(name, name) for name in names]
-        )
+        self._dialog.naming_profile = None
 
     async def refresh_lists(self) -> None:
         try:
@@ -135,14 +128,12 @@ class SavedProfileManager:
             # same broad-catch rationale as ConnectDialog._scan()'s own.
             show_error(self._dialog, "#connect-status", exc)
             return
-        self.populate_select(_ProfileBackend.S3, profiles)
-        self.populate_select(_ProfileBackend.AZURE, profiles)
-        self.populate_select(_ProfileBackend.SMB, profiles)
+        self._dialog.post_message(self.ProfilesRefreshed(profiles))
 
     async def load_selected(self, backend: _ProfileBackend, name: str) -> None:
         try:
             fields = await load_profile(name)
-        except Exception as exc:  # see refresh_lists's own comment.
+        except Exception as exc:  # Same guard as refresh_lists above.
             show_error(self._dialog, "#connect-status", exc)
             return
         self.refill(backend, form_fields_for(_BACKEND_KIND[backend]), fields)
@@ -157,11 +148,15 @@ class SavedProfileManager:
         fields = self.fields(backend, form_fields_for(kind))
         try:
             await save_profile(name, kind, fields)
-        except Exception as exc:  # see refresh_lists's own comment.
+        except Exception as exc:  # Same guard as refresh_lists above.
             show_error(self._dialog, "#connect-status", exc)
             return
         self.hide_name_row()
-        status.update(f"saved profile {safe(name)!r}")
+        # repr() (real-value quoting/escaping) runs before safe() (markup
+        # escaping + RTL-isolate wrap) -- the reverse order would have
+        # safe()'s isolate marks re-escaped as visible text by repr()'s
+        # own non-printable-character handling.
+        status.update(f"saved profile {safe(repr(name))}")
         self._dialog.refresh_profile_lists()
 
     async def delete_selected(self, backend: _ProfileBackend) -> None:
@@ -171,8 +166,10 @@ class SavedProfileManager:
         status = self._dialog.query_one("#connect-status", Static)
         try:
             await delete_profile(value)
-        except Exception as exc:  # see refresh_lists's own comment.
+        except Exception as exc:  # Same guard as refresh_lists above.
             show_error(self._dialog, "#connect-status", exc)
             return
-        status.update(f"deleted profile {safe(value)!r}")
+        # Same repr()-before-safe() ordering as confirm_save(), and for
+        # the same reason.
+        status.update(f"deleted profile {safe(repr(value))}")
         self._dialog.refresh_profile_lists()

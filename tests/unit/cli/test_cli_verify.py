@@ -42,8 +42,8 @@ def _fake_session(monkeypatch: pytest.MonkeyPatch) -> None:
             pass
 
     # verify.py doesn't import Session itself — Session() lives inside
-    # cli.browse.opened_repo(), so that's the module this patches.
-    monkeypatch.setattr("synology_apm_repo.cli.browse.Session", _FakeSession)
+    # cli.repo_session.opened_repo(), so that's the module this patches.
+    monkeypatch.setattr("synology_apm_repo.cli.repo_session.Session", _FakeSession)
 
 
 def test_json_output_shows_the_real_path(tmp_path: Path) -> None:
@@ -82,7 +82,7 @@ def test_human_output_renders_a_bracketed_path_and_detail_literally(
         async def close(self) -> None:
             pass
 
-    monkeypatch.setattr("synology_apm_repo.cli.browse.Session", _FakeSession)
+    monkeypatch.setattr("synology_apm_repo.cli.repo_session.Session", _FakeSession)
 
     result = runner.invoke(app, ["verify", str(tmp_path)])
     assert result.exit_code == 0, result.output
@@ -128,7 +128,7 @@ class TestRefVerboseGating:
             async def close(self) -> None:
                 pass
 
-        monkeypatch.setattr("synology_apm_repo.cli.browse.Session", _FakeSession)
+        monkeypatch.setattr("synology_apm_repo.cli.repo_session.Session", _FakeSession)
 
     def test_json_output_hides_ref_without_verbose(self, tmp_path: Path) -> None:
         result = runner.invoke(app, ["--json", "verify", str(tmp_path)])
@@ -166,24 +166,26 @@ def _patch_verify_findings(monkeypatch: pytest.MonkeyPatch, findings: list[Findi
         async def close(self) -> None:
             pass
 
-    monkeypatch.setattr("synology_apm_repo.cli.browse.Session", _FakeSession)
+    monkeypatch.setattr("synology_apm_repo.cli.repo_session.Session", _FakeSession)
 
 
 class TestGroupingAndSorting:
-    """``_group_report``/``_sort_key`` (``commands/verify.py``): repeated
-    findings that share a root cause collapse into one header + one line
-    per instance, and findings render in a stable, chronological order
-    regardless of discovery order — see each test's own docstring for the
-    specific shape it pins down."""
+    """End-to-end checks that the CLI's ``verify`` command still renders
+    grouped output correctly through ``sdk.dedup.verify_report``'s
+    ``group_findings``/``sort_key`` — the detailed grouping-collision/
+    template/ref-vs-fallback/sort-order logic itself is tested directly,
+    at the SDK layer, in
+    ``tests/unit/sdk/test_dedup_verify_report.py``; this class only
+    covers what's genuinely CLI-specific: rendering shape, ``--json``
+    output, and ``--verbose`` gating."""
 
     def test_repeated_findings_sharing_one_ref_collapse_into_one_group(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:
-        """Two versions whose detail names the exact same missing/stale
-        object (``[ref=shared-obj]``, identical in both) collapse into
-        one group — grouping's primary key, per Part D.1. The header
-        shows that concrete ref once; per-instance lines no longer repeat
-        it (it's the same value for every member, by construction)."""
+        """Smoke test that ``group_findings``'s own grouping actually
+        reaches the rendered output: two versions sharing one ``ref``
+        collapse into one header + one line per instance, not two
+        separate headers."""
         findings = [
             Finding(
                 Stage.VERSION,
@@ -207,169 +209,6 @@ class TestGroupingAndSorting:
         assert unwrapped.count("[ref=shared-obj]") == 1  # shown once, in the header -- not once per instance
         assert "wl-a/2026-01-01 00:00:01" in unwrapped
         assert "wl-b/2026-01-01 00:00:02" in unwrapped
-
-    def test_a_spec_tag_stays_placeholdered_even_in_a_ref_based_group(
-        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-    ) -> None:
-        """``keep_ref=True`` only exempts the ``ref`` tag specifically —
-        the header's own representative text still abstracts a separate
-        ``[spec=...]`` tag (``ApmRepoError``'s other optional forensics
-        field) away to a bare ``[spec]`` placeholder, since nothing
-        establishes it's constant across the group the way ``ref`` itself
-        is by construction; the real per-instance value still shows on
-        each instance's own line regardless (same as any other
-        instance-specific value, e.g. a digit or quoted path)."""
-        findings = [
-            Finding(
-                Stage.VERSION,
-                Symptom.DATA_MISSING,
-                "wl-a/2026-01-01 00:00:01",
-                "no file_map entry for path 'shared-obj' [ref=shared-obj] [spec=FORMAT-SPEC.md: A]",
-            ),
-            Finding(
-                Stage.VERSION,
-                Symptom.DATA_MISSING,
-                "wl-b/2026-01-01 00:00:02",
-                "no file_map entry for path 'shared-obj' [ref=shared-obj] [spec=FORMAT-SPEC.md: B]",
-            ),
-        ]
-        _patch_verify_findings(monkeypatch, findings)
-        result = runner.invoke(app, ["verify", str(tmp_path)])
-        assert result.exit_code == 0, result.output
-        lines = result.output.replace("\n", "").split("  ")  # crude but enough to isolate the header line
-        header = next(line for line in lines if line.startswith("[DataMissing]"))
-        assert "[ref=shared-obj]" in header  # the ref tag: verbatim, shown once, in the header
-        assert "[spec]" in header  # the spec tag: still placeholdered in the header, unlike ref
-        assert "FORMAT-SPEC.md" not in header  # the header itself never leaks a concrete spec value
-        # ... but each instance's own real spec value still appears on its own line, same as any
-        # other instance-specific value (a digit, a quoted path) already does.
-        assert "FORMAT-SPEC.md: A" in result.output
-        assert "FORMAT-SPEC.md: B" in result.output
-
-    def test_a_quoted_value_with_both_quote_characters_is_matched_as_one_span(
-        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-    ) -> None:
-        """A raise site formatting a real path via ``{path!r}`` can embed
-        Python's own backslash-escaped ``repr()`` output — e.g. a real
-        filename containing both a ``'`` and a ``"`` forces ``repr()`` to
-        keep ``'`` as the delimiter and escape the internal one
-        (``repr("O'Brien's \\"backup\\".pst")`` is
-        ``'O\\'Brien\\'s "backup".pst'``). A non-escape-aware quoted-span
-        pattern stops at that first escaped ``'`` instead of the real
-        closing one, leaking a mangled fragment (``Brien\\'``) straight
-        into the group's own header text; ``_VARIABLE_RE`` must consume
-        the whole span as one value instead, collapsing it to a single
-        clean placeholder like every other quoted value."""
-        path = repr("O'Brien's \"backup\".pst")
-        findings = [
-            Finding(
-                Stage.VERSION, Symptom.DATA_MISSING, "wl-a/2026-01-01 00:00:01", f"no file_map entry for path {path}"
-            ),
-        ]
-        _patch_verify_findings(monkeypatch, findings)
-        result = runner.invoke(app, ["verify", str(tmp_path)])
-        assert result.exit_code == 0, result.output
-        # The real name legitimately (and correctly) still appears on the
-        # instance's own bullet line -- only the *header*'s own normalized
-        # template must never leak a mangled fragment of it.
-        lines = result.output.replace("\n", "").split("  ")  # crude but enough to isolate the header line
-        header = next(line for line in lines if line.startswith("[DataMissing]"))
-        assert "Brien" not in header
-
-    def test_findings_sharing_a_ref_but_different_templates_still_merge(
-        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-    ) -> None:
-        """``ref`` is the primary grouping key (per Part D.1) — two
-        findings naming the same missing object merge even though their
-        surrounding sentence differs, since it's the same underlying root
-        cause either way. Mirrors the real
-        ``snapshot_id``/``version_id`` shape ``cli_verify_sample1.json.gz``
-        actually produces, where bare-digit differences ride alongside an
-        identical ``ref``."""
-        findings = [
-            Finding(
-                Stage.VERSION,
-                Symptom.DATA_MISSING,
-                "wl-a/2026-01-01 00:00:01",
-                "no version_info row for snapshot_id=2 version_id=1 [ref=@X] — possibly a stale/rotated reference",
-            ),
-            Finding(
-                Stage.VERSION,
-                Symptom.DATA_MISSING,
-                "wl-b/2026-01-01 00:00:02",
-                "no version_info row for snapshot_id=1 version_id=1 [ref=@X] — possibly a stale/rotated reference",
-            ),
-        ]
-        _patch_verify_findings(monkeypatch, findings)
-        result = runner.invoke(app, ["verify", str(tmp_path)])
-        assert result.exit_code == 0, result.output
-        unwrapped = result.output.replace("\n", "")
-        assert unwrapped.count("no version_info row for") == 1
-        assert unwrapped.count("(2 versions)") == 1
-        # The digits still legitimately vary per instance even though ref
-        # doesn't -- still shown, just no longer alongside a repeated ref.
-        assert "2 1" in unwrapped
-        assert "1 1" in unwrapped
-
-    def test_findings_with_the_same_template_but_different_refs_do_not_merge(
-        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-    ) -> None:
-        """The direct counterpart to the "different templates" test below,
-        for the opposite axis: same sentence shape, but a different
-        ``ref`` each -- two genuinely distinct missing objects, so they
-        must render as two separate one-member groups, not merge into
-        one."""
-        findings = [
-            Finding(
-                Stage.VERSION,
-                Symptom.DATA_MISSING,
-                "wl-a/2026-01-01 00:00:01",
-                "no file_map entry for path 'p1' [ref=p1] — possibly a stale/rotated version reference",
-            ),
-            Finding(
-                Stage.VERSION,
-                Symptom.DATA_MISSING,
-                "wl-b/2026-01-01 00:00:02",
-                "no file_map entry for path 'p2' [ref=p2] — possibly a stale/rotated version reference",
-            ),
-        ]
-        _patch_verify_findings(monkeypatch, findings)
-        result = runner.invoke(app, ["verify", str(tmp_path)])
-        assert result.exit_code == 0, result.output
-        unwrapped = result.output.replace("\n", "")
-        assert unwrapped.count("(1 version)") == 2  # two separate one-member groups, not one shared group
-        assert "[ref=p1]" in unwrapped
-        assert "[ref=p2]" in unwrapped
-
-    def test_findings_with_no_ref_at_all_still_collapse_via_template_fallback(
-        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-    ) -> None:
-        """Not every raise site attaches a ``ref`` (``units/saas/objectdb.py``'s
-        own ``NotFoundError`` doesn't -- mirrored here) -- grouping must
-        still fall back to the normalized-template match from Part D for
-        these, exactly as before Part D.1."""
-        findings = [
-            Finding(
-                Stage.VERSION,
-                Symptom.CORRUPTION,
-                "wl-a/2026-01-01 00:00:01",
-                "no object_table row for object_id=42",
-            ),
-            Finding(
-                Stage.VERSION,
-                Symptom.CORRUPTION,
-                "wl-b/2026-01-01 00:00:02",
-                "no object_table row for object_id=43",
-            ),
-        ]
-        _patch_verify_findings(monkeypatch, findings)
-        result = runner.invoke(app, ["verify", str(tmp_path)])
-        assert result.exit_code == 0, result.output
-        unwrapped = result.output.replace("\n", "")
-        assert unwrapped.count("no object_table row for object_id=#") == 1
-        assert unwrapped.count("(2 versions)") == 1  # count_label depends on Stage, not ref-vs-template
-        assert "42" in unwrapped
-        assert "43" in unwrapped
 
     def test_a_non_version_stage_group_uses_occurrences_not_versions(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
@@ -414,109 +253,6 @@ class TestGroupingAndSorting:
         assert "(1 version)" in result.output
         assert "    - wl-a/2026-01-01 00:00:01" in result.output
 
-    def test_findings_with_different_templates_do_not_merge(
-        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-    ) -> None:
-        findings = [
-            Finding(Stage.VERSION, Symptom.DATA_MISSING, "wl-a/2026-01-01 00:00:01", "no file_map entry for path"),
-            Finding(Stage.VERSION, Symptom.DATA_MISSING, "wl-b/2026-01-01 00:00:02", "no such object"),
-        ]
-        _patch_verify_findings(monkeypatch, findings)
-        result = runner.invoke(app, ["verify", str(tmp_path)])
-        assert result.exit_code == 0, result.output
-        assert result.output.count("(1 version)") == 2  # two separate one-member groups, not merged
-        assert "no file_map entry for path" in result.output
-        assert "no such object" in result.output
-
-    def test_findings_within_one_group_are_sorted_chronologically_regardless_of_discovery_order(
-        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-    ) -> None:
-        """A group's own members still render chronologically, fed out
-        of order -- _sort_key's own job, unaffected by this ask's change
-        to *inter*-group order (see the next test)."""
-        findings = [
-            Finding(
-                Stage.VERSION,
-                Symptom.DATA_MISSING,
-                "wl-b/2026-03-01 00:00:00",
-                "no file_map entry for path 'shared' [ref=shared]",
-            ),
-            Finding(
-                Stage.VERSION,
-                Symptom.DATA_MISSING,
-                "wl-a/2026-01-01 00:00:00",
-                "no file_map entry for path 'shared' [ref=shared]",
-            ),
-            Finding(
-                Stage.VERSION,
-                Symptom.DATA_MISSING,
-                "wl-c/2026-02-01 00:00:00",
-                "no file_map entry for path 'shared' [ref=shared]",
-            ),
-        ]
-        _patch_verify_findings(monkeypatch, findings)
-        result = runner.invoke(app, ["verify", str(tmp_path)])
-        assert result.exit_code == 0, result.output
-        unwrapped = result.output.replace("\n", "")
-        assert "(3 versions)" in unwrapped
-        assert (
-            unwrapped.index("wl-a/2026-01-01") < unwrapped.index("wl-c/2026-02-01") < unwrapped.index("wl-b/2026-03-01")
-        )
-
-    def test_groups_are_sorted_by_their_own_ref_not_by_whichever_member_is_chronologically_first(
-        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-    ) -> None:
-        """Two separate ref-groups order by their own ref value, not by
-        which one's earliest member happens to sort chronologically
-        first — the real shape that motivated this: two SaaS refs
-        interleaving oddly in a report because one workload's display
-        name happens to sort before the other's on the day both first
-        appear. Ref "b"'s only member (2026-01-01) is chronologically
-        earlier than ref "a"'s (2026-01-02) — first-member ordering
-        would put "b" first; ref-based ordering must still put "a"
-        first."""
-        findings = [
-            Finding(
-                Stage.VERSION,
-                Symptom.DATA_MISSING,
-                "wl-x/2026-01-01 00:00:00",
-                "no file_map entry for path 'b' [ref=b]",
-            ),
-            Finding(
-                Stage.VERSION,
-                Symptom.DATA_MISSING,
-                "wl-y/2026-01-02 00:00:00",
-                "no file_map entry for path 'a' [ref=a]",
-            ),
-        ]
-        _patch_verify_findings(monkeypatch, findings)
-        result = runner.invoke(app, ["verify", str(tmp_path)])
-        assert result.exit_code == 0, result.output
-        assert result.output.index("[ref=a]") < result.output.index("[ref=b]")
-
-    def test_a_non_per_version_stage_version_finding_sorts_by_whole_path_not_a_bogus_timestamp(
-        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-    ) -> None:
-        """Not every ``Stage.VERSION`` finding is per-version — a
-        connection-enumeration failure (``units/verify_reachable.py``'s
-        ``_unresolvable_finding(repo.layout.repo_root, exc)``) uses a bare
-        filesystem path, with no ``"<workload>/<version>"`` shape and no
-        trailing timestamp at all. These two findings share the same
-        stage+symptom, so the sort depends entirely on ``_sort_key``'s
-        tiebreak, and the two candidate strategies disagree on the
-        result: naively trusting the last ``/``-separated segment
-        ("root") sorts *after* a real timestamp (`"r" > "2"`), while
-        falling back to the whole path ("/repo/root") sorts *before* one
-        (`"/" < "2"`) — this pins down the latter, correct behavior."""
-        findings = [
-            Finding(Stage.VERSION, Symptom.DATA_MISSING, "wl-a/2026-01-01 00:00:00", "reason A"),
-            Finding(Stage.VERSION, Symptom.DATA_MISSING, "/repo/root", "connection enumeration failed"),
-        ]
-        _patch_verify_findings(monkeypatch, findings)
-        result = runner.invoke(app, ["verify", str(tmp_path)])
-        assert result.exit_code == 0, result.output
-        assert result.output.index("connection enumeration failed") < result.output.index("reason A")
-
     def test_json_output_stays_flat_and_sorted(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
         findings = [
             Finding(Stage.VERSION, Symptom.DATA_MISSING, "wl-b/2026-01-01 00:00:02", "no file_map entry for path 'p2'"),
@@ -560,9 +296,9 @@ class TestGroupingAndSorting:
 
 
 class TestRepairedViaParityRendering:
-    """``Symptom.REPAIRED_VIA_PARITY`` findings are a successful self-heal,
-    not a problem left unresolved (see that symptom's own docstring) --
-    ``_render_human`` must not fold them into the red "problem" count."""
+    """``Symptom.REPAIRED_VIA_PARITY`` findings are a successful repair, not
+    a problem left unresolved -- ``_render_human`` must not fold them into
+    the red "problem" count."""
 
     def test_repaired_only_report_renders_green(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
         findings = [

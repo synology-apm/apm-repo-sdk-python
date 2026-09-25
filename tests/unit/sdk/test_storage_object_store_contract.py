@@ -14,8 +14,8 @@ no directory entities to check for (a prefix with zero matches and one
 that was "never created" are the same observable state), so
 ``S3Store``/``AzureStore`` return ``[]`` there while ``LocalFsStore``/
 ``SmbStore`` (real filesystems, which *do* have directory entities) raise
-``NotFoundError`` — every one of those modules' own
-docstrings document this as deliberate, and it is tested explicitly as a
+``NotFoundError`` — a deliberate difference in each backend's own
+contract, and it is tested explicitly as a
 *difference*, not folded into the shared parametrized cases below.
 
 Backend-specific internals that aren't part of the generic ``ObjectStore``
@@ -64,9 +64,9 @@ def _make_local(tmp_path: Path) -> ObjectStore:
 
 def _s3_parse_range(range_header: str, size: int) -> tuple[int, int]:
     """``"bytes=X-Y"``/``"bytes=X-"`` -> ``(start, end)``, ``end`` already
-    clamped to ``size`` — see ``test_storage_s3.py``'s own copy of this
-    same helper for the full rationale (duplicated per this project's
-    "no test module imports from another" convention)."""
+    clamped to ``size`` — duplicated byte-for-byte from
+    ``test_storage_s3.py`` per this project's "no test module imports
+    from another" convention."""
     start_s, _, end_s = range_header.removeprefix("bytes=").partition("-")
     start = int(start_s)
     end = int(end_s) + 1 if end_s else size
@@ -74,10 +74,11 @@ def _s3_parse_range(range_header: str, size: int) -> tuple[int, int]:
 
 
 class _FakeS3Paginator:
-    """See ``test_storage_s3.py``'s own, fuller copy of this class for
-    the real-1000-key-page-limit rationale — this file's own fixed
-    two-file tree never needs a second page, but ``S3Store.listdir()``
-    always drives this same paginator regardless of dataset size."""
+    """Mirrors ``test_storage_s3.py``'s fuller copy of this class (the
+    real 1000-key-page-limit rationale lives there) — this file's own
+    fixed two-file tree never needs a second page, but
+    ``S3Store.listdir()`` always drives this same paginator regardless
+    of dataset size."""
 
     def __init__(self, client: _FakeS3Client) -> None:
         self._client = client
@@ -93,8 +94,10 @@ class _FakeS3Paginator:
 
 
 class _FakeS3Client:
-    """A minimal in-memory S3 -- see ``test_storage_s3.py``'s own, fuller
-    copy of this class for the full rationale behind each error code."""
+    """A minimal in-memory S3 stand-in for the client shape ``S3Store``
+    drives directly: ``get_object``/``head_object``/``list_objects_v2``/
+    ``get_paginator``, with the same ``NoSuchKey``/``404``/``InvalidRange``
+    error codes a real bucket would raise."""
 
     _PAGE_SIZE = 1000
 
@@ -181,9 +184,9 @@ def _make_s3() -> ObjectStore:
 class _FakeAzureBlob:
     """A real class with ``async def`` methods, unlike
     ``test_storage_azure.py``'s ``MagicMock``/``AsyncMock``-based fake for
-    the same ``BlobClient`` shape — see that module's docstring for why
-    the shape (coroutine ``download_blob``/``get_blob_properties``) looks
-    like this.
+    the same ``BlobClient`` shape: both model ``azure.storage.blob.aio``,
+    where ``download_blob``/``get_blob_properties`` are themselves
+    coroutines.
     """
 
     def __init__(self, content: bytes | None) -> None:
@@ -227,9 +230,9 @@ class _FakeAzureBlob:
 
 class _FakeAzureContainer:
     """Container counterpart to ``_FakeAzureBlob`` over the same
-    ``_FILES`` tree — see ``test_storage_azure.py``'s module docstring
-    for why ``walk_blobs`` is a plain method returning an async iterator
-    rather than ``async def``."""
+    ``_FILES`` tree — ``walk_blobs`` is a plain (non-``async def``) method
+    returning an async iterator, matching the real ``AsyncItemPaged``
+    ``walk_blobs()`` itself returns."""
 
     def __init__(self, files: dict[str, bytes]) -> None:
         self._files = files
@@ -384,8 +387,7 @@ async def store(
 async def test_satisfies_the_object_store_protocol(store: ObjectStore) -> None:
     # ObjectStore is @runtime_checkable — this isinstance check is the
     # actual proof the four-method shape matches, not just a docstring
-    # claim (carried over from the pre-real-implementation skeleton era's
-    # own test of this, which otherwise would have had no successor).
+    # claim.
     assert isinstance(store, ObjectStore)
 
 
@@ -464,9 +466,10 @@ async def test_listdir_on_missing_prefix_azure_returns_empty() -> None:
 
 # A second disclosed, deliberate cross-backend difference: only the two
 # real-filesystem backends (local, SMB) have an OS-level permission concept
-# to translate at all — S3/Azure leave every non-not-found ClientError/
-# HttpResponseError untranslated by their own existing design (see each
-# module's own docstring), so there's no equivalent case to test there.
+# to translate at all — S3/Azure let every non-not-found ClientError/
+# HttpResponseError (e.g. AccessDenied) propagate unhandled, the same as
+# any other backend-specific exception their own methods let through, so
+# there's no equivalent case to test there.
 
 
 async def test_listdir_on_permission_denied_directory_local_raises(
@@ -529,10 +532,10 @@ class TestJoinPath:
 
 
 async def test_local_fs_store_concurrent_calls_return_correct_results(tmp_path: Path) -> None:
-    """``LocalFsStore`` caches fds shared across ``asyncio.to_thread()``
-    executor threads behind a real lock — this drives many concurrent
-    ``read``/``exists``/``listdir`` calls against one store instance and
-    checks every result is still correct, not just that nothing raises."""
+    """Each ``read``/``exists``/``listdir`` call runs its own
+    ``asyncio.to_thread()`` — this drives many concurrent calls against
+    one ``LocalFsStore`` instance and checks every result is still
+    correct, not just that nothing raises."""
     store = _make_local(tmp_path)
 
     async def read_a() -> bytes:

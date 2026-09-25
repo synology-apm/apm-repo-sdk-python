@@ -3,10 +3,12 @@ replayed from committed fixtures recorded against real bytes, with **no
 external dependency**. Most tests below use ``tui_apv1_pilot_walk.json.gz``
 (see each test below for exactly which real walk it covers) — the fixture
 backing ``test_open_browse_and_unit_tree_happy_path_replayed`` stays
-``tui_browse_happy_path_apv1.json.gz`` on its own (see that test's own
-docstring for why it's kept separate, even though it's recorded through
-the same ``--record-against``-aware ``_patch_local_store`` every other
-``--record-against``-supporting test in this file uses).
+``tui_browse_happy_path_apv1.json.gz`` on its own, recorded
+independently even though it's recorded through the same
+``--record-against``-aware ``_patch_local_store`` every other
+``--record-against``-supporting test in this file uses: every replay
+test gets its own dedicated fixture, never one merged across test
+files.
 
 Real-time export-progress behavior (cancel latency, rate/ETA display,
 backgrounding) isn't covered here: it needs an actual stream to run over
@@ -58,17 +60,20 @@ the same vault.
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Awaitable, Callable
+from collections.abc import AsyncIterator, Awaitable, Callable
 from pathlib import Path
 from typing import Any
 
 import pytest
+from textual.coordinate import Coordinate
 from textual.screen import ModalScreen
 from textual.widgets import Button, DataTable, Input, Static, Tree
 
 import synology_apm_repo.browser.screens.connect_dialog as connect_dialog_module
 from synology_apm_repo.browser.app import ApmRepoBrowserApp
-from synology_apm_repo.browser.screens.browse_screen import BrowseScreen, CatalogEntry
+from synology_apm_repo.browser.core.app.msg import CancelJobRequested, ExportProgressed, StartExport
+from synology_apm_repo.browser.core.unit.msg import ChildrenRequested
+from synology_apm_repo.browser.screens.browse_screen import BrowseScreen
 from synology_apm_repo.browser.screens.connect_dialog import ConnectDialog
 from synology_apm_repo.browser.screens.export_screen import ExportScreen
 from synology_apm_repo.browser.screens.key_dialog import KeyDialog
@@ -79,6 +84,8 @@ from synology_apm_repo.sdk.presentation.format import format_bytes
 from synology_apm_repo.sdk.presentation.progress import Progress, ProgressMeter
 from synology_apm_repo.sdk.storage.base import ObjectStore
 from synology_apm_repo.sdk.storage.recording import ReplayStore
+from synology_apm_repo.sdk.units.base import Node, RestorableUnit
+from synology_apm_repo.sdk.units.node_ref import NodeRef
 
 _APV1_FIXTURE = Path(__file__).parent.parent.parent / "fixtures" / "tui_apv1_pilot_walk.json.gz"
 #: apv-sample-2-encrypted's real vault key — see
@@ -96,6 +103,8 @@ def test_open_browse_and_unit_tree_happy_path_replayed(
     record_target: Callable[[str], Awaitable[ObjectStore]],
     focus_widget: Any,
     move_cursor_to: Any,
+    ui_timeout: float,
+    sdk_timeout: float,
 ) -> None:
     async def scenario() -> None:
         await _patch_local_store(monkeypatch, record_target, "tui_browse_happy_path_apv1.json.gz")
@@ -103,33 +112,40 @@ def test_open_browse_and_unit_tree_happy_path_replayed(
         async with app.run_test(size=(140, 45)) as pilot:
             await pilot.pause()
             # tmp_path's content is never read once _build_local_store is
-            # replaced — see this module's own docstring.
+            # replaced, so any placeholder value works.
             await open_browser_pilot(app, pilot, tmp_path)
             assert isinstance(app.screen, BrowseScreen), app.screen
 
             cat_tree = app.screen.query_one("#col-catalogs", Tree)
             assert len(cat_tree.root.children) == 1
             assert len(cat_tree.root.children[0].children) == 2
-            cat_tree.focus()
+            await focus_widget(pilot, cat_tree)
             await pilot.press("enter")
             wl_tree = app.screen.query_one("#col-workloads", Tree)
-            await wait_until(pilot, lambda: wl_tree.root.children, timeout=3.0, interval=0.02)
+            await wait_until(pilot, lambda: wl_tree.root.children, timeout=sdk_timeout, interval=0.02)
             assert any(wl_tree.root.children), "no workload type groups populated"
-            wl_tree.focus()
+            await focus_widget(pilot, wl_tree)
             await pilot.press("enter")
             ver_table = app.screen.query_one("#col-versions", DataTable)
-            await wait_until(pilot, lambda: ver_table.row_count, timeout=3.0, interval=0.02)
-            assert ver_table.row_count > 0
-            ver_table.focus()
-            await pilot.press("enter")
-            await wait_until(pilot, lambda: isinstance(app.screen, UnitScreen), timeout=0.6, interval=0.03)
-            assert isinstance(app.screen, UnitScreen), app.screen
-
-            tree = app.screen.query_one("#unit-tree", Tree)
+            # row_count alone can be stale; wait for _visible_version_indices
+            # too (see tests/conftest.py's drill_to_unit_screen_via_fs_device).
             await wait_until(
                 pilot,
-                lambda: tree.root.children or (tree.root.data is not None and tree.root.data.is_leaf),
-                timeout=0.6,
+                lambda: ver_table.row_count and app.screen._visible_version_indices,
+                timeout=sdk_timeout,
+                interval=0.02,
+            )
+            assert ver_table.row_count > 0
+            await focus_widget(pilot, ver_table)
+            await pilot.press("enter")
+            await wait_until(pilot, lambda: isinstance(app.screen, UnitScreen), timeout=ui_timeout, interval=0.03)
+            assert isinstance(app.screen, UnitScreen), app.screen
+
+            tree = app.screen.query_one("#folder-tree", Tree)
+            await wait_until(
+                pilot,
+                lambda: tree.root.children or (tree.root.data is not None and tree.root.data.payload.is_leaf),
+                timeout=sdk_timeout,
                 interval=0.03,
             )
             assert tree.root.data is not None
@@ -164,13 +180,14 @@ async def _patch_local_store(
     monkeypatch.setattr(connect_dialog_module.ConnectDialog, "_build_local_store", _fake)
 
 
-def test_esc_on_the_main_screen_does_not_blank_it_replayed(
+def test_esc_on_the_main_screen_closes_the_repo_and_reopens_connect_replayed(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
     open_browser_pilot: Any,
     wait_until: Any,
     focus_widget: Any,
     move_cursor_to: Any,
+    ui_timeout: float,
 ) -> None:
     monkeypatch.setattr(
         connect_dialog_module.ConnectDialog,
@@ -178,7 +195,7 @@ def test_esc_on_the_main_screen_does_not_blank_it_replayed(
         _fake_build_local_store_for(_APV1_FIXTURE, "apv-sample-1"),
     )
 
-    async def scenario() -> tuple[bool, bool]:
+    async def scenario() -> tuple[bool, bool, bool, bool]:
         app = ApmRepoBrowserApp()
         async with app.run_test(size=(140, 45)) as pilot:
             await pilot.pause()
@@ -186,91 +203,206 @@ def test_esc_on_the_main_screen_does_not_blank_it_replayed(
             assert isinstance(app.screen, BrowseScreen), app.screen
 
             await pilot.press("escape")
-            await pilot.pause(0.03)
+            await wait_until(pilot, lambda: isinstance(app.screen, ConnectDialog), timeout=ui_timeout, interval=0.02)
+            reopened_connect_dialog = isinstance(app.screen, ConnectDialog)
 
-            still_browse_screen = isinstance(app.screen, BrowseScreen)
-            connections_still_present = still_browse_screen and bool(
-                app.screen.query_one("#col-catalogs", Tree).root.children
-            )
-            return still_browse_screen, connections_still_present
+            # Cancel that reopened dialog (Esc again, ConnectDialog's own
+            # "cancel" binding) -- lands back on BrowseScreen, now blank,
+            # the same acceptable "nothing connected" state as a fresh
+            # app boot (c still available to retry).
+            await pilot.press("escape")
+            await wait_until(pilot, lambda: isinstance(app.screen, BrowseScreen), timeout=ui_timeout, interval=0.02)
+            back_on_browse_screen = isinstance(app.screen, BrowseScreen)
+            connections_gone = back_on_browse_screen and not app.screen.query_one("#col-catalogs", Tree).root.children
+            status_cleared = back_on_browse_screen and str(app.screen.query_one("#open-status", Static).render()) == ""
+            return reopened_connect_dialog, back_on_browse_screen, connections_gone, status_cleared
 
-    still_browse_screen, connections_still_present = asyncio.run(scenario())
-    assert still_browse_screen
-    assert connections_still_present
+    reopened_connect_dialog, back_on_browse_screen, connections_gone, status_cleared = asyncio.run(scenario())
+    assert reopened_connect_dialog
+    assert back_on_browse_screen
+    assert connections_gone
+    assert status_cleared
 
 
-async def _drill_to_unit_screen(app: ApmRepoBrowserApp, pilot: Any, wait_until: Any) -> None:
-    """Drills into a specific, confirmed-good workload -- the connection
-    with connection_config_id 1's FS device -- rather than whatever a
-    cursor-default "press enter" lands on first: a VM device under this
-    same connection has a real version whose target.db was never captured
-    (a genuine gap in the real sample data itself, not a recording or
-    anonymization bug), and which device sorts/groups first shifts every
-    time display names are re-anonymized. FS content is structurally
-    immune to that whole failure mode -- it never goes through target.db
-    at all -- so it's the more durable choice, not just a
-    currently-lucky pick."""
-    assert isinstance(app.screen, BrowseScreen), app.screen
-    cat_tree = app.screen.query_one("#col-catalogs", Tree)
-    repo_node = cat_tree.root.children[0]
-    # connection_config_id 1 -- an internal catalog identifier, stable and
-    # non-identifying (never touched by anonymization).
-    connection_node = next(
-        n
-        for n in repo_node.children
-        if isinstance(n.data, CatalogEntry) and n.data.catalog.connection.connection_config_id == 1
+class _BlockingContentSource:
+    """A fake ``ContentSource`` whose own ``export_to`` never completes
+    on its own, only via cancellation -- deterministic control over
+    exactly when the job this test starts actually ends, so it can be
+    cancelled on the way out rather than racing this scenario's own
+    teardown. Matches ``test_browser_export_screen.py``'s own fake of
+    the same shape (duplicated here rather than imported — ``tests/``
+    isn't a package, see ``tests/CLAUDE.md``)."""
+
+    size = 10
+    supports_concurrent_export = False
+
+    async def read(self, offset: int = 0, length: int | None = None) -> bytes:
+        raise AssertionError("not used in this test")
+
+    def stream(self, block: int = 0) -> AsyncIterator[tuple[int, bytes]]:
+        raise AssertionError("not used in this test")
+
+    async def export_to(self, dst: Path, *, sparse: bool = True, progress: object = None) -> object:
+        await asyncio.Event().wait()  # never set -- only cancellation ends this
+        raise AssertionError("unreachable -- this export can only end by being cancelled")
+
+
+def test_tasks_hint_stays_in_sync_across_browse_and_unit_screens_replayed(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    open_browser_pilot: Any,
+    wait_until: Any,
+    drill_to_unit_screen_via_fs_device: Any,
+    ui_timeout: float,
+) -> None:
+    """A background job started on ``BrowseScreen`` must show in
+    ``UnitScreen``'s own breadcrumb immediately once pushed
+    (``NavigableScreen._update_breadcrumb_text`` -- called synchronously
+    from each screen's own ``on_mount`` -- always re-reads
+    ``app.jobs`` fresh rather than waiting for that job's own next
+    progress tick, a real gap since the job started before this
+    ``UnitScreen`` instance ever existed), keep tracking live progress
+    while ``UnitScreen`` stays on top (every dispatch that changes
+    ``app.store.model.jobs`` re-fires every screen's own
+    ``NavigableScreen.on_mount``-registered ``jobs`` watch regardless of
+    stack position -- ``_render_breadcrumb``'s own covered-screen guard
+    just skips the actual widget write for one still mounted
+    underneath, e.g. ``BrowseScreen`` here, not a correctness gap since
+    it re-reads the real, current job count fresh the moment it becomes
+    visible again instead), and still be correct back on ``BrowseScreen``
+    after Esc pops back to it
+    (``on_screen_resume`` re-renders it at exactly that moment). The job
+    itself is synthetic (a fake unit/content source,
+    never the real fixture data this file otherwise replays) — only its
+    effect on the hint's own job *count* is under test here (per-job
+    detail like a label/percent lives in ``WorklistScreen``'s own dialog
+    now, not this hint); real export-progress timing isn't covered here
+    at all -- a replayed fixture returns instantly, with no wall-clock
+    window for it to be observable in."""
+    monkeypatch.setattr(
+        connect_dialog_module.ConnectDialog,
+        "_build_local_store",
+        _fake_build_local_store_for(_APV1_FIXTURE, "apv-sample-1"),
     )
-    cat_tree.move_cursor(connection_node)
-    cat_tree.focus()
-    await pilot.press("enter")
 
-    wl_tree = app.screen.query_one("#col-workloads", Tree)
-    await wait_until(pilot, lambda: wl_tree.root.children, timeout=3.0, interval=0.02)
-    fs_group = next(n for n in wl_tree.root.children if str(n.label) == "FS")
-    # Only the *first* group auto-expands (BrowseScreen._set_workloads) --
-    # "FS" isn't always that one, so its own children aren't visible/
-    # selectable via move_cursor until expanded explicitly.
-    fs_group.expand()
-    await wait_until(pilot, lambda: fs_group.children, timeout=0.8, interval=0.02)
-    wl_tree.move_cursor(fs_group.children[0])
-    wl_tree.focus()
-    await pilot.press("enter")
+    def _breadcrumb_text(app: ApmRepoBrowserApp) -> str:
+        return str(app.screen.query_one("#breadcrumb", Static).render())
 
-    ver_table = app.screen.query_one("#col-versions", DataTable)
-    await wait_until(pilot, lambda: ver_table.row_count, timeout=3.0, interval=0.02)
-    ver_table.focus()
-    await pilot.press("enter")
-    await wait_until(pilot, lambda: isinstance(app.screen, UnitScreen), timeout=0.6, interval=0.03)
-    assert isinstance(app.screen, UnitScreen), app.screen
+    async def scenario() -> tuple[str, str, str, str]:
+        unit = RestorableUnit(
+            ref=NodeRef("repo", ("item",)),
+            name="exporting.bin",
+            is_leaf=True,
+            content=_BlockingContentSource(),  # genuinely satisfies the ContentSource protocol
+        )
+        app = ApmRepoBrowserApp()
+        async with app.run_test(size=(140, 45)) as pilot:
+            await pilot.pause()
+            await open_browser_pilot(app, pilot, tmp_path)
+            idle_on_browse_screen = _breadcrumb_text(app)
+
+            app.store.dispatch(StartExport(unit=unit, dst_text=str(tmp_path / "out.bin"), sparse=True))
+            job_id = next(iter(app.jobs))
+
+            await drill_to_unit_screen_via_fs_device(app, pilot)
+            on_unit_screen = _breadcrumb_text(app)
+
+            app.store.dispatch(
+                ExportProgressed(
+                    job_id=job_id,
+                    done=50,
+                    total=100,
+                    size_text="100 B",
+                    rate_text="50 B/s",
+                    eta_text="",
+                    elapsed_text="00:01",
+                )
+            )
+            await pilot.pause()
+            after_update = _breadcrumb_text(app)
+
+            await pilot.press("escape")
+            await wait_until(pilot, lambda: isinstance(app.screen, BrowseScreen), timeout=ui_timeout, interval=0.02)
+            back_on_browse_screen = _breadcrumb_text(app)
+
+            # Cancel and wait for it to actually finish before the scenario
+            # returns -- otherwise run_test()'s own teardown cancels the
+            # still-running job itself (on_unmount's cleanup loop), which
+            # races the App's own widget teardown and can raise NoMatches
+            # from a widget query during job-finish handling.
+            app.store.dispatch(CancelJobRequested(job_id=job_id))
+            await wait_until(pilot, lambda: not app.jobs, timeout=ui_timeout, interval=0.02)
+
+            return idle_on_browse_screen, on_unit_screen, after_update, back_on_browse_screen
+
+    idle_on_browse_screen, on_unit_screen, after_update, back_on_browse_screen = asyncio.run(scenario())
+    assert "Task" not in idle_on_browse_screen  # no jobs yet -- no suffix at all
+    assert "1 Task (t)" in on_unit_screen
+    assert "1 Task (t)" in after_update  # count unaffected by a progress tick
+    assert "1 Task (t)" in back_on_browse_screen
 
 
 async def _first_leaf(
-    app: ApmRepoBrowserApp, pilot: Any, wait_until: Any, focus_widget: Any, move_cursor_to: Any
-) -> Any:
+    app: ApmRepoBrowserApp,
+    pilot: Any,
+    wait_until: Any,
+    focus_widget: Any,
+    move_cursor_to: Any,
+    ui_timeout: float,
+    sdk_timeout: float,
+) -> Node:
+    """DFS with backtracking, not a blind ``children[0]`` walk (a real
+    directory's own first child can be an empty one at any depth).
+    Driven straight through the store (``ChildrenRequested`` + real
+    replayed provider fetches), not the folder-tree widget: the tree
+    only ever shows containers now, so a leaf -- and this one
+    specifically needs a leaf with a real declared ``size`` -- can never
+    be found by walking it.
+
+    Also points the file table's own cursor at the leaf found (focus +
+    cursor position, no Enter press) before returning."""
     unit_screen = app.screen
-    tree = unit_screen.query_one("#unit-tree", Tree)
-    await wait_until(pilot, lambda: tree.root.data is not None, timeout=3.0, interval=0.02)
-    await focus_widget(pilot, tree)
-    node = tree.root
-    depth = 0
-    while (
-        node is not None
-        and node.data is not None
-        and not (node.data.is_leaf and node.data.size is not None)
-        and depth < 8
-    ):
-        node.expand()
-        await wait_until(pilot, lambda n=node: n.children, timeout=3.0, interval=0.02)
-        if not node.children:
-            break
-        node = node.children[0]
-        depth += 1
-    # move_cursor only takes effect against an up-to-date line map; forcing it
-    # here is the same idiom _select_matching_workload uses.
-    _ = tree._tree_lines
-    tree.move_cursor(node)
-    await wait_until(pilot, lambda: tree.cursor_node is node, timeout=0.4, interval=0.02, message="cursor never landed")
-    return node
+    assert isinstance(unit_screen, UnitScreen)
+    await wait_until(pilot, lambda: unit_screen.store.model.root is not None, timeout=sdk_timeout, interval=0.02)
+    root = unit_screen.store.model.root
+    assert root is not None and not root.is_leaf, "version root is itself a leaf -- no parent to select it under"
+
+    async def _search(node: Node, depth: int) -> tuple[Node, Node] | None:
+        if depth >= 8:
+            return None
+        level = unit_screen.store.model.loaded.get(node.ref)
+        if level is None:
+            unit_screen.store.dispatch(ChildrenRequested(node=node))
+            await wait_until(
+                pilot,
+                lambda ref=node.ref: ref in unit_screen.store.model.loaded or ref in unit_screen.store.model.errors,
+                timeout=sdk_timeout,
+                interval=0.02,
+            )
+            level = unit_screen.store.model.loaded.get(node.ref)
+        if level is None:
+            return None  # a children() failure for this one branch -- not fatal, just try elsewhere
+        leaf = next((c for c in level.children if c.is_leaf and c.size is not None), None)
+        if leaf is not None:
+            return leaf, node
+        for child in level.children:
+            if not child.is_leaf:
+                found = await _search(child, depth + 1)
+                if found is not None:
+                    return found
+        return None
+
+    found = await _search(root, 0)
+    assert found is not None, "no leaf with a declared size found"
+    leaf, parent = found
+
+    unit_screen._select_folder_ref(parent)
+    await wait_until(pilot, lambda: leaf in unit_screen._file_table._nodes, timeout=ui_timeout, interval=0.02)
+    row_index = unit_screen._file_table._nodes.index(leaf)
+    table = unit_screen.query_one("#file-table", DataTable)
+    await focus_widget(pilot, table)
+    table.cursor_coordinate = Coordinate(row_index, 0)
+    return leaf
 
 
 def test_detail_panel_and_export_dialog_show_human_readable_sizes_replayed(
@@ -281,6 +413,9 @@ def test_detail_panel_and_export_dialog_show_human_readable_sizes_replayed(
     record_target: Callable[[str], Awaitable[ObjectStore]],
     focus_widget: Any,
     move_cursor_to: Any,
+    drill_to_unit_screen_via_fs_device: Any,
+    ui_timeout: float,
+    sdk_timeout: float,
 ) -> None:
     async def scenario() -> tuple[str, str, int]:
         await _patch_local_store(monkeypatch, record_target)
@@ -288,29 +423,27 @@ def test_detail_panel_and_export_dialog_show_human_readable_sizes_replayed(
         async with app.run_test(size=(160, 50)) as pilot:
             await pilot.pause()
             await open_browser_pilot(app, pilot, tmp_path)
-            await _drill_to_unit_screen(app, pilot, wait_until)
-            assert isinstance(app.screen, UnitScreen), app.screen
-
+            await drill_to_unit_screen_via_fs_device(app, pilot)
             unit_screen = app.screen
-            node = await _first_leaf(app, pilot, wait_until, focus_widget, move_cursor_to)
-            assert node.data is not None and node.data.is_leaf
-            assert node.data.size is not None
-            size = node.data.size
+            assert isinstance(unit_screen, UnitScreen), app.screen
+            leaf = await _first_leaf(app, pilot, wait_until, focus_widget, move_cursor_to, ui_timeout, sdk_timeout)
+            assert leaf.is_leaf and leaf.size is not None
+            size = leaf.size
 
-            tree = unit_screen.query_one("#unit-tree", Tree)
-            await move_cursor_to(pilot, tree, node)
+            # _first_leaf already left the file table focused with its
+            # own cursor on this row.
             unit_screen.action_show_detail()
             await wait_until(
                 pilot,
                 lambda: str(unit_screen.query_one("#detail", Static).render()),
-                timeout=0.6,
+                timeout=ui_timeout,
                 interval=0.02,
                 message="detail pane never rendered",
             )
             detail_text = str(unit_screen.query_one("#detail", Static).render())
 
-            await unit_screen.action_export_selected()
-            await wait_until(pilot, lambda: isinstance(app.screen, ExportScreen), timeout=0.6, interval=0.02)
+            unit_screen.action_export_selected()
+            await wait_until(pilot, lambda: isinstance(app.screen, ExportScreen), timeout=sdk_timeout, interval=0.02)
             assert isinstance(app.screen, ExportScreen), app.screen
             export_title = str(app.screen.query_one("Static").render())
 
@@ -332,6 +465,9 @@ def test_export_screen_is_a_centered_modal_over_the_still_present_unit_screen_re
     record_target: Callable[[str], Awaitable[ObjectStore]],
     focus_widget: Any,
     move_cursor_to: Any,
+    drill_to_unit_screen_via_fs_device: Any,
+    ui_timeout: float,
+    sdk_timeout: float,
 ) -> None:
     async def scenario() -> tuple[bool, bool, bool, int, int]:
         await _patch_local_store(monkeypatch, record_target)
@@ -339,15 +475,24 @@ def test_export_screen_is_a_centered_modal_over_the_still_present_unit_screen_re
         async with app.run_test(size=(160, 50)) as pilot:
             await pilot.pause()
             await open_browser_pilot(app, pilot, tmp_path)
-            await _drill_to_unit_screen(app, pilot, wait_until)
-            assert isinstance(app.screen, UnitScreen), app.screen
-
+            await drill_to_unit_screen_via_fs_device(app, pilot)
             unit_screen = app.screen
-            node = await _first_leaf(app, pilot, wait_until, focus_widget, move_cursor_to)
-            tree = unit_screen.query_one("#unit-tree", Tree)
-            await move_cursor_to(pilot, tree, node)
-            await unit_screen.action_export_selected()
-            await wait_until(pilot, lambda: isinstance(app.screen, ExportScreen), timeout=0.6, interval=0.02)
+            assert isinstance(unit_screen, UnitScreen), app.screen
+            await _first_leaf(app, pilot, wait_until, focus_widget, move_cursor_to, ui_timeout, sdk_timeout)
+            # _first_leaf already left the file table focused with its
+            # own cursor on this row.
+            unit_screen.action_export_selected()
+            # isinstance(app.screen, ExportScreen) alone only proves the
+            # screen has been pushed, not that its compose() has actually
+            # mounted a child yet -- querying "Vertical" immediately after
+            # can race an unmounted screen (NoMatches) on a slow/busy
+            # runner. Wait for the query to actually resolve too.
+            await wait_until(
+                pilot,
+                lambda: isinstance(app.screen, ExportScreen) and bool(app.screen.query("Vertical")),
+                timeout=sdk_timeout,
+                interval=0.02,
+            )
 
             is_modal = isinstance(app.screen, ModalScreen)
             unit_screen_still_on_stack = unit_screen in app.screen_stack
@@ -373,6 +518,8 @@ def test_encrypted_repo_key_flow_then_shutdown_does_not_raise_replayed(
     record_target: Callable[[str], Awaitable[ObjectStore]],
     focus_widget: Any,
     move_cursor_to: Any,
+    ui_timeout: float,
+    sdk_timeout: float,
 ) -> None:
     """Against ``tui_apv2_encrypted_pilot_walk.json.gz`` — guards the
     same sqlite cross-thread open/close bug
@@ -393,29 +540,36 @@ def test_encrypted_repo_key_flow_then_shutdown_does_not_raise_replayed(
             assert isinstance(app.screen, BrowseScreen), app.screen
 
             cat_tree = app.screen.query_one("#col-catalogs", Tree)
-            cat_tree.focus()
+            await focus_widget(pilot, cat_tree)
             await pilot.press("enter")
-            await wait_until(pilot, lambda: isinstance(app.screen, KeyDialog), timeout=0.4, interval=0.02)
+            await wait_until(pilot, lambda: isinstance(app.screen, KeyDialog), timeout=sdk_timeout, interval=0.02)
             assert isinstance(app.screen, KeyDialog), app.screen
 
             key_input = app.screen.query_one("#key-input", Input)
             key_input.value = key_string
-            key_input.focus()
+            await focus_widget(pilot, key_input)
             await pilot.press("enter")
-            await wait_until(pilot, lambda: isinstance(app.screen, BrowseScreen), timeout=0.9, interval=0.03)
+            await wait_until(pilot, lambda: isinstance(app.screen, BrowseScreen), timeout=sdk_timeout, interval=0.03)
             assert isinstance(app.screen, BrowseScreen), app.screen
 
             wl_tree = app.screen.query_one("#col-workloads", Tree)
-            await wait_until(pilot, lambda: wl_tree.root.children, timeout=3.0, interval=0.03)
+            await wait_until(pilot, lambda: wl_tree.root.children, timeout=sdk_timeout, interval=0.03)
             assert wl_tree.root.children, "workload list never populated after key verification"
-            wl_tree.focus()
+            await focus_widget(pilot, wl_tree)
             await pilot.press("enter")
             ver_table = app.screen.query_one("#col-versions", DataTable)
-            await wait_until(pilot, lambda: ver_table.row_count, timeout=3.0, interval=0.02)
+            # row_count alone can be stale; wait for _visible_version_indices
+            # too (see tests/conftest.py's drill_to_unit_screen_via_fs_device).
+            await wait_until(
+                pilot,
+                lambda: ver_table.row_count and app.screen._visible_version_indices,
+                timeout=sdk_timeout,
+                interval=0.02,
+            )
             if ver_table.row_count:
-                ver_table.focus()
+                await focus_widget(pilot, ver_table)
                 await pilot.press("enter")
-                await wait_until(pilot, lambda: isinstance(app.screen, UnitScreen), timeout=0.6, interval=0.03)
+                await wait_until(pilot, lambda: isinstance(app.screen, UnitScreen), timeout=ui_timeout, interval=0.03)
 
     asyncio.run(scenario())  # must not raise sqlite3.ProgrammingError on shutdown
 
@@ -434,9 +588,9 @@ def test_connect_dialog_reports_repos_found_incrementally_while_scanning_replaye
     ``s3-sample-2-encrypted`` has two sibling repo-ids sharing one bucket
     — discovery correctly yields *one* ``Repository`` (holding both as
     ``catalogs()``), never two separate ones, so this test's own
-    premise — verifying progress ticks once per *repository* as several stream
-    in — can't be exercised by this specific fixture, since it never
-    discovers more than one repository. What's left worth checking here is that
+    premise — verifying progress ticks once per *repository* as several
+    repositories stream in — can't be exercised by this specific fixture,
+    since it never discovers more than one repository. What's left worth checking here is that
     discovery still reports found=1 exactly once and the tree ends up
     with exactly one repository node. Coverage for progress reporting across
     genuinely multiple, separate repositories (distinct buckets/vaults) lives at
@@ -476,6 +630,7 @@ def test_default_repo_lands_on_the_first_discovered_one_not_the_last_without_aut
     record_target: Callable[[str], Awaitable[ObjectStore]],
     focus_widget: Any,
     move_cursor_to: Any,
+    sdk_timeout: float,
 ) -> None:
     """Against ``s3-sample-2-encrypted``, whose two sibling repo-ids
     sharing one bucket resolve into a single ``Repository`` (holding both
@@ -483,10 +638,12 @@ def test_default_repo_lands_on_the_first_discovered_one_not_the_last_without_aut
     proof the "first, not last" ordering logic is right; that distinction
     needs a sample with genuinely separate repositories (distinct buckets/vaults)
     discovered together, none committed as a fixture here. What this test
-    does check — and still exercises the same `_add_repo` code path — is
-    that the sole discovered repository becomes ``app.repo`` and the column-1
-    cursor lands on the root without auto-expanding it, both real,
-    load-bearing behaviors `_add_repo`/`on_mount` implement. The synthetic
+    does check — and still exercises the same `_apply_discovered`/``RepoAdded``
+    code path — is that the sole discovered repository becomes
+    ``app.repo_handle`` and the column-1 cursor lands on the root without
+    auto-expanding it,
+    both real, load-bearing behaviors `_apply_discovered`/`on_mount`
+    implement. The synthetic
     `test_multiple_sibling_vaults`-style coverage in
     `tests/unit/sdk/test_storage_layout.py` is the closest existing
     substitute for "first, not last" itself, at the discovery layer rather
@@ -503,7 +660,7 @@ def test_default_repo_lands_on_the_first_discovered_one_not_the_last_without_aut
             dialog = app.screen
             dialog.query_one("#connect-local-path", Input).value = str(tmp_path)
             dialog.query_one("#connect-submit", Button).press()
-            await wait_until(pilot, lambda: isinstance(app.screen, BrowseScreen), timeout=1.5, interval=0.03)
+            await wait_until(pilot, lambda: isinstance(app.screen, BrowseScreen), timeout=sdk_timeout, interval=0.03)
             screen = app.screen
             assert isinstance(screen, BrowseScreen), screen
             # BrowseScreen's own transition (waited for above) only means the
@@ -516,20 +673,22 @@ def test_default_repo_lands_on_the_first_discovered_one_not_the_last_without_aut
             await wait_until(
                 pilot,
                 lambda: tree.root.children,
-                timeout=3.0,
+                timeout=sdk_timeout,
                 interval=0.03,
                 message="#col-catalogs never populated",
             )
-            repo_count = len(screen._repos)
+            repos = screen.store.model.repos
+            repo_count = len(repos)
             cursor_on_root = tree.cursor_node is tree.root
             no_repo_expanded = not any(node.is_expanded for node in tree.root.children)
-            app_repo_is_first = app.repo is screen._repos[0]
+            first_handle = next(iter(repos))
+            app_repo_is_first = app.repo_handle == first_handle
             return (cursor_on_root and no_repo_expanded), app_repo_is_first, repo_count
 
     landed_on_root_unexpanded, app_repo_is_first, repo_count = asyncio.run(scenario())
     assert repo_count == 1, "test invariant: this sample's two sibling repo-ids must discover as one Repository"
     assert landed_on_root_unexpanded, "the cursor must stay on column 1's root, with no repository auto-expanded"
-    assert app_repo_is_first, "app.repo must be the sole/first discovered repository"
+    assert app_repo_is_first, "app.repo_handle must be the sole/first discovered repository"
 
 
 def test_workloads_raises_key_required_on_an_encrypted_repo_before_a_key_is_verified_replayed(
@@ -543,9 +702,7 @@ def test_workloads_raises_key_required_on_an_encrypted_repo_before_a_key_is_veri
 ) -> None:
     """``Repository.catalogs()`` still succeeds on a locked repository (its
     underlying tables are genuinely unencrypted); ``Catalog.workloads()``
-    now raises ``KeyRequiredError`` before any catalog I/O instead of the old
-    behavior this test used to assert (silently succeeding with a
-    zero-version workload list for every workload) — see
+    raises ``KeyRequiredError`` before any catalog I/O — see
     ``api/repository.py``'s ``_require_key_verified``."""
 
     async def scenario() -> tuple[bool, bool]:
@@ -558,7 +715,7 @@ def test_workloads_raises_key_required_on_an_encrypted_repo_before_a_key_is_veri
             await open_browser_pilot(app, pilot, tmp_path)
             assert isinstance(app.screen, BrowseScreen), app.screen
 
-            repo = app.repo
+            repo = app.current_repo
             assert repo is not None
             not_verified = repo.key_status is not KeyStatus.VERIFIED
             catalogs = await repo.catalogs()
@@ -566,7 +723,7 @@ def test_workloads_raises_key_required_on_an_encrypted_repo_before_a_key_is_veri
             return not_verified, bool(results) and all(results)
 
     not_verified, raised_for_every_connection = asyncio.run(scenario())
-    assert not_verified, "test invariant: app.repo must still be locked (no key verified) for this sample"
+    assert not_verified, "test invariant: app.repo_handle's repo must still be locked (no key verified) for this sample"
     assert raised_for_every_connection, (
         "an unverified encrypted repository's workloads() must raise KeyRequiredError, not succeed"
     )

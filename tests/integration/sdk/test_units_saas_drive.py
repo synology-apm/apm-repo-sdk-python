@@ -21,10 +21,11 @@ index's own ``item_table`` metadata
 below). Dedup content reconstruction itself (does a chunk/composition
 layout decode to the right plaintext at all) is proven synthetically,
 with zero real-sample dependency, by
-``tests/unit/sdk/test_dedup_dedup_file.py`` instead — this is the same
-"push real-content-dependent proof to a synthetic test, keep the replay
-narrow" idea the Teams-chat fixture's own docstring describes for its
-"many stickers" scenario, applied here because ``P/C.jpg``'s own real
+``tests/unit/sdk/test_dedup_dedup_file.py`` instead — the same idea
+``test_units_saas_teams_chat.py`` applies to sticker embedding (real
+image bytes, only provable against a real "many_stickers" Teams
+channel): push real-content-dependent proof to a synthetic test and
+keep the replay narrow, applied here because ``P/C.jpg``'s own real
 bytes are a third-party illustration, not inert sample data, and can't
 be committed to a public fixture at all.
 
@@ -49,6 +50,7 @@ from synology_apm_repo.sdk.units.base import Node, UnitKind
 from synology_apm_repo.sdk.units.dispatch import saas_provider_for
 from synology_apm_repo.sdk.units.saas.drive import DriveProvider
 from synology_apm_repo.sdk.units.saas.provider import SaasWorkloadProvider
+from synology_apm_repo.sdk.units.saas.stream import SaasStreamCache
 
 #: Internal catalog identifier -- stable and non-identifying (never
 #: touched by catalog-metadata anonymization, so it resolves the same
@@ -66,7 +68,7 @@ async def _open_repo(record_target: Callable[..., Awaitable[ObjectStore]]) -> De
     return await DedupRepo.open(store, layout)
 
 
-async def _open_provider(repo: DedupRepo) -> SaasWorkloadProvider:
+async def _open_provider(repo: DedupRepo, saas_streams: SaasStreamCache) -> SaasWorkloadProvider:
     all_workloads = [w for c in await connections(repo) for w in await workloads(repo, c)]
     version = await anext(
         v
@@ -74,14 +76,14 @@ async def _open_provider(repo: DedupRepo) -> SaasWorkloadProvider:
         for v in await versions(repo, w)
         if w.workload_id == _TEAM_DRIVE_WORKLOAD_ID and v.saas_stream_uuid == "XfGkaDjWyGhXVoRC" and not v.deleted
     )
-    return await DriveProvider(repo, version)
+    return await DriveProvider(repo, version, saas_streams)
 
 
 async def test_replayed_root_and_nested_tree_match_known_real_layout(
     record_target: Callable[..., Awaitable[ObjectStore]],
 ) -> None:
-    async with await _open_repo(record_target) as repo:
-        provider = await _open_provider(repo)
+    async with await _open_repo(record_target) as repo, SaasStreamCache(repo) as saas_streams:
+        provider = await _open_provider(repo, saas_streams)
         try:
             top = await provider.children(provider.root())
             # A folder/file name here is a real, backed-up filename choice
@@ -106,10 +108,9 @@ async def test_replayed_every_real_files_kind_and_size_match_item_table(
     record_target: Callable[..., Awaitable[ObjectStore]],
 ) -> None:
     """Every real leaf's ``kind``/``size`` is checked against the catalog's
-    own ``item_table`` metadata; no leaf's content is ever read — see this
-    module's own docstring for why."""
-    async with await _open_repo(record_target) as repo:
-        provider = await _open_provider(repo)
+    own ``item_table`` metadata; no leaf's content is ever read."""
+    async with await _open_repo(record_target) as repo, SaasStreamCache(repo) as saas_streams:
+        provider = await _open_provider(repo, saas_streams)
         try:
             checked = 0
 
@@ -132,11 +133,11 @@ async def test_replayed_every_real_files_kind_and_size_match_item_table(
 async def test_replayed_team_drive_dispatches_and_resolves_real_content_via_the_catalog_index(
     record_target: Callable[..., Awaitable[ObjectStore]],
 ) -> None:
-    async with await _open_repo(record_target) as repo:
+    async with await _open_repo(record_target) as repo, SaasStreamCache(repo) as saas_streams:
         all_workloads = [w for c in await connections(repo) for w in await workloads(repo, c)]
         workload = next(w for w in all_workloads if w.workload_id == _TEAM_DRIVE_WORKLOAD_ID)
         version = (await versions(repo, workload))[-1]  # latest
-        provider = await saas_provider_for(repo, workload, version)
+        provider = await saas_provider_for(repo, workload, version, saas_streams)
         assert isinstance(provider, SaasWorkloadProvider), type(provider)
         try:
             top = await provider.children(provider.root())

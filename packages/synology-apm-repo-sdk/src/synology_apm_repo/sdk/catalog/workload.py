@@ -1,12 +1,12 @@
 """``Workload``: one ``db/workload_config`` row, with its own display-name/
 subtitle extraction (``_device_display_name``/``_saas_display_name``) as a
-first-class output, not an afterthought — same reasoning as
-``catalog/connection.py``'s own module docstring states for ``Connection``.
+first-class output, not an afterthought: CLI/TUI show only
+``display_name``/``subtitle``/``attrs`` in the default (non-diagnostic)
+mode, so this can't be bolted on later.
 
 ``workloads()``'s own per-connection lookup, ``_workload_ids_for_connection``,
-relies on the ``copy_target_version`` join ``catalog/connection.py``'s
-module docstring explains in full (that module's ``_workload_ids_by_connection``
-is the same join's batched form, used by ``connections()`` instead).
+relies on the same ``copy_target_version`` join ``catalog/connection.py``
+documents in its batched form.
 """
 
 from __future__ import annotations
@@ -94,10 +94,7 @@ class Workload:
 
 async def _workload_ids_for_connection(repo: DedupRepo, connection_config_id: ConnectionConfigId) -> list[WorkloadId]:
     """Workloads for one connection — the single-connection form of the
-    ``copy_target_version`` join ``catalog/connection.py``'s own module
-    docstring explains is the source of truth here (that module's
-    ``_workload_ids_by_connection`` is this same join's batched form,
-    used by ``connections()`` instead)."""
+    ``copy_target_version`` join ``catalog/connection.py`` documents."""
     conn = await repo.db("copy_target_version")
     cursor = await conn.execute(
         "SELECT DISTINCT workload_id FROM copy_target_version WHERE connection_config_id = ?",
@@ -108,9 +105,8 @@ async def _workload_ids_for_connection(repo: DedupRepo, connection_config_id: Co
 
 
 async def workloads(repo: DedupRepo, connection: Connection) -> list[Workload]:
-    """Sorted by ``display_name`` (case-insensitive) — see ``connections``'s
-    own docstring for why that's the collection order here rather than a
-    chronological one."""
+    """Sorted by ``display_name`` (case-insensitive), same reasoning as
+    ``connections()``."""
     workload_ids = await _workload_ids_for_connection(repo, connection.connection_config_id)
     if not workload_ids:
         return []

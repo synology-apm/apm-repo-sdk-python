@@ -3,8 +3,8 @@ check primitives — synthetic bytes written to real files, no sample
 repositories required.
 
 Every primitive's *success* path is already exercised indirectly through
-``units/verify_reachable.py``'s top-down walk
-(``test_units_verify_reachable.py``); its own call-site guards mean some
+``units/verify_reachable.py``'s top-down walk (the
+``test_units_verify_reachable_*.py`` files); its own call-site guards mean some
 branches never get exercised that way at all (``check_map_and_attr_crc``
 is skipped entirely when ``record_head.map_num == 0``, and a broken
 bucket's ``ensure_chunk_crc_store()`` failure is always caught by
@@ -223,7 +223,7 @@ class TestCheckCompositionHeaderMissing:
     async def test_no_subfile_at_all_is_data_missing(self, tmp_path: Path) -> None:
         """No ``c0`` sub-file exists under ``comp_root`` at all -- distinct
         from a ``c0`` file that exists but fails to parse (covered by
-        ``test_units_verify_reachable.py``)."""
+        ``test_units_verify_reachable_composition.py``)."""
         store = LocalFsStore(tmp_path)
         reader = CompositionReader(store, DirCache(store), "Composition", StreamId(7), SessionId(3))
         finding = await check_composition_header(reader, path="some/path")
@@ -255,9 +255,8 @@ class TestCheckChunkCiphertextCrcErrors:
     check on that failure -- so ``check_chunk_ciphertext_crc``'s own
     ``NotFoundError``/``FormatError`` branches are exercised directly here,
     against a ``BucketReader`` opened before its underlying bytes are
-    tampered with (mirroring the same kind of race
-    ``test_units_verify_reachable.py`` simulates for its own trailer
-    checks)."""
+    tampered with, to simulate the kind of race a real backend can produce
+    between open and read."""
 
     async def test_chunk_data_disappearing_after_open_is_data_missing(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -286,7 +285,8 @@ class TestCheckChunkCiphertextCrcErrors:
         """The trailer read comes back shorter than ``ChunkCrcStore``
         needs -- ``parse_chunk_crc_store`` itself raises ``FormatError``
         for this, distinct from ``DataCorruptError`` (a self-consistency CRC
-        mismatch, already covered by ``test_units_verify_reachable.py``)."""
+        mismatch, already covered by
+        ``test_units_verify_reachable_composition.py``)."""
         path = tmp_path / "Pool" / "0" / "0.buk"
         _write_plain_bucket(path, bytes([1]) * 4096)
         store = LocalFsStore(tmp_path)
@@ -314,7 +314,7 @@ class TestCheckChunkCiphertextCrcsErrors:
     come from its ``reader.read_raw_chunks`` call, not from the per-chunk
     verify loop after it (that loop's ``DataCorruptError``-per-mismatch path is
     already exercised end to end by
-    ``test_units_verify_reachable.py``'s
+    ``test_units_verify_reachable_extents.py``'s
     ``test_full_level_still_checks_ciphertext_crc_exhaustively_without_a_key``)."""
 
     async def test_chunk_data_disappearing_is_data_missing(

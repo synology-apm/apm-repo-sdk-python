@@ -63,8 +63,11 @@ class SmokeContext:
         note: str = "",
     ) -> T | None:
         """Await ``coro()``, recorded into ``<domain>.md`` as step
-        ``step`` -- same DEGRADED/FAILED/PASSED shape as ``sdk/``'s own
-        ``ctx.call`` (see that module's docstring)."""
+        ``step`` -- same shape as ``sdk/``'s ``ctx.call``: a
+        ``degrade_on`` exception is recorded DEGRADED and returns
+        ``None``; any other exception is recorded ``unexpected`` (a real
+        bug) and also returns ``None``, so the calling phase can keep
+        going either way."""
         stats = self.stats[domain]
         self._mark(domain, step)
         stats.ran += 1
@@ -86,7 +89,10 @@ class SmokeContext:
 
     def check(self, domain: str, step: str, condition: bool, *, note: str = "") -> bool:
         """Record a pure boolean assertion (no I/O, never raises) --
-        PASSED/FAILED, never SKIPPED/DEGRADED."""
+        PASSED/FAILED, never SKIPPED/DEGRADED. ``condition`` must already be
+        a safe value to evaluate -- anything that could itself raise (an
+        attribute chain into a real domain object, ...) belongs inside its
+        own ``ctx.call``-wrapped helper first."""
         stats = self.stats[domain]
         self._mark(domain, step)
         if condition:

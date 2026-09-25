@@ -11,25 +11,17 @@ self-contained (no test module imports another; ``tests/`` isn't a package).
 from __future__ import annotations
 
 import asyncio
-import atexit
 import contextlib
-import os
-import sys
 import zlib
-from collections.abc import Awaitable, Callable, Iterator
+from collections.abc import Awaitable, Callable
 from pathlib import Path
 
 import pytest
 import zstandard
 
-from synology_apm_repo.sdk import concurrency
-from synology_apm_repo.sdk.dedup import chunk_walk
 from synology_apm_repo.sdk.dedup.chunk_walk import (
     ChunkPlan,
     ChunkRun,
-    ExportGroupWorkerArgs,
-    _export_worker_init,
-    _export_worker_shutdown,
     _flush_run,
     _GapDelta,
     _handle_gap_extent,
@@ -39,13 +31,11 @@ from synology_apm_repo.sdk.dedup.chunk_walk import (
     _walk_extents,
     count_planned_bytes,
     exec_chunks,
-    export_bucket_group_worker,
     plan_chunks_windowed,
 )
 from synology_apm_repo.sdk.dedup.composition_reader import CompositionReader
 from synology_apm_repo.sdk.dedup.dedup_file import DedupFile, Extent, ExtentKind
 from synology_apm_repo.sdk.dedup.pool import BucketReader, Pool
-from synology_apm_repo.sdk.dedup.pool_descriptor import PoolDescriptor
 from synology_apm_repo.sdk.format.addressing import ChunkAddress
 from synology_apm_repo.sdk.format.bucket import MODE_CHUNK_CRC, MODE_COMPRESS
 from synology_apm_repo.sdk.format.chunkmap import ChunkMapKind
@@ -55,8 +45,6 @@ from synology_apm_repo.sdk.format.redundancy import redundancy_size
 from synology_apm_repo.sdk.identifiers import BucketId, ChunkIdx, SessionId, StreamId
 from synology_apm_repo.sdk.storage.dircache import DirCache
 from synology_apm_repo.sdk.storage.local import LocalFsStore
-
-_O_BINARY = getattr(os, "O_BINARY", 0)
 
 _STREAM_ID = StreamId(7)
 _SESSION_ID = SessionId(3)
@@ -318,8 +306,10 @@ def _expand_placements(groups: dict[tuple[StreamId, BucketId], list[ChunkRun]]) 
 
 
 class TestIterChunkRuns:
-    """``_iter_chunk_runs`` is where the run-length arithmetic this
-    module's own docstring describes actually lives — covered directly
+    """``_iter_chunk_runs`` is where the run-length arithmetic actually
+    lives -- splitting a run only at a repeat-cycle wraparound
+    (``k % map_num == 0``, the Pool address jumping back to the template
+    start) or a bucket carry -- covered directly
     here since ``TestPlanChunks``/``TestPlanChunksWindowed``
     only observe its output already merged into a ``ChunkPlan``."""
 
@@ -368,8 +358,7 @@ class TestIterChunkRuns:
 
 
 class TestMergeOverlappingRanges:
-    """``_merge_overlapping_ranges`` (its own docstring has the full
-    story): two *different* ``ChunkRun``s for one bucket can reference
+    """``_merge_overlapping_ranges``: two *different* ``ChunkRun``s for one bucket can reference
     genuinely overlapping-but-not-identical physical ranges, which plain
     tuple-equality dedup never catches."""
 
@@ -400,11 +389,10 @@ class TestMergeOverlappingRanges:
         assert _merge_overlapping_ranges([(0, 417), (300, 300)]) == [(0, 600)]
 
     def test_the_real_production_bucket_11716_shape_collapses_correctly(self) -> None:
-        """The exact (chunk_idx_start, length) set measured on a real PS
-        sample's bucket 11716 — 15 ChunkRuns from overlapping destination
-        extents that a plain tuple-dedup left as 15 separate ranges (10 of
-        which caused a spurious extra read each); interval-merging must
-        collapse it to its true disjoint footprint."""
+        """A real-world shape: 15 ``ChunkRun``s from overlapping destination
+        extents that a plain tuple-dedup would leave as 15 separate ranges
+        (10 of which would cause a spurious extra read each); interval-merging
+        must collapse it to its true disjoint footprint."""
         ranges = [
             (0, 417),
             (417, 1068),
@@ -607,10 +595,10 @@ class TestPlanChunksWindowed:
             assert total <= max_entries
 
     async def test_small_window_yields_more_than_one_plan(self, dedup_file: DedupFile) -> None:
-        # The standard fixture has 7 DATA chunk placements total (3 + 4,
-        # see _standard_entries()'s own comment) -- max_entries=2 must
-        # split them across multiple windows, not silently plan
-        # everything into one anyway.
+        # The standard fixture has 7 DATA chunk placements total: 3 at
+        # [0,12288) plus 4 (templated via repeat) at [24576,40960) --
+        # max_entries=2 must split them across multiple windows, not
+        # silently plan everything into one anyway.
         windows = [w async for w in plan_chunks_windowed(dedup_file, 0, _SIZE, 0, write_zero_fill=None, max_entries=2)]
         assert len(windows) > 1
 
@@ -754,10 +742,12 @@ class TestExecChunks:
         assert runs == []
 
     async def test_on_run_calls_reconstruct_the_correct_data_bytes(self, dedup_file: DedupFile) -> None:
-        """Doesn't assert a specific run count (repeat-run dest offsets
-        don't stay contiguous once sorted primarily by chunk_idx — see
-        ``exec_chunks``'s own docstring on why merging is a best-effort
-        optimization, not a guarantee); instead reconstructs the full
+        """Doesn't assert a specific run count (``exec_chunks`` merges
+        chunks that are contiguous in *destination* offset, re-sorted
+        from the read/chunk_idx order it decoded them in -- a repeat
+        record's dest offsets don't stay contiguous under that resort, so
+        how many merged runs come out isn't a stable, predictable
+        number); instead reconstructs the full
         output buffer from whatever runs ``on_run`` was actually called
         with and checks the DATA bytes land at the right offsets — the
         actual observable contract, and the same one
@@ -780,8 +770,8 @@ class TestExecChunks:
     async def test_overlapping_chunk_runs_for_one_bucket_produce_correct_bytes_with_no_redundant_read(
         self, tmp_path: Path
     ) -> None:
-        """The real shape this session found in production
-        (``_merge_overlapping_ranges``'s own docstring): two different
+        """The real shape ``_merge_overlapping_ranges`` exists to handle:
+        two different
         destination extents reference overlapping-but-not-identical
         physical chunk ranges within the same bucket — record 2's chunks
         3-7 are a strict subset of record 1's chunks 0-7. Must produce
@@ -829,9 +819,10 @@ class TestExecChunks:
 
 
 class TestExecChunksMultiBucket:
-    """Multi-bucket execution — needs its own fixture (see
-    ``_build_multi_bucket_dedup_file``'s own docstring for why):
-    correct bytes across many buckets, non-overlapping destination
+    """Multi-bucket execution — needs its own fixture (real cross-bucket
+    parallelization has nothing to parallelize over with the module's
+    single-bucket ``dedup_file`` fixture): correct bytes across many
+    buckets, non-overlapping destination
     ranges, monotonic progress, exception propagation, cancellation."""
 
     async def test_matches_expected_output_across_many_buckets(self, tmp_path: Path) -> None:
@@ -1079,12 +1070,10 @@ class TestExecChunksPrefetch:
             # Let the prefetch task's own (already in-flight) opens for
             # buckets 1-3 actually complete. Each open is a real
             # ``asyncio.to_thread()`` local-filesystem read (LocalFsStore),
-            # so it needs the executor thread pool to actually get
-            # scheduled -- a fixed count of zero-duration ``asyncio.sleep(0)``
-            # yields only guarantees event-loop ticks, not real wall-clock
-            # time for that thread to run, and was observed to fail
-            # intermittently under CPU contention (e.g. many parallel
-            # ``pytest -n auto`` workers). Wait on the real condition
+            # which needs the executor thread pool to actually get
+            # scheduled -- a fixed count of zero-duration
+            # ``asyncio.sleep(0)`` yields only guarantees event-loop ticks,
+            # not real wall-clock time for that. Wait on the real condition
             # (``all_prefetched``, set by ``_tracking_open_bucket_uncached``
             # above) with a generous timeout instead; not asserting on
             # timing itself, only on which opens happened before release
@@ -1144,10 +1133,10 @@ class TestExecChunksPrefetch:
         assert call_count == 2  # the prefetch's failed attempt, then the main loop's own successful retry
 
     async def test_an_on_run_exception_still_propagates_unwrapped_with_prefetch_enabled(self, tmp_path: Path) -> None:
-        """The compatibility guarantee ``exec_chunks``'s own docstring
-        makes for ``max_concurrent_opens``: the prefetch task never
-        raises and is spawned via a plain ``asyncio.create_task`` rather
-        than folded into the serial path's own control flow, so a real
+        """The compatibility guarantee ``max_concurrent_opens`` makes: its
+        prefetch task never raises, and is spawned via a plain
+        ``asyncio.create_task`` rather than folded into the serial path's
+        own control flow, so a real
         ``on_run`` failure on the (default) ``max_concurrent_reads=1``
         path must still surface as the plain exception, never wrapped in
         an ``ExceptionGroup``."""
@@ -1173,19 +1162,15 @@ class _ConcurrencyTrackingStore:
     long enough for every other read already scheduled (its own
     semaphore permit already acquired) to also enter and bump
     ``active``, so ``peak`` reflects genuine overlap rather than just
-    call order. A fixed count of zero-duration ``asyncio.sleep(0)``
-    ticks was tried first and observed to fail intermittently under
-    real scheduling contention (many parallel workers): each tick only
-    guarantees an event-loop turn, not real wall-clock time for a
-    sibling read's own prior awaits — ``asyncio.to_thread()`` dispatch
-    among them — to actually resolve. Waiting on the real condition
-    removes that dependency on how many ticks happen to be "enough."
+    call order. Waits on this real condition rather than a fixed count
+    of zero-duration ``asyncio.sleep(0)`` ticks, which only guarantee
+    an event-loop turn, not real wall-clock time for a sibling read's
+    own ``asyncio.to_thread()`` dispatch to resolve.
 
     Built for ``TestExecChunksCombinedConcurrencyCeiling``'s own
     need: prove the cross-bucket and in-bucket levels really do share one
-    ceiling instead of stacking (a concern ``exec_chunks``'s own
-    docstring calls out as the easiest part of this design to get
-    wrong)."""
+    ceiling instead of stacking, a permit hand-off that's easy to get
+    wrong in a way that silently double-counts."""
 
     def __init__(self, backing: LocalFsStore, *, expected_peak: int) -> None:
         self._backing = backing
@@ -1248,8 +1233,7 @@ def _build_split_run_dedup_file(tmp_path: Path, *, expected_peak: int) -> tuple[
 
 class TestExecChunksCombinedConcurrencyCeiling:
     """The whole point of unifying cross-bucket and in-bucket concurrency
-    onto one shared ``asyncio.Semaphore`` (see ``exec_chunks``'s own
-    docstring for the exact hand-off mechanics): the *combined* number of
+    onto one shared ``asyncio.Semaphore``: the *combined* number of
     concurrently in-flight reads — across bucket boundaries and within
     one bucket's own multiple runs — must never exceed
     ``max_concurrent_reads``, not just each axis checked in isolation
@@ -1258,7 +1242,7 @@ class TestExecChunksCombinedConcurrencyCeiling:
     tests prove cross-bucket output correctness, not a ceiling)."""
 
     async def test_combined_ceiling_is_never_exceeded(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-        monkeypatch.setattr("synology_apm_repo.sdk.dedup.pool._GAP_TOLERANCE", 0)
+        monkeypatch.setattr("synology_apm_repo.sdk.dedup.pool._bucket_reader._GAP_TOLERANCE", 0)
         file, store = _build_split_run_dedup_file(tmp_path, expected_peak=2)
         size = file.size
         assert size is not None
@@ -1274,182 +1258,3 @@ class TestExecChunksCombinedConcurrencyCeiling:
         assert bytes_run == size
         assert store.peak <= 2, f"expected at most 2 concurrent reads, observed a peak of {store.peak}"
         assert store.peak == 2, "expected the 3 available sources to actually reach the ceiling, not undershoot it"
-
-
-@pytest.fixture(autouse=True)
-def _reset_export_worker_globals() -> Iterator[None]:
-    """``_worker_store``/``_worker_pool``/``_worker_dst_fd`` (this module's
-    own process-global worker state) and ``concurrency``'s own persistent
-    ``_worker_runner`` must not leak between tests — a real worker process
-    only ever sets these once, per its own whole lifetime, but this suite
-    runs every test in the same process."""
-    yield
-    if chunk_walk._worker_dst_fd is not None:
-        with contextlib.suppress(OSError):
-            os.close(chunk_walk._worker_dst_fd)
-    chunk_walk._worker_store = None
-    chunk_walk._worker_pool = None
-    chunk_walk._worker_dst_fd = None
-    if concurrency._worker_runner is not None:
-        concurrency.close_worker_loop()
-
-
-class _LoopCheckingStore:
-    """Reproduces ``S3Store._get_client``'s exact hazard
-    (``storage/s3.py``) — a network client lazily built and cached on
-    first use, bound to whichever event loop happens to be running then —
-    without touching ``aioboto3``/``aiohttp``: caches the running loop on
-    this store's first call and raises if a later call runs on a
-    *different* one, the same observable failure a per-task
-    ``asyncio.run()`` worker produces against a real lazily-cached client
-    once a second task reuses it."""
-
-    def __init__(self, backing: LocalFsStore) -> None:
-        self._backing = backing
-        self._bound_loop: asyncio.AbstractEventLoop | None = None
-
-    def _check_loop(self) -> None:
-        loop = asyncio.get_running_loop()
-        if self._bound_loop is None:
-            self._bound_loop = loop
-        elif self._bound_loop is not loop:
-            raise RuntimeError("Event loop is closed")
-
-    async def read(self, path: str, offset: int = 0, length: int | None = None) -> bytes:
-        self._check_loop()
-        return await self._backing.read(path, offset, length)
-
-    async def size(self, path: str) -> int:
-        self._check_loop()
-        return await self._backing.size(path)
-
-    async def exists(self, path: str) -> bool:
-        self._check_loop()
-        return await self._backing.exists(path)
-
-    async def listdir(self, path: str) -> list[str]:
-        self._check_loop()
-        return await self._backing.listdir(path)
-
-
-class TestExportWorkerLoopReuse:
-    """Regression test for the bug ``concurrency.run_in_worker_loop`` fixes:
-    a ``ProcessPoolExecutor`` worker handles many bucket-group tasks over
-    its lifetime, and its ``ObjectStore`` (built once per worker process —
-    see ``_export_worker_init``'s own docstring) is meant to survive every
-    one of them, including a lazily-cached, loop-bound client
-    (``S3Store._get_client``, say). Exercised in-process — no real
-    subprocess needed, since the bug is about ``asyncio.run()``'s own
-    per-call loop, not about multiprocessing itself — via
-    ``_LoopCheckingStore``, which reproduces that hazard without a real
-    network backend."""
-
-    def test_second_task_in_the_same_worker_reuses_the_first_ones_loop(self, tmp_path: Path) -> None:
-        _write_standard_composition(tmp_path / "Composition", _standard_entries())
-        _write_bucket(tmp_path / "Pool" / "0" / "0.buk", _CHUNK_PLAINTEXTS)
-        store = _LoopCheckingStore(LocalFsStore(tmp_path))
-        dir_cache = DirCache(store)
-        pool = Pool(store, "Pool", dir_cache)
-        dst = tmp_path / "out.bin"
-        dst.write_bytes(bytes(4096))
-        chunk_walk._worker_pool = pool
-        chunk_walk._worker_dst_fd = os.open(dst, os.O_WRONLY | _O_BINARY)
-        args = ExportGroupWorkerArgs(
-            stream_id=StreamId(0), bucket_id=BucketId(0), runs=[ChunkRun(0, 1, 0)], size=4096, dst_offset=0
-        )
-
-        # First task in this "worker": builds the loop-checking store's
-        # cached loop.
-        export_bucket_group_worker(args)
-        # Second task, same worker (same process-global state, exactly
-        # like a real ProcessPoolExecutor worker handling a second item)
-        # — must reuse the same loop, not open a fresh one that orphans
-        # the first task's cached loop reference. Before this fix, this
-        # raised "Event loop is closed".
-        export_bucket_group_worker(args)
-
-
-class TestExportWorkerShutdown:
-    """``_export_worker_init`` registers ``_export_worker_shutdown`` via
-    ``atexit`` as its very last statement; ``_export_worker_shutdown``
-    itself releases an ``AsyncCloseable`` store and the destination fd,
-    tolerating the store's own ``aclose()`` raising. See
-    ``test_concurrency.py``'s own module docstring for why a real
-    spawned-worker proof that ``atexit`` itself fires isn't possible in
-    this test suite — this class covers this shutdown function's own
-    logic instead, via direct calls."""
-
-    def test_export_worker_init_registers_the_shutdown_hook(
-        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        _write_standard_composition(tmp_path / "Composition", _standard_entries())
-        _write_bucket(tmp_path / "Pool" / "0" / "0.buk", _CHUNK_PLAINTEXTS)
-        store = LocalFsStore(tmp_path)
-        dir_cache = DirCache(store)
-        pool = Pool(store, "Pool", dir_cache)
-        descriptor = PoolDescriptor.from_pool(pool)
-        assert descriptor is not None
-        dst = tmp_path / "out.bin"
-        dst.write_bytes(b"")
-        registered: list[object] = []
-        monkeypatch.setattr(atexit, "register", registered.append)
-
-        _export_worker_init(descriptor, str(dst))
-
-        assert registered == [_export_worker_shutdown]
-
-    def test_shutdown_acloses_an_asynccloseable_store_and_closes_the_fd(self, tmp_path: Path) -> None:
-        closed: list[bool] = []
-
-        class _FakeAsyncCloseableStore:
-            async def aclose(self) -> None:
-                closed.append(True)
-
-        dst = tmp_path / "out.bin"
-        dst.write_bytes(b"")
-        fd = os.open(dst, os.O_WRONLY | _O_BINARY)
-        chunk_walk._worker_store = _FakeAsyncCloseableStore()  # type: ignore[assignment]
-        chunk_walk._worker_dst_fd = fd
-
-        _export_worker_shutdown()
-
-        assert closed == [True]
-        with pytest.raises(OSError):
-            os.write(fd, b"x")  # the fd was actually closed, not merely dropped
-        chunk_walk._worker_dst_fd = None  # already closed above; the autouse fixture must not double-close it
-
-    def test_shutdown_tolerates_the_store_s_aclose_raising(self, tmp_path: Path) -> None:
-        class _FailingAsyncCloseableStore:
-            async def aclose(self) -> None:
-                raise RuntimeError("synthetic aclose failure")
-
-        dst = tmp_path / "out.bin"
-        dst.write_bytes(b"")
-        fd = os.open(dst, os.O_WRONLY | _O_BINARY)
-        chunk_walk._worker_store = _FailingAsyncCloseableStore()  # type: ignore[assignment]
-        chunk_walk._worker_dst_fd = fd
-
-        _export_worker_shutdown()  # must not raise despite aclose() failing
-
-        with pytest.raises(OSError):
-            os.write(fd, b"x")  # the fd still got closed
-        chunk_walk._worker_dst_fd = None  # already closed above; the autouse fixture must not double-close it
-
-
-class TestPositionalWriteFallback:
-    """``os.pwrite`` doesn't exist on Windows — this project's own CI runs
-    on Linux/macOS, where the ``sys.platform != "win32"`` branch is always
-    taken; here the ``lseek``+``write`` fallback is exercised directly by
-    forcing ``sys.platform`` to ``"win32"``, proving it lands bytes at the
-    same offset ``os.pwrite`` would."""
-
-    def test_fallback_lands_bytes_at_the_given_offset(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-        monkeypatch.setattr(sys, "platform", "win32")
-        dst = tmp_path / "out.bin"
-        dst.write_bytes(bytes(10))
-        fd = os.open(dst, os.O_WRONLY | _O_BINARY)
-        try:
-            chunk_walk._pwrite(fd, b"hello", 3)
-        finally:
-            os.close(fd)
-        assert dst.read_bytes() == bytes(3) + b"hello" + bytes(2)

@@ -46,9 +46,9 @@ class DirCache:
 
     Both ``_raw`` and ``_grouped`` are ``AsyncKeyedCache`` instances —
     unbounded, session-wide shared. Two Tasks racing on the same cold
-    directory only pay for one listing: the second joins the first's
-    in-flight ``store.listdir()`` instead of issuing its own (see that
-    module's own docstring for the exact in-flight-dedup contract).
+    directory only pay for one listing: the second awaits the first's
+    still-in-flight ``store.listdir()`` future instead of issuing its own,
+    and both end up with the same result (or exception).
     """
 
     def __init__(self, store: ObjectStore) -> None:

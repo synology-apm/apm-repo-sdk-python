@@ -22,10 +22,8 @@ configured -- see `../README.md`.
 
 `--group` runs one domain only; each repository's own discovery and
 catalog enumeration (`__main__.py`'s `_process_entry`/`_enumerate_catalog`)
-still always run for it regardless, since it's cheap metadata-only I/O --
-see `__main__.py`'s own module docstring for why this deliberately
-doesn't mirror the reference project's own `--group`-gated discovery, and
-for the one-repository-at-a-time shape this tool runs in either way.
+still always run for it regardless, since it's cheap, metadata-only I/O --
+no reason to gate something this cheap behind `--group`.
 
 ## Report
 
@@ -44,7 +42,7 @@ a mechanism this tool reinvents.
   discovery/dispatch bug in this tool (or the SDK), not an expected gap --
   check the sample is actually configured and spelled correctly before
   assuming otherwise.
-- A `◐` DEGRADED is only unremarkable when that sample's own comment says
+- A `◐` DEGRADED is only unremarkable when that sample's comment says
   so; anywhere else, it's worth a closer look at `<domain>.md`'s
   corresponding detail entry.
 
@@ -59,8 +57,9 @@ a mechanism this tool reinvents.
   its live `Catalog` -- via `_shared_refs.py`'s `resolve_catalog`, which
   wraps the real `Repository.catalog_by_id()`, always freshly, never a
   cached `Catalog` object -- would silently build a provider against the
-  wrong or a stale one; see that function's own docstring for why
-  staleness matters here specifically), and
+  wrong or a stale one: a key change tears down and reopens every
+  `DedupRepo` under the hood, so a `Catalog` cached from before that
+  change would end up pointing at a closed one), and
   `bootstrap_elapsed: dict[str, float]` (wall-clock seconds per sample's
   own catalog enumeration, keyed by `RepoInfo.sample_name` --
   `catalog.py`'s own enumeration-budget check reads it) -- both extended
@@ -105,11 +104,11 @@ a mechanism this tool reinvents.
    purely per-repo (see the "Per-sample, not per-type-globally" convention
    above -- no `run_once`/global aggregate skip); register it in
    `DOMAINS` (`_context.py`) and `_ORDER`/`_PHASES` (`__main__.py`); add
-   its coverage expectations to the relevant sample(s)' own comments in
+   its coverage expectations to the relevant sample(s)' comments in
    your `smoke_samples.toml`.
 3. **A new named sample surfaces** -- add a commented block of the right
    kind (`[[local]]`/`[[profile]]`/`[[remote_storage]]` -- see
    `../README.md`) to `../smoke_samples.toml.example`, following
-   `tests/CLAUDE.md`'s own sample coverage table; note what it's expected
+   `tests/CLAUDE.md`'s sample coverage table; note what it's expected
    to cover and any expected skips/degradations only in your own
    `smoke_samples.toml`'s comment on that block.

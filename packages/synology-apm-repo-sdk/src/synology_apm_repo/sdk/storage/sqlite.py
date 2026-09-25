@@ -48,7 +48,9 @@ async def open_sqlite(
 ) -> tuple[aiosqlite.Connection, tempfile.TemporaryDirectory[str] | None]:
     """Open an ``aiosqlite`` connection to ``path`` within ``store`` — read-only
     on the fast path, read-write on the slow path's own private materialized
-    copy (see this module's own docstring for which path a given call takes).
+    copy. The slow path is taken whenever ``transform`` is given, ``store``
+    isn't a ``LocalFsStore``, or a non-zero ``-wal`` sidecar is present;
+    the fast path is the ``LocalFsStore``-only case with none of those.
 
     Returns ``(connection, materialized_tmp_dir)``. ``materialized_tmp_dir``
     is ``None`` on the fast path (nothing extra was created); on the slow

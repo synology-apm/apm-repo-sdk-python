@@ -3,8 +3,9 @@ present), its own meta-availability checks, and ``open_target_db()`` — the
 one place this layer does real decrypt work (shared by the Unit Layer's
 Device and FS providers). Display/status extraction
 (``_version_epoch``/``_version_display_name``) is a first-class output here
-too, same reasoning as ``catalog/connection.py``'s own module docstring
-states for ``Connection``.
+too: CLI/TUI show only ``display_name``/``subtitle``/``attrs`` in the
+default (non-diagnostic) mode, so this can't be an afterthought bolted on
+later.
 
 **Encrypted connections**: ``version_spec`` itself is AES-256-CTR
 ciphertext (whole-string, standard base64) whenever the connection has a
@@ -34,6 +35,7 @@ from ..identifiers import (
     VersionUid,
     WorkloadId,
 )
+from ..presentation.format import format_timestamp
 from ..storage.base import join_path
 from ..storage.sqlite_source import SqliteSource
 from ..storage.table import Column, Table, as_int, as_str, sql_placeholders
@@ -154,10 +156,13 @@ async def open_target_db(repo: DedupRepo, version: Version, meta_dir: str) -> Sq
     ``SqliteSource`` — the identical sequence ``units.device`` and
     ``units.fs`` each need before going on to interpret ``target.db``'s
     own tables their own way. May be ``aHlT``-enveloped and have a real
-    ``-wal``/``-shm`` sidecar (FORMAT-SPEC.md §6.1); ``SqliteSource.
+    ``-wal``/``-shm`` sidecar (FORMAT-SPEC.md: copy_meta_file-layout); ``SqliteSource.
     from_enveloped_store`` handles both. A different addressing scheme
-    than ``DedupRepo.db``'s own envelope auto-detection (``db/<name>``;
-    see its own docstring), so this resolves the physical filename itself.
+    than ``DedupRepo.db``'s own ``db/<name>`` auto-detection (name-alias
+    resolution plus generation-selection for ``OBJECT_STORE``):
+    ``copy_meta_file`` entries are written once by the backup agent and
+    never rotated, so this resolves the physical filename directly
+    against the version's own recorded ``meta_filenames`` instead.
 
     ``rebuild_target.db`` (§6.4) is never read through this function.
     """
@@ -242,10 +247,9 @@ def _as_epoch_seconds(value: object) -> int | None:
     values to a usable epoch — real data has these as **strings**
     (protobuf-JSON's own int64-as-string convention,
     e.g. ``"1786024626"``), and ``"0"``/``0`` is the proto's own "not
-    set" sentinel (``status.copy_time``'s own field comment says so
-    explicitly; the same convention applies to ``start_time``/
-    ``end_time``), so both parse failure and the zero sentinel return
-    ``None`` — never ``0`` itself, which would format as 1970."""
+    set" sentinel for both fields, not a real 1970 timestamp, so both
+    parse failure and the zero sentinel return ``None`` — never ``0``
+    itself, which would format as 1970."""
     if isinstance(value, bool):
         return None
     if isinstance(value, int):
@@ -347,7 +351,14 @@ def _version_display_name(status: ParsedVersionStatus | None, version_uid: str) 
     epoch = _version_epoch(status)
     if epoch is None:
         return version_uid
-    return datetime.fromtimestamp(epoch, UTC).astimezone().strftime("%Y-%m-%d %H:%M:%S")
+    try:
+        return format_timestamp(datetime.fromtimestamp(epoch, UTC))
+    except (OverflowError, OSError, ValueError):
+        # _as_epoch_seconds narrows a protobuf-JSON string to int with no
+        # range check of its own -- an out-of-datetime-range value is
+        # exactly the kind of corrupt data this function already degrades
+        # on, not something to add a new exception type for.
+        return version_uid
 
 
 async def _version_metas_for(repo: DedupRepo, version_uids: list[str]) -> dict[str, VersionMeta]:

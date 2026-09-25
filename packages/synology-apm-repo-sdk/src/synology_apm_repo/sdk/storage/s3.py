@@ -11,8 +11,10 @@ of ``storage`` pay that cost even if it never touches ``S3Store``. Python
 caches the import after the first successful call, so the repeated
 ``import`` statements below cost a dict lookup, not a re-import.
 
-See ``ObjectStore``'s docstring for why this and ``AzureStore`` use
-``aioboto3``/async rather than a thread around plain ``boto3``. One
+This and ``AzureStore`` use ``aioboto3``/async rather than a thread around
+plain ``boto3`` because both sit on ``aiohttp``, where many outstanding
+network round-trips genuinely overlap on one thread — a real gain a
+thread-pool wrapper around a synchronous client wouldn't provide. One
 consequence: ``aioboto3``'s client is an *async context manager*, so this
 class creates it lazily on first use and owns its teardown via
 ``S3Store.aclose`` (called by ``Session.close()``) — forgetting that would
@@ -20,10 +22,8 @@ leak an ``aiohttp`` connector. The constructor itself stays synchronous
 (it only builds an ``aioboto3.Session``, which does no I/O).
 
 Two contract differences from ``LocalFsStore``, both because S3 genuinely
-has no directory entities: ``S3Store.listdir`` never raises ``NotFoundError``
-for an absent "directory" (a zero-match prefix is indistinguishable from
-one that was never created, and every caller already treats an empty
-listing and a missing entry the same way); ``S3Store.read`` treats an
+has no directory entities (``listdir``'s and ``exists``'s own docstrings
+cover the "directory" side of that): ``S3Store.read`` treats an
 out-of-range ``Range`` request as the ``ObjectStore`` contract's own
 short-read-at-EOF case (``b""``) rather than S3's own ``InvalidRange``
 client error, to match the same contract every other backend already
@@ -32,8 +32,7 @@ provides.
 Every client this module builds goes through ``_with_default_timeouts``,
 which caps botocore's own long batch-job timeouts down to values an
 interactive caller — the TUI's connect dialog, in particular — can actually
-wait through when an endpoint is unreachable. See that function's own
-docstring for the exact values.
+wait through when an endpoint is unreachable.
 """
 
 from __future__ import annotations
@@ -66,13 +65,14 @@ _DEFAULT_MAX_ATTEMPTS = 2
 # flows straight into aiohttp.TCPConnector(limit=...), meaning it caps the
 # *total* concurrent connections one S3Store's client
 # can ever hold open, across every caller sharing it: chunk_walk.py's
-# max_concurrent_reads (shared cross-bucket/in-bucket, see its own
-# docstring) and max_concurrent_opens both ultimately compete for slots in
+# max_concurrent_reads (one semaphore sized to it gates both the
+# cross-bucket dispatch loop and each bucket's own in-bucket fan-out) and
+# max_concurrent_opens both ultimately compete for slots in
 # this one pool, and either knob raised past this ceiling on its own (let
 # alone the two together) would queue inside the connector itself before a
 # single byte moves, on top of whatever the network/server itself is
 # doing — a silent, easy-to-miss
-# second bottleneck neither knob's own docstring accounts for. Raised
+# second bottleneck neither knob's docstring accounts for. Raised
 # generously above any concurrency this SDK exposes today (their sum
 # rarely exceeds double digits) rather than tied to a specific caller's
 # setting, since one client is shared across a whole session's unrelated
@@ -86,8 +86,8 @@ def _error_code(exc: ClientError) -> str:
 
 
 def _with_default_timeouts(client_kwargs: dict[str, Any]) -> dict[str, Any]:
-    """``client_kwargs`` with an interactive-friendly ``config`` merged in —
-    see the module-level timeout/pool-size constants above for why.
+    """``client_kwargs`` with an interactive-friendly ``config`` merged in
+    (values and rationale: the module-level constants above).
     ``Config.merge()`` lets a ``config`` the caller already supplied take
     precedence field-by-field over these defaults, rather than replacing
     it outright."""
@@ -106,10 +106,9 @@ def _with_default_timeouts(client_kwargs: dict[str, Any]) -> dict[str, Any]:
 
 
 def _import_aioboto3() -> Any:
-    """Lazy ``import aioboto3`` — see the module docstring for why this is
-    imported lazily rather than at module scope. Shared by every
-    constructor/free function here that needs it, so the choice of what to
-    import lives in one place."""
+    """Lazy ``import aioboto3``, same rationale as the module docstring
+    above. Shared by every constructor/free function here that needs it,
+    so the choice of what to import lives in one place."""
     import aioboto3
 
     return aioboto3
@@ -256,6 +255,10 @@ class S3Store:
         )
 
     async def listdir(self, path: str) -> list[str]:
+        """An absent "directory" (a prefix with zero objects under it) and
+        an empty one are indistinguishable — S3 has no real directory
+        entities, only prefixes — so both correctly report ``[]`` rather
+        than one of them raising ``NotFoundError``."""
         client = await self._get_client()
         prefix = _key(path)
         list_prefix = as_list_prefix(prefix)

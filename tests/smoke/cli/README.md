@@ -67,13 +67,15 @@ or `make smoke-test` (runs `sdk`/`cli`/`browser` together; not part of
   real data volume.
 - **`global_flags`** -- `--verbose`'s field-visibility gating, `--quiet`
   never suppressing errors, `--progress`'s NDJSON stream (needs `--json`
-  too -- see `phases/_global_flags.py`'s own comment), `--trace` never
-  polluting `--json` stdout.
+  too -- plain `--progress` on its own still renders a human progress bar,
+  not NDJSON), `--trace` never polluting `--json`
+  stdout.
 - **`export_lifecycle`** -- a real file export end to end (`.part` ->
   renamed final file), plus a real, timed `SIGINT` mid-export: a
   first-press Ctrl-C is a *clean* cancellation (exit 0, `.part` deleted,
-  no final file) -- see `_export_lifecycle.py`'s own docstring for why
-  that's the correct expectation, not a failure exit.
+  no final file), not a failure exit -- `export.py` handles the
+  cancellation explicitly and returns normally instead of letting it
+  crash the process.
 - **`profile`** -- `profile add/list/show/remove` round trip against a
   sandboxed config dir, driven through `--no-input`'s stdin-secrets flow.
   Forces `PYTHON_KEYRING_BACKEND=keyring.backends.null.Keyring` (see
@@ -113,7 +115,7 @@ discovery when it deliberately supplies an incorrect key.
 2. **Add a new domain** -- create `phases/_<domain>.py` with an
    `async def run(ctx: SmokeContext) -> None`; register it in `DOMAINS`
    (`_context.py`) and `_ORDER`/`_PHASES` (`__main__.py`); add its
-   coverage expectations to the relevant sample(s)' own comments in your
+   coverage expectations to the relevant sample(s)' comments in your
    `smoke_samples.toml`.
 3. **A new named sample surfaces** -- see `tests/smoke/sdk/README.md`'s
    "How to extend" for the shared `smoke_samples.toml.example` recipe;

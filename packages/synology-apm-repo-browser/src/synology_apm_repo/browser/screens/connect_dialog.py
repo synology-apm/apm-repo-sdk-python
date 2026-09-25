@@ -15,15 +15,18 @@ their message right here, inline, letting the user fix and retry without
 leaving the dialog. By the time ``BrowseScreen`` gets control back, there
 is always at least one already-scanned repository to show.
 
-Local browsing is ``DirsOnlyTree`` (see its own docstring for the
-directory-only filtering and the two navigation gaps a plain
-``DirectoryTree`` has no answer for) paired with a plain path ``Input``
-that mirrors the tree's current selection and can also be typed into
-directly.
+Local browsing is ``DirsOnlyTree`` -- filters to directories only, and
+adds two navigation conveniences a plain ``DirectoryTree`` has no
+built-in answer for: a synthetic ``".."`` entry for going up out of the
+rooted directory, and type-ahead that jumps the cursor to the first
+sibling starting with what's been typed -- paired with a plain path
+``Input`` that mirrors the tree's current selection and can also be
+typed into directly.
 
-Two collaborators, split out the same way ``goto_walker.py``'s
-``GotoChainWalker`` is split out of ``UnitScreen`` (see that module's own
-docstring for the convention): ``profile_manager.SavedProfileManager``
+Two collaborators, held privately and reaching back into this dialog
+only through the small public surface exposed for that purpose -- the
+same convention ``goto_walker.py``'s ``GotoChainWalker`` uses to reach
+back into ``UnitScreen``: ``profile_manager.SavedProfileManager``
 (saved-connection-profile CRUD) and ``remote_browser.RemoteOptionsBrowser``
 (the bucket/container "Browse" flow). This dialog keeps backend
 selection, store construction/validation, and the scan itself.
@@ -31,21 +34,39 @@ selection, store construction/validation, and the scan itself.
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
 import enum
 from collections.abc import Awaitable, Callable
 from pathlib import Path
 from typing import cast
 
-from textual import work
 from textual.app import ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical
+from textual.css.query import NoMatches
+from textual.reactive import reactive
 from textual.screen import ModalScreen
 from textual.widgets import Button, Checkbox, DirectoryTree, Input, OptionList, Select, Static, Tab, Tabs, Tree
+from textual.worker import Worker
 
 from synology_apm_repo.browser.app import ApmRepoBrowserApp
+from synology_apm_repo.browser.core.connect.validate import (
+    ConnectValidationError,
+    azure_config_and_secrets,
+    s3_config_and_secrets,
+    smb_config_and_secrets,
+    validate_azure,
+    validate_local,
+    validate_s3,
+)
 from synology_apm_repo.browser.screens._shared import modal_box_css, move_cursor_to_parent, show_error
-from synology_apm_repo.browser.screens.profile_manager import SavedProfileManager, _ProfileBackend, profile_backend_of
+from synology_apm_repo.browser.screens.profile_manager import (
+    _BACKEND_KIND,
+    SavedProfileManager,
+    _ProfileBackend,
+    profile_backend_of,
+)
 from synology_apm_repo.browser.screens.remote_browser import RemoteOptionsBrowser
 from synology_apm_repo.browser.strings import (
     CONNECT_AZURE_ACCOUNT_URL_PLACEHOLDER,
@@ -57,14 +78,10 @@ from synology_apm_repo.browser.strings import (
     CONNECT_BACKEND_LOCAL_LABEL,
     CONNECT_BACKEND_S3_LABEL,
     CONNECT_BACKEND_SMB_LABEL,
+    CONNECT_CANCEL_LABEL,
+    CONNECT_CANCELLING_STATUS,
     CONNECT_DELETE_PROFILE_LABEL,
     CONNECT_LOCAL_PROMPT,
-    CONNECT_NO_BUCKET_WARNING,
-    CONNECT_NO_CONTAINER_WARNING,
-    CONNECT_NO_PATH_WARNING,
-    CONNECT_NO_SERVER_WARNING,
-    CONNECT_NO_SHARE_WARNING,
-    CONNECT_PATH_NOT_A_DIRECTORY_WARNING,
     CONNECT_PROFILE_NAME_CONFIRM_LABEL,
     CONNECT_PROFILE_NAME_PLACEHOLDER,
     CONNECT_PROMPT,
@@ -77,7 +94,6 @@ from synology_apm_repo.browser.strings import (
     CONNECT_S3_SECRET_KEY_PLACEHOLDER,
     CONNECT_S3_VERIFY_TLS_LABEL,
     CONNECT_SAVE_PROFILE_LABEL,
-    CONNECT_SMB_INVALID_PORT_WARNING,
     CONNECT_SMB_PASSWORD_PLACEHOLDER,
     CONNECT_SMB_PROFILE_SELECT_PROMPT,
     CONNECT_SMB_SERVER_PLACEHOLDER,
@@ -87,6 +103,7 @@ from synology_apm_repo.browser.strings import (
     CONNECT_SUBMIT_LABEL_LOCAL,
 )
 from synology_apm_repo.browser.widgets.dirs_only_tree import DirsOnlyTree
+from synology_apm_repo.browser.widgets.worker_progress import work
 from synology_apm_repo.sdk.api import Repository
 from synology_apm_repo.sdk.errors import ApmRepoError
 from synology_apm_repo.sdk.presentation.format import pluralize
@@ -96,7 +113,6 @@ from synology_apm_repo.sdk.profiles import (
     AzureProfileConfig,
     BackendKind,
     S3ProfileConfig,
-    SmbProfileConfig,
     client_kwargs_with_secrets,
     store_from_config,
 )
@@ -119,27 +135,51 @@ _PROFILE_NAME_CONFIRM_BUTTON_IDS = tuple(f"connect-{b}-profile-name-confirm" for
 _PROFILE_NAME_INPUT_IDS = tuple(f"connect-{b}-profile-name-input" for b in _ProfileBackend)
 _PROFILE_SELECT_IDS = tuple(f"connect-{b}-profile-select" for b in _ProfileBackend)
 
+#: Every widget group ``_set_fields_disabled`` toggles while a scan is in
+#: flight -- the backend-picker tabs plus all four fields groups
+#: (disabling a container recursively disables every focusable
+#: descendant, so this doesn't need each individual ``Input``/``Tree``/
+#: ``Select``/``Checkbox``/profile button spelled out). Deliberately
+#: excludes ``#connect-actions``: that's the submit/cancel button itself,
+#: which must stay clickable throughout -- it's what actually cancels
+#: the scan.
+_DISABLE_WHILE_SCANNING_IDS = (
+    "connect-backend-tabs",
+    "connect-local-fields",
+    "connect-smb-fields",
+    "connect-s3-fields",
+    "connect-azure-fields",
+)
+
 
 #: What this dialog dismisses with on a successful scan: every repository
 #: found, plus the same display label ``BrowseScreen._repo_label`` needs
 #: (a real path string, or ``"s3://bucket"``/``"azure://container"``/
 #: ``"smb://server/share"``) — ``None`` on Esc/cancel. Connections are
 #: *not* fetched here — this dialog's job ends at "confirmed found, and
-#: cheaply opened"; ``BrowseScreen`` loads each repository's connections lazily,
-#: on demand (see its own module docstring for why).
+#: cheaply opened"; ``BrowseScreen`` loads each repository's connections
+#: lazily, on demand, only once its catalog node is actually expanded --
+#: fetching from S3/Azure is a real network cost (several full
+#: SQLite-file downloads), so connecting every discovered repository
+#: eagerly would mean waiting on repositories the user may never look at.
 ConnectResult = tuple[list[Repository], str]
 
 
-class _ConnectValidationError(Exception):
-    """A field this dialog itself can check before ever attempting a
-    scan (empty path/bucket/container name, or a local path that isn't
-    a directory) — never raised for anything that needs real I/O to
-    detect."""
-
-
 class ConnectDialog(ModalScreen[ConnectResult | None]):
-    """See module docstring. ``ModalScreen`` truncates the App-level
-    binding chain at itself, same as ``KeyDialog``/``ExportScreen``."""
+    """``ModalScreen`` truncates the App-level binding chain at itself,
+    same as ``KeyDialog``/``ExportScreen``."""
+
+    #: Which backend tab is active. ``init=False``: the real initial value
+    #: is established by the ``Tabs`` widget's own first ``TabActivated``
+    #: (fired once it mounts with its default active tab), not by this
+    #: reactive auto-firing its watcher a second time at construction.
+    backend: reactive[_Backend] = reactive(_Backend.LOCAL, init=False)
+
+    #: Which tab's inline "save as profile" name row is open, if any --
+    #: Esc while it's open closes only that row, not the whole dialog (see
+    #: action_cancel). ``init=False``: nothing is open at construction, so
+    #: there's nothing for the watcher to do on the first fire.
+    naming_profile: reactive[_ProfileBackend | None] = reactive(None, init=False)
 
     DEFAULT_CSS = (
         modal_box_css("ConnectDialog", width=84, guard_child_horizontal=True)
@@ -218,11 +258,11 @@ class ConnectDialog(ModalScreen[ConnectResult | None]):
         Binding("escape", "cancel", "Cancel", show=False),
         # Same shared "jump to parent, collapse it" behavior every
         # other tree in the app gets via NavigableScreen — reached
-        # directly here since ConnectDialog isn't one (see
-        # move_cursor_to_parent's own docstring for what this does and
-        # why; see DirsOnlyTree's own docstring for how going *up out
-        # of the rooted directory* is a different thing, handled by its
-        # synthetic ".." entry instead). Never reached while an Input
+        # directly here since ConnectDialog isn't one. Going *up out of*
+        # the rooted local directory is a different thing entirely --
+        # DirsOnlyTree handles that itself via a synthetic ".." leaf on
+        # its own root, which re-roots the whole tree at the parent
+        # directory rather than just moving the cursor. Never reached while an Input
         # has focus — Input already claims backspace for character
         # deletion, which wins first regardless of this binding.
         Binding("backspace", "cursor_to_parent", "To parent", show=False),
@@ -230,12 +270,20 @@ class ConnectDialog(ModalScreen[ConnectResult | None]):
 
     def __init__(self) -> None:
         super().__init__()
-        self._backend: _Backend = _Backend.LOCAL
-        # Guards against a second submit firing mid-scan (e.g. an
-        # impatient double Enter) — cleared on every failure path inside
-        # _scan(); never cleared on success since the dialog dismisses
-        # and there is nothing left here to guard.
-        self._scanning = False
+        # The real Worker _scan() is currently running as -- None
+        # whenever no scan is in flight, which also doubles as the
+        # ``scanning`` property's flag: a guard against a second submit
+        # firing mid-scan, and against ``RemoteOptionsBrowser.browse()``
+        # kicking off a bucket/container listing while a scan is already
+        # running. The two are set/cleared in lockstep at every site below, so tracking
+        # them as one field removes a whole class of desync bug a
+        # separate bool could invite. Textual's own @work decorator
+        # returns this synchronously (scheduling, not awaiting, the
+        # coroutine), so there's no race between _submit() assigning it
+        # and a user pressing Cancel a moment later. Never cleared on a
+        # successful scan since the dialog dismisses and there is
+        # nothing left here to guard.
+        self._scan_worker: Worker[None] | None = None
         self._profiles = SavedProfileManager(self)
         self._remote_browser = RemoteOptionsBrowser(self)
 
@@ -281,9 +329,8 @@ class ConnectDialog(ModalScreen[ConnectResult | None]):
                     yield Button(CONNECT_PROFILE_NAME_CONFIRM_LABEL, id="connect-smb-profile-name-confirm")
                 # No "Browse" button here, unlike the S3/Azure tabs below:
                 # an SMB server has no single account-level "list every
-                # share" operation the way S3/Azure list buckets/containers
-                # (see sdk.profiles.list_remote_items's own docstring), so
-                # the share name is always typed directly.
+                # share" operation the way S3/Azure list buckets/containers,
+                # so the share name is always typed directly.
                 yield Input(placeholder=CONNECT_SMB_SERVER_PLACEHOLDER, id="connect-smb-server")
                 yield Input(placeholder=CONNECT_SMB_SHARE_PLACEHOLDER, id="connect-smb-share")
                 yield Input(value="445", id="connect-smb-port")
@@ -364,7 +411,10 @@ class ConnectDialog(ModalScreen[ConnectResult | None]):
     def on_button_pressed(self, event: Button.Pressed) -> None:
         button_id = event.button.id
         if button_id == "connect-submit":
-            self._submit()
+            # This one button is submit or cancel depending on whether a
+            # scan is currently in flight -- its own label already says
+            # which.
+            self._cancel_scan() if self.scanning else self._submit()
         elif button_id == "connect-s3-browse-buckets":
             self._browse_buckets()
         elif button_id == "connect-azure-browse-containers":
@@ -377,7 +427,7 @@ class ConnectDialog(ModalScreen[ConnectResult | None]):
             self._confirm_save_profile(profile_backend_of(button_id))
 
     def on_tabs_tab_activated(self, event: Tabs.TabActivated) -> None:
-        self._switch_backend(cast(_Backend, event.tab.id))
+        self.backend = cast(_Backend, event.tab.id)
 
     def on_input_submitted(self, event: Input.Submitted) -> None:
         input_id = event.input.id
@@ -423,17 +473,51 @@ class ConnectDialog(ModalScreen[ConnectResult | None]):
             # the whole tree at the parent instead of leaving ".." as
             # an inert selected leaf — every real subdirectory keeps
             # Tree's own normal expand-in-place behavior, untouched.
-            # See DirsOnlyTree's own docstring for why ".." can never
-            # collide with a real directory's name.
+            # No real directory can ever be named exactly "..": every
+            # filesystem reserves it as the parent-directory alias, so
+            # this check can never misfire against a real subdirectory.
             self.query_one("#connect-local-tree", DirsOnlyTree).path = str(event.path)
 
     def action_cursor_to_parent(self) -> None:
         if isinstance(self.focused, Tree):
             move_cursor_to_parent(self.focused)
 
-    def _switch_backend(self, backend: _Backend) -> None:
-        """Shows the given backend's field group, hides the others, and
-        swaps the submit label."""
+    def watch_naming_profile(self, old: _ProfileBackend | None, new: _ProfileBackend | None) -> None:
+        if old is not None:
+            self.query_one(f"#connect-{old}-profile-name-row").remove_class("-visible")
+        if new is not None:
+            name_input = self.query_one(f"#connect-{new}-profile-name-input", Input)
+            name_input.value = ""
+            self.query_one(f"#connect-{new}-profile-name-row").add_class("-visible")
+            name_input.focus()
+
+    def on_saved_profile_manager_profiles_refreshed(self, message: SavedProfileManager.ProfilesRefreshed) -> None:
+        for backend, kind in _BACKEND_KIND.items():
+            names = [p.name for p in message.profiles if p.kind is kind]
+            self.query_one(f"#connect-{backend}-profile-select", Select).set_options([(name, name) for name in names])
+
+    def on_remote_options_browser_items_listed(self, message: RemoteOptionsBrowser.ItemsListed) -> None:
+        if message.error is not None:
+            show_error(self, "#connect-status", message.error)
+            return
+        option_list = self.query_one(message.option_list_id, OptionList)
+        if not message.items:
+            self.query_one("#connect-status", Static).update(f"no {message.noun}s found")
+            return
+        option_list.clear_options()
+        for item in message.items:
+            option_list.add_option(item)
+        # ``OptionList.highlighted`` starts ``None`` -- Enter's own ``action_select``
+        # is a no-op with nothing highlighted, so the first option is
+        # highlighted explicitly rather than leaving Enter dead until an
+        # arrow key is pressed first.
+        option_list.highlighted = 0
+        option_list.add_class("-visible")
+        option_list.focus()
+        found = len(message.items)
+        self.query_one("#connect-status", Static).update(f"found {found} {pluralize(found, message.noun)} — pick one")
+
+    def _watch_backend(self, backend: _Backend) -> None:
         # Deliberately leaves focus wherever it already is (on the tabs strip
         # in the common case) rather than moving it into the newly-active
         # group: this runs on every Tabs.TabActivated, including one fired by
@@ -442,37 +526,99 @@ class ConnectDialog(ModalScreen[ConnectResult | None]):
         # silently ending arrow-key backend browsing one step in. Tab is what
         # moves focus from the tabs strip into the active group.
         self._profiles.hide_name_row()
-        self._backend = backend
         for key in _Backend:
             self.query_one(f"#connect-{key}-fields").set_class(key == backend, "active")
-        self.query_one("#connect-submit", Button).label = (
-            CONNECT_SUBMIT_LABEL_LOCAL if backend == _Backend.LOCAL else CONNECT_SUBMIT_LABEL
-        )
+        # Never reached mid-scan -- the tabs strip is one of the widgets
+        # _set_fields_disabled() disables while a scan is in flight, so
+        # this can't race with the button already showing
+        # CONNECT_CANCEL_LABEL.
+        self.query_one("#connect-submit", Button).label = self._submit_label()
+
+    def _submit_label(self) -> str:
+        return CONNECT_SUBMIT_LABEL_LOCAL if self.backend == _Backend.LOCAL else CONNECT_SUBMIT_LABEL
+
+    def _set_fields_disabled(self, disabled: bool) -> None:
+        """Toggles every backend-picker/field-group widget's own
+        ``disabled`` -- each covers a whole container, so every
+        focusable descendant (``Input``/``Tree``/``Select``/
+        ``Checkbox``/profile button) is covered without spelling out
+        each one -- while a scan is in flight, so nothing here can be
+        edited out from under it. ``#connect-actions`` is deliberately
+        not among them -- it must stay clickable to cancel the scan."""
+        for widget_id in _DISABLE_WHILE_SCANNING_IDS:
+            self.query_one(f"#{widget_id}").disabled = disabled
+
+    def _end_scan(self) -> None:
+        """Restores this dialog to its normal, editable state once a
+        scan stops running -- however it stopped (a failure, or a
+        cancellation; a *successful* scan dismisses the whole screen
+        instead of ever reaching here). Shared by ``_fail_scan`` and
+        ``_cancel_scan``/``action_cancel``'s own cancellation path, so
+        neither leaves a different remnant of the other behind.
+        Tolerates the screen already being gone (``NoMatches``): a
+        cancellation's own cleanup can run after ``action_cancel``
+        already dismissed the screen, since ``Worker.cancel()`` only
+        *requests* cancellation -- the real ``CancelledError`` lands in
+        ``_scan`` later, asynchronously, so for the Escape path this
+        cleanup runs after the screen is already gone."""
+        self._scan_worker = None
+        with contextlib.suppress(NoMatches):
+            self._set_fields_disabled(False)
+            self.query_one("#connect-submit", Button).label = self._submit_label()
+            # Clears whatever scan-in-progress text (the real "scanning
+            # '...'..." line, or _cancel_scan's own "cancelling..." below)
+            # is still showing -- _fail_scan's show_error() immediately
+            # overwrites this with the real error right after, so a
+            # failure never visibly flickers through a blank status.
+            self.query_one("#connect-status", Static).update("")
+
+    def _cancel_scan(self) -> None:
+        if self._scan_worker is not None:
+            self._scan_worker.cancel()
+            # Immediate feedback -- _end_scan's own clear (above) doesn't
+            # run until the real CancelledError actually lands in _scan
+            # (Worker.cancel() only requests cancellation), an
+            # async-boundary-away moment after this click.
+            self.query_one("#connect-status", Static).update(CONNECT_CANCELLING_STATUS)
 
     def action_cancel(self) -> None:
         # Esc while the inline "save as profile" name row is open closes
         # only that row, not the whole dialog.
-        if self._profiles.naming_profile is not None:
+        if self.naming_profile is not None:
             self._profiles.hide_name_row()
             return
+        # Stop a scan in flight too, not just close the dialog on top of
+        # it -- otherwise it kept running orphaned in the background
+        # (still doing real network I/O for a remote backend) until it
+        # finished on its own, wasting the work and risking a stray
+        # dismiss()/#connect-status write against an already-gone screen.
+        self._cancel_scan()
         self.dismiss(None)
 
     # -- store construction/validation -----------------------------------
-    # Async ``@work`` (never ``thread=True``) — see browser/README.md. ``_build_store``
-    # awaits ``store_from_config`` for the s3/azure backends, so this and
+    # ``_build_store`` awaits ``store_from_config`` for the s3/azure backends, so this and
     # ``validated_store_for``'s own callers must run as workers rather than
     # plain synchronous event handlers.
-    @work
+    # busy=False: this dialog is a ModalScreen, not a NavigableScreen, so
+    # it has no breadcrumb to animate; constructing a store never performs
+    # network I/O either way, so there's nothing here worth a busy
+    # indicator anyway -- the real scan (_scan, below) already reports
+    # its own progress.
+    @work(busy=False)
     async def _submit(self) -> None:
-        if self._scanning or any(self._remote_browser.browsing.values()):
+        if self.scanning or any(self._remote_browser.browsing.values()):
             return
         result = await self._validated_store(self._build_store)
         if result is None:
             return
         store, label = result
-        self._scanning = True
-        self.query_one("#connect-submit", Button).disabled = True
-        self._scan(store, label)
+        self._set_fields_disabled(True)
+        # Stays enabled, not disabled -- it's now the Cancel button
+        # (on_button_pressed branches on self.scanning), the only
+        # widget in this whole dialog still meant to be clickable while
+        # a scan is running.
+        self.query_one("#connect-submit", Button).label = CONNECT_CANCEL_LABEL
+        self._scan_worker = self._scan(store, label)
 
     async def _validated_store(
         self, build: Callable[[], Awaitable[tuple[ObjectStore, str]]]
@@ -485,9 +631,11 @@ class ConnectDialog(ModalScreen[ConnectResult | None]):
         two-except shape below."""
         try:
             return await build()
-        except _ConnectValidationError as exc:
-            # A field this dialog itself can check with no I/O (see that
-            # exception's own docstring).
+        except ConnectValidationError as exc:
+            # A field this dialog itself can check before ever attempting
+            # a scan (empty path/bucket/container/server/share, a local
+            # path that isn't a directory, a non-numeric SMB port) -- no
+            # I/O involved.
             show_error(self, "#connect-status", exc)
             return None
         except Exception as exc:  # Constructing a store never performs network I/O: S3Store
@@ -519,41 +667,41 @@ class ConnectDialog(ModalScreen[ConnectResult | None]):
     def scanning(self) -> bool:
         """Whether ``_scan()`` currently has a connectivity check in
         flight — ``RemoteOptionsBrowser.browse()``'s own guard against
-        browsing while a submit is already scanning."""
-        return self._scanning
+        browsing while a submit is already scanning, and ``_submit``'s
+        own guard against a second submit firing mid-scan."""
+        return self._scan_worker is not None
 
     async def _build_store(self) -> tuple[ObjectStore, str]:
-        if self._backend == _Backend.LOCAL:
+        if self.backend == _Backend.LOCAL:
             return self._build_local_store()
-        if self._backend == _Backend.S3:
+        if self.backend == _Backend.S3:
             return await self._build_s3_store()
-        if self._backend == _Backend.AZURE:
+        if self.backend == _Backend.AZURE:
             return await self._build_azure_store()
         return await self._build_smb_store()
 
     def _build_local_store(self) -> tuple[ObjectStore, str]:
         raw = self.query_one("#connect-local-path", Input).value.strip()
-        if not raw:
-            raise _ConnectValidationError(CONNECT_NO_PATH_WARNING)
-        path = Path(raw).expanduser()
-        if not path.is_dir():
-            raise _ConnectValidationError(CONNECT_PATH_NOT_A_DIRECTORY_WARNING)
+        path = validate_local(raw)
         return LocalFsStore(path), str(path)
 
     def _s3_config_and_secrets(self, bucket: str) -> tuple[S3ProfileConfig, dict[str, str]]:
-        """Every S3 tab field, split into ``store_from_config``'s
-        ``config``/``secret_source`` pair — shared by ``_build_s3_store``
-        (``bucket`` already chosen) and ``s3_client_kwargs``
-        (``RemoteOptionsBrowser.browse_buckets``'s bucket-less
-        placeholder)."""
-        endpoint = self.query_one("#connect-s3-endpoint", Input).value.strip()
-        region = self.query_one("#connect-s3-region", Input).value.strip()
-        access_key = self.query_one("#connect-s3-access-key", Input).value.strip()
-        secret_key = self.query_one("#connect-s3-secret-key", Input).value
-        verify = self.query_one("#connect-s3-verify-tls", Checkbox).value
-
-        config = S3ProfileConfig(bucket=bucket, endpoint=endpoint or None, region=region or None, verify_tls=verify)
-        return config, {"access_key": access_key, "secret_key": secret_key}
+        """Reads every S3 tab field and delegates the actual
+        config/secret-source construction to ``core/connect/validate.py``'s
+        pure ``s3_config_and_secrets`` — this method's own job is purely
+        the Textual-coupled field reads; ``bucket`` decides whether the
+        caller wants ``s3_client_kwargs``'s bucket-less placeholder or
+        ``_build_s3_store``'s own already-chosen bucket, neither of
+        which validates ``bucket`` here (``validate_s3`` does, for the
+        latter)."""
+        return s3_config_and_secrets(
+            bucket=bucket,
+            endpoint=self.query_one("#connect-s3-endpoint", Input).value.strip(),
+            region=self.query_one("#connect-s3-region", Input).value.strip(),
+            access_key=self.query_one("#connect-s3-access-key", Input).value.strip(),
+            secret_key=self.query_one("#connect-s3-secret-key", Input).value,
+            verify_tls=self.query_one("#connect-s3-verify-tls", Checkbox).value,
+        )
 
     def s3_client_kwargs(self) -> dict[str, object]:
         """The bucket-less resolved client kwargs
@@ -567,125 +715,131 @@ class ConnectDialog(ModalScreen[ConnectResult | None]):
 
     async def _build_s3_store(self) -> tuple[ObjectStore, str]:
         bucket = self.query_one("#connect-s3-bucket", Input).value.strip()
-        if not bucket:
-            raise _ConnectValidationError(CONNECT_NO_BUCKET_WARNING)
-        config, secret_source = self._s3_config_and_secrets(bucket)
+        # validate_s3 re-derives config/secret_source from the same
+        # fields _s3_config_and_secrets above reads -- the bucket-check
+        # is the only thing this needs beyond what that method already
+        # gives s3_client_kwargs, and duplicating the read here keeps
+        # the pure validate_s3/s3_config_and_secrets split in
+        # core/connect/validate.py the single source of truth for what
+        # "valid" means, rather than this method re-deriving it by hand.
+        config, secret_source = validate_s3(
+            bucket=bucket,
+            endpoint=self.query_one("#connect-s3-endpoint", Input).value.strip(),
+            region=self.query_one("#connect-s3-region", Input).value.strip(),
+            access_key=self.query_one("#connect-s3-access-key", Input).value.strip(),
+            secret_key=self.query_one("#connect-s3-secret-key", Input).value,
+            verify_tls=self.query_one("#connect-s3-verify-tls", Checkbox).value,
+        )
         store = await store_from_config(BackendKind.S3, config, secret_source)
         return store, f"s3://{bucket}"
 
     def _azure_config_and_secrets(self, container: str) -> tuple[AzureProfileConfig, dict[str, str]]:
-        """Every Azure tab field, split into ``store_from_config``'s
-        ``config``/``secret_source`` pair — shared by ``_build_azure_store``
-        (``container`` already chosen) and ``azure_client_kwargs``
-        (``RemoteOptionsBrowser.browse_containers``'s container-less
-        placeholder). This dialog has no ``verify_tls``-equivalent field
-        for Azure (unlike S3's own checkbox), so ``AzureProfileConfig``'s
-        default (``verify_tls=True``) always applies here, same as a
-        saved Azure profile with that field never touched."""
-        account_url = self.query_one("#connect-azure-account-url", Input).value.strip()
-        credential = self.query_one("#connect-azure-credential", Input).value
-
-        config = AzureProfileConfig(container=container, account_url=account_url or None)
-        return config, {"credential": credential}
+        """Same role as ``_s3_config_and_secrets`` — the Textual-coupled
+        field reads, delegating construction to
+        ``core/connect/validate.py``'s pure ``azure_config_and_secrets``."""
+        return azure_config_and_secrets(
+            container=container,
+            account_url=self.query_one("#connect-azure-account-url", Input).value.strip(),
+            credential=self.query_one("#connect-azure-credential", Input).value,
+        )
 
     def azure_client_kwargs(self) -> dict[str, object]:
         """The container-less resolved client kwargs
-        ``RemoteOptionsBrowser.browse_containers`` needs — see
-        ``s3_client_kwargs``'s own docstring for why this stays a
-        separate call from ``_build_azure_store``."""
+        ``RemoteOptionsBrowser.browse_containers`` needs -- built via
+        ``client_kwargs_with_secrets`` directly, since
+        ``RemoteOptionsBrowser.browse`` calls ``list_remote_items`` with
+        already-resolved kwargs rather than the ``config``/``secret_source``
+        pair ``_build_azure_store`` produces."""
         config, secret_source = self._azure_config_and_secrets("")
         return client_kwargs_with_secrets(config, secret_source)
 
     async def _build_azure_store(self) -> tuple[ObjectStore, str]:
         container = self.query_one("#connect-azure-container", Input).value.strip()
-        if not container:
-            raise _ConnectValidationError(CONNECT_NO_CONTAINER_WARNING)
-        config, secret_source = self._azure_config_and_secrets(container)
+        config, secret_source = validate_azure(
+            container=container,
+            account_url=self.query_one("#connect-azure-account-url", Input).value.strip(),
+            credential=self.query_one("#connect-azure-credential", Input).value,
+        )
         store = await store_from_config(BackendKind.AZURE, config, secret_source)
         return store, f"azure://{container}"
-
-    def _smb_config_and_secrets(self, server: str, share: str) -> tuple[SmbProfileConfig, dict[str, str]]:
-        """Every SMB tab field, split into ``store_from_config``'s
-        ``config``/``secret_source`` pair — same role as
-        ``_s3_config_and_secrets``/``_azure_config_and_secrets``, but with
-        no bucket-less/container-less counterpart: SMB has no "Browse"
-        button (see ``compose()``'s own comment for why), so this is only
-        ever called from ``_build_smb_store`` with both already chosen."""
-        port_text = self.query_one("#connect-smb-port", Input).value.strip()
-        username = self.query_one("#connect-smb-username", Input).value.strip()
-        password = self.query_one("#connect-smb-password", Input).value
-
-        try:
-            port = int(port_text) if port_text else 445
-        except ValueError:
-            raise _ConnectValidationError(CONNECT_SMB_INVALID_PORT_WARNING) from None
-
-        config = SmbProfileConfig(server=server, share=share, port=port, username=username or None)
-        return config, {"password": password}
 
     async def _build_smb_store(self) -> tuple[ObjectStore, str]:
         server = self.query_one("#connect-smb-server", Input).value.strip()
         share = self.query_one("#connect-smb-share", Input).value.strip()
-        if not server:
-            raise _ConnectValidationError(CONNECT_NO_SERVER_WARNING)
-        if not share:
-            raise _ConnectValidationError(CONNECT_NO_SHARE_WARNING)
-        config, secret_source = self._smb_config_and_secrets(server, share)
+        port_text = self.query_one("#connect-smb-port", Input).value.strip()
+        username = self.query_one("#connect-smb-username", Input).value.strip()
+        password = self.query_one("#connect-smb-password", Input).value
+        config, secret_source = smb_config_and_secrets(
+            server=server, share=share, port_text=port_text, username=username, password=password
+        )
         store = await store_from_config(BackendKind.SMB, config, secret_source)
         return store, f"smb://{server}/{share}"
 
     # -- saved profiles (SavedProfileManager) -----------------------------
     # Thin @work wrappers: Textual's @work decorator schedules against the
     # actual Screen/Widget it's defined on, so the worker entry points stay
-    # here even though each body now lives on self._profiles.
+    # here even though each body now lives on self._profiles. busy=False
+    # throughout: local profiles.json disk I/O, not real network -- no
+    # busy indicator needed, and this dialog -- a ModalScreen, not a
+    # NavigableScreen -- has no breadcrumb to animate anyway.
 
-    @work
+    @work(busy=False)
     async def _show_profile_name_row(self, backend: _ProfileBackend) -> None:
         await self._profiles.show_name_row(backend)
 
     # Run on mount and after every save/delete so both tabs' pickers stay
     # in sync with ``profiles.json``.
-    @work
+    @work(busy=False)
     async def refresh_profile_lists(self) -> None:
         await self._profiles.refresh_lists()
 
-    @work
+    @work(busy=False)
     async def _load_selected_profile(self, backend: _ProfileBackend, name: str) -> None:
         await self._profiles.load_selected(backend, name)
 
-    @work
+    @work(busy=False)
     async def _confirm_save_profile(self, backend: _ProfileBackend) -> None:
         await self._profiles.confirm_save(backend)
 
     # Immediate, no confirmation dialog — matches this app's only existing
     # precedent for a destructive action (WorklistScreen's ``x`` key
     # cancels a job immediately, no confirm step).
-    @work
+    @work(busy=False)
     async def _delete_selected_profile(self, backend: _ProfileBackend) -> None:
         await self._profiles.delete_selected(backend)
 
     # -- remote bucket/container browsing (RemoteOptionsBrowser) ----------
-    # Same thin-wrapper reasoning as the profile methods above.
+    # Same thin-wrapper reasoning as the profile methods above -- the real
+    # busy indicator lives inside RemoteOptionsBrowser.browse() itself,
+    # which already owns "#connect-status".
 
-    @work
+    @work(busy=False)
     async def _browse_buckets(self) -> None:
         await self._remote_browser.browse_buckets()
 
-    @work
+    @work(busy=False)
     async def _browse_containers(self) -> None:
         await self._remote_browser.browse_containers()
 
     # -- scan --------------------------------------------------------------
-    # Async ``@work`` (never ``thread=True``) — see browser/README.md. One shared
-    # scan for every backend, "local" included: ``store`` is already fully
+    # One shared scan for every backend, "local" included: ``store`` is already fully
     # backend-specific by the time this runs, and ``Session.discover()`` is
     # itself defined as nothing more than ``LocalFsStore(path)`` fed into these
     # same ``discover_remote()``-shared internals — so there's no separate
     # local-only scan path to keep in sync with this one.
-    @work
+    # busy=False: this already reports its own real, continuously-updated
+    # progress into #connect-status via on_progress below -- a generic
+    # DebouncedProgress sink writing "<frame> Loading" into the same
+    # widget on its own timer would fight with those writes instead of
+    # complementing them, unlike every other call site in this package
+    # where nothing else is already updating the target widget.
+    @work(busy=False)
     async def _scan(self, store: ObjectStore, label: str) -> None:
         status = self.query_one("#connect-status", Static)
-        status.update(f"scanning {safe(label)!r}...")
+        # repr() before safe(), same as profile_manager.py's confirm_save()
+        # -- the reverse order would have repr() re-escape safe()'s own
+        # RTL-isolate marks as visible text.
+        status.update(f"scanning {safe(repr(label))}...")
         session = cast(ApmRepoBrowserApp, self.app).session
 
         async def on_progress(p: Progress) -> None:
@@ -697,6 +851,18 @@ class ConnectDialog(ModalScreen[ConnectResult | None]):
         repos: list[Repository] = []
         try:
             repos.extend([repo async for repo in session.discover_remote(store, progress=meter.update)])
+        except asyncio.CancelledError:
+            # Cancel button/Esc (action_cancel/_cancel_scan) -- restore
+            # this dialog's own editable state, then re-raise so
+            # Textual's own Worker still sees the cancellation and marks
+            # itself CANCELLED, not FAILED. Worker.cancel() only
+            # *requests* cancellation -- the real CancelledError lands
+            # here later, asynchronously, so for the Escape path this
+            # runs *after* action_cancel's own dismiss(None) already
+            # closed the screen; _end_scan's own NoMatches tolerance is
+            # what keeps that ordering harmless.
+            self._end_scan()
+            raise
         except ApmRepoError as exc:
             self._fail_scan(exc)
             return
@@ -717,7 +883,8 @@ class ConnectDialog(ModalScreen[ConnectResult | None]):
     def _fail_scan(self, message: object) -> None:
         # Routed through show_error, rather than each call site
         # pre-formatting "[red]error:[/red] ..." itself, so every
-        # failure renders identically.
-        self._scanning = False
-        self.query_one("#connect-submit", Button).disabled = False
+        # failure renders identically. State reset itself goes through
+        # _end_scan -- shared with the cancellation path below, so
+        # neither leaves a different remnant of the other behind.
+        self._end_scan()
         show_error(self, "#connect-status", message)

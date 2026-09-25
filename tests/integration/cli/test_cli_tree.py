@@ -1,9 +1,11 @@
 """Regression test for ``synology-apm-repo-cli tree`` (and one ``ls``-based
 disambiguation-round-trip scenario) — replayed from a committed fixture
 recorded against real bytes, with **no external dependency** — same
-``patch_profile_store`` fixture (``tests/conftest.py``) every sibling
-in this directory uses. See ``test_cli_ls.py``'s own docstring
-for why refs are written ``"#<fragment>"`` under ``--profile``.
+``patch_profile_store`` fixture (``tests/integration/cli/conftest.py``)
+every sibling in this directory uses. Refs here are written ``"#<fragment>"`` (or a
+bare ``"#"`` for the root) rather than a real filesystem path prefix,
+since ``--profile`` supplies the store in place of the ref's
+``<fs_path>`` half.
 
 Fixture: ``cli_tree_apv1_vault.json.gz``, this file's own dedicated
 recording against ``apv-sample-1/@ActiveProtectVault`` — covers both real
@@ -11,9 +13,9 @@ connections' full workload lists (``tree --depth 2`` walks the whole
 catalog, not just one connection the way ``test_cli_ls.py``'s own
 narrower recording does), at least one real persona whose 4 workloads
 (MAIL/CALENDAR/CONTACT/DRIVE) collide on one display name, and the same
-VM device tree (navigated via a canonical ref, immune to
-catalog-metadata anonymization — see ``test_cli_ls.py``'s own
-docstring). Recording it needs both the depth-2 catalog walk
+VM device tree (navigated via a canonical ref — an internal catalog
+identifier, immune to catalog-metadata anonymization). Recording it needs
+both the depth-2 catalog walk
 (``test_disambiguates_colliding_workload_names_replayed``) and the
 device-tree walk (``test_json_tree_of_device_items_replayed``) — no
 single test here covers both.
@@ -35,7 +37,7 @@ from types import ModuleType
 import pytest
 from typer.testing import CliRunner
 
-import synology_apm_repo.cli.browse as browse_mod
+import synology_apm_repo.cli.repo_session as repo_session_mod
 import synology_apm_repo.sdk.units.device as device_module
 from synology_apm_repo.cli.main import app
 
@@ -46,13 +48,13 @@ _VM_REF = "#cat:1/wl:2/ver:06b4b5e3-5490-4b6a-bee8-ce4287f7a9a7"
 
 @pytest.fixture(autouse=True)
 def _replay(patch_profile_store: Callable[[str, ModuleType], None], monkeypatch: pytest.MonkeyPatch) -> None:
-    patch_profile_store("cli_tree_apv1_vault.json.gz", browse_mod)
+    patch_profile_store("cli_tree_apv1_vault.json.gz", repo_session_mod)
     # tree's own --depth recursion eagerly expands every non-leaf child
     # it finds within that depth, including units/device.py's own
     # additive "(filesystem)" sibling node next to the VM disk image —
     # which needs real pytsk3 reads this fixture was never recorded
     # against (predating that feature). This file is about tree's own
-    # CLI wiring, not units/content/disk_fs.py — see
+    # CLI wiring, not units/content/disk_fs/ — see
     # tests/unit/sdk/test_units_disk_fs.py for that feature's own tests.
     monkeypatch.setattr(device_module, "disk_fs_available", lambda: False)
 

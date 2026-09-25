@@ -89,9 +89,9 @@ def _version_spec_json(start_time: object = None, end_time: object = None, statu
     """A minimal real-shaped ``version_spec`` blob — just the
     ``status.start_time``/``status.end_time``/``status.status`` fields
     this module actually reads (real production values are
-    protobuf-JSON int64-as-string, e.g. ``"1786024626"`` — see
-    ``version.proto``'s own real shape); omitted keys model a field
-    genuinely absent from a real row, not just zero/empty."""
+    protobuf-JSON int64-as-string, e.g. ``"1786024626"``); omitted keys
+    model a field genuinely absent from a real row, not just
+    zero/empty."""
     status_obj: dict[str, object] = {}
     if start_time is not None:
         status_obj["start_time"] = str(start_time)

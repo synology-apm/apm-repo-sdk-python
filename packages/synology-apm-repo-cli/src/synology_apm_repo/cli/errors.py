@@ -11,6 +11,8 @@ from typing import NoReturn, TypeVar
 import typer
 from rich.console import Console
 
+from synology_apm_repo.cli.progress_render import finish_live_progress
+from synology_apm_repo.cli.state import CliState
 from synology_apm_repo.sdk.errors import ApmRepoError, KeyMismatchError, KeyRequiredError
 from synology_apm_repo.sdk.presentation.markup import safe
 
@@ -68,6 +70,18 @@ def fail_unexpected(exc: Exception) -> NoReturn:
     err_console.print("".join(traceback.format_exception(exc)), style="dim", highlight=False)
     err_console.print(f"[dim]this looks like a bug — please file it at {_ISSUE_TRACKER_URL}[/dim]")
     raise typer.Exit(code=1) from exc
+
+
+def fail_from_apm_error(exc: ApmRepoError, state: CliState, *, prefix: str = "") -> NoReturn:
+    """The shared tail every Session/store-open skeleton
+    (``repo_session.opened_repo``, ``export.py``, ``dump.py``'s
+    ``_resolved_store``, ``profile.py``'s ``_verify_connectivity``) runs
+    once an ``ApmRepoError`` ends it: clear any live progress line, then
+    ``fail()`` with ``friendly_message``'s verbose-gated rendering.
+    ``prefix`` exists only for ``profile.py``'s "connectivity check
+    failed: " wording; every other caller leaves it blank."""
+    finish_live_progress(state)
+    fail(f"{prefix}{friendly_message(exc, verbose=state.verbose)}", cause=exc)
 
 
 async def unwrap(awaitable: Awaitable[_T], *, verbose: bool = False) -> _T:

@@ -9,6 +9,9 @@ from typing import Any
 
 from textual.widgets import Input, Tree
 
+from synology_apm_repo.browser.view.reconcile import Binding
+from synology_apm_repo.sdk.units.node_ref import NodeRef
+
 from ..._shared_refs import RepresentativeRef
 from .._context import SmokeContext
 from ._shared import connect_local, expand_first_repo, wait_until
@@ -33,7 +36,7 @@ async def run(ctx: SmokeContext, app: Any, pilot: Any) -> None:
         ctx.skip("navigate", f"navigate.{ref.sample_name}.goto", "connect step failed, see .connect above")
         return
 
-    async def _goto() -> Tree[Any]:
+    async def _goto() -> Tree[Binding[NodeRef]]:
         from synology_apm_repo.browser.screens.browse_screen import BrowseScreen
         from synology_apm_repo.browser.screens.unit_screen import UnitScreen
 
@@ -48,20 +51,28 @@ async def run(ctx: SmokeContext, app: Any, pilot: Any) -> None:
 
     tree = await ctx.call("navigate", f"navigate.{ref.sample_name}.goto", _goto)
     if tree is not None:
-        cursor_node = tree.cursor_node
-        # Compare segments only, not the whole NodeRef: this session's
-        # own connect_local() scanned from ref.repo_path directly, so its
-        # repo_root (and thus repo_path) legitimately differs from
-        # bootstrap's in-process session, which scanned from one level
-        # higher for an unkeyed ref (see _shared_refs.py's RepoInfo.
-        # narrow_repo_ref) -- same node, different scan root, different
-        # repo_path label. segments are the real "which node" identity.
-        landed = (
-            cursor_node is not None
-            and cursor_node.data is not None
-            and cursor_node.data.ref.segments == ref.node.ref.segments
-        )
-        ctx.check("navigate", f"navigate.{ref.sample_name}.cursor_on_leaf", landed)
+
+        async def _check_landed() -> bool:
+            from synology_apm_repo.browser.screens.unit_screen import UnitScreen
+
+            unit_screen = app.screen
+            if not isinstance(unit_screen, UnitScreen):
+                return False
+            # ref.node is always a leaf; a leaf target's own cursor lands on
+            # the folder tree's parent node, while the leaf itself is
+            # selected in the file table -- _selected_node() covers
+            # whichever of the two is actually focused.
+            selected = unit_screen._selected_node()
+            # This session's own connect_local() scan and bootstrap's
+            # separate in-process scan can resolve different repo_path
+            # values for the same node (bootstrap scans one level higher
+            # for an unkeyed ref) -- segments alone are the stable "which
+            # node" identity across both.
+            return selected is not None and selected.ref.segments == ref.node.ref.segments
+
+        landed = await ctx.call("navigate", f"navigate.{ref.sample_name}.cursor_on_leaf", _check_landed)
+        if landed is not None:
+            ctx.check("navigate", f"navigate.{ref.sample_name}.cursor_on_leaf.verified", landed)
         ctx.data["unit_tree"] = tree
 
 

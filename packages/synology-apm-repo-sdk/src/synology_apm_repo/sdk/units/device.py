@@ -10,8 +10,7 @@ disk-image object also gets one additional, purely-additive sibling node —
 guest OS's own filesystem
 (NTFS/FAT/exFAT/ext2-4/XFS/Btrfs/APFS) inside that same disk image and
 offers individual guest files as real, browsable/exportable
-``RestorableUnit``\\ s (see that module's own docstring for which formats
-it recognizes). When Dissect can't recognize any filesystem on a given
+``RestorableUnit``\\ s. When Dissect can't recognize any filesystem on a given
 disk (encrypted, unsupported, or genuinely not a filesystem-bearing
 image), that sibling node is simply absent or shows one diagnostic leaf
 explaining why — the whole-image node is completely unaffected either
@@ -31,9 +30,11 @@ constructed (``db/copy_target_version.target_type``, see ``catalog/version.py``)
   (``version_id`` → ``fid``) joined with ``db/file_meta`` (``fid`` → ``path``),
   looked up in ``db/file_map`` through the same bridge the VM path uses —
   the same production code path populates both tables for VM and PC/PS
-  alike. Handled by ``device_pcps.PcpsDiskTree``, a collaborator this
-  module's own ``DeviceProvider`` delegates to (see its own module
-  docstring for the disk-grouping rationale).
+  alike. Handled by ``device_pcps.PcpsDiskTree``, a collaborator
+  ``DeviceProvider`` delegates to because one physical PC/PS disk can land
+  as several independently-registered fragment objects, not one, and
+  ``PcpsDiskTree`` owns both the grouping rule and reassembling a group's
+  fragments into one disk.
 
 **Trap:** a PC/PS landing directory exists for every normally-landed
 version too, just without ``target.db`` — so "does ``copy_meta_file/<dir>``
@@ -61,6 +62,7 @@ from .base import (
     Node,
     RestorableUnit,
     UnitKind,
+    disk_fs_containers_before_leaves,
     not_restorable,
     paginate,
 )
@@ -84,19 +86,17 @@ class DeviceProvider:
     """
 
     def __init__(self, repo: DedupRepo, version: Version) -> None:
-        """Pure field initialization. ``_is_pcps`` is a plain,
-        already-known fact about ``version`` — never re-derived from a
-        filesystem probe (see this module's own docstring's Trap for
-        why)."""
+        """Pure field initialization. ``_is_pcps`` is derived from
+        ``version.target_type`` — the only reliable VM/PC-PS signal, since
+        file presence alone can't distinguish the two."""
         self._repo = repo
         self._version = version
         self._meta_dir: str | None = None
         self._target_db: SqliteSource | None = None
         self._is_pcps = version.target_type != TargetType.VM
         # The two collaborators this class delegates PC/PS listing and
-        # the disk-fs sibling axis to — see their own module docstrings.
-        # Each is scoped to this one provider instance and owns its own
-        # per-disk caches.
+        # the disk-fs sibling axis to. Each is scoped to this one
+        # provider instance and owns its own per-disk caches.
         self._pcps = PcpsDiskTree(self)
         self._disk_fs = DiskFsSibling(self)
 
@@ -137,10 +137,14 @@ class DeviceProvider:
 
     # -- copy_meta_file location (VM/FS only) --------------------------
 
-    async def _resolve_meta_dir(self) -> str:
+    def _resolve_meta_dir(self) -> str:
         """The ``copy_meta_file/<dir>`` this VM/FS version's ``target.db``
         lives under. VM-only — PC/PS has no ``target.db`` (module
         docstring) and never calls this.
+
+        Synchronous: ``resolve_copy_meta_dir()`` is pure, no-I/O lookup
+        work, the same reason ``units/fs.py``'s identically-shaped
+        ``_resolve_meta_dir`` stays sync.
 
         Raises:
             NotFoundError: This version has no ``copy_target_version_meta``
@@ -155,7 +159,7 @@ class DeviceProvider:
     async def _target_db_source(self) -> SqliteSource:
         if self._target_db is not None:
             return self._target_db
-        meta_dir = await self._resolve_meta_dir()
+        meta_dir = self._resolve_meta_dir()
         self._target_db = await open_target_db(self._repo, self._version, meta_dir)
         return self._target_db
 
@@ -220,12 +224,14 @@ class DeviceProvider:
             case _NodeKind.DISK_FS_ENTRY:
                 return await self._disk_fs.open_entry(node)
             case _NodeKind.PCPS_DIAGNOSTIC:
-                # Not a real restorable object — see PcpsDiskTree's own
-                # _diagnostic_node() for what this summarizes.
+                # Not a real restorable object — attrs["diagnostic"] already
+                # holds the human-readable summary of which registered fids
+                # never resolved.
                 raise NotFoundError(node.attrs["diagnostic"], ref=str(node.attrs["missing_fids"]))
             case _NodeKind.DISK_FS_DIAGNOSTIC:
-                # Not a real restorable object either — see
-                # DiskFsSibling.diagnostic_node()'s own construction site.
+                # Not a real restorable object either — attrs["diagnostic"]
+                # already holds the human-readable explanation of why no
+                # filesystem was recognized.
                 raise NotFoundError(node.attrs["diagnostic"], ref=self._version.version_uid)
             case _:
                 not_restorable("node", node.name)
@@ -286,8 +292,10 @@ class DeviceProvider:
         # the real schema — nothing covers (version_id, config_device_id)
         # itself. A no-op in practice (this table is already scoped to
         # one version's own devices, typically small) but applied
-        # unconditionally for consistency — see apply_index_hint()'s own
-        # docstring for why this is always safe to call regardless.
+        # unconditionally for consistency — safe even when the columns
+        # are already covered by an existing index (a cheap leading-
+        # prefix check skips it) or the connection is read-only (CREATE
+        # INDEX then just raises, caught and treated as a no-op).
         await apply_index_hint(conn, "object_table", ["version_id", "config_device_id"])
         # Fetched unpaginated and sliced in Python below — same reasoning
         # PcpsDiskTree._build_nodes() already has for its own per-key node
@@ -298,7 +306,10 @@ class DeviceProvider:
         # up with this method's actual returned node count. Real devices
         # register a handful of disk objects, never thousands, so this
         # stays cheap.
-        cursor = await conn.execute(  # pragma: no cover - sys.settrace-confirmed false negative, see CONTRIBUTING.md
+        # coverage.py attributes this multi-line call's hit to its closing
+        # line, not this opening one, so this line is flagged uncovered
+        # even though it always executes.
+        cursor = await conn.execute(  # pragma: no cover
             "SELECT object_id, data_format, file_path, src_file_path, temp_postfix, dedup_object, file_size "
             "FROM object_table WHERE version_id = ? AND config_device_id = ? "
             "AND (temp_postfix IS NULL OR temp_postfix = '') "
@@ -332,7 +343,10 @@ class DeviceProvider:
                 nodes.append(
                     self._disk_fs.root_node(disk_key=("object", object_id), source_node=object_node, name=leaf_name)
                 )
-        return paginate(nodes, offset, limit)
+        # disk_fs_containers_before_leaves(): each "(filesystem)" sibling
+        # keeps its own file_path/object_id-ordered position relative to
+        # its peers.
+        return paginate(disk_fs_containers_before_leaves(nodes), offset, limit)
 
     async def _open_object(self, node: Node) -> RestorableUnit:
         attrs = node.attrs
@@ -349,7 +363,7 @@ class DeviceProvider:
                 location.stream_id, location.session_id, location.comp_offset, size=node.size
             )
         else:
-            meta_dir = await self._resolve_meta_dir()
+            meta_dir = self._resolve_meta_dir()
             content = await _LocalFileContentSource.create(self._repo, f"{meta_dir}/{attrs['file_path']}", node.size)
         return RestorableUnit(
             ref=node.ref, name=node.name, is_leaf=True, kind=node.kind, size=node.size, attrs=attrs, content=content
@@ -370,11 +384,15 @@ class _LocalFileContentSource:
     def __init__(self, repo: DedupRepo, path: str, size: int | None) -> None:
         self._repo = repo
         self._path = path
-        self.size: int | None = size
+        self._size = size
 
     @classmethod
     async def create(cls, repo: DedupRepo, path: str, size: int | None) -> Self:
         return cls(repo, path, size if size is not None else await repo.store.size(path))
+
+    @property
+    def size(self) -> int | None:
+        return self._size
 
     @property
     def supports_concurrent_export(self) -> bool:
@@ -404,8 +422,9 @@ class _LocalFileContentSource:
         # a real result to report, not a silent None.
         assert self.size is not None
         data = await self.read(0, self.size)
-        # Local file writes have no native async form (storage/local.py's
-        # own docstring) — the blocking call goes through to_thread, same
-        # as dedup/dedup_file.py's own export path.
+        # Local file writes have no native async form in CPython (no
+        # asyncio equivalent of os.open/os.write) — the blocking call
+        # goes through to_thread, same as dedup/dedup_file.py's own
+        # export path.
         await asyncio.to_thread(Path(dst).write_bytes, data)
         return ExportResult(bytes_written=self.size, logical_size=self.size, holes=0, zeros=0)

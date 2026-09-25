@@ -17,7 +17,8 @@ import pytest
 import zstandard
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 
-from synology_apm_repo.sdk.dedup.pool import _GAP_TOLERANCE, BucketReader, Pool
+from synology_apm_repo.sdk.dedup.pool import BucketReader, Pool
+from synology_apm_repo.sdk.dedup.pool._bucket_reader import _GAP_TOLERANCE
 from synology_apm_repo.sdk.errors import ChunkCompactedError, DataCorruptError, KeyRequiredError
 from synology_apm_repo.sdk.format.addressing import ChunkAddress
 from synology_apm_repo.sdk.format.bucket import (
@@ -218,9 +219,11 @@ class TestBucketPathResolution:
 
 class TestLegacyUncompressedBucket:
     async def test_open_synthesizes_none_type_size_store_entries(self, tmp_path: Path) -> None:
-        """No current writer produces this layout (see ``open()``'s own
-        comment) — a real header with ``MODE_COMPRESS`` unset, no
-        SizeStore region present at all."""
+        """The uncompressed layout (``MODE_COMPRESS`` unset) is handled but
+        never produced by any current writer -- a real header with it
+        unset has no
+        SizeStore region present at all, so every chunk is synthesized as
+        ``CompressType.NONE`` at a fixed stride instead."""
         header = bytearray(64)
         header[0:4] = b"bFiL"
         header[4:6] = (3).to_bytes(2, "big")
@@ -265,6 +268,32 @@ class TestReadChunkPlaintext:
         result = await plaintext_pool.read_chunk(_addr(1), cache=False)
         assert result == _PLAINTEXTS[1]
         assert (5, 0, 1) not in plaintext_pool._chunks
+
+
+class TestCachedChunkAndBackfill:
+    """``cached_chunk``/``backfill_chunk`` — the peek/insert pair
+    ``dedup_file.py``'s multi-chunk batch path uses instead of
+    ``read_chunk()``'s own single-key fetch shape."""
+
+    async def test_cached_chunk_is_none_before_anything_populates_it(self, plaintext_pool: Pool) -> None:
+        assert plaintext_pool.cached_chunk(_addr(0)) is None
+
+    async def test_read_chunk_populates_what_cached_chunk_then_sees(self, plaintext_pool: Pool) -> None:
+        await plaintext_pool.read_chunk(_addr(0))
+        assert plaintext_pool.cached_chunk(_addr(0)) == _PLAINTEXTS[0]
+
+    async def test_backfill_chunk_makes_a_later_read_chunk_a_cache_hit(self, plaintext_pool: Pool) -> None:
+        plaintext_pool.backfill_chunk(_addr(0), _PLAINTEXTS[0])
+        assert plaintext_pool.cached_chunk(_addr(0)) == _PLAINTEXTS[0]
+
+        real_bucket = plaintext_pool.bucket
+
+        async def exploding_bucket(stream_id: StreamId, bucket_id: BucketId) -> BucketReader:
+            raise AssertionError("read_chunk() must not open a bucket for an already-backfilled chunk")
+
+        plaintext_pool.bucket = exploding_bucket  # type: ignore[method-assign]
+        assert await plaintext_pool.read_chunk(_addr(0)) == _PLAINTEXTS[0]
+        plaintext_pool.bucket = real_bucket  # type: ignore[method-assign]
 
 
 class TestVerifyFingerprint:
@@ -722,8 +751,7 @@ class TestNonCompactedChunkIndices:
         _write_bucket(path, plaintexts, stream_id=5, bucket_id=0, compress_types=[CompressType.NONE] * 4)
 
         # Hand-patch entry 1's SizeStore slot to COMPACTED after the fact --
-        # _write_bucket() itself doesn't support COMPACTED (see its own
-        # docstring); this test only needs a mixed SizeStore, not a
+        # _write_bucket() itself doesn't support COMPACTED; this test only needs a mixed SizeStore, not a
         # genuinely reclaimed chunk's real on-disk byte layout.
         raw = bytearray(path.read_bytes())
         entries = [(CompressType.NONE.value, 0)] * 4
@@ -834,12 +862,12 @@ async def test_bucket_reader_open_is_safe_under_concurrent_access(tmp_path: Path
 
 class TestFitsInRun:
     """Pure-logic tests for ``BucketReader._fits_in_run`` (merge
-    gap-tolerance arithmetic — no size cap, only a gap tolerance, see
-    ``pool.py``'s own ``_GAP_TOLERANCE`` docstring for why). Takes a bare
+    gap-tolerance arithmetic — no size cap, only a gap tolerance).
+    Takes a bare
     ``(prev_end, offset)`` pair rather than a whole run tuple — shared
-    verbatim by ``read_chunks`` and ``read_raw_chunks``, each computing its
-    own ``prev_end`` off its own run shape (see this method's own
-    docstring) — so these tests don't need any particular run-tuple shape
+    verbatim by ``read_chunks`` and ``read_raw_chunks``, each passing its
+    own run shape's offset+length in rather than this method assuming
+    one — so these tests don't need any particular run-tuple shape
     at all. Exact boundary behavior would need multi-hundred-KiB/multi-MiB
     real bucket fixtures to exercise through real files, which the
     batch-read correctness tests below don't need (they only need "does
@@ -862,7 +890,7 @@ class TestFitsInRun:
         assert BucketReader._fits_in_run(250, 100) is False
 
     def test_a_32_mib_zero_gap_run_still_fits(self) -> None:
-        """No size cap, only a gap tolerance (``pool.py``'s
+        """No size cap, only a gap tolerance (``_bucket_reader.py``'s
         ``_GAP_TOLERANCE`` docstring has the real-data reasoning) — a
         contiguous run past even one whole bucket's realistic size (here:
         32 MiB) still merges as long as the gap itself is zero."""
@@ -948,10 +976,10 @@ class TestReadChunksBatch:
     ) -> None:
         # Mirrors TestCompacted.test_compacted_chunk_raises but through
         # the batch path, and additionally proves the raise happens
-        # *before* any ObjectStore.read() call — the compacted check
-        # runs as its own pass over every request first (see
-        # read_chunks()'s own docstring), so a caller never pays for a
-        # read it can't use.
+        # *before* any ObjectStore.read() call — read_chunks() resolves
+        # every request's compress type (and so its COMPACTED-ness) in
+        # its own pass before planning or issuing any read, so a caller
+        # never pays for a read it can't use.
         path = tmp_path / "Pool" / "5" / "0.buk"
         path.parent.mkdir(parents=True)
         entries = [(CompressType.COMPACTED.value, 0), (CompressType.ZSTD.value, 100)]
@@ -1284,11 +1312,9 @@ class _ParkFirstDataReadStore:
 
 
 class TestReadChunksConcurrentReads:
-    """``semaphore`` — concurrency *within* one bucket's own merged runs
-    (see ``BucketReader.read_chunks``'s own docstring for the
-    mechanism and the "caller already acquired the first run's permit"
-    hand-off contract shared with ``chunk_walk.py``'s cross-bucket
-    dispatch loop). ``_GAP_TOLERANCE`` is monkeypatched to 0 for these
+    """``semaphore`` — concurrency *within* one bucket's own merged runs,
+    the same shared pool ``chunk_walk.py``'s cross-bucket dispatch loop
+    draws from. ``_GAP_TOLERANCE`` is monkeypatched to 0 for these
     tests — the smallest, cheapest way to force a real two-run split with
     only the module's existing 3-chunk fixture (skip chunk 1's request
     entirely; its own compressed length becomes a real, positive gap
@@ -1307,7 +1333,7 @@ class TestReadChunksConcurrentReads:
         store = LocalFsStore(tmp_path)
         pool = Pool(store, "Pool", DirCache(store))
         reader = await pool.bucket(StreamId(5), BucketId(0))
-        monkeypatch.setattr("synology_apm_repo.sdk.dedup.pool._GAP_TOLERANCE", 0)
+        monkeypatch.setattr("synology_apm_repo.sdk.dedup.pool._bucket_reader._GAP_TOLERANCE", 0)
 
         requests = [(0, _addr(0)), (2, _addr(2))]  # skip chunk 1 -> forced 2-run split at tolerance=0
         result = await reader.read_chunks(requests, semaphore=asyncio.Semaphore(4))
@@ -1328,7 +1354,7 @@ class TestReadChunksConcurrentReads:
         reader = await pool.bucket(
             StreamId(5), BucketId(0)
         )  # header already opened via ``backing``, before the store swap below
-        monkeypatch.setattr("synology_apm_repo.sdk.dedup.pool._GAP_TOLERANCE", 0)
+        monkeypatch.setattr("synology_apm_repo.sdk.dedup.pool._bucket_reader._GAP_TOLERANCE", 0)
 
         parking_store = _ParkFirstDataReadStore(backing)
         reader._store = parking_store
@@ -1360,7 +1386,7 @@ class TestReadChunksConcurrentReads:
         backing = LocalFsStore(tmp_path)
         pool = Pool(backing, "Pool", DirCache(backing))
         reader = await pool.bucket(StreamId(5), BucketId(0))
-        monkeypatch.setattr("synology_apm_repo.sdk.dedup.pool._GAP_TOLERANCE", 0)
+        monkeypatch.setattr("synology_apm_repo.sdk.dedup.pool._bucket_reader._GAP_TOLERANCE", 0)
 
         parking_store = _ParkFirstDataReadStore(backing)
         reader._store = parking_store
@@ -1513,6 +1539,17 @@ class TestReleaseCaches:
         assert len(plaintext_pool._chunks) == 0
         assert len(plaintext_pool._buckets) == 0
         assert len(plaintext_pool._allocation_cache._tables) == 0
+
+    async def test_release_caches_drops_backfilled_chunks_too(self, plaintext_pool: Pool) -> None:
+        """``backfill_chunk`` (the multi-chunk batch path's own way into
+        ``_chunks``, alongside ``read_chunk``'s) must be covered by the
+        same release, not just entries a real fetch populated."""
+        plaintext_pool.backfill_chunk(_addr(0), _PLAINTEXTS[0])
+        assert len(plaintext_pool._chunks) > 0
+
+        plaintext_pool.release_caches()
+
+        assert len(plaintext_pool._chunks) == 0
 
     async def test_the_pool_still_works_after_a_release(self, plaintext_pool: Pool) -> None:
         """Releasing is not closing: the next read just re-opens what it

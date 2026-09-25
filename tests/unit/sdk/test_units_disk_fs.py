@@ -2,7 +2,7 @@
 ext2/3/4, XFS, Btrfs, and NTFS backends (``dissect.fat``/``dissect.extfs``/
 ``dissect.xfs``/``dissect.btrfs``/``dissect.ntfs``) — kept together in one
 file since all five use offline, committed/hand-built fixtures with no
-external sample dependency (see ``tests/unit/test_units_disk_fs_apfs.py``
+external sample dependency (see ``tests/unit/sdk/test_units_disk_fs_apfs.py``
 for APFS's own fixture, built differently again). This is a real,
 mkfs-built NTFS volume, not a fixture the real-sample-only
 ``tests/integration/sdk/test_units_disk_fs.py`` coverage replaces — that
@@ -14,8 +14,8 @@ FAT12 fixture: hand-built byte-exact in pure Python (no external mkfs
 tool needed — macOS's own ``newfs_msdos`` refuses to format a plain file
 rather than a real block device).
 
-ext4 fixture: ``tests/fixtures/tiny_ext4.raw.tar.gz`` — a real, minimal
-(~9KB compressed), committed binary fixture: an 8MiB ext4 filesystem
+ext4 fixture: ``tests/fixtures/tiny_ext4.raw.tar.gz`` — a real, minimal,
+committed binary fixture: an 8MiB ext4 filesystem
 built with the real ``mke2fs -t ext4`` (journal disabled to keep it
 small/deterministic), given a known ``hello.txt``/``subdir/nested.txt``
 payload. Not hand-assembled like FAT12 — ext4's own on-disk structures
@@ -66,8 +66,8 @@ ext4/XFS/Btrfs's directory-tree-only ``mkfs -r``/``-d`` build, ``mkntfs``
 formats an empty volume that then needs mounting to write real files
 into — done via ``mount -t ntfs-3g -o loop`` inside the same
 ``--privileged`` container (``ntfs-3g``'s FUSE driver, not an in-kernel
-NTFS write driver). This real volume also reproduces the exact on-disk
-convention ``a55415d`` fixed: its root directory really does carry a
+NTFS write driver). This real volume also reproduces the on-disk
+convention that its root directory really does carry a
 literal ``"."`` self-referential entry, which ``_ntfs_iterdir`` filters —
 this fixture's own tests below prove that filtering against a real
 volume, on top of
@@ -100,6 +100,7 @@ import tempfile
 import threading
 import time
 from collections.abc import AsyncIterator, Awaitable, Callable
+from datetime import UTC, datetime
 from functools import cache
 from pathlib import Path
 from typing import BinaryIO, cast
@@ -107,21 +108,39 @@ from typing import BinaryIO, cast
 import pytest
 
 from synology_apm_repo.sdk.dedup.dedup_file import DEFAULT_STREAM_BLOCK
-from synology_apm_repo.sdk.errors import DataCorruptError
+from synology_apm_repo.sdk.errors import ContentUnavailableError, DataCorruptError
+from synology_apm_repo.sdk.units.base import FileState
 from synology_apm_repo.sdk.units.content.disk_fs import (
     DiskFilesystem,
     DissectFileContentSource,
-    _btrfs_iterdir,
-    _btrfs_volume_label,
+    _DissectEntry,
+    _partition_table_label,
+    disk_fs_available,
+)
+from synology_apm_repo.sdk.units.content.disk_fs._base import (
+    _CLOUD_ONLY_REASON,
+    _ENCRYPTED_REASON,
     _default_size,
-    _extfs_volume_label,
-    _fat_volume_label,
+    _DirEntry,
+    _Format,
+    _try_import,
+)
+from synology_apm_repo.sdk.units.content.disk_fs._ntfs import (
+    _is_cloud_file,
+    _ntfs_content_unavailable,
+    _ntfs_entry_mtime,
+    _ntfs_is_encrypted,
+    _ntfs_is_encrypted_attr,
     _ntfs_iterdir,
     _ntfs_size,
-    _partition_table_label,
-    _try_import,
+)
+from synology_apm_repo.sdk.units.content.disk_fs._posix_formats import (
+    _btrfs_iterdir,
+    _btrfs_volume_label,
+    _extfs_volume_label,
+    _fat_entry_mtime,
+    _fat_volume_label,
     _xfs_volume_label,
-    disk_fs_available,
 )
 
 _O_BINARY = getattr(os, "O_BINARY", 0)
@@ -249,8 +268,10 @@ def _load_tar_gz_fixture(name: str) -> tuple[Path, int]:
     worker process.
 
     ``.tar.gz``, not plain ``.gz``: each of these images is mostly
-    unallocated relative to its own logical size (see the module
-    docstring), and ``tarfile``'s ``extract()`` reconstructs a
+    unallocated relative to its own logical size (XFS/Btrfs's real
+    format tooling forces a large minimum image size -- 300MiB/~109MiB --
+    even though the actual payload is a couple of tiny files), and
+    ``tarfile``'s ``extract()`` reconstructs a
     ``tar --sparse``-recorded hole as a real hole on the destination
     filesystem (seeking past it rather than writing real zero bytes) —
     the same outcome a hand-rolled zero-detecting write loop would need
@@ -364,15 +385,20 @@ async def _open_fat12() -> tuple[DiskFilesystem, int]:
 async def test_fat12_list_dir_lists_real_entries() -> None:
     disk_fs, addr = await _open_fat12()
     entries = await disk_fs.list_dir(addr, "/")
-    names = {name for name, _is_dir, _size in entries}
+    names = {e.name for e in entries}
     assert names == {"HELLO.TXT", "SUBDIR"}
 
-    hello = next(e for e in entries if e[0] == "HELLO.TXT")
-    assert hello[1] is False  # is_dir
-    assert hello[2] == len(_FAT12_FILE_CONTENT)
+    hello = next(e for e in entries if e.name == "HELLO.TXT")
+    assert hello.is_dir is False
+    assert hello.size == len(_FAT12_FILE_CONTENT)
+    # The hand-built image never sets DIR_WrtDate/DIR_WrtTime (left
+    # zeroed) -- dostimestamp(0) is FAT's own epoch sentinel, not a
+    # missing value, and _fat_entry_mtime reinterprets it as UTC.
+    assert hello.mtime == datetime(1980, 1, 1, tzinfo=UTC)
 
-    subdir = next(e for e in entries if e[0] == "SUBDIR")
-    assert subdir[1] is True
+    subdir = next(e for e in entries if e.name == "SUBDIR")
+    assert subdir.is_dir is True
+    assert subdir.mtime == datetime(1980, 1, 1, tzinfo=UTC)
 
 
 async def test_fat12_open_file_reads_the_real_file_content() -> None:
@@ -446,7 +472,9 @@ def test_extfs_volume_label_falls_back_to_last_mount_when_unset() -> None:
     real-data confirmation lives in
     tests/integration/sdk/test_units_disk_fs.py's own Fedora /boot coverage
     (a real ext4 partition with an empty volume_name but
-    last_mount="/boot", see ``_extfs_volume_label``'s own comment)."""
+    last_mount="/boot"). ``last_mount`` is the kernel's own
+    ``last_mounted`` superblock field, updated on every real mount, so it's
+    a populated fallback in the common case a label was never set."""
 
     class _FakeVolume:
         volume_name = ""
@@ -472,9 +500,8 @@ def test_extfs_volume_label_is_none_when_neither_is_set() -> None:
 
 
 def test_xfs_volume_label_reads_the_real_name_attribute() -> None:
-    """Direct fallback-chain test, mirroring _extfs_volume_label's own
-    -- real-data confirmation lives in the XFS partition coverage
-    elsewhere in this file/test_units_disk_fs.py."""
+    """Pure fallback-chain test, no real fixture involved -- mirrors
+    ``_extfs_volume_label``'s own tests above."""
 
     class _FakeVolume:
         name = "MyXfsLabel"
@@ -513,19 +540,24 @@ async def _open_ext4() -> tuple[DiskFilesystem, int]:
 async def test_ext4_list_dir_lists_real_entries() -> None:
     disk_fs, addr = await _open_ext4()
     entries = await disk_fs.list_dir(addr, "/")
-    names = {name for name, _is_dir, _size in entries}
+    names = {e.name for e in entries}
     # "lost+found" is a real ext-family reserved directory (kept, not
     # filtered: a real directory a real filesystem creates, the same
     # posture already taken for NTFS's own $MFT/$LogFile in the previous
     # pytsk3-based implementation).
     assert {"hello.txt", "subdir", "lost+found"} <= names
 
-    hello = next(e for e in entries if e[0] == "hello.txt")
-    assert hello[1] is False
-    assert hello[2] == len(_EXT4_HELLO_CONTENT)
+    hello = next(e for e in entries if e.name == "hello.txt")
+    assert hello.is_dir is False
+    assert hello.size == len(_EXT4_HELLO_CONTENT)
+    # A real mtime the real mke2fs build set at fixture-creation time --
+    # not guessable in advance, just confirmed present and real.
+    assert isinstance(hello.mtime, datetime)
+    assert hello.mtime.tzinfo is not None
 
-    subdir = next(e for e in entries if e[0] == "subdir")
-    assert subdir[1] is True
+    subdir = next(e for e in entries if e.name == "subdir")
+    assert subdir.is_dir is True
+    assert isinstance(subdir.mtime, datetime)
 
 
 async def test_ext4_open_file_reads_the_real_file_content() -> None:
@@ -539,7 +571,7 @@ async def test_ext4_open_file_reads_the_real_file_content() -> None:
 async def test_ext4_subdirectory_listing_and_read_of_a_nested_file() -> None:
     disk_fs, addr = await _open_ext4()
     entries = await disk_fs.list_dir(addr, "/subdir")
-    assert {name for name, _is_dir, _size in entries} == {"nested.txt"}
+    assert {e.name for e in entries} == {"nested.txt"}
 
     content = await disk_fs.open_file(addr, "/subdir/nested.txt")
     assert await content.read(0, content.size) == _EXT4_NESTED_CONTENT
@@ -589,15 +621,18 @@ async def _open_xfs() -> tuple[DiskFilesystem, int]:
 async def test_xfs_list_dir_lists_real_entries() -> None:
     disk_fs, addr = await _open_xfs()
     entries = await disk_fs.list_dir(addr, "/")
-    names = {name for name, _is_dir, _size in entries}
+    names = {e.name for e in entries}
     assert {"hello.txt", "subdir"} <= names
 
-    hello = next(e for e in entries if e[0] == "hello.txt")
-    assert hello[1] is False
-    assert hello[2] == len(_XFS_HELLO_CONTENT)
+    hello = next(e for e in entries if e.name == "hello.txt")
+    assert hello.is_dir is False
+    assert hello.size == len(_XFS_HELLO_CONTENT)
+    assert isinstance(hello.mtime, datetime)
+    assert hello.mtime.tzinfo is not None
 
-    subdir = next(e for e in entries if e[0] == "subdir")
-    assert subdir[1] is True
+    subdir = next(e for e in entries if e.name == "subdir")
+    assert subdir.is_dir is True
+    assert isinstance(subdir.mtime, datetime)
 
 
 async def test_xfs_open_file_reads_the_real_file_content() -> None:
@@ -611,7 +646,7 @@ async def test_xfs_open_file_reads_the_real_file_content() -> None:
 async def test_xfs_subdirectory_listing_and_read_of_a_nested_file() -> None:
     disk_fs, addr = await _open_xfs()
     entries = await disk_fs.list_dir(addr, "/subdir")
-    assert {name for name, _is_dir, _size in entries} == {"nested.txt"}
+    assert {e.name for e in entries} == {"nested.txt"}
 
     content = await disk_fs.open_file(addr, "/subdir/nested.txt")
     assert await content.read(0, content.size) == _XFS_NESTED_CONTENT
@@ -648,15 +683,18 @@ async def _open_btrfs() -> tuple[DiskFilesystem, int]:
 async def test_btrfs_list_dir_lists_real_entries() -> None:
     disk_fs, addr = await _open_btrfs()
     entries = await disk_fs.list_dir(addr, "/")
-    names = {name for name, _is_dir, _size in entries}
+    names = {e.name for e in entries}
     assert {"hello.txt", "subdir"} <= names
 
-    hello = next(e for e in entries if e[0] == "hello.txt")
-    assert hello[1] is False
-    assert hello[2] == len(_BTRFS_HELLO_CONTENT)
+    hello = next(e for e in entries if e.name == "hello.txt")
+    assert hello.is_dir is False
+    assert hello.size == len(_BTRFS_HELLO_CONTENT)
+    assert isinstance(hello.mtime, datetime)
+    assert hello.mtime.tzinfo is not None
 
-    subdir = next(e for e in entries if e[0] == "subdir")
-    assert subdir[1] is True
+    subdir = next(e for e in entries if e.name == "subdir")
+    assert subdir.is_dir is True
+    assert isinstance(subdir.mtime, datetime)
 
 
 async def test_btrfs_open_file_reads_the_real_file_content() -> None:
@@ -670,15 +708,14 @@ async def test_btrfs_open_file_reads_the_real_file_content() -> None:
 async def test_btrfs_subdirectory_listing_and_read_of_a_nested_file() -> None:
     disk_fs, addr = await _open_btrfs()
     entries = await disk_fs.list_dir(addr, "/subdir")
-    assert {name for name, _is_dir, _size in entries} == {"nested.txt"}
+    assert {e.name for e in entries} == {"nested.txt"}
 
     content = await disk_fs.open_file(addr, "/subdir/nested.txt")
     assert await content.read(0, content.size) == _BTRFS_NESTED_CONTENT
 
 
 def test_btrfs_dot_dot_can_be_a_bare_subvolume_object_not_a_real_inode() -> None:
-    """Characterization test for a ``dissect.btrfs`` quirk that
-    ``_btrfs_iterdir``'s own comment documents:
+    """Characterization test for a ``dissect.btrfs`` quirk:
     ``Subvolume.get(path)`` -- the resolve every Btrfs listing in
     ``disk_fs.py`` goes through -- sets a resolved ``INode``'s own
     ``.parent`` to the ``Subvolume`` object itself, not a real
@@ -729,7 +766,38 @@ def test_btrfs_iterdir_skips_a_child_missing_is_dir_even_under_a_non_dot_name() 
         def listdir(self) -> dict[str, object]:
             return {"real_file.txt": _FakeChild(), "weird": _NotARealInode()}
 
-    assert _btrfs_iterdir(_FakeEntry()) == [("real_file.txt", False, 3)]
+    assert _btrfs_iterdir(_FakeEntry()) == [
+        _DirEntry(name="real_file.txt", is_dir=False, size=3, file_state=FileState.NORMAL, mtime=None)
+    ]
+
+
+def test_dissect_entry_list_dir_sorts_directories_before_files() -> None:
+    """``_DissectEntry.list_dir`` sorts directories before files, then by
+    name within each group -- a hand-built fake ``_Format`` rather than
+    any real fixture, since real fixtures above don't control naming
+    precisely enough to prove the container-vs-leaf rank is applied (as
+    opposed to just the name tiebreaker). "zzz_dir" would sort after
+    "aaa.txt" by name alone."""
+    unsorted = [
+        _DirEntry(name="aaa.txt", is_dir=False, size=10, file_state=FileState.NORMAL, mtime=None),
+        _DirEntry(name="zzz_dir", is_dir=True, size=None, file_state=FileState.NORMAL, mtime=None),
+        _DirEntry(name="mid.txt", is_dir=False, size=5, file_state=FileState.NORMAL, mtime=None),
+    ]
+    fmt = _Format(
+        label="fake",
+        open=lambda fh: object(),
+        resolve=lambda volume, path: None,
+        iterdir=lambda entry: unsorted,
+        size=_default_size,
+        volume_label=lambda volume: None,
+        content_unavailable=lambda entry: None,
+    )
+    entry = _DissectEntry(fmt, object())
+    assert entry.list_dir("/") == [
+        _DirEntry(name="zzz_dir", is_dir=True, size=None, file_state=FileState.NORMAL, mtime=None),
+        _DirEntry(name="aaa.txt", is_dir=False, size=10, file_state=FileState.NORMAL, mtime=None),
+        _DirEntry(name="mid.txt", is_dir=False, size=5, file_state=FileState.NORMAL, mtime=None),
+    ]
 
 
 async def test_btrfs_export_to_writes_the_real_file_content(tmp_path: Path) -> None:
@@ -751,16 +819,16 @@ async def _open_btrfs_subvols() -> tuple[DiskFilesystem, int]:
 async def test_btrfs_top_level_lists_both_real_subvolumes() -> None:
     disk_fs, addr = await _open_btrfs_subvols()
     entries = await disk_fs.list_dir(addr, "/")
-    assert {name for name, _is_dir, _size in entries} == {"root", "home"}
-    assert all(is_dir for _name, is_dir, _size in entries)
+    assert {e.name for e in entries} == {"root", "home"}
+    assert all(e.is_dir for e in entries)
 
 
 async def test_btrfs_each_subvolume_lists_its_own_distinct_content() -> None:
     disk_fs, addr = await _open_btrfs_subvols()
     root_entries = await disk_fs.list_dir(addr, "/root")
-    assert {name for name, _is_dir, _size in root_entries} == {"hello.txt", "subdir"}
+    assert {e.name for e in root_entries} == {"hello.txt", "subdir"}
     home_entries = await disk_fs.list_dir(addr, "/home")
-    assert {name for name, _is_dir, _size in home_entries} == {"hello.txt"}
+    assert {e.name for e in home_entries} == {"hello.txt"}
 
 
 async def test_btrfs_reads_real_content_across_two_different_subvolumes() -> None:
@@ -794,21 +862,25 @@ async def _open_ntfs() -> tuple[DiskFilesystem, int]:
 async def test_ntfs_list_dir_lists_real_entries() -> None:
     disk_fs, addr = await _open_ntfs()
     entries = await disk_fs.list_dir(addr, "/")
-    names = {name for name, _is_dir, _size in entries}
+    names = {e.name for e in entries}
     # $MFT/$LogFile/etc. are real NTFS system metadata files every real
     # volume has (kept, not filtered — the same posture ext4's own
     # "lost+found" test above takes); "." is the real self-referential
-    # entry _ntfs_iterdir filters (see test_ntfs_iterdir_filters_the_
-    # roots_self_referential_dot_entry and this module's own docstring).
+    # entry _ntfs_iterdir filters -- left unfiltered it would loop into
+    # itself forever (see
+    # test_ntfs_iterdir_filters_the_roots_self_referential_dot_entry).
     assert {"hello.txt", "subdir", "$MFT"} <= names
     assert "." not in names
 
-    hello = next(e for e in entries if e[0] == "hello.txt")
-    assert hello[1] is False
-    assert hello[2] == len(_NTFS_HELLO_CONTENT)
+    hello = next(e for e in entries if e.name == "hello.txt")
+    assert hello.is_dir is False
+    assert hello.size == len(_NTFS_HELLO_CONTENT)
+    assert isinstance(hello.mtime, datetime)
+    assert hello.mtime.tzinfo is not None
 
-    subdir = next(e for e in entries if e[0] == "subdir")
-    assert subdir[1] is True
+    subdir = next(e for e in entries if e.name == "subdir")
+    assert subdir.is_dir is True
+    assert isinstance(subdir.mtime, datetime)
 
 
 async def test_ntfs_open_file_reads_the_real_file_content() -> None:
@@ -822,7 +894,7 @@ async def test_ntfs_open_file_reads_the_real_file_content() -> None:
 async def test_ntfs_subdirectory_listing_and_read_of_a_nested_file() -> None:
     disk_fs, addr = await _open_ntfs()
     entries = await disk_fs.list_dir(addr, "/subdir")
-    assert {name for name, _is_dir, _size in entries} == {"nested.txt"}
+    assert {e.name for e in entries} == {"nested.txt"}
 
     content = await disk_fs.open_file(addr, "/subdir/nested.txt")
     assert await content.read(0, content.size) == _NTFS_NESTED_CONTENT
@@ -848,10 +920,10 @@ async def test_ntfs_export_to_writes_the_real_file_content(tmp_path: Path) -> No
 
 
 def test_disk_fs_available_reflects_real_import_system_state() -> None:
-    # This dev environment installs the whole disk-fs extra as one unit
-    # (see pyproject.toml's own comment on why it isn't split per
-    # format) -- see test_units_disk_fs_apfs.py for the "only one
-    # backend present" cases, exercised via monkeypatch instead.
+    # The whole dissect.* stack is a required dependency, not split per
+    # format, so a normal dev environment always has every backend
+    # present. See test_units_disk_fs_apfs.py for the "only one backend
+    # present" cases, exercised via monkeypatch instead.
     assert disk_fs_available() is True
 
 
@@ -864,13 +936,11 @@ def test_disk_fs_available_false_when_every_backend_is_absent(monkeypatch: pytes
 
 
 async def test_open_returns_none_when_nothing_on_the_disk_is_recognized() -> None:
-    """``DiskFilesystem.open()``'s own documented invariant (disk_fs.py's
-    own docstring): a disk image no partition table (``dissect.volume``)
-    recognizes and no filesystem format (flat or APFS) recognizes either
-    returns ``None``, never raises -- every existing test elsewhere in
+    """``DiskFilesystem.open()`` returns ``None``, never raises, when
+    nothing on the disk is recognized -- every existing test elsewhere in
     this file/``test_units_disk_fs_apfs.py``/the replay suite feeds real,
-    openable bytes, leaving this documented "nothing found" path with no
-    coverage of its own until now."""
+    openable bytes, leaving this path with no coverage of its own until
+    now."""
     disk_fs = await DiskFilesystem.open(_FakeAsyncContent(b"\x00" * (2 * 1024 * 1024)))
     assert disk_fs is None
 
@@ -900,18 +970,15 @@ def test_ntfs_size_falls_back_to_none_when_size_raises() -> None:
 
 
 def test_ntfs_iterdir_filters_the_roots_self_referential_dot_entry() -> None:
-    """Regression test for commit a55415d: a volume's own root directory
-    (MFT record 5) carries a genuine, structural ``$FILE_NAME`` index
-    entry literally named ``"."`` whose own ``ParentDirectory`` points
-    back at the root itself — a real NTFS on-disk convention (confirmed
-    against a real Windows VM sample when this was originally found),
-    not a corrupt-disk artifact. Left unfiltered, this made any
-    canonical-ref resolution reaching past the root level recurse into
-    ``"."`` forever (its own listing contains another ``"."`` pointing
-    at the same root, with no base case). Uses a hand-built fake entry
-    (no real ``dissect.ntfs`` install or disk image needed at all): the
-    point is ``_ntfs_iterdir``'s own filtering behavior, not
-    reproducing the underlying on-disk shape again."""
+    """``_ntfs_iterdir``'s own filtering behavior: left unfiltered, the
+    root directory's genuine, structural ``$FILE_NAME`` entry literally
+    named ``"."`` (MFT record 5, whose ``ParentDirectory`` points back at
+    the root itself) would make any resolution reaching past the root
+    level recurse into ``"."`` forever, since its own listing contains
+    another ``"."`` pointing at the same root, with no base case. Hand-built
+    fake entry, no real ``dissect.ntfs`` install or disk image needed --
+    ``test_ntfs_list_dir_lists_real_entries`` above proves the same
+    filtering against the real fixture."""
 
     class _FakeAttr:
         def __init__(self, name: str, is_dir: bool, size: int | None) -> None:
@@ -933,7 +1000,237 @@ def test_ntfs_iterdir_filters_the_roots_self_referential_dot_entry() -> None:
                 _FakeChild(_FakeAttr("real_file.txt", False, 3)),
             ]
 
-    assert _ntfs_iterdir(_FakeEntry()) == [("real_file.txt", False, 3)]
+    assert _ntfs_iterdir(_FakeEntry()) == [
+        _DirEntry(name="real_file.txt", is_dir=False, size=3, file_state=FileState.NORMAL, mtime=None)
+    ]
+
+
+def test_is_cloud_file_returns_false_when_the_method_is_absent_or_raises() -> None:
+    class _NoMethod:
+        pass
+
+    class _Raises:
+        def is_cloud_file(self) -> bool:
+            raise RuntimeError("dissect.ntfs internal failure")
+
+    class _True:
+        def is_cloud_file(self) -> bool:
+            return True
+
+    assert _is_cloud_file(_NoMethod()) is False
+    assert _is_cloud_file(_Raises()) is False
+    assert _is_cloud_file(_True()) is True
+
+
+def test_ntfs_content_unavailable_returns_a_reason_only_for_a_cloud_file_entry() -> None:
+    class _CloudEntry:
+        def is_cloud_file(self) -> bool:
+            return True
+
+    class _NormalEntry:
+        def is_cloud_file(self) -> bool:
+            return False
+
+    assert _ntfs_content_unavailable(_CloudEntry()) == _CLOUD_ONLY_REASON
+    assert _ntfs_content_unavailable(_NormalEntry()) is None
+
+
+def test_ntfs_iterdir_flags_a_cloud_file_child_as_cloud_only() -> None:
+    """Uses the same lightweight, non-dereferenced ``$FILE_NAME``
+    attribute shape ``_ntfs_iterdir`` already reads for
+    ``is_dir``/``file_size`` — ``_is_cloud_file`` costs nothing extra
+    here."""
+
+    class _CloudAttr:
+        file_name = "cloud.txt"
+        file_size = 5
+
+        def is_dir(self) -> bool:
+            return False
+
+        def is_cloud_file(self) -> bool:
+            return True
+
+    class _CloudChild:
+        attribute = _CloudAttr()
+
+    class _FakeEntry:
+        def iterdir(self, *, dereference: bool, ignore_dos: bool) -> list[_CloudChild]:
+            return [_CloudChild()]
+
+    assert _ntfs_iterdir(_FakeEntry()) == [
+        _DirEntry(name="cloud.txt", is_dir=False, size=5, file_state=FileState.CLOUD_ONLY, mtime=None)
+    ]
+
+
+#: Microsoft's own FILE_ATTRIBUTE_ENCRYPTED value (winnt.h), matching
+#: dissect.ntfs's own ``c_ntfs.FILE_ATTRIBUTE.ENCRYPTED`` (0x4000) -- used
+#: to build fakes below without importing dissect.ntfs into this test
+#: module.
+_FILE_ATTRIBUTE_ENCRYPTED = 0x4000
+
+
+class _FakeStandardInformation:
+    def __init__(self, file_attributes: int) -> None:
+        self.file_attributes = file_attributes
+
+
+class _FakeNtfsAttributes:
+    """Fakes just enough of ``AttributeMap`` for ``_ntfs_is_encrypted``:
+    ``.STANDARD_INFORMATION.file_attributes`` and ``.find(name, type)``
+    for a ``$EFS``-named ``$LOGGED_UTILITY_STREAM``."""
+
+    def __init__(self, *, file_attributes: int = 0, has_efs: bool = False) -> None:
+        self.STANDARD_INFORMATION = _FakeStandardInformation(file_attributes)
+        self._has_efs = has_efs
+
+    def find(self, name: str, attr_type: object) -> list[object]:
+        return [object()] if self._has_efs and name == "$EFS" else []
+
+
+class _FakeMftRecord:
+    def __init__(self, *, file_attributes: int = 0, has_efs: bool = False) -> None:
+        self.attributes = _FakeNtfsAttributes(file_attributes=file_attributes, has_efs=has_efs)
+
+
+def test_ntfs_is_encrypted_attr_reads_the_file_names_own_cached_flag() -> None:
+    class _EncryptedAttr:
+        file_attributes = _FILE_ATTRIBUTE_ENCRYPTED
+
+    class _NormalAttr:
+        file_attributes = 0
+
+    class _NoAttr:
+        pass
+
+    assert _ntfs_is_encrypted_attr(_EncryptedAttr()) is True
+    assert _ntfs_is_encrypted_attr(_NormalAttr()) is False
+    assert _ntfs_is_encrypted_attr(_NoAttr()) is False
+
+
+def test_ntfs_is_encrypted_matches_the_standard_information_flag_or_a_real_efs_attribute() -> None:
+    flagged = _FakeMftRecord(file_attributes=_FILE_ATTRIBUTE_ENCRYPTED)
+    efs_attribute_only = _FakeMftRecord(file_attributes=0, has_efs=True)
+    neither = _FakeMftRecord(file_attributes=0, has_efs=False)
+
+    assert _ntfs_is_encrypted(flagged) is True
+    assert _ntfs_is_encrypted(efs_attribute_only) is True
+    assert _ntfs_is_encrypted(neither) is False
+
+
+def test_ntfs_content_unavailable_returns_the_efs_reason_for_an_encrypted_entry() -> None:
+    class _EncryptedEntry:
+        def is_cloud_file(self) -> bool:
+            return False
+
+        attributes = _FakeNtfsAttributes(file_attributes=_FILE_ATTRIBUTE_ENCRYPTED)
+
+    assert _ntfs_content_unavailable(_EncryptedEntry()) == _ENCRYPTED_REASON
+
+
+def test_ntfs_content_unavailable_prioritizes_cloud_only_over_encrypted() -> None:
+    """A file that's both an evicted cloud placeholder *and* EFS-encrypted
+    is reported as the cloud placeholder — it has no local bytes to even
+    attempt reading, encrypted or not."""
+
+    class _CloudAndEncryptedEntry:
+        def is_cloud_file(self) -> bool:
+            return True
+
+        attributes = _FakeNtfsAttributes(file_attributes=_FILE_ATTRIBUTE_ENCRYPTED)
+
+    assert _ntfs_content_unavailable(_CloudAndEncryptedEntry()) == _CLOUD_ONLY_REASON
+
+
+def test_ntfs_iterdir_flags_an_encrypted_child_as_encrypted() -> None:
+    class _EncryptedFileNameAttr:
+        file_name = "secret.docx"
+        file_size = 42
+        file_attributes = _FILE_ATTRIBUTE_ENCRYPTED
+
+        def is_dir(self) -> bool:
+            return False
+
+        def is_cloud_file(self) -> bool:
+            return False
+
+    class _EncryptedChild:
+        attribute = _EncryptedFileNameAttr()
+
+    class _FakeEntry:
+        def iterdir(self, *, dereference: bool, ignore_dos: bool) -> list[_EncryptedChild]:
+            return [_EncryptedChild()]
+
+    assert _ntfs_iterdir(_FakeEntry()) == [
+        _DirEntry(name="secret.docx", is_dir=False, size=42, file_state=FileState.ENCRYPTED, mtime=None)
+    ]
+
+
+def test_ntfs_iterdir_reads_a_real_last_modification_time_off_the_file_name_attribute() -> None:
+    expected = datetime(2024, 1, 2, 3, 4, 5, tzinfo=UTC)
+
+    class _TimedAttr:
+        file_name = "timed.txt"
+        file_size = 7
+        last_modification_time = expected
+
+        def is_dir(self) -> bool:
+            return False
+
+    class _TimedChild:
+        attribute = _TimedAttr()
+
+    class _FakeEntry:
+        def iterdir(self, *, dereference: bool, ignore_dos: bool) -> list[_TimedChild]:
+            return [_TimedChild()]
+
+    (entry,) = _ntfs_iterdir(_FakeEntry())
+    assert entry.mtime == expected
+
+
+def test_ntfs_entry_mtime_degrades_to_none_when_the_underlying_read_raises() -> None:
+    class _RaisingAttr:
+        @property
+        def last_modification_time(self) -> datetime:
+            raise RuntimeError("malformed $FILE_NAME timestamp")
+
+    assert _ntfs_entry_mtime(_RaisingAttr()) is None
+
+
+def test_open_file_raises_content_unavailable_without_opening_or_sizing_the_entry() -> None:
+    """Generic proof of ``_DissectEntry.open_file``'s own short-circuit:
+    a truthy ``_Format.content_unavailable(entry)`` result raises before
+    ``size()``/``DissectFileContentSource`` are ever touched. Built
+    against a synthetic ``_Format``, not ``_NTFS_FORMAT`` itself — the
+    point is this shared mechanism, not NTFS's own detection (already
+    proven above)."""
+
+    class _PlaceholderEntry:
+        def open(self) -> object:
+            raise AssertionError("must not be called for a content-unavailable entry")
+
+    size_calls: list[object] = []
+
+    def _unreachable_open(fh: object) -> object:
+        raise NotImplementedError("unused by this test")
+
+    def _size(entry: object) -> int | None:
+        size_calls.append(entry)
+        return 123
+
+    fmt = _Format(
+        label="fake",
+        open=_unreachable_open,
+        resolve=lambda volume, path: _PlaceholderEntry(),
+        iterdir=lambda entry: [],
+        size=_size,
+        volume_label=lambda volume: None,
+        content_unavailable=lambda entry: "synthetic placeholder reason",
+    )
+    dissect_entry = _DissectEntry(fmt, volume=object())
+    with pytest.raises(ContentUnavailableError, match="synthetic placeholder reason"):
+        dissect_entry.open_file("/some/path")
+    assert size_calls == []
 
 
 def test_fat_volume_label_falls_back_to_none_when_reading_it_raises() -> None:
@@ -943,6 +1240,23 @@ def test_fat_volume_label_falls_back_to_none_when_reading_it_raises() -> None:
             raise RuntimeError("dissect.fat doesn't handle this variant")
 
     assert _fat_volume_label(_FakeVolume()) is None
+
+
+def test_fat_entry_mtime_attaches_utc_to_the_naive_dostimestamp_value() -> None:
+    class _FakeEntry:
+        mtime = datetime(2023, 6, 15, 12, 30, 0)  # naive, as dostimestamp() returns
+
+    result = _fat_entry_mtime(_FakeEntry())
+    assert result == datetime(2023, 6, 15, 12, 30, 0, tzinfo=UTC)
+
+
+def test_fat_entry_mtime_degrades_to_none_when_the_underlying_read_raises() -> None:
+    class _FakeEntry:
+        @property
+        def mtime(self) -> datetime:
+            raise RuntimeError("malformed FAT directory-entry timestamp")
+
+    assert _fat_entry_mtime(_FakeEntry()) is None
 
 
 class TestPartitionTableLabel:
@@ -1055,9 +1369,9 @@ class _CountingFakeEntry:
 class TestDissectFileContentSourceHandleReuse:
     """``DissectFileContentSource._read_blocking`` must resolve the guest
     file's own stream (``entry.open()`` — re-parses the whole file's
-    runlist/fragmentation internally, per this class's own docstring) at
-    most once per instance, reusing it across every block a streamed
-    read/export issues rather than reopening per block."""
+    runlist/fragmentation internally, work identical across every block
+    of the same file) at most once per instance, reusing it across every
+    block a streamed read/export issues rather than reopening per block."""
 
     async def test_two_separate_reads_share_one_open_call(self) -> None:
         content = b"hello world"
@@ -1084,7 +1398,12 @@ class TestDissectFileContentSourceHandleReuse:
         """A stream that raises partway through is left in an unknown
         state -- the cached handle must be dropped so a later call opens
         a fresh stream instead of reusing a possibly-broken one, the same
-        self-healing a fresh per-call ``entry.open()`` always had."""
+        self-healing a fresh per-call ``entry.open()`` always had. The
+        raw failure itself is converted to ``DataCorruptError`` (this
+        fake has no ``bsd_flags``/decmpfs xattr, so it never matches the
+        cloud-placeholder check) -- see
+        ``test_read_converts_a_dataless_apfs_open_failure_to_content_unavailable``
+        for the ``ContentUnavailableError`` counterpart."""
         content = b"hello world"
 
         class _FailFirstOpenEntry:
@@ -1104,8 +1423,9 @@ class TestDissectFileContentSourceHandleReuse:
 
         entry = _FailFirstOpenEntry()
         source = DissectFileContentSource(entry, size=len(content))
-        with pytest.raises(OSError, match="synthetic read failure"):
+        with pytest.raises(DataCorruptError, match="synthetic read failure") as exc_info:
             await source.read(0, 5)
+        assert isinstance(exc_info.value.__cause__, OSError)
         assert await source.read(0, 5) == b"hello"
         assert entry.open_calls == 2  # the failed handle was dropped; the retry opened a fresh one
 
@@ -1130,21 +1450,97 @@ class TestDissectFileContentSourceHandleReuse:
 
     async def test_export_to_short_read_reaching_declared_end_raises_data_corrupt(self, tmp_path: Path) -> None:
         # export_to()'s own read-and-write helper replicates read()'s
-        # short-read-at-declared-end check (see disk_fs.py's own comment on
-        # why it can't just call read() and reuse this one) -- same fixture
+        # short-read-at-declared-end check independently, rather than
+        # calling read() and reusing it, because it fuses one block's read
+        # and write into a single asyncio.to_thread() call for throughput
+        # -- same fixture
         # shape as test_short_read_reaching_declared_end_raises_data_corrupt
         # above, proving that duplicated check independently.
+        dst = tmp_path / "out.bin"
         entry = _CountingFakeEntry(b"ab")
         source = DissectFileContentSource(entry, size=100)
         with pytest.raises(DataCorruptError, match="declared size=100"):
-            await source.export_to(tmp_path / "out.bin")
+            await source.export_to(dst)
+        # This is the file's *only* block (100 bytes < DEFAULT_STREAM_BLOCK)
+        # failing -- no destination file (or its parent directory) is ever
+        # created for a doomed export that never got a single real byte.
+        assert not dst.exists()
+
+    async def test_export_to_never_creates_the_destination_file_when_the_first_block_fails(
+        self, tmp_path: Path
+    ) -> None:
+        """Regression test: the destination file (and its parent
+        directory) must not exist at all after a first-block failure --
+        this is what previously let a cloud-sync placeholder's failed
+        export leave a stray, empty ``.part`` file on disk (the ``.part``
+        file itself is ``_run_export``'s/the CLI's own naming, not
+        something this class knows about -- proven here at the plain
+        ``dst`` path it's given)."""
+
+        class _AlwaysFailsToOpenEntry:
+            def open(self) -> object:
+                raise EOFError("not enough bytes to read struct")
+
+        dst = tmp_path / "nested" / "out.bin"
+        source = DissectFileContentSource(_AlwaysFailsToOpenEntry(), size=1000)
+        with pytest.raises(DataCorruptError):
+            await source.export_to(dst)
+        assert not dst.exists()
+        assert not dst.parent.exists()  # mkdir(parents=True) is deferred right alongside dst.open()
+
+    async def test_export_to_still_creates_an_empty_destination_file_for_a_genuinely_empty_source(
+        self, tmp_path: Path
+    ) -> None:
+        """``size == 0`` means the read/write loop never runs at all (no
+        "first block" to defer opening the destination past) -- a
+        genuinely empty guest file's correct export result is still an
+        empty destination file, not a missing one."""
+        dst = tmp_path / "out.bin"
+        entry = _CountingFakeEntry(b"")
+        source = DissectFileContentSource(entry, size=0)
+        result = await source.export_to(dst)
+        assert dst.exists()
+        assert dst.read_bytes() == b""
+        assert result.bytes_written == 0
+
+    async def test_export_to_keeps_the_partial_destination_file_when_a_later_block_fails(self, tmp_path: Path) -> None:
+        """Deferring the destination file's creation only changes
+        behavior for a *first*-block failure -- a failure on a later
+        block still leaves the earlier, real bytes already written on
+        disk (unchanged from before), matching ``_run_export``'s own
+        Ctrl-C/``--keep-partial`` posture of keeping real partial
+        progress rather than discarding it."""
+
+        class _FailsOnSecondBlockStream:
+            def __init__(self) -> None:
+                self._reads = 0
+
+            def seek(self, offset: int) -> None:
+                pass
+
+            def read(self, length: int) -> bytes:
+                self._reads += 1
+                if self._reads == 1:
+                    return b"x" * length
+                raise OSError("synthetic failure on the second block")
+
+        class _FailsOnSecondBlockEntry:
+            def open(self) -> _FailsOnSecondBlockStream:
+                return _FailsOnSecondBlockStream()
+
+        dst = tmp_path / "out.bin"
+        source = DissectFileContentSource(_FailsOnSecondBlockEntry(), size=DEFAULT_STREAM_BLOCK * 2)
+        with pytest.raises(DataCorruptError, match="synthetic failure on the second block"):
+            await source.export_to(dst)
+        assert dst.exists()
+        assert dst.read_bytes() == b"x" * DEFAULT_STREAM_BLOCK
 
     async def test_export_to_terminates_on_a_short_read_before_the_declared_end(self, tmp_path: Path) -> None:
         """Regression test: an *interior* short read (the guest file's
-        real data genuinely truncated partway through -- read()'s own
-        docstring already documents this as legitimate, not just a
-        final-block case) must not spin export_to()'s own read/write loop
-        forever. ``size`` spans more than one ``DEFAULT_STREAM_BLOCK`` so
+        real data genuinely truncated partway through, not just at the
+        final block -- read() already treats this as legitimate) must not
+        spin export_to()'s own read/write loop forever. ``size`` spans
+        more than one ``DEFAULT_STREAM_BLOCK`` so
         the short read lands on a non-final block first; ``asyncio.
         wait_for``'s timeout is the actual regression guard -- a version
         of this loop that advances by actual bytes written, not by the
@@ -1172,11 +1568,11 @@ class TestDissectFileContentSourceHandleReuse:
         """Without ``_fh_lock``, two concurrent ``asyncio.to_thread()``
         hops sharing one cached handle could interleave: A's ``seek(0)``,
         B's ``seek(5)`` (both fast, no delay), then A's delayed ``read()``
-        picks up whichever ``seek`` landed last (B's) instead of its own
-        — confirmed to actually reproduce this way without the lock
-        (a delay placed inside ``seek`` instead does not: by the time
-        either thread wakes, its own immediately-following ``read()`` has
-        already run, since nothing yields the GIL in between). The lock
+        picks up whichever ``seek`` landed last (B's) instead of its own.
+        The race needs the delay inside ``read()`` specifically — a delay
+        placed inside ``seek()`` instead would not reproduce it, since
+        each thread's own ``read()`` already runs immediately after its
+        ``seek()`` with nothing yielding the GIL in between. The lock
         must still serialize the two regardless of thread-pool timing."""
         content = b"AAAAABBBBB"  # offset [0,5) is 'A's, [5,10) is 'B's
 

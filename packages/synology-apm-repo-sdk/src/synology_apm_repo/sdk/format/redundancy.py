@@ -28,8 +28,7 @@ Because ``StepCrc`` is *rolling*, not independent per window, this
 mechanism can locate and repair **at most one corrupted region, bounded to
 two consecutive coverage-windows** — a "single-disk-failure RAID" limit,
 not N-way independent parity (FORMAT-SPEC.md: ChunkCrcStore). See
-``attempt_repair``'s own docstring for how it confirms a repair before
-returning it.
+``attempt_repair`` for how it confirms a repair before returning it.
 """
 
 from __future__ import annotations
@@ -79,9 +78,8 @@ class RedundancyBlob:
     checkpoints (``step_crc``, one per ``coverage``-byte window of the
     protected data, the last window truncated if ``data_size`` isn't an
     exact multiple of ``coverage``) plus the ``2*coverage``-byte XOR parity
-    ring buffer (``parity``) — see this module's own docstring for the
-    even/odd-window-into-each-half layout ``attempt_repair`` reconstructs
-    from."""
+    ring buffer (``parity``) — the even/odd-window-into-each-half layout
+    described above, that ``attempt_repair`` reconstructs from."""
 
     coverage: int
     data_size: int
@@ -156,7 +154,7 @@ def _reconstruct_window(data: bytes, blob: RedundancyBlob, idx: int, num_windows
     half and every *other* window sharing that half (even/odd), taken from
     ``data`` as-is — correct as long as at most one window per half is
     actually corrupted, which is exactly the bound this whole mechanism
-    relies on (see this module's own docstring).
+    relies on.
 
     XORs whole windows as big-endian integers rather than byte-by-byte —
     only the final window (when ``data_size`` isn't an exact multiple of
@@ -236,17 +234,17 @@ async def repair_via_trailer(
     fetch_trailer: Callable[[], Awaitable[bytes]],
 ) -> bytes | None:
     """Shared orchestration behind every Redundancy-blob self-repair call
-    site (``dedup/pool.py``'s SizeStore repair, ``dedup/verify_checks.py``'s
-    map-CRC repair): fetch the trailer via ``fetch_trailer`` — already
-    resolved to that record's/bucket's own trailer offset, however that
-    offset needs computing at each call site — and hand it to
-    ``attempt_repair``.
+    site (``dedup/pool/_bucket_reader.py``'s SizeStore repair,
+    ``dedup/verify_checks.py``'s map-CRC repair): fetch the trailer via
+    ``fetch_trailer`` — already resolved to that record's/bucket's own
+    trailer offset, however that offset needs computing at each call site
+    — and hand it to ``attempt_repair``.
 
     ``attempt_repair`` runs on a real OS thread (``asyncio.to_thread``), the
-    same responsiveness rationale as ``dedup/pool.py``'s ``_read_run``: the
-    map-CRC repair path can see an array up to several MB, and its rolling
-    CRC32 scan plus reconstruction must not stall every other concurrent
-    Task for that duration.
+    same responsiveness rationale as ``dedup/pool/_bucket_reader.py``'s
+    ``_read_run``: the map-CRC repair path can see an array up to several
+    MB, and its rolling CRC32 scan plus reconstruction must not stall every
+    other concurrent Task for that duration.
 
     Returns:
         ``attempt_repair``'s own result, or ``None`` if ``fetch_trailer``

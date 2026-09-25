@@ -75,6 +75,22 @@ def _as_object_store(fake: _FakeStore) -> ObjectStore:
     return cast(ObjectStore, fake)
 
 
+class _FakeStoreWithAclose(_FakeStore):
+    """``_FakeStore`` plus a real ``aclose()`` — every ``close_repo()``/
+    ``close()`` test below that needs to observe whether (and how many
+    times) a store actually got closed shares this one definition rather
+    than each redeclaring an identical nested class; ``aclose_calls`` is
+    harmless overhead for a test that only ever checks ``closed``."""
+
+    def __init__(self) -> None:
+        self.closed = False
+        self.aclose_calls = 0
+
+    async def aclose(self) -> None:
+        self.closed = True
+        self.aclose_calls += 1
+
+
 class _FakeDedupRepo:
     """Stands in for ``DedupRepo`` — just enough surface for
     ``Repository`` to wire through: ``store``/``layout``/``info``/``close``.
@@ -89,10 +105,9 @@ class _FakeDedupRepo:
         self.closed = False
         # Unused by Session.discover() itself now (it probes via the
         # free function dedup.keys.probe_encrypted() against the store,
-        # before any DedupRepo is opened -- see api_session's own
-        # _probe_encrypted); kept for a caller that constructs a
-        # Repository directly with an explicit `encrypted=` and wants
-        # this fake's own probe_encrypted() to agree with it.
+        # before any DedupRepo is opened); kept for a caller that
+        # constructs a Repository directly with an explicit `encrypted=`
+        # and wants this fake's own probe_encrypted() to agree with it.
         self._encrypted = encrypted
 
     async def close(self) -> None:
@@ -119,10 +134,11 @@ def _repository_layout(repo_root: str = "") -> RepositoryLayout:
     bucket/vault, not one already-opened ``DedupRepo``). Every test
     here uses ``RepoKind.VAULT``, matching ``_layout()``'s own default:
     ``catalog_repo_layouts()`` always resolves a ``VAULT``
-    ``RepositoryLayout`` to exactly one derived ``RepoLayout``
-    (``storage.layout``'s own docstring), so a single-catalog fake
-    (``_FakeDedupRepo``) is always the right shape regardless of which of
-    the two layout types a given test builds by hand."""
+    ``RepositoryLayout`` to exactly one derived ``RepoLayout`` (a vault's
+    own catalogs come from querying ``db/connection_config`` after
+    opening, not a separate directory per catalog), so a single-catalog
+    fake (``_FakeDedupRepo``) is always the right shape regardless of
+    which of the two layout types a given test builds by hand."""
     return RepositoryLayout(kind=RepoKind.VAULT, repo_root=repo_root)
 
 
@@ -141,10 +157,11 @@ def _repo_with_fake_dedup(
     ``DedupRepo.open()`` rather than taking one ready-made. Monkeypatches
     ``DedupRepo.open`` to hand back ``fake`` regardless of which derived
     ``RepoLayout`` it's called with — fine for every test here, which only
-    ever has one single-catalog vault layout to open (see
-    ``_repository_layout()``'s own docstring). Construction itself never
+    ever has one single-catalog vault layout to open (every test here
+    builds a ``VAULT`` layout, which always resolves to exactly one
+    ``RepoLayout``). Construction itself never
     opens anything (only ``Session``'s own ``_confirm_real()`` or an
-    explicit ``catalogs()``/``_dedup_catalogs.resolve()`` call does) — a
+    explicit ``catalogs()``/``_open_catalogs.resolve()`` call does) — a
     test that only checks ``key_status``/``is_encrypted`` right after
     construction doesn't need this helper at all, a bare ``api.Repository(
     _as_object_store(_FakeStore()), _repository_layout(), ...)`` is enough."""
@@ -253,7 +270,7 @@ async def test_session_discover_yields_one_repository_per_layout(monkeypatch: py
     layouts = [_repository_layout("a"), _repository_layout("b")]
     monkeypatch.setattr(api_session, "LocalFsStore", lambda path: _FakeStore())
     monkeypatch.setattr(api_session, "iter_repository_layouts", _async_iter_repository_layouts(layouts))
-    monkeypatch.setattr(DedupRepo, "open", _async_open(lambda store, layout, keys: _FakeDedupRepo(layout)))
+    monkeypatch.setattr(DedupRepo, "open", _async_open(lambda store, layout, keys, **kwargs: _FakeDedupRepo(layout)))
 
     session = api.Session()
     repos = await session.open("/some/path")
@@ -270,21 +287,23 @@ async def test_session_discover_no_longer_confirms_a_vault_via_a_real_open(monke
     same as an ``OBJECT_STORE`` bucket whose siblings' own corrupt
     ``repo_info`` isn't caught at discovery either. The failure surfaces
     later instead, scoped to that repository's own ``catalogs()`` call,
-    which raises it (see ``_confirm_real()``'s own docstring)."""
+    which raises it."""
     layouts = [_repository_layout("looks-fine-but-corrupt")]
     monkeypatch.setattr(api_session, "LocalFsStore", lambda path: _FakeStore())
     monkeypatch.setattr(api_session, "iter_repository_layouts", _async_iter_repository_layouts(layouts))
 
-    async def failing_open(cls: object, /, store: object, layout: RepoLayout, keys: object) -> DedupRepo:
+    async def failing_open(
+        cls: object, /, store: object, layout: RepoLayout, keys: object, **kwargs: object
+    ) -> DedupRepo:
         raise ApmRepoError("corrupt repo_info")
 
     monkeypatch.setattr(DedupRepo, "open", classmethod(failing_open))
 
     repos = await api.Session().open("/some/path")
 
-    assert len(repos) == 1  # no longer skipped at discovery time
+    assert len(repos) == 1
     with pytest.raises(ApmRepoError, match="corrupt repo_info"):
-        await repos[0].catalogs()  # the failure surfaces later, scoped to this one broken catalog
+        await repos[0].catalogs()
 
 
 async def test_session_discover_skips_an_object_store_layout_with_no_valid_catalog_ids(
@@ -317,7 +336,7 @@ async def test_session_discover_skips_a_layout_whose_key_probe_itself_fails(monk
     layouts = [_repository_layout("bad"), _repository_layout("good")]
     monkeypatch.setattr(api_session, "LocalFsStore", lambda path: _FakeStore())
     monkeypatch.setattr(api_session, "iter_repository_layouts", _async_iter_repository_layouts(layouts))
-    monkeypatch.setattr(DedupRepo, "open", _async_open(lambda store, layout, keys: _FakeDedupRepo(layout)))
+    monkeypatch.setattr(DedupRepo, "open", _async_open(lambda store, layout, keys, **kwargs: _FakeDedupRepo(layout)))
 
     async def fake_probe_encrypted(store: object, layout: RepoLayout) -> bool | None:
         if layout.repo_root == "bad":
@@ -336,7 +355,7 @@ async def test_session_discover_reports_progress_with_found_count(monkeypatch: p
     layouts = [_repository_layout("a"), _repository_layout("b")]
     monkeypatch.setattr(api_session, "LocalFsStore", lambda path: _FakeStore())
     monkeypatch.setattr(api_session, "iter_repository_layouts", _async_iter_repository_layouts(layouts))
-    monkeypatch.setattr(DedupRepo, "open", _async_open(lambda store, layout, keys: _FakeDedupRepo(layout)))
+    monkeypatch.setattr(DedupRepo, "open", _async_open(lambda store, layout, keys, **kwargs: _FakeDedupRepo(layout)))
 
     seen: list[Progress] = []
 
@@ -359,14 +378,14 @@ async def test_session_discover_cancellation_aborts_the_scan_partway(monkeypatch
     Synchronizes on "a" actually reaching ``seen`` (set from inside
     ``drain()`` itself), not on ``iter_layouts`` having merely been asked
     for its *next* layout: ``_discover_from_store`` races "look for the
-    next layout" against "finish opening an already-found one" (see its
-    own docstring), specifically so a hang discovering layout "b" can
+    next layout" against "finish opening an already-found one" via
+    ``asyncio.wait(..., FIRST_COMPLETED)``, specifically so a hang discovering layout "b" can
     never block yielding an already-opened "a" — which means "iter_layouts
     reached its second yield point" and "repository a was delivered to the
     consumer" have no guaranteed order relative to each other.
     """
     monkeypatch.setattr(api_session, "LocalFsStore", lambda path: _FakeStore())
-    monkeypatch.setattr(DedupRepo, "open", _async_open(lambda store, layout, keys: _FakeDedupRepo(layout)))
+    monkeypatch.setattr(DedupRepo, "open", _async_open(lambda store, layout, keys, **kwargs: _FakeDedupRepo(layout)))
 
     async def fake_iter_repository_layouts(store: object, root: str = "") -> AsyncIterator[RepositoryLayout]:
         yield _repository_layout("a")
@@ -399,7 +418,7 @@ async def test_session_discover_resolves_key_verification_when_key_given(monkeyp
     monkeypatch.setattr(
         api_session, "iter_repository_layouts", _async_iter_repository_layouts([_repository_layout("a")])
     )
-    monkeypatch.setattr(DedupRepo, "open", _async_open(lambda store, layout, keys: _FakeDedupRepo(layout)))
+    monkeypatch.setattr(DedupRepo, "open", _async_open(lambda store, layout, keys, **kwargs: _FakeDedupRepo(layout)))
     verification = KeyVerification(gcm_ok=True, vault_key=b"x" * 32)
     monkeypatch.setattr(KeyMaterial, "verify", _async_returning(verification))
 
@@ -415,7 +434,7 @@ async def test_session_discover_resolves_encrypted_status_eagerly_when_no_key_gi
     """The point of this whole mechanism: key_status must already be
     NOT_ENCRYPTED right out of discover(), with zero key ever given —
     never the ambiguous NO_KEY_PROVIDED a confirmed-unencrypted repository used
-    to get stuck reporting (KeyStatus's own docstring). ``_probe_encrypted``
+    to get stuck reporting. ``_probe_encrypted``
     (the free function ``_open_repository`` calls before a ``Repository``
     ever opens a ``DedupRepo``) is faked directly here, rather than via
     ``DedupRepo.open``/``_FakeDedupRepo`` -- it now runs *before* any
@@ -425,7 +444,7 @@ async def test_session_discover_resolves_encrypted_status_eagerly_when_no_key_gi
         api_session, "iter_repository_layouts", _async_iter_repository_layouts([_repository_layout("a")])
     )
     monkeypatch.setattr(api_session, "_probe_encrypted", _async_returning(False))
-    monkeypatch.setattr(DedupRepo, "open", _async_open(lambda store, layout, keys: _FakeDedupRepo(layout)))
+    monkeypatch.setattr(DedupRepo, "open", _async_open(lambda store, layout, keys, **kwargs: _FakeDedupRepo(layout)))
 
     [repo] = await api.Session().open("/some/path")
 
@@ -440,7 +459,7 @@ async def test_session_discover_reports_no_key_provided_when_probe_confirms_encr
         api_session, "iter_repository_layouts", _async_iter_repository_layouts([_repository_layout("a")])
     )
     monkeypatch.setattr(api_session, "_probe_encrypted", _async_returning(True))
-    monkeypatch.setattr(DedupRepo, "open", _async_open(lambda store, layout, keys: _FakeDedupRepo(layout)))
+    monkeypatch.setattr(DedupRepo, "open", _async_open(lambda store, layout, keys, **kwargs: _FakeDedupRepo(layout)))
 
     [repo] = await api.Session().open("/some/path")
 
@@ -452,13 +471,12 @@ async def test_session_discover_skips_the_probe_entirely_when_a_key_is_given(
 ) -> None:
     """Cost-avoidance half of the same mechanism: once a key is given,
     key_verification alone already fully answers key_status, so the
-    eager probe must not run at all — a second, wasted read per repository
-    (api.session's Session.discover() docstring)."""
+    eager probe must not run at all — a second, wasted read per repository."""
     monkeypatch.setattr(api_session, "LocalFsStore", lambda path: _FakeStore())
     monkeypatch.setattr(
         api_session, "iter_repository_layouts", _async_iter_repository_layouts([_repository_layout("a")])
     )
-    monkeypatch.setattr(DedupRepo, "open", _async_open(lambda store, layout, keys: _FakeDedupRepo(layout)))
+    monkeypatch.setattr(DedupRepo, "open", _async_open(lambda store, layout, keys, **kwargs: _FakeDedupRepo(layout)))
     verification = KeyVerification(gcm_ok=True, vault_key=b"x" * 32)
     monkeypatch.setattr(KeyMaterial, "verify", _async_returning(verification))
 
@@ -483,7 +501,7 @@ async def test_session_discover_remote_uses_the_given_store_directly(monkeypatch
     already holding a constructed ``S3Store``/``AzureStore``) handed in."""
     layouts = [_repository_layout("a"), _repository_layout("b")]
     monkeypatch.setattr(api_session, "iter_repository_layouts", _async_iter_repository_layouts(layouts))
-    monkeypatch.setattr(DedupRepo, "open", _async_open(lambda store, layout, keys: _FakeDedupRepo(layout)))
+    monkeypatch.setattr(DedupRepo, "open", _async_open(lambda store, layout, keys, **kwargs: _FakeDedupRepo(layout)))
 
     store = _as_object_store(_FakeStore())
     repos = await api.Session().open_remote(store)
@@ -495,12 +513,13 @@ async def test_session_discover_remote_uses_the_given_store_directly(monkeypatch
 async def test_session_discover_remote_registers_the_store_for_close(monkeypatch: pytest.MonkeyPatch) -> None:
     """``discover_remote`` takes ownership of ``store`` the same way
     ``discover`` already does its own ``LocalFsStore`` — tracked in
-    ``_stores`` so ``close()`` can ``aclose()`` it (see that method's own
-    docstring on why S3/Azure stores specifically need this)."""
+    ``_stores`` so ``close()`` can ``aclose()`` it: ``S3Store``/``AzureStore``
+    own an ``aiohttp`` connector that must be released (local stores have
+    no ``aclose()`` and are skipped)."""
     monkeypatch.setattr(
         api_session, "iter_repository_layouts", _async_iter_repository_layouts([_repository_layout("a")])
     )
-    monkeypatch.setattr(DedupRepo, "open", _async_open(lambda store, layout, keys: _FakeDedupRepo(layout)))
+    monkeypatch.setattr(DedupRepo, "open", _async_open(lambda store, layout, keys, **kwargs: _FakeDedupRepo(layout)))
 
     store = _as_object_store(_FakeStore())
     session = api.Session()
@@ -521,7 +540,7 @@ async def test_session_discover_remote_reports_progress_and_resolves_key_status(
         "iter_repository_layouts",
         _async_iter_repository_layouts([_repository_layout("a"), _repository_layout("b")]),
     )
-    monkeypatch.setattr(DedupRepo, "open", _async_open(lambda store, layout, keys: _FakeDedupRepo(layout)))
+    monkeypatch.setattr(DedupRepo, "open", _async_open(lambda store, layout, keys, **kwargs: _FakeDedupRepo(layout)))
 
     seen: list[Progress] = []
 
@@ -533,9 +552,8 @@ async def test_session_discover_remote_reports_progress_and_resolves_key_status(
     assert [p.found for p in seen] == [1, 2]
     # _FakeStore.exists() -> False short-circuits _probe_encrypted() to
     # None, resolved eagerly here (no key given) into
-    # KeyStatus.NO_KEY_PROVIDED — see KeyStatus's own docstring for why
-    # that's the correct "confirmed encrypted, or the rare couldn't-tell"
-    # state, not a guess.
+    # KeyStatus.NO_KEY_PROVIDED — that's the correct "confirmed encrypted,
+    # or the rare couldn't-tell" state, not a guess.
     assert all(repo.key_status is api.KeyStatus.NO_KEY_PROVIDED for repo in repos)
 
 
@@ -549,17 +567,18 @@ async def test_session_close_closes_all_repos_and_clears_the_list(monkeypatch: p
     monkeypatch.setattr(api_session, "iter_repository_layouts", _async_iter_repository_layouts(layouts))
     fakes: list[_FakeDedupRepo] = []
 
-    def make_fake(store: object, layout: RepoLayout, keys: object) -> _FakeDedupRepo:
+    def make_fake(store: object, layout: RepoLayout, keys: object, **kwargs: object) -> _FakeDedupRepo:
         fake = _FakeDedupRepo(layout)
         fakes.append(fake)
         return fake
 
     monkeypatch.setattr(DedupRepo, "open", _async_open(make_fake))
+    monkeypatch.setattr(api_repository, "connections", _async_returning([]))
 
     session = api.Session()
     repos = await session.open("/some/path")
     for repo in repos:
-        await repo._dedup_catalogs.resolve(0)  # force VAULT open explicitly, mirroring real use
+        await repo._open_catalogs.resolve(0)  # force VAULT open explicitly, mirroring real use
     await session.close()
 
     assert fakes  # sanity: the resolves above actually opened something
@@ -589,17 +608,18 @@ async def test_session_close_still_closes_every_remaining_repo_when_an_earlier_o
     fakes: list[_FakeDedupRepo] = []
     first_repo_root = layouts[0].repo_root
 
-    def make_fake(store: object, layout: RepoLayout, keys: object) -> _FakeDedupRepo:
+    def make_fake(store: object, layout: RepoLayout, keys: object, **kwargs: object) -> _FakeDedupRepo:
         fake = _FakeRaisingDedupRepo(layout) if layout.repo_root == first_repo_root else _FakeDedupRepo(layout)
         fakes.append(fake)
         return fake
 
     monkeypatch.setattr(DedupRepo, "open", _async_open(make_fake))
+    monkeypatch.setattr(api_repository, "connections", _async_returning([]))
 
     session = api.Session()
     repos = await session.open("/some/path")
     for repo in repos:
-        await repo._dedup_catalogs.resolve(0)  # force VAULT open explicitly, mirroring real use
+        await repo._open_catalogs.resolve(0)  # force VAULT open explicitly, mirroring real use
 
     with pytest.raises(ExceptionGroup):
         await session.close()
@@ -615,12 +635,13 @@ async def test_session_context_manager_closes_on_exit(monkeypatch: pytest.Monkey
         api_session, "iter_repository_layouts", _async_iter_repository_layouts([_repository_layout("a")])
     )
     fake = _FakeDedupRepo(_layout("a"))
-    monkeypatch.setattr(DedupRepo, "open", _async_open(lambda store, layout, keys: fake))
+    monkeypatch.setattr(DedupRepo, "open", _async_open(lambda store, layout, keys, **kwargs: fake))
+    monkeypatch.setattr(api_repository, "connections", _async_returning([]))
 
-    # ``async with`` — Session's sync ``__enter__``/``__exit__`` are gone.
+    # ``Session`` only implements ``__aenter__``/``__aexit__``, not the sync pair.
     async with api.Session() as session:
         (repo,) = await session.open("/some/path")
-        await repo._dedup_catalogs.resolve(0)  # force VAULT open explicitly, mirroring real use
+        await repo._open_catalogs.resolve(0)  # force VAULT open explicitly, mirroring real use
     assert fake.closed is True
 
 
@@ -631,17 +652,10 @@ async def test_session_close_acloses_stores_that_have_it(monkeypatch: pytest.Mon
     S3/AzureStore are the real callers of this branch; a store with an
     ``aclose`` stands in for either without needing a real backend."""
 
-    class _FakeStoreWithAclose(_FakeStore):
-        def __init__(self) -> None:
-            self.closed = False
-
-        async def aclose(self) -> None:
-            self.closed = True
-
     monkeypatch.setattr(
         api_session, "iter_repository_layouts", _async_iter_repository_layouts([_repository_layout("a")])
     )
-    monkeypatch.setattr(DedupRepo, "open", _async_open(lambda store, layout, keys: _FakeDedupRepo(layout)))
+    monkeypatch.setattr(DedupRepo, "open", _async_open(lambda store, layout, keys, **kwargs: _FakeDedupRepo(layout)))
 
     store = _FakeStoreWithAclose()
     session = api.Session()
@@ -666,19 +680,12 @@ async def test_session_close_still_acloses_every_remaining_store_when_an_earlier
             self.closed = True
             raise RuntimeError("synthetic aclose failure")
 
-    class _FakeStoreWithAclose(_FakeStore):
-        def __init__(self) -> None:
-            self.closed = False
-
-        async def aclose(self) -> None:
-            self.closed = True
-
     monkeypatch.setattr(
         api_session,
         "iter_repository_layouts",
         _async_iter_repository_layouts([_repository_layout("a"), _repository_layout("b")]),
     )
-    monkeypatch.setattr(DedupRepo, "open", _async_open(lambda store, layout, keys: _FakeDedupRepo(layout)))
+    monkeypatch.setattr(DedupRepo, "open", _async_open(lambda store, layout, keys, **kwargs: _FakeDedupRepo(layout)))
 
     first_store, second_store = _FakeRaisingStoreWithAclose(), _FakeStoreWithAclose()
     session = api.Session()
@@ -692,6 +699,194 @@ async def test_session_close_still_acloses_every_remaining_store_when_an_earlier
     assert second_store.closed is True  # still aclosed despite the first store's failure
 
 
+async def test_session_close_repo_closes_and_forgets_it_and_acloses_unshared_store(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``close_repo()`` on the one repository a store yielded closes both
+    the repository and (unlike a bare ``repo.close()``) its own store, and
+    removes both from this session's own bookkeeping."""
+
+    monkeypatch.setattr(
+        api_session, "iter_repository_layouts", _async_iter_repository_layouts([_repository_layout("a")])
+    )
+    fake_dedup = _FakeDedupRepo(_layout("a"))
+    monkeypatch.setattr(DedupRepo, "open", _async_open(lambda store, layout, keys, **kwargs: fake_dedup))
+    monkeypatch.setattr(api_repository, "connections", _async_returning([]))
+
+    store = _FakeStoreWithAclose()
+    session = api.Session()
+    (repo,) = await session.open_remote(_as_object_store(store))
+    await repo._open_catalogs.resolve(0)  # force VAULT open explicitly, mirroring real use
+
+    await session.close_repo(repo)
+
+    assert fake_dedup.closed is True
+    assert repo not in session._repos
+    assert cast(object, store) not in session._stores
+    assert store.closed is True
+
+
+async def test_session_close_repo_keeps_a_shared_store_open_until_every_sharing_repo_closes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Two repositories yielded by one ``open()`` call share one store --
+    closing one must not release it while the other is still tracked."""
+
+    store = _FakeStoreWithAclose()
+    monkeypatch.setattr(api_session, "LocalFsStore", lambda path: store)
+    monkeypatch.setattr(
+        api_session,
+        "iter_repository_layouts",
+        _async_iter_repository_layouts([_repository_layout("a"), _repository_layout("b")]),
+    )
+    monkeypatch.setattr(DedupRepo, "open", _async_open(lambda store, layout, keys, **kwargs: _FakeDedupRepo(layout)))
+
+    session = api.Session()
+    repo_a, repo_b = await session.open("/some/path")
+
+    await session.close_repo(repo_a)
+    assert store.closed is False
+    assert cast(object, store) in session._stores
+    assert repo_a not in session._repos
+    assert repo_b in session._repos
+
+    await session.close_repo(repo_b)
+    assert store.closed is True
+    assert cast(object, store) not in session._stores
+
+
+async def test_session_close_repo_is_safe_when_the_caller_already_closed_the_repo(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Mirrors a caller (``BrowseScreen``, before it switched to
+    ``close_repo()``) closing a repository directly before handing it here --
+    ``close_repo()`` must still release the store and its own bookkeeping
+    even though the repository itself is already closed (``Repository.close()``
+    is idempotent, so a second close is a no-op)."""
+
+    monkeypatch.setattr(
+        api_session, "iter_repository_layouts", _async_iter_repository_layouts([_repository_layout("a")])
+    )
+    monkeypatch.setattr(DedupRepo, "open", _async_open(lambda store, layout, keys, **kwargs: _FakeDedupRepo(layout)))
+
+    store = _FakeStoreWithAclose()
+    session = api.Session()
+    (repo,) = await session.open_remote(_as_object_store(store))
+    await repo.close()  # caller already closed it directly
+
+    await session.close_repo(repo)
+
+    assert store.closed is True
+    assert repo not in session._repos
+    assert cast(object, store) not in session._stores
+
+
+async def test_session_close_repo_is_idempotent(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Calling ``close_repo()`` twice on the same repository must not raise
+    or ``aclose()`` its store a second time."""
+
+    monkeypatch.setattr(
+        api_session, "iter_repository_layouts", _async_iter_repository_layouts([_repository_layout("a")])
+    )
+    monkeypatch.setattr(DedupRepo, "open", _async_open(lambda store, layout, keys, **kwargs: _FakeDedupRepo(layout)))
+
+    store = _FakeStoreWithAclose()
+    session = api.Session()
+    (repo,) = await session.open_remote(_as_object_store(store))
+
+    await session.close_repo(repo)
+    await session.close_repo(repo)  # second call: a no-op, not a double-aclose
+
+    assert store.aclose_calls == 1
+
+
+async def test_session_close_repo_treats_two_traced_discovers_of_one_backing_store_as_shared(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``_discover_from_store`` wraps ``store`` in a **new** ``TracingStore``
+    on every call when ``trace=`` is given -- two separate
+    ``discover_remote()`` calls against the same backing store (the shape
+    ``discover_remote``'s own ``root=`` parameter exists to support: scanning
+    one bucket's several sibling repositories via separate calls) must still
+    be recognized as sharing one backing connector, not two independent
+    ones, or ``close_repo()`` would ``aclose()`` the shared connector out
+    from under whichever group is closed second."""
+
+    monkeypatch.setattr(
+        api_session, "iter_repository_layouts", _async_iter_repository_layouts([_repository_layout("a")])
+    )
+    monkeypatch.setattr(DedupRepo, "open", _async_open(lambda store, layout, keys, **kwargs: _FakeDedupRepo(layout)))
+
+    def _no_trace(event: api_session.TraceEvent) -> None:
+        pass
+
+    backing = _FakeStoreWithAclose()
+    session = api.Session()
+    (repo_a,) = await session.open_remote(_as_object_store(backing), trace=_no_trace)
+    (repo_b,) = await session.open_remote(_as_object_store(backing), trace=_no_trace)
+
+    await session.close_repo(repo_a)
+    assert backing.closed is False  # repo_b's group still references the same backing store
+    assert len(session._stores) == 2  # neither wrapper removed yet -- still shared
+
+    await session.close_repo(repo_b)
+    assert backing.closed is True
+    assert session._stores == []  # both wrappers released together, not just repo_b's own
+
+
+async def test_session_close_repo_keeps_store_tracked_when_cancelled_mid_aclose(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A cancellation arriving while ``aclose_if_possible`` is still
+    in-flight (the TUI quitting while ``BrowseScreen._close_repos``'s own
+    fire-and-forget worker is mid-close, say) must not orphan the store --
+    neither tracked nor closed. ``close_repo()`` only removes a store from
+    ``self._stores`` once its own aclose attempt has actually returned or
+    raised, never before it starts, so a still-in-flight one stays
+    trackable for ``Session.close()`` to pick up later instead."""
+
+    class _FakeStoreThatHangsOnFirstAclose(_FakeStore):
+        """Hangs only on its first ``aclose()`` -- standing in for a real
+        connector whose close the *first* caller's cancellation interrupts
+        mid-flight; a second, later caller (``Session.close()`` here)
+        retrying the same close must still succeed normally, the same way
+        a real backend's ``aclose()`` isn't itself left half-broken just
+        because a previous attempt was cancelled before it returned."""
+
+        def __init__(self) -> None:
+            self.closed = False
+            self._first_call = True
+
+        async def aclose(self) -> None:
+            if self._first_call:
+                self._first_call = False
+                aclose_started.set()
+                await asyncio.Event().wait()  # never resolves - only cancellation ends this
+            self.closed = True
+
+    monkeypatch.setattr(
+        api_session, "iter_repository_layouts", _async_iter_repository_layouts([_repository_layout("a")])
+    )
+    monkeypatch.setattr(DedupRepo, "open", _async_open(lambda store, layout, keys, **kwargs: _FakeDedupRepo(layout)))
+
+    aclose_started = asyncio.Event()
+    store = _FakeStoreThatHangsOnFirstAclose()
+    session = api.Session()
+    (repo,) = await session.open_remote(_as_object_store(store))
+
+    task = asyncio.create_task(session.close_repo(repo))
+    await aclose_started.wait()
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert cast(object, store) in session._stores  # still tracked -- not orphaned
+    assert store.closed is False
+
+    await session.close()  # can still reach and close it later
+    assert store.closed is True
+
+
 async def test_session_discover_cancellation_also_cancels_still_pending_open_tasks(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -703,8 +898,9 @@ async def test_session_discover_cancellation_also_cancels_still_pending_open_tas
     ``pending_open`` still holds its in-flight task when cancellation
     lands, exercising that cleanup for real. The probe (not
     ``DedupRepo.open()``) is what's made to hang: ``Repository.
-    _confirm_real()`` no longer opens a ``DedupRepo`` for ``VAULT`` to
-    double-check it (see that method's own docstring), so the probe is
+    _confirm_real()`` trusts the marker check ``iter_repository_layouts``
+    already performed rather than opening a real ``DedupRepo`` for
+    ``VAULT`` to double-check it, so the probe is
     the one remaining per-layout step ``_open_repository`` still awaits
     before ``_confirm_real()``."""
     monkeypatch.setattr(api_session, "LocalFsStore", lambda path: _FakeStore())
@@ -869,7 +1065,7 @@ def _repo_with_tree(monkeypatch: pytest.MonkeyPatch, provider: UnitProvider) -> 
         return workload if workload_id == workload.workload_id else None
 
     async def fake_saas_provider_for(
-        dedup_repo: object, w: object, v: object, *, object_db_id: str | None = None
+        dedup_repo: object, w: object, v: object, saas_streams: object, *, object_db_id: str | None = None
     ) -> UnitProvider:
         assert v is version
         return provider
@@ -909,8 +1105,9 @@ async def test_resolve_canonical_ref_flat_id_leaf_via_direct_lookup(monkeypatch:
     """The Drive-shaped case: a leaf whose single extra segment is not a
     growing prefix of the version root's segments is resolved via
     ``synology_apm_repo.sdk.units.base.SupportsDirectRefLookup``,
-    not units/resolve.py's generic prefix-guided descent (which can't
-    reach this shape at all — see that module's own docstring)."""
+    not units/resolve.py's generic prefix-guided descent (Drive/Team
+    Drive's flat, depth-independent node ids never form the growing-prefix
+    relationship that descent needs)."""
     root_ref = NodeRef.canonical(
         "", catalog_id=CatalogId(str(_RESOLVE_CCID)), workload_id=_RESOLVE_WORKLOAD_ID, version_uid=_RESOLVE_VERSION_UID
     )

@@ -81,9 +81,9 @@ class FileMapTreeProvider:
         if prefix is None:
             return []
         # Re-normalized from the request's own prefix string (not assumed
-        # already-clean) the same way the pre-index version did, since
-        # this lookup key must match exactly how _index() built its own
-        # prefix keys ("/".join of filtered, non-empty parts).
+        # already-clean), since this lookup key must match exactly how
+        # _index() built its own prefix keys ("/".join of filtered,
+        # non-empty parts).
         prefix_parts = [p for p in prefix.split("/") if p]
         normalized_prefix = "/".join(prefix_parts)
 

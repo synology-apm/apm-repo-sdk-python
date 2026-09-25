@@ -18,21 +18,39 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-from textual.widgets import DataTable, Input, Static, Tree
+from textual.coordinate import Coordinate
+from textual.widgets import Button, DataTable, Input, Static, Tree
 
 import synology_apm_repo.browser.screens.connect_dialog as connect_dialog_module
 from synology_apm_repo.browser.app import ApmRepoBrowserApp
-from synology_apm_repo.browser.screens.browse_screen import BrowseScreen, CatalogEntry
+from synology_apm_repo.browser.core.unit.msg import ChildrenRequested
+from synology_apm_repo.browser.screens.browse_screen import BrowseScreen
 from synology_apm_repo.browser.screens.connect_dialog import ConnectDialog
 from synology_apm_repo.browser.screens.hex_preview_screen import HexPreviewScreen
 from synology_apm_repo.browser.screens.unit_screen import UnitScreen
-from synology_apm_repo.sdk.api import Catalog, Version
+from synology_apm_repo.sdk.api import Catalog, Repository, Version
 from synology_apm_repo.sdk.storage.base import ObjectStore
 from synology_apm_repo.sdk.storage.recording import ReplayStore
-from synology_apm_repo.sdk.units.base import UnitProvider
+from synology_apm_repo.sdk.units.base import Node, UnitProvider
 
 _FIXTURES = Path(__file__).parent.parent.parent / "fixtures"
 _APV1_FIXTURE = _FIXTURES / "tui_hex_filter_refresh_apv1_pilot.json.gz"
+
+
+def _unique_needle(names: list[str], index: int) -> str:
+    """The shortest substring of ``names[index]`` that doesn't occur
+    (case-insensitively) in any other entry of ``names`` -- lets a filter
+    test prove real narrowing happened without hardcoding a
+    fixture-specific literal that a re-recording could invalidate.
+    """
+    target = names[index]
+    others = [name.lower() for i, name in enumerate(names) if i != index]
+    for length in range(1, len(target) + 1):
+        for start in range(len(target) - length + 1):
+            candidate = target[start : start + length]
+            if not any(candidate.lower() in other for other in others):
+                return candidate
+    raise AssertionError(f"no substring of {target!r} discriminates it from {names!r}")
 
 
 def _fake_build_local_store_for(fixture: Path, label: str) -> Any:
@@ -49,9 +67,14 @@ async def _patch_local_store(
     allow_content: bool = False,
 ) -> None:
     """``--record-against``-aware equivalent of ``_fake_build_local_store_for``
-    -- used only by the tests below that also need ``_drill_to_unit_screen``'s
-    explicit-target fix (see its own docstring); every other test in this
-    file still uses the plain ``_fake_build_local_store_for(_APV1_FIXTURE,
+    -- used only by the tests below that also need
+    ``drill_to_unit_screen_via_fs_device``'s fix of always targeting one
+    specific, confirmed-good workload (the ``connection_config_id`` 1 FS
+    device) rather than whatever a cursor-default "press enter" lands on
+    first -- avoiding both a VM device whose ``target.db`` was never
+    captured and a device whose sort/group order shifts on every
+    re-anonymization; every other test in this file
+    still uses the plain ``_fake_build_local_store_for(_APV1_FIXTURE,
     ...)`` helper above and doesn't yet support ``--record-against``."""
     store = await record_target("tui_hex_filter_refresh_apv1_pilot.json.gz", allow_content=allow_content)
 
@@ -61,81 +84,69 @@ async def _patch_local_store(
     monkeypatch.setattr(connect_dialog_module.ConnectDialog, "_build_local_store", _fake)
 
 
-async def _drill_to_unit_screen(app: ApmRepoBrowserApp, pilot: Any, wait_until: Any) -> None:
-    """Drills into a specific, confirmed-good workload — the connection
-    with connection_config_id 1's FS device — rather than whatever a
-    cursor-default "press enter" lands on first: a VM device under this
-    same connection has a real version whose ``target.db`` was never
-    captured (a genuine gap in the real sample data itself, not a
-    recording or anonymization bug), and which device sorts/groups first
-    shifts every time display names are re-anonymized. FS content is
-    structurally immune to that whole failure mode — it never goes
-    through ``target.db`` at all — so it's the more durable choice, not
-    just a currently-lucky pick."""
-    assert isinstance(app.screen, BrowseScreen), app.screen
-    cat_tree = app.screen.query_one("#col-catalogs", Tree)
-    repo_node = cat_tree.root.children[0]
-    # connection_config_id 1 -- an internal catalog identifier, stable and
-    # non-identifying (never touched by anonymization).
-    connection_node = next(
-        n
-        for n in repo_node.children
-        if isinstance(n.data, CatalogEntry) and n.data.catalog.connection.connection_config_id == 1
-    )
-    cat_tree.move_cursor(connection_node)
-    cat_tree.focus()
-    await pilot.press("enter")
-
-    wl_tree = app.screen.query_one("#col-workloads", Tree)
-    await wait_until(pilot, lambda: wl_tree.root.children, timeout=3.0, interval=0.02)
-    fs_group = next(n for n in wl_tree.root.children if str(n.label) == "FS")
-    # Only the *first* group auto-expands (BrowseScreen._set_workloads) --
-    # "FS" isn't always that one, so its own children aren't visible/
-    # selectable via move_cursor until expanded explicitly.
-    fs_group.expand()
-    await wait_until(pilot, lambda: fs_group.children, timeout=0.8, interval=0.02)
-    wl_tree.move_cursor(fs_group.children[0])
-    wl_tree.focus()
-    await pilot.press("enter")
-
-    versions_table = app.screen.query_one("#col-versions", DataTable)
-    await wait_until(pilot, lambda: versions_table.row_count, timeout=3.0, interval=0.02)
-    versions_table.focus()
-    await pilot.press("enter")
-    await wait_until(pilot, lambda: isinstance(app.screen, UnitScreen), timeout=0.6, interval=0.03)
-    assert isinstance(app.screen, UnitScreen), app.screen
-
-
 async def _first_leaf(
-    app: ApmRepoBrowserApp, pilot: Any, wait_until: Any, focus_widget: Any, move_cursor_to: Any
-) -> Any:
+    app: ApmRepoBrowserApp,
+    pilot: Any,
+    wait_until: Any,
+    focus_widget: Any,
+    move_cursor_to: Any,
+    ui_timeout: float,
+    sdk_timeout: float,
+) -> Node:
+    """DFS with backtracking, not a blind ``children[0]`` walk: since
+    ``units/fs.py`` sorts directories before files, a real directory's own
+    *first* child (alphabetically first among its subdirectories) can be
+    an empty one at any depth -- an ordinary real filesystem fact -- which
+    a greedy walk would dead-end into. Driven straight through the store
+    (``ChildrenRequested`` + real replayed provider fetches), not the
+    folder-tree widget: the tree only ever shows containers now, so a
+    leaf can never be found by walking it.
+
+    Also points the file table's own cursor at the leaf found (focus +
+    cursor position, no Enter press) before returning, so a caller can
+    press ``x``/whatever key it needs immediately."""
     unit_screen = app.screen
     assert isinstance(unit_screen, UnitScreen)
-    tree = unit_screen.query_one("#unit-tree", Tree)
-    await wait_until(pilot, lambda: tree.root.data is not None, timeout=3.0, interval=0.02)
-    await focus_widget(pilot, tree)
-    node = tree.root
-    depth = 0
-    while node is not None and node.data is not None and not node.data.is_leaf and depth < 6:
-        node.expand()
-        await wait_until(pilot, lambda n=node: n.children, timeout=3.0, interval=0.02)
-        if not node.children:
-            break
-        node = node.children[0]
-        depth += 1
-    assert node is not None and node.data is not None and node.data.is_leaf, "no leaf found"
-    # move_cursor only takes effect against an up-to-date line map; forcing it
-    # here is the same idiom _select_matching_workload uses.
-    _ = tree._tree_lines
-    tree.move_cursor(node)
-    await wait_until(
-        pilot,
-        lambda n=node: tree.cursor_node is n,
-        timeout=0.4,
-        interval=0.02,
-        message="cursor never landed on the chosen leaf",
-    )
-    return node
+    await wait_until(pilot, lambda: unit_screen.store.model.root is not None, timeout=sdk_timeout, interval=0.02)
+    root = unit_screen.store.model.root
+    assert root is not None and not root.is_leaf, "version root is itself a leaf -- no parent to select it under"
+
+    async def _search(node: Node, depth: int) -> tuple[Node, Node] | None:
+        if depth >= 10:
+            return None
+        level = unit_screen.store.model.loaded.get(node.ref)
+        if level is None:
+            unit_screen.store.dispatch(ChildrenRequested(node=node))
+            await wait_until(
+                pilot,
+                lambda ref=node.ref: ref in unit_screen.store.model.loaded or ref in unit_screen.store.model.errors,
+                timeout=sdk_timeout,
+                interval=0.02,
+            )
+            level = unit_screen.store.model.loaded.get(node.ref)
+        if level is None:
+            return None  # a children() failure for this one branch -- not fatal, just try elsewhere
+        leaf = next((c for c in level.children if c.is_leaf), None)
+        if leaf is not None:
+            return leaf, node
+        for child in level.children:
+            if not child.is_leaf:
+                found = await _search(child, depth + 1)
+                if found is not None:
+                    return found
+        return None
+
+    found = await _search(root, 0)
+    assert found is not None, "no leaf found"
+    leaf, parent = found
+
+    unit_screen._select_folder_ref(parent)
+    await wait_until(pilot, lambda: leaf in unit_screen._file_table._nodes, timeout=ui_timeout, interval=0.02)
+    row_index = unit_screen._file_table._nodes.index(leaf)
+    table = unit_screen.query_one("#file-table", DataTable)
+    await focus_widget(pilot, table)
+    table.cursor_coordinate = Coordinate(row_index, 0)
+    return leaf
 
 
 def test_hex_preview_blocked_outside_diagnostic_mode_replayed(
@@ -146,6 +157,9 @@ def test_hex_preview_blocked_outside_diagnostic_mode_replayed(
     record_target: Callable[..., Awaitable[ObjectStore]],
     focus_widget: Any,
     move_cursor_to: Any,
+    drill_to_unit_screen_via_fs_device: Any,
+    ui_timeout: float,
+    sdk_timeout: float,
 ) -> None:
     async def scenario() -> bool:
         await _patch_local_store(monkeypatch, record_target)
@@ -153,11 +167,24 @@ def test_hex_preview_blocked_outside_diagnostic_mode_replayed(
         async with app.run_test(size=(140, 45)) as pilot:
             await pilot.pause()
             await open_browser_pilot(app, pilot, tmp_path)
-            await _drill_to_unit_screen(app, pilot, wait_until)
-            await _first_leaf(app, pilot, wait_until, focus_widget, move_cursor_to)
+            await drill_to_unit_screen_via_fs_device(app, pilot)
+            await _first_leaf(app, pilot, wait_until, focus_widget, move_cursor_to, ui_timeout, sdk_timeout)
 
+            unit_screen = app.screen
+            assert isinstance(unit_screen, UnitScreen)
+            # action_hex_preview's own outside-verbose-mode branch is a
+            # synchronous no-op that never pushes a screen, so there's no
+            # UI state to wait_until() on for "x was blocked" -- the
+            # warning it does fire (the same real signal
+            # test_hex_preview_outside_verbose_mode_is_a_no_op_warning
+            # asserts on directly) is what this waits for, proving the
+            # key was actually recognized and correctly rejected, not
+            # just that the screen hadn't changed yet.
+            warnings: list[str] = []
+            unit_screen.notify = lambda message, **kwargs: warnings.append(message)  # type: ignore[method-assign]
             await pilot.press("x")
-            await pilot.pause(0.3)
+            await wait_until(pilot, lambda: warnings, timeout=ui_timeout, interval=0.02)
+            assert warnings == ["press d to enable verbose mode first"]
             return isinstance(app.screen, UnitScreen)
 
     still_on_unit_screen = asyncio.run(scenario())
@@ -172,6 +199,9 @@ def test_hex_preview_pages_forward_and_back_replayed(
     record_target: Callable[..., Awaitable[ObjectStore]],
     focus_widget: Any,
     move_cursor_to: Any,
+    drill_to_unit_screen_via_fs_device: Any,
+    ui_timeout: float,
+    sdk_timeout: float,
 ) -> None:
     """Also covers plain "opens for a leaf in diagnostic mode" on its
     own (the ``initial`` assertion below) -- there is no separate test
@@ -185,8 +215,8 @@ def test_hex_preview_pages_forward_and_back_replayed(
         async with app.run_test(size=(140, 45)) as pilot:
             await pilot.pause()
             await open_browser_pilot(app, pilot, tmp_path)
-            await _drill_to_unit_screen(app, pilot, wait_until)
-            await _first_leaf(app, pilot, wait_until, focus_widget, move_cursor_to)
+            await drill_to_unit_screen_via_fs_device(app, pilot)
+            await _first_leaf(app, pilot, wait_until, focus_widget, move_cursor_to, ui_timeout, sdk_timeout)
 
             def dump() -> str:
                 return str(app.screen.query_one("#hex-dump").render())
@@ -196,11 +226,15 @@ def test_hex_preview_pages_forward_and_back_replayed(
             # no longer exists afterwards -- re-acquire one rather than press
             # ``x`` into a tree that is still being rebuilt.
             await pilot.press("d")
-            await wait_until(pilot, lambda: app.verbose, timeout=0.4, interval=0.02, message="verbose never turned on")
-            await _first_leaf(app, pilot, wait_until, focus_widget, move_cursor_to)
+            await wait_until(
+                pilot, lambda: app.verbose, timeout=ui_timeout, interval=0.02, message="verbose never turned on"
+            )
+            await _first_leaf(app, pilot, wait_until, focus_widget, move_cursor_to, ui_timeout, sdk_timeout)
 
             await pilot.press("x")
-            await wait_until(pilot, lambda: isinstance(app.screen, HexPreviewScreen), timeout=0.4, interval=0.02)
+            await wait_until(
+                pilot, lambda: isinstance(app.screen, HexPreviewScreen), timeout=sdk_timeout, interval=0.02
+            )
             assert isinstance(app.screen, HexPreviewScreen), app.screen
             initial = dump()
 
@@ -209,12 +243,14 @@ def test_hex_preview_pages_forward_and_back_replayed(
             # landed", and a fixed pause would only be guessing at it.
             await pilot.press("x")  # page forward
             await wait_until(
-                pilot, lambda: dump() != initial, timeout=0.4, interval=0.02, message="never paged forward"
+                pilot, lambda: dump() != initial, timeout=sdk_timeout, interval=0.02, message="never paged forward"
             )
             forward = dump()
 
             await pilot.press("X")  # page back to the original window
-            await wait_until(pilot, lambda: dump() != forward, timeout=0.4, interval=0.02, message="never paged back")
+            await wait_until(
+                pilot, lambda: dump() != forward, timeout=sdk_timeout, interval=0.02, message="never paged back"
+            )
             back = dump()
 
             return initial, forward, back
@@ -233,6 +269,10 @@ def test_unit_screen_filter_narrows_then_esc_restores_replayed(
     record_target: Callable[..., Awaitable[ObjectStore]],
     focus_widget: Any,
     move_cursor_to: Any,
+    drill_to_unit_screen_via_fs_device: Any,
+    wait_for_filter_closed: Any,
+    ui_timeout: float,
+    sdk_timeout: float,
 ) -> None:
     async def scenario() -> tuple[int, str, list[str], int]:
         await _patch_local_store(monkeypatch, record_target)
@@ -240,12 +280,12 @@ def test_unit_screen_filter_narrows_then_esc_restores_replayed(
         async with app.run_test(size=(140, 45)) as pilot:
             await pilot.pause()
             await open_browser_pilot(app, pilot, tmp_path)
-            await _drill_to_unit_screen(app, pilot, wait_until)
+            await drill_to_unit_screen_via_fs_device(app, pilot)
 
             unit_screen = app.screen
             assert isinstance(unit_screen, UnitScreen)
-            tree = unit_screen.query_one("#unit-tree", Tree)
-            await wait_until(pilot, lambda: tree.root.children, timeout=3.0, interval=0.03)
+            tree = unit_screen.query_one("#folder-tree", Tree)
+            await wait_until(pilot, lambda: tree.root.children, timeout=sdk_timeout, interval=0.03)
             full_count = len(tree.root.children)
             assert full_count > 0, "root has no children to filter"
 
@@ -255,17 +295,36 @@ def test_unit_screen_filter_narrows_then_esc_restores_replayed(
             await wait_until(
                 pilot,
                 lambda: unit_screen.query("#filter-input"),
-                timeout=0.4,
+                timeout=ui_timeout,
                 interval=0.02,
                 message="filter input never opened",
             )
             filter_input = unit_screen.query_one("#filter-input", Input)
+            # The filter rebuild is debounced after the last keystroke (see
+            # widgets/filter_debounce.py -- and tests/conftest.py's
+            # fast_browser_debounce for why this test session's delay isn't
+            # literally its 0.3s production default) -- wait for the
+            # model's own committed filter text rather than a fixed pause
+            # shorter than the debounce. Unlike the pre-reconciler rebuild,
+            # a still-matching node (``needle`` is a prefix of the first
+            # child's own label, by construction above) keeps its own
+            # TreeNode object across this re-render -- reconcile_children
+            # keys survivors by domain identity rather than position, so
+            # only what's genuinely new or gone is added or removed -- and
+            # "every node replaced" is no longer the right signal to
+            # wait for.
             filter_input.value = needle
-            await pilot.pause(0.02)
+            await wait_until(
+                pilot,
+                lambda: unit_screen.store.model.filter is not None and unit_screen.store.model.filter.text == needle,
+                timeout=ui_timeout,
+                interval=0.02,
+                message="debounced filter never committed",
+            )
             filtered_labels = [str(c.label) for c in tree.root.children]
 
             await pilot.press("escape")
-            await pilot.pause(0.02)
+            await wait_for_filter_closed(pilot, unit_screen)
             restored_count = len(tree.root.children)
 
             return full_count, needle, filtered_labels, restored_count
@@ -273,8 +332,9 @@ def test_unit_screen_filter_narrows_then_esc_restores_replayed(
     full_count, needle, filtered_labels, restored_count = asyncio.run(scenario())
     assert 0 < len(filtered_labels) <= full_count
     # Every surviving node's label actually contains the needle
-    # (case-insensitively, matching _rerender_filtered's own ``.lower()``)
-    # -- a regression that narrowed to the right *count* but the wrong
+    # (case-insensitively, matching core/unit/select.py's own
+    # ``_needle_for``/``_folder_node_spec`` ``.lower()`` matching) -- a
+    # regression that narrowed to the right *count* but the wrong
     # *nodes* would still pass a count-only bound.
     assert all(needle.lower() in label.lower() for label in filtered_labels), filtered_labels
     assert restored_count == full_count
@@ -287,6 +347,8 @@ def test_browse_screen_filter_narrows_connections_replayed(
     wait_until: Any,
     focus_widget: Any,
     move_cursor_to: Any,
+    wait_for_filter_closed: Any,
+    ui_timeout: float,
 ) -> None:
     monkeypatch.setattr(
         connect_dialog_module.ConnectDialog,
@@ -302,28 +364,44 @@ def test_browse_screen_filter_narrows_connections_replayed(
             assert isinstance(app.screen, BrowseScreen), app.screen
 
             tree = app.screen.query_one("#col-catalogs", Tree)
-            tree.focus()
+            await focus_widget(pilot, tree)
             repo_node = tree.root.children[0]
             full_count = len(repo_node.children)
             assert full_count >= 1
 
-            first_name = str(repo_node.children[0].label)
-            needle = first_name[:4]
+            # A naive `first_name[:4]`-style needle is the exact anti-pattern
+            # to avoid: if every connection's anonymized display name happens
+            # to share a prefix, it matches every row and the filter could
+            # silently do nothing while every assertion below still passed.
+            # _unique_needle picks a substring that matches only the target
+            # row.
+            names = [str(c.label) for c in repo_node.children]
+            needle = _unique_needle(names, 0)
             await pilot.press("slash")
             await wait_until(
                 pilot,
                 lambda: app.screen.query("#filter-input"),
-                timeout=0.4,
+                timeout=ui_timeout,
                 interval=0.02,
                 message="filter input never opened",
             )
             filter_input = app.screen.query_one("#filter-input", Input)
             filter_input.value = needle
-            await pilot.pause(0.02)
+            # The filter rebuild is debounced (see widgets/filter_debounce.py);
+            # `needle` matches exactly one row, so waiting for the tree to
+            # actually narrow to that one row is itself the real completion
+            # signal.
+            await wait_until(
+                pilot,
+                lambda: len(repo_node.children) == 1,
+                timeout=ui_timeout,
+                interval=0.02,
+                message="debounced filter never narrowed the connection list",
+            )
             filtered_labels = [str(c.label) for c in repo_node.children]
 
             await pilot.press("escape")
-            await pilot.pause(0.02)
+            await wait_for_filter_closed(pilot, app.screen)
             restored_count = len(repo_node.children)
 
             return full_count, needle, filtered_labels, restored_count
@@ -331,9 +409,10 @@ def test_browse_screen_filter_narrows_connections_replayed(
     full_count, needle, filtered_labels, restored_count = asyncio.run(scenario())
     assert 0 < len(filtered_labels) <= full_count
     # Every surviving connection's label actually contains the needle
-    # (case-insensitively, matching _rerender_tree_filter's own
-    # ``.lower()``) -- a regression that narrowed to the right *count* but
-    # the wrong *nodes* would still pass a count-only bound.
+    # (case-insensitively, matching core/browse/select.py's own
+    # ``.lower()`` needle match) -- a regression that narrowed to the
+    # right *count* but the wrong *nodes* would still pass a
+    # count-only bound.
     assert all(needle.lower() in label.lower() for label in filtered_labels), filtered_labels
     assert restored_count == full_count
 
@@ -345,6 +424,8 @@ def test_browse_screen_version_filter_enter_closes_it_replayed(
     wait_until: Any,
     focus_widget: Any,
     move_cursor_to: Any,
+    ui_timeout: float,
+    sdk_timeout: float,
 ) -> None:
     monkeypatch.setattr(
         connect_dialog_module.ConnectDialog,
@@ -352,54 +433,93 @@ def test_browse_screen_version_filter_enter_closes_it_replayed(
         _fake_build_local_store_for(_APV1_FIXTURE, "apv-sample-1"),
     )
 
-    async def scenario() -> tuple[int, str, list[str], int, bool, bool]:
+    async def scenario() -> tuple[int, str, str, list[str], int, bool, bool]:
         app = ApmRepoBrowserApp()
         async with app.run_test(size=(140, 45)) as pilot:
             await pilot.pause()
             await open_browser_pilot(app, pilot, tmp_path)
             assert isinstance(app.screen, BrowseScreen), app.screen
 
-            app.screen.query_one("#col-catalogs", Tree).focus()
+            await focus_widget(pilot, app.screen.query_one("#col-catalogs", Tree))
             await pilot.press("enter")
             workloads_tree = app.screen.query_one("#col-workloads", Tree)
-            await wait_until(pilot, lambda: workloads_tree.root.children, timeout=0.8, interval=0.02)
-            workloads_tree.focus()
+            await wait_until(pilot, lambda: workloads_tree.root.children, timeout=sdk_timeout, interval=0.02)
+            await focus_widget(pilot, workloads_tree)
             await pilot.press("enter")
             versions_table = app.screen.query_one("#col-versions", DataTable)
-            await wait_until(pilot, lambda: versions_table.row_count, timeout=3.0, interval=0.02)
-            versions_table.focus()
-            full_count = versions_table.row_count
+            # row_count alone can be stale; wait for _visible_version_indices
+            # too (see tests/conftest.py's drill_to_unit_screen_via_fs_device).
+            await wait_until(
+                pilot,
+                lambda: versions_table.row_count and app.screen._visible_version_indices,
+                timeout=sdk_timeout,
+                interval=0.02,
+            )
+            await focus_widget(pilot, versions_table)
+            all_names = [str(versions_table.get_row_at(i)[0]) for i in range(versions_table.row_count)]
+            full_count = len(all_names)
             assert full_count >= 1
 
-            first_name = str(versions_table.get_row_at(0)[0])
-            needle = first_name[:4]
+            # `_unique_needle` picks a substring that matches row 0 and
+            # nothing else -- this real fixture's version display names
+            # all share a common date-based prefix, so a naive
+            # `first_name[:4]`-style needle would match every row and the
+            # filter could silently do nothing while every assertion below
+            # still passed.
+            expected_name = all_names[0]
+            needle = _unique_needle(all_names, 0)
             await pilot.press("slash")
             await wait_until(
                 pilot,
                 lambda: app.screen.query("#filter-input"),
-                timeout=0.4,
+                timeout=ui_timeout,
                 interval=0.02,
                 message="filter input never opened",
             )
             filter_input = app.screen.query_one("#filter-input", Input)
             filter_input.value = needle
-            await pilot.pause(0.02)
+            # The filter rebuild is debounced (see widgets/filter_debounce.py);
+            # `needle` matches exactly one row, so waiting for the table to
+            # actually narrow to that one row is itself the real completion
+            # signal.
+            await wait_until(
+                pilot,
+                lambda: versions_table.row_count == 1,
+                timeout=ui_timeout,
+                interval=0.02,
+                message="debounced filter never narrowed the table",
+            )
             filtered_names = [str(versions_table.get_row_at(i)[0]) for i in range(versions_table.row_count)]
 
             await pilot.press("enter")
-            await pilot.pause(0.02)
+            # FilterFieldController.close() removes #filter-input's "active"
+            # class, restores the full list, and (its own post_close)
+            # refocuses #col-versions -- all synchronously, in that order,
+            # within one call. Waiting for the last of the three (rather
+            # than re-deriving the same "active" check the assertions below
+            # already make) still proves the other two already happened,
+            # without the wait itself being the very thing being asserted.
+            await wait_until(
+                pilot,
+                lambda: versions_table.has_focus,
+                timeout=ui_timeout,
+                interval=0.02,
+                message="versions table never regained focus after the filter closed",
+            )
             restored_count = versions_table.row_count
             input_still_active = filter_input.has_class("active")
             table_focused = versions_table.has_focus
 
-            return full_count, needle, filtered_names, restored_count, input_still_active, table_focused
+            return full_count, expected_name, needle, filtered_names, restored_count, input_still_active, table_focused
 
-    full_count, needle, filtered_names, restored_count, input_still_active, table_focused = asyncio.run(scenario())
-    assert 0 < len(filtered_names) <= full_count
-    # Every surviving row's own name column actually contains the needle
-    # (case-insensitively) -- a regression that narrowed to the right
-    # *count* but the wrong *rows* would still pass a count-only bound.
-    assert all(needle.lower() in name.lower() for name in filtered_names), filtered_names
+    full_count, expected_name, needle, filtered_names, restored_count, input_still_active, table_focused = asyncio.run(
+        scenario()
+    )
+    # Exactly the one row `needle` was built to match -- a regression that
+    # narrowed to the right *count* but the wrong *row*, or didn't narrow
+    # at all, would both be caught here (unlike a shared-prefix needle,
+    # which every row would match regardless of whether filtering ran).
+    assert filtered_names == [expected_name], (needle, filtered_names)
     assert restored_count == full_count
     assert not input_still_active
     assert table_focused
@@ -412,6 +532,7 @@ def test_browse_screen_backspace_jumps_cursor_to_parent_and_collapses_it_replaye
     wait_until: Any,
     focus_widget: Any,
     move_cursor_to: Any,
+    ui_timeout: float,
 ) -> None:
     monkeypatch.setattr(
         connect_dialog_module.ConnectDialog,
@@ -427,7 +548,7 @@ def test_browse_screen_backspace_jumps_cursor_to_parent_and_collapses_it_replaye
             assert isinstance(app.screen, BrowseScreen), app.screen
 
             tree = app.screen.query_one("#col-catalogs", Tree)
-            tree.focus()
+            await focus_widget(pilot, tree)
             repo_node = tree.root.children[0]
             assert repo_node.children, "expected at least one connection under the repository"
             connection_node = repo_node.children[0]
@@ -435,14 +556,14 @@ def test_browse_screen_backspace_jumps_cursor_to_parent_and_collapses_it_replaye
 
             await pilot.press("backspace")
             await wait_until(
-                pilot, lambda: tree.cursor_node is repo_node, timeout=0.4, interval=0.02, message="never went up"
+                pilot, lambda: tree.cursor_node is repo_node, timeout=ui_timeout, interval=0.02, message="never went up"
             )
             landed_on_repo = tree.cursor_node is repo_node
             repo_collapsed = not repo_node.is_expanded
 
             await pilot.press("backspace")
             await wait_until(
-                pilot, lambda: tree.cursor_node is tree.root, timeout=0.4, interval=0.02, message="never went up"
+                pilot, lambda: tree.cursor_node is tree.root, timeout=ui_timeout, interval=0.02, message="never went up"
             )
             landed_on_root = tree.cursor_node is tree.root
             root_still_expanded = tree.root.is_expanded
@@ -462,13 +583,13 @@ def test_browse_screen_refresh_rescans_the_same_path_replayed(
     open_browser_pilot: Any,
     wait_until: Any,
     record_target: Callable[..., Awaitable[ObjectStore]],
+    ui_timeout: float,
 ) -> None:
-    """``s3-sample-2-encrypted``'s two sibling repo-ids now correctly
-    discover as one ``Repository`` (holding both as ``catalogs()``) under
-    the Repository/Catalog architecture rename — the repository count this test
-    checks before/after refresh is 1, not the pre-rename 2, but the
-    behavior under test (a refresh rescans and finds the same thing
-    again) is unaffected."""
+    """``s3-sample-2-encrypted``'s two sibling repo-ids discover as one
+    ``Repository`` (holding both as ``catalogs()``), so the repository
+    count this test checks before/after refresh is 1 — the behavior
+    under test (a refresh rescans and finds the same thing again)
+    doesn't depend on that count."""
 
     async def scenario() -> tuple[int, int]:
         store = await record_target("tui_hex_filter_refresh_s3sample2_pilot.json.gz")
@@ -486,7 +607,7 @@ def test_browse_screen_refresh_rescans_the_same_path_replayed(
             first_count = len(tree.root.children)
 
             await pilot.press("r")
-            await wait_until(pilot, lambda: isinstance(app.screen, ConnectDialog), timeout=0.6, interval=0.02)
+            await wait_until(pilot, lambda: isinstance(app.screen, ConnectDialog), timeout=ui_timeout, interval=0.02)
             assert isinstance(app.screen, ConnectDialog), "refresh with nothing selected must reopen ConnectDialog"
             await open_browser_pilot(app, pilot, tmp_path)
             assert isinstance(app.screen, BrowseScreen), app.screen
@@ -503,6 +624,8 @@ def test_unit_screen_refresh_reloads_the_tree_replayed(
     open_browser_pilot: Any,
     wait_until: Any,
     record_target: Callable[..., Awaitable[ObjectStore]],
+    drill_to_unit_screen_via_fs_device: Any,
+    sdk_timeout: float,
 ) -> None:
     async def scenario() -> tuple[int, int, bool]:
         await _patch_local_store(monkeypatch, record_target)
@@ -510,19 +633,19 @@ def test_unit_screen_refresh_reloads_the_tree_replayed(
         async with app.run_test(size=(140, 45)) as pilot:
             await pilot.pause()
             await open_browser_pilot(app, pilot, tmp_path)
-            await _drill_to_unit_screen(app, pilot, wait_until)
+            await drill_to_unit_screen_via_fs_device(app, pilot)
 
             unit_screen = app.screen
             assert isinstance(unit_screen, UnitScreen)
-            tree = unit_screen.query_one("#unit-tree", Tree)
-            await wait_until(pilot, lambda: tree.root.children, timeout=3.0, interval=0.03)
+            tree = unit_screen.query_one("#folder-tree", Tree)
+            await wait_until(pilot, lambda: tree.root.children, timeout=sdk_timeout, interval=0.03)
             before_count = len(tree.root.children)
-            provider_before = unit_screen._provider
+            provider_before = unit_screen._current_provider()
 
             await pilot.press("r")
-            await wait_until(pilot, lambda: tree.root.children, timeout=3.0, interval=0.03)
+            await wait_until(pilot, lambda: tree.root.children, timeout=sdk_timeout, interval=0.03)
             after_count = len(tree.root.children)
-            provider_replaced = unit_screen._provider is not provider_before
+            provider_replaced = unit_screen._current_provider() is not provider_before
 
             return before_count, after_count, provider_replaced
 
@@ -537,23 +660,102 @@ def test_loading_indicator_never_appears_for_a_fast_catalog_query_replayed(
     open_browser_pilot: Any,
     wait_until: Any,
 ) -> None:
+    """A fast catalog-level query (real local storage) settles well under
+    the 300ms debounce delay — the repo node's own label (this call site's
+    loading target, since ``_load_catalogs_for`` is a genuine tree-node
+    expand — see ``TreeNodeLoadingSink``) must never show a Loading suffix,
+    and the breadcrumb (a different call site's target) must not either."""
     monkeypatch.setattr(
         connect_dialog_module.ConnectDialog,
         "_build_local_store",
         _fake_build_local_store_for(_APV1_FIXTURE, "apv-sample-1"),
     )
 
-    async def scenario() -> bool:
+    async def scenario() -> tuple[bool, bool]:
         app = ApmRepoBrowserApp()
         async with app.run_test(size=(140, 45)) as pilot:
             await pilot.pause()
             await open_browser_pilot(app, pilot, tmp_path)
             assert isinstance(app.screen, BrowseScreen), app.screen
-            assert app.screen.query_one("#col-catalogs", Tree).root.children
-            return "loading" in str(app.screen.query_one("#breadcrumb", Static).render()).lower()
+            repo_node = app.screen.query_one("#col-catalogs", Tree).root.children[0]
+            assert repo_node.children
+            node_hint = "loading" in str(repo_node.label).lower()
+            breadcrumb_hint = "loading" in str(app.screen.query_one("#breadcrumb", Static).render()).lower()
+            return node_hint, breadcrumb_hint
 
-    hint_appeared = asyncio.run(scenario())
-    assert not hint_appeared, "the breadcrumb must never show a Loading suffix for a catalog-level query"
+    node_hint_appeared, breadcrumb_hint_appeared = asyncio.run(scenario())
+    assert not node_hint_appeared, "the repo node's label must never show a Loading suffix for a fast query"
+    assert not breadcrumb_hint_appeared, "the breadcrumb must never show a Loading suffix for a catalog-level query"
+
+
+def test_loading_indicator_appears_on_the_repo_node_label_for_a_slow_catalog_query_replayed(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    open_browser_pilot: Any,
+    wait_until: Any,
+    sdk_timeout: float,
+) -> None:
+    """``_load_catalogs_for`` (a real tree-node expand) shows its loading
+    hint on the expanding repo node's own label, not the breadcrumb — the
+    opposite target from ``_load_root``'s own loading hint (covered by
+    ``test_loading_indicator_appears_for_an_operation_slower_than_300ms_replayed``
+    below)."""
+    monkeypatch.setattr(
+        connect_dialog_module.ConnectDialog,
+        "_build_local_store",
+        _fake_build_local_store_for(_APV1_FIXTURE, "apv-sample-1"),
+    )
+    original_catalogs = Repository.catalogs
+
+    async def slow_catalogs(self: Repository) -> Any:
+        # Comfortably past the debounce delay (0.3s in production, sped up
+        # for this whole test session -- see tests/integration/browser/
+        # conftest.py's own autouse fixture) either way, so the indicator
+        # has ample real time both to appear and to still be showing by the
+        # time the wait_until below checks for it, regardless of real
+        # scheduling load.
+        await asyncio.sleep(3.0)
+        return await original_catalogs(self)
+
+    async def scenario() -> None:
+        app = ApmRepoBrowserApp()
+        async with app.run_test(size=(140, 45)) as pilot:
+            await pilot.pause()
+            assert isinstance(app.screen, ConnectDialog), app.screen
+            dialog = app.screen
+            dialog.query_one("#connect-local-path", Input).value = str(tmp_path)
+            dialog.query_one("#connect-submit", Button).press()
+            await wait_until(
+                pilot,
+                lambda: isinstance(app.screen, BrowseScreen),
+                timeout=sdk_timeout,
+                message="BrowseScreen never appeared",
+            )
+            tree = app.screen.query_one("#col-catalogs", Tree)
+            await wait_until(
+                pilot, lambda: tree.root.children, timeout=sdk_timeout, message="#col-catalogs never populated"
+            )
+            repo_node = tree.root.children[0]
+            _ = tree._tree_lines  # forces the line map to rebuild; see move_cursor_to's docstring
+            tree.move_cursor(repo_node)
+            await pilot.press("enter")
+
+            await wait_until(
+                pilot,
+                lambda: "loading" in str(repo_node.label).lower(),
+                timeout=2.0,
+                interval=0.02,
+                message="the repo node's label must show a Loading suffix once its own catalog query "
+                "runs past the debounce delay",
+            )
+            breadcrumb_hint = "loading" in str(app.screen.query_one("#breadcrumb", Static).render()).lower()
+            assert not breadcrumb_hint, "a tree-node-expand's own loading hint must not also touch the breadcrumb"
+
+    Repository.catalogs = slow_catalogs  # type: ignore[method-assign]
+    try:
+        asyncio.run(scenario())
+    finally:
+        Repository.catalogs = original_catalogs  # type: ignore[method-assign]
 
 
 def test_loading_indicator_appears_for_an_operation_slower_than_300ms_replayed(
@@ -561,6 +763,8 @@ def test_loading_indicator_appears_for_an_operation_slower_than_300ms_replayed(
     tmp_path: Path,
     open_browser_pilot: Any,
     wait_until: Any,
+    focus_widget: Any,
+    sdk_timeout: float,
 ) -> None:
     monkeypatch.setattr(
         connect_dialog_module.ConnectDialog,
@@ -572,10 +776,9 @@ def test_loading_indicator_appears_for_an_operation_slower_than_300ms_replayed(
     async def slow_provider(
         self: Catalog, version: Version, *, object_db_id: str | None = None, force_raw: bool = False
     ) -> UnitProvider:
-        # An order of magnitude past the real 300ms debounce delay, so
-        # the indicator has ample real time both to appear and to still
-        # be showing by the time the wait_until below checks for it,
-        # regardless of real scheduling load.
+        # Comfortably past the debounce delay either way -- see
+        # test_loading_indicator_appears_on_the_repo_node_label_for_a_slow_catalog_query_replayed's
+        # own slow_catalogs above for why.
         await asyncio.sleep(3.0)
         return await original_provider(self, version, object_db_id=object_db_id, force_raw=force_raw)
 
@@ -585,13 +788,22 @@ def test_loading_indicator_appears_for_an_operation_slower_than_300ms_replayed(
             await pilot.pause()
             await open_browser_pilot(app, pilot, tmp_path)
             assert isinstance(app.screen, BrowseScreen), app.screen
-            app.screen.query_one("#col-catalogs", Tree).focus()
+            await focus_widget(pilot, app.screen.query_one("#col-catalogs", Tree))
             await pilot.press("enter")
-            await pilot.pause(0.4)
-            app.screen.query_one("#col-workloads", Tree).focus()
+            workloads_tree = app.screen.query_one("#col-workloads", Tree)
+            await wait_until(pilot, lambda: workloads_tree.root.children, timeout=sdk_timeout, interval=0.02)
+            await focus_widget(pilot, workloads_tree)
             await pilot.press("enter")
-            await pilot.pause(0.4)
-            app.screen.query_one("#col-versions", DataTable).focus()
+            versions_table = app.screen.query_one("#col-versions", DataTable)
+            # row_count alone can be stale; wait for _visible_version_indices
+            # too (see tests/conftest.py's drill_to_unit_screen_via_fs_device).
+            await wait_until(
+                pilot,
+                lambda: versions_table.row_count and app.screen._visible_version_indices,
+                timeout=sdk_timeout,
+                interval=0.02,
+            )
+            await focus_widget(pilot, versions_table)
             await pilot.press("enter")
 
             def _shows_loading_hint() -> bool:
@@ -605,7 +817,7 @@ def test_loading_indicator_appears_for_an_operation_slower_than_300ms_replayed(
                 _shows_loading_hint,
                 timeout=2.0,
                 interval=0.02,
-                message="the breadcrumb must show a Loading suffix once an operation runs past the 300ms debounce delay",
+                message="the breadcrumb must show a Loading suffix once an operation runs past the debounce delay",
             )
 
     Catalog.provider = slow_provider  # type: ignore[method-assign]

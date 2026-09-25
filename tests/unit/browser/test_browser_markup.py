@@ -43,11 +43,22 @@ def _update(text: str) -> None:
     asyncio.run(scenario())
 
 
+def _rendered(text: str) -> str:
+    async def scenario() -> str:
+        app = _OneStatic()
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            static = app.query_one("#s", Static)
+            static.update(text)
+            return str(static.render())
+
+    return asyncio.run(scenario())
+
+
 def test_unescaped_exception_text_crashes_static_update() -> None:
-    """Establishes the failure this module exists to fix — see the
-    module's own docstring for the full explanation (an ``ApmRepoError``'s
-    ``[ref=...]`` suffix isn't valid Rich markup once the ref
-    contains ``/``, which every real path does)."""
+    """Establishes the failure this module exists to fix: an
+    ``ApmRepoError``'s ``[ref=...]`` suffix isn't valid Rich markup once
+    the ref contains ``/``, which every real path does."""
     exc = KeyRequiredError(
         "data is aHlT-enveloped but no vault_key was given", ref="@ActiveProtectVault/@data/Pool/45/0"
     )
@@ -64,6 +75,43 @@ def test_safe_prevents_the_crash() -> None:
 
 def test_safe_handles_the_exact_real_sample_shape() -> None:
     _update(f"[red]error:[/red] {safe(_REAL_SHAPE_MESSAGE)}")  # must not raise
+
+
+# An uppercase-starting "[Key=" -- Textual's own markup grammar reads
+# this as a real key=value tag attribute, then fails to resolve the
+# value (TOKEN/VARIABLE_REF need a leading letter/"$", COLOR needs
+# "#"/"rgb"/"hsl", and PERCENT's own leading "-" still needs a digit
+# right after it). rich.markup.escape() itself leaves the leading "["
+# untouched too (its own regex only escapes one immediately followed by
+# a lowercase letter, "#", "/", or "@", so the uppercase "K" here
+# defeats it) -- this is exactly why safe() escapes every "[" rather
+# than reusing rich.markup.escape()'s narrower heuristic.
+_KEYVALUE_BRACKET_MESSAGE = 'see [Ticket=-MVP-5002577"\nfor details'
+
+
+def test_unescaped_uppercase_key_bracketed_text_crashes_static_update() -> None:
+    """Establishes the second, distinct failure this module's ``safe()``
+    fixes -- not the ``[ref=...]``-shaped one above (already escaped
+    correctly by plain ``rich.markup.escape()`` too, since ``ref`` is
+    lowercase), but an uppercase-starting ``key=value``-shaped bracket a
+    real chat message can just as easily contain."""
+    with pytest.raises(MarkupError):
+        _update(_KEYVALUE_BRACKET_MESSAGE)
+
+
+def test_safe_prevents_the_uppercase_key_bracket_crash() -> None:
+    _update(safe(_KEYVALUE_BRACKET_MESSAGE))  # must not raise
+
+
+def test_safe_preserves_a_literal_backslash_right_before_an_unclosed_bracket() -> None:
+    """A literal backslash immediately before a ``[`` that never closes
+    must come back through ``Static.update()`` unchanged, not with an
+    extra backslash inserted: Rich's/Textual's fallback un-escaping for
+    a non-tag-shaped bracket strips exactly one backslash from the run,
+    not half of it, so doubling here (as a tag-shaped match needs) would
+    round-trip wrong."""
+    original = "a Windows-style path fragment \\[not-a-real-tag"
+    assert _rendered(safe(original)) == original
 
 
 def test_safe_is_a_plain_str_transform() -> None:

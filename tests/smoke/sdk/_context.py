@@ -1,8 +1,6 @@
-"""SDK-specific run state for the real-sample smoke test: the ``ctx.data``
-registry bootstrap populates and every domain reads, plus the per-domain
-report files and stats/checklist that back ``index.md``. See ``../
-_context.py`` for the generic ``DomainStats``/``StepResult``/``step_slug``/
-``to_jsonable``/``_truncate`` pieces this builds on.
+"""SDK-specific run state for the real-sample smoke test -- ``SmokeContext``
+below, built on ``../_context.py``'s generic ``DomainStats``/``StepResult``/
+``step_slug``/``to_jsonable``/``_truncate`` pieces.
 """
 
 from __future__ import annotations
@@ -93,7 +91,10 @@ class SmokeContext:
 
     def check(self, domain: str, step: str, condition: bool, *, note: str = "") -> bool:
         """Record a pure boolean assertion (no I/O, never raises) --
-        PASSED/FAILED, never SKIPPED/DEGRADED."""
+        PASSED/FAILED, never SKIPPED/DEGRADED. ``condition`` must already be
+        a safe value to evaluate -- anything that could itself raise (an
+        attribute chain into a real domain object, ...) belongs inside its
+        own ``ctx.call``-wrapped helper first."""
         stats = self.stats[domain]
         self._mark(domain, step)
         if condition:

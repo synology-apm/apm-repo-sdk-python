@@ -45,10 +45,11 @@ Usage:
     uv run python scripts/anonymize_catalog_metadata.py tests/fixtures/foo.json.gz tests/fixtures/bar.json.gz
 
 ``anonymize_fixtures(paths)`` is the same batch logic as an importable
-function -- ``tests/conftest.py``'s own post-recording hook calls it
-directly (rather than shelling out to this file) so recording a fixture
-via ``pytest --record-against=...`` anonymizes it automatically at session
-end; see that fixture's own docstring and its ``--no-anonymize`` opt-out.
+function -- ``tests/integration/conftest.py``'s own ``pytest_sessionfinish``
+hook calls it directly (rather than shelling out to this file) so recording
+a fixture via ``pytest --record-against=...`` anonymizes it automatically at
+session end, with a ``--no-anonymize`` opt-out for inspecting the real,
+pre-scrub bytes a recording captured.
 """
 
 from __future__ import annotations
@@ -84,8 +85,8 @@ def _ahlt_reencrypt(original: bytes, plaintext: bytes, vault_key: bytes) -> byte
     AES-256-CTR is its own inverse given the same key/IV, so encrypting
     ``plaintext`` with that same IV reproduces a validly-enveloped file, even
     when ``plaintext``'s length differs from what the header originally wrapped
-    (see ``ahlt_decrypt``'s own docstring for the envelope shape; nothing in
-    the header encodes a length that would need adjusting to match)."""
+    (a 64-byte header, IV at ``[8, 24)``, followed by ciphertext -- nothing
+    in it encodes a length that would need adjusting to match)."""
     header = original[:HEADER_LEN]
     iv = header[_AHLT_OFF_IV : _AHLT_OFF_IV + _AHLT_IV_LEN]
     encryptor = Cipher(algorithms.AES(vault_key), modes.CTR(iv)).encryptor()
@@ -112,9 +113,7 @@ _KNOWN_VAULT_KEY_STRINGS = [
 # Structural registry: WHICH fields are customer-derived. Safe to commit --
 # this is knowledge about the catalog schema, never a real value. Add an
 # entry (table, column, JSON key path within it, category) when a new real
-# sample surfaces a field not yet listed; see the module docstring's
-# "SENSITIVE_FIELDS is deliberately narrow" paragraph for why nothing here
-# tries to infer this automatically.
+# sample surfaces a field not yet listed.
 # ---------------------------------------------------------------------------
 
 
@@ -157,10 +156,10 @@ SENSITIVE_FIELDS: list[SensitiveField] = [
     SensitiveField("workload_config", "workload_spec", "status.config_ps.agent_token", "token"),
     SensitiveField("workload_config", "workload_spec", "spec.config_fs.login_user", "username"),
     # A GWS tenant's own domain, present as two independent copies of the
-    # same value (a top-level ``spec.domain`` and a nested
-    # ``status.entity_meta.spec.domain``) -- both feed ``Workload.domain``
-    # (see catalog.py's own docstring), so both need the same fixed
-    # placeholder as ``user_info.email``'s own domain suffix (below).
+    # same value (a top-level ``spec.domain`` -- the one ``Workload.domain``
+    # itself reads -- and a nested ``status.entity_meta.spec.domain``), so
+    # both need the same fixed placeholder as ``user_info.email``'s own
+    # domain suffix (below).
     SensitiveField("workload_config", "workload_spec", "spec.domain", "gws_domain"),
     SensitiveField("workload_config", "workload_spec", "status.entity_meta.spec.domain", "gws_domain"),
 ]
@@ -278,9 +277,8 @@ def _set_json_path(obj: dict[str, Any], path: str, value: Any) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Placeholder assignment: one-way, hash-*derived* -- no external file, no
-# in-process memory that outlives one invocation. See the module docstring's
-# "no external state is kept" paragraph for why this is safe and stable.
+# Placeholder assignment: hash-derived, one-way -- see _placeholder_for and
+# _mint_placeholder below for the mechanism.
 # ---------------------------------------------------------------------------
 
 _FAKE_MAIL_DOMAIN = "gwsdemo.example.com"
@@ -293,10 +291,10 @@ _FAKE_MAIL_DOMAIN = "gwsdemo.example.com"
 #: address in the reserved RFC 5737 ``192.0.2.0/24`` block. ``persona``'s
 #: own slot is the mailbox local part; ``_anonymize_user_info`` derives the
 #: display name and full address from that same slot rather than minting
-#: them separately -- see its own docstring for why a fixed name pool
-#: (Alice/Bob/...) isn't needed: nothing downstream cares whether a mailbox
-#: owner's fake name looks like a human name, only that it's a string and,
-#: for the email field, that it has a valid `local@domain` shape.
+#: them separately -- a fixed name pool (Alice/Bob/...) isn't needed here:
+#: nothing downstream cares whether a mailbox owner's fake name looks like
+#: a human name, only that it's a string and, for the email field, that it
+#: has a valid `local@domain` shape.
 _POOLS: dict[str, str] = {
     "device_name": "CORP-PC-%s",
     "workload_name": "Test-Workload-%s",
@@ -317,8 +315,8 @@ _POOLS: dict[str, str] = {
 
 #: Matches a category's own placeholder *shape* -- used by
 #: ``_is_already_placeholder`` to recognize already-anonymized text
-#: statelessly (see the module docstring). Only categories with a ``%s``
-#: slot need one; ``ip``'s shape is simple enough to check without a
+#: statelessly, by shape rather than remembered history. Only categories
+#: with a ``%s`` slot need one; ``ip``'s shape is simple enough to check without a
 #: precompiled pattern (any address in the reserved 192.0.2.0/24 block was
 #: never real customer data to begin with), and ``token``/``username`` are
 #: plain constants checked by equality.
@@ -380,8 +378,9 @@ def _mint_placeholder(category: str, digest: str, taken: Iterable[str]) -> str:
                 return candidate
         raise LookupError("mac placeholder pool exhausted (65536 slots)")
     # A 4-hex-char slot: 65536 possibilities, ample for this project's real
-    # sample corpus -- see the module docstring for the collision-probing
-    # contract.
+    # sample corpus -- a same-run collision between two different real
+    # values just probes forward to the next free slot, deterministically,
+    # so a later invocation recomputes the identical resolution.
     span = 1 << 16
     start = int(digest, 16) % span
     for step in range(span):
@@ -413,9 +412,8 @@ def _placeholder_for(real: str, category: str, resolved: dict[str, str]) -> str:
     ``host_name``, say) intentionally gets back the *same* placeholder as
     its first occurrence rather than a category-correct one of its own:
     ``resolved`` correlates a real value to one output everywhere it
-    appears, across every field and path segment (see
-    ``_anonymize_vault_link_key``'s own call and ``_anonymize_path``'s
-    docstring) -- a real value cross-referenced by both a catalog field and
+    appears, across every field and path segment -- a real value
+    cross-referenced by both a catalog field and
     a directory path only stays legible as "the same thing" if both get the
     identical replacement, which matters more here than any one field's
     placeholder matching its own category's shape exactly. The (rare) cost
@@ -436,9 +434,10 @@ def _placeholder_for(real: str, category: str, resolved: dict[str, str]) -> str:
 def _anonymize_user_info(user_info: dict[str, Any], resolved: dict[str, str]) -> bool:
     """``user_info.name``/``.email``/``.user_name`` (mailbox display name, full
     address, bare local part) must resolve to the same persona wherever
-    they recur, so this is keyed off one identity (the email if present,
-    else the display name) rather than three independently hashed fields.
-    Mutates ``user_info`` in place; returns whether anything changed.
+    they recur, so this is keyed off one identity (``email`` if present,
+    else ``name``, else ``user_name``) rather than three independently
+    hashed fields. Mutates ``user_info`` in place; returns whether anything
+    changed.
 
     Derives all three fields from one ``persona``-category placeholder
     (see ``_placeholder_for`` -- same hash-slot-with-collision-probing
@@ -447,8 +446,7 @@ def _anonymize_user_info(user_info: dict[str, Any], resolved: dict[str, str]) ->
     the placeholder itself (``anon-<hex>``), the display name is its
     capitalized form, and the email address appends the fixed fake
     domain. Nothing downstream needs a human-sounding name here, only a
-    correctly-shaped `local@domain` string for the email field -- see the
-    module docstring's ``persona`` pool comment.
+    correctly-shaped `local@domain` string for the email field.
 
     Already-assigned fields (re-running against an already-anonymized
     fixture) are left alone rather than re-hashed -- checked via the same
@@ -649,11 +647,11 @@ def _process_column(
             except (TypeError, ValueError):
                 items = None
             if isinstance(items, list):
-                # Extraction runs every pass (write=False included) -- this
-                # column can be the *only* surviving place a device name
-                # appears (see the field's own comment), so resolved must
-                # learn it here rather than assume some other field already
-                # will.
+                # Extraction runs every pass (write=False included), same
+                # reason as the _JSON_ARRAY_PATH_COLUMNS comment above:
+                # this column can be the *only* surviving place a device
+                # name appears, so resolved must learn it here rather than
+                # assume some other field already will.
                 _extract_meta_filenames_device_names(items, resolved)
                 if write:
                     new_items = [_anonymize_path(i, resolved) if isinstance(i, str) else i for i in items]
@@ -800,9 +798,11 @@ async def _resolve_known_vault_key(store: ReplayStore, layout: object) -> bytes 
 async def _anonymize_ahlt_payload(payload: dict[str, Any], resolved: dict[str, str]) -> bool:
     """Second pass, after ``_rewrite_fixture``: unwrap and rewrite any
     ``copy_meta_file/<vm>/target.db`` entry that's aHlT-encrypted rather
-    than plain SQLite (an encrypted real sample's own VM metadata) -- see
-    ``_KNOWN_VAULT_KEY_STRINGS``'s own comment for why this is safe to do
-    with a committed key string. ``payload`` (an already-parsed fixture
+    than plain SQLite (an encrypted real sample's own VM metadata) --
+    safe to do with a committed key string since it only unlocks that
+    sample's own synthetic vault, never customer data (this project's
+    tests already commit each encrypted sample's own key string on that
+    basis). ``payload`` (an already-parsed fixture
     dict) is mutated in place; the caller owns reading/writing the file --
     kept out of this ``async def`` since both are blocking calls (ASYNC240).
     A no-op if the fixture has no aHlT entry."""
@@ -881,14 +881,13 @@ async def _anonymize_all_ahlt(payloads: dict[Path, dict[str, Any]], resolved: di
 
 
 def anonymize_fixtures(fixtures: list[Path]) -> list[Path]:
-    """Anonymize exactly the given fixtures as one batch (shared ``resolved``
-    map across all of them -- see the module docstring's two-phase
-    extract/rewrite description) and write back whichever ones changed.
-    Returns the paths actually rewritten. The single entry point both
-    ``_main()`` (the standalone CLI) and ``tests/conftest.py``'s own
-    post-recording hook call -- see that fixture's docstring for why
-    recording a fixture runs this automatically rather than leaving it a
-    separate manual step."""
+    """Anonymize exactly the given fixtures as one batch, sharing one
+    ``resolved`` map across all of them, and write back whichever ones
+    changed. Returns the paths actually rewritten. The single entry point both
+    ``_main()`` (the standalone CLI) and ``tests/integration/conftest.py``'s
+    own ``pytest_sessionfinish`` hook call -- recording a fixture is
+    anonymized by default this way rather than relying on a separate
+    manual step someone can forget."""
     payloads = {path: json.loads(load_fixture_text(path)) for path in fixtures}
 
     # Phase 1: extract every registered field's current value across the

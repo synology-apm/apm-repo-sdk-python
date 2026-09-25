@@ -14,6 +14,7 @@ from synology_apm_repo.browser.content_preview import (
     render_contact_preview,
     render_html_preview,
     render_mail_preview,
+    render_teams_chat_preview,
     visible_site_fields,
 )
 from synology_apm_repo.sdk.units.content.saas_calendar import build_ics
@@ -90,9 +91,9 @@ class TestRenderMailPreview:
         assert "truncated" not in text.lower()
 
 
-_REAL_MESSAGE_ROWS = [
+_MESSAGE_ROWS = [
     {
-        "author": '{"name": "waichi kan"}',
+        "author": '{"name": "Alice Example"}',
         "create_time": 1700000000,
         "content_preview": "general 1",
         "metadata": None,
@@ -117,10 +118,10 @@ class TestRenderHtmlPreview:
         # handle (TeamsChatProvider's channel export) — using it directly
         # here (not a hand-rolled HTML fixture) means this test breaks if
         # the two ever drift out of sync with each other.
-        html = render_channel_html(_REAL_MESSAGE_ROWS, channel_name="General").encode("utf-8")
+        html = render_channel_html(_MESSAGE_ROWS, channel_name="General").encode("utf-8")
         text = render_html_preview(html)
         assert text is not None
-        assert "waichi kan" in text
+        assert "Alice Example" in text
         assert "general 1" in text
         assert "general 2" in text
         assert "<div" not in text and "<html" not in text and "<style" not in text
@@ -285,23 +286,185 @@ class TestRenderContactPreview:
         assert text == "Full Name: (none)\nEmail: (none)"
 
     def test_gws_json_shows_full_name_and_email(self) -> None:
-        # Real People API shape (apv-sample-1's own real Alice Example
-        # contacts): names[0].displayName / emailAddresses[0].value.
+        # Google's People API nests names/emails as lists of objects,
+        # unlike M365's flat CSV columns above.
         data = json.dumps(
             {
                 "client_metadata": {
-                    "names": [{"displayName": "alvin A", "givenName": "alvin", "familyName": "A"}],
-                    "emailAddresses": [{"value": "bob@synologytestdev.onmicrosoft.com"}],
+                    "names": [{"displayName": "Alice Example", "givenName": "Alice", "familyName": "Example"}],
+                    "emailAddresses": [{"value": "alice@gwsdemo.example.com"}],
                 }
             }
         ).encode()
         text = render_contact_preview(data)
-        assert text == "Full Name: alvin A\nEmail: bob@synologytestdev.onmicrosoft.com"
+        assert text == "Full Name: Alice Example\nEmail: alice@gwsdemo.example.com"
 
     def test_gws_json_with_no_name_or_email_shows_the_none_placeholder(self) -> None:
         data = json.dumps({"client_metadata": {}}).encode()
         text = render_contact_preview(data)
         assert text == "Full Name: (none)\nEmail: (none)"
+
+    def test_m365_csv_shows_every_present_optional_field(self) -> None:
+        meta = json.dumps(
+            {
+                "client_metadata": {
+                    "givenName": "Alice",
+                    "surname": "Wu",
+                    "emailAddresses": [{"address": "alice@x.com"}],
+                    "jobTitle": "Engineer",
+                    "companyName": "Acme",
+                    "businessPhones": ["555-1000"],
+                    "homePhones": ["555-2000"],
+                    "mobilePhone": "555-3000",
+                    "businessAddress": {
+                        "street": "1 Main St",
+                        "city": "Springfield",
+                        "state": "IL",
+                        "postalCode": "62704",
+                        "countryOrRegion": "US",
+                    },
+                    "personalNotes": "met at conference",
+                }
+            }
+        ).encode()
+        csv_bytes = build_contact_csv(meta)
+        text = render_contact_preview(csv_bytes)
+        assert text == (
+            "Full Name: Alice Wu\n"
+            "Email: alice@x.com\n"
+            "Job Title: Engineer\n"
+            "Company: Acme\n"
+            "Business Phone: 555-1000\n"
+            "Home Phone: 555-2000\n"
+            "Mobile Phone: 555-3000\n"
+            "Address: 1 Main St, Springfield IL, 62704, US\n"
+            "Notes: met at conference"
+        )
+
+    def test_gws_json_shows_every_present_optional_field(self) -> None:
+        # Real GWS contact field shapes: organizations[0].{name,title},
+        # phoneNumbers[0].value (no "type" in real data), biographies[0].value,
+        # birthdays[0].text.
+        data = json.dumps(
+            {
+                "client_metadata": {
+                    "names": [{"displayName": "a bc"}],
+                    "emailAddresses": [{"value": "a@x.com"}],
+                    "organizations": [{"name": "syno", "title": "bartender"}],
+                    "phoneNumbers": [{"value": "08000000123"}],
+                    "birthdays": [{"date": {"day": 11, "month": 10, "year": 1996}, "text": "10/11/1996"}],
+                    "biographies": [{"value": "likes cats"}],
+                }
+            }
+        ).encode()
+        text = render_contact_preview(data)
+        assert text == (
+            "Full Name: a bc\n"
+            "Email: a@x.com\n"
+            "Job Title: bartender\n"
+            "Company: syno\n"
+            "Phone: 08000000123\n"
+            "Birthday: 10/11/1996\n"
+            "Notes: likes cats"
+        )
+
+    def test_gws_phone_number_with_a_real_type_gets_a_labeled_line(self) -> None:
+        data = json.dumps(
+            {"client_metadata": {"phoneNumbers": [{"value": "555-1000", "formattedType": "Mobile"}]}}
+        ).encode()
+        text = render_contact_preview(data)
+        assert "Phone (Mobile): 555-1000" in text
+
+    def test_gws_address_prefers_the_formatted_value_over_composing_components(self) -> None:
+        data = json.dumps(
+            {
+                "client_metadata": {
+                    "addresses": [{"formattedValue": "1 Main St, Springfield", "streetAddress": "should not be used"}]
+                }
+            }
+        ).encode()
+        text = render_contact_preview(data)
+        assert "Address: 1 Main St, Springfield" in text
+
+    def test_gws_address_composes_from_components_when_no_formatted_value(self) -> None:
+        data = json.dumps(
+            {"client_metadata": {"addresses": [{"streetAddress": "1 Main St", "city": "Springfield"}]}}
+        ).encode()
+        text = render_contact_preview(data)
+        assert "Address: 1 Main St, Springfield" in text
+
+    def test_gws_birthday_falls_back_to_composing_from_date_when_no_text(self) -> None:
+        data = json.dumps(
+            {"client_metadata": {"birthdays": [{"date": {"year": 1996, "month": 10, "day": 11}}]}}
+        ).encode()
+        text = render_contact_preview(data)
+        assert "Birthday: 1996-10-11" in text
+
+    def test_gws_birthday_without_a_year_omits_it(self) -> None:
+        data = json.dumps({"client_metadata": {"birthdays": [{"date": {"month": 10, "day": 11}}]}}).encode()
+        text = render_contact_preview(data)
+        assert "Birthday: 10-11" in text
+
+    def test_gws_birthday_with_year_only_shows_just_the_year(self) -> None:
+        data = json.dumps({"client_metadata": {"birthdays": [{"date": {"year": 1996}}]}}).encode()
+        text = render_contact_preview(data)
+        assert "Birthday: 1996" in text
+
+    def test_gws_birthday_with_month_and_day_as_the_unspecified_sentinel_shows_just_the_year(self) -> None:
+        """The People API's own "unspecified" sentinel for a repeated
+        Date field's ``month``/``day`` is ``0``, not an absent key --
+        real GWS data for a year-only birthday. Must not render the
+        nonsensical "1996-00-00"."""
+        data = json.dumps({"client_metadata": {"birthdays": [{"date": {"year": 1996, "month": 0, "day": 0}}]}}).encode()
+        text = render_contact_preview(data)
+        assert "Birthday: 1996" in text
+        assert "00" not in text
+
+    def test_gws_birthday_with_a_known_month_and_unspecified_day_still_shows_the_month(self) -> None:
+        """A known month with the People API's own ``day=0``
+        "unspecified" sentinel must still show the month, not fall all
+        the way back to year-only."""
+        data = json.dumps({"client_metadata": {"birthdays": [{"date": {"year": 1990, "month": 6, "day": 0}}]}}).encode()
+        text = render_contact_preview(data)
+        assert "Birthday: 1990-06" in text
+
+    def test_gws_birthday_with_the_unspecified_year_sentinel_omits_the_year(self) -> None:
+        """Regression test: ``year=0`` is the People API's own
+        "unspecified" sentinel too (same as ``month``/``day``'s), so a
+        year-omitted birthday must not render the nonsensical
+        "0-06-15"."""
+        data = json.dumps({"client_metadata": {"birthdays": [{"date": {"year": 0, "month": 6, "day": 15}}]}}).encode()
+        text = render_contact_preview(data)
+        assert "Birthday: 06-15" in text
+        assert "0-06-15" not in text
+
+    def test_gws_birthday_with_a_known_day_and_unspecified_month_still_shows_the_day(self) -> None:
+        """A known day with no month (and no year) must still render
+        that one real field, not nothing."""
+        data = json.dumps({"client_metadata": {"birthdays": [{"date": {"day": 15}}]}}).encode()
+        text = render_contact_preview(data)
+        assert "Birthday: 15" in text
+
+    def test_gws_birthday_with_no_text_and_no_usable_date_at_all_is_omitted_entirely(self) -> None:
+        data = json.dumps({"client_metadata": {"birthdays": [{"date": {}}]}}).encode()
+        text = render_contact_preview(data)
+        assert "Birthday" not in text
+
+    def test_gws_phone_numbers_not_a_list_are_ignored(self) -> None:
+        data = json.dumps({"client_metadata": {"phoneNumbers": "not-a-list"}}).encode()
+        text = render_contact_preview(data)
+        assert "Phone" not in text
+
+    def test_gws_phone_number_entries_that_are_not_objects_are_skipped(self) -> None:
+        data = json.dumps({"client_metadata": {"phoneNumbers": ["not-an-object", {"value": "555-1000"}]}}).encode()
+        text = render_contact_preview(data)
+        assert "Phone: 555-1000" in text
+
+    def test_gws_phone_number_with_no_real_value_is_skipped(self) -> None:
+        data = json.dumps({"client_metadata": {"phoneNumbers": [{"value": ""}, {"value": "555-1000"}]}}).encode()
+        text = render_contact_preview(data)
+        assert text.count("Phone") == 1
+        assert "Phone: 555-1000" in text
 
 
 class TestVisibleSiteFields:
@@ -324,6 +487,331 @@ class TestVisibleSiteFields:
     def test_preserves_insertion_order_of_surviving_keys(self) -> None:
         values = {"Title": "a", "odata.type": "x", "Modified": "b", "AuthorId": 1, "Status": "c"}
         assert list(visible_site_fields(values)) == ["Title", "Modified", "Status"]
+
+
+class TestRenderTeamsChatPreview:
+    """Every case here builds its HTML via the real ``render_channel_html``
+    (not a hand-rolled fixture) — the same reasoning
+    ``TestRenderHtmlPreview.test_recognizes_and_flattens_a_real_channel_export``
+    already gives: this breaks if the two ever drift out of sync."""
+
+    def test_sender_and_timestamp_sit_directly_above_the_body_no_gap(self) -> None:
+        rows = [
+            {
+                "author": '{"name": "Alice"}',
+                "create_time": 1700000000,
+                "content_preview": "hello there",
+                "metadata": None,
+                "is_sys_message": 0,
+                "reply_to_id": None,
+                "msg_id": "1",
+            }
+        ]
+        html = render_channel_html(rows, channel_name="General").encode("utf-8")
+        text = render_teams_chat_preview(html)
+        lines = text.splitlines()
+        hdr_index = next(i for i, line in enumerate(lines) if "Alice" in line and "·" in line)
+        assert lines[hdr_index + 1] == "hello there"
+        # The avatar's own single-letter placeholder never appears as its
+        # own line -- pure visual noise in a text rendering.
+        assert "A" not in lines
+
+    def test_date_separator_appears_as_its_own_block(self) -> None:
+        rows = [
+            {
+                "author": '{"name": "Alice"}',
+                "create_time": 1700000000,
+                "content_preview": "hi",
+                "metadata": None,
+                "is_sys_message": 0,
+                "reply_to_id": None,
+                "msg_id": "1",
+            }
+        ]
+        html = render_channel_html(rows, channel_name="General").encode("utf-8")
+        text = render_teams_chat_preview(html)
+        assert any(line.startswith("──") and line.endswith("──") for line in text.splitlines())
+
+    def test_reply_quote_sits_directly_above_the_replying_messages_header(self) -> None:
+        rows = [
+            {
+                "author": '{"name": "Alice"}',
+                "create_time": 1700000000,
+                "content_preview": "original message",
+                "metadata": None,
+                "is_sys_message": 0,
+                "reply_to_id": None,
+                "msg_id": "1",
+            },
+            {
+                "author": '{"name": "Bob"}',
+                "create_time": 1700000100,
+                "content_preview": "reply text",
+                "metadata": None,
+                "is_sys_message": 0,
+                "reply_to_id": "1",
+                "msg_id": "2",
+            },
+        ]
+        html = render_channel_html(rows, channel_name="General").encode("utf-8")
+        text = render_teams_chat_preview(html)
+        lines = text.splitlines()
+        reply_index = next(i for i, line in enumerate(lines) if "replying to" in line)
+        assert "Alice" in lines[reply_index]
+        assert "Bob" in lines[reply_index + 1]
+        assert lines[reply_index + 2] == "reply text"
+
+    def test_reply_to_a_message_not_in_this_export_gets_the_unresolved_note(self) -> None:
+        rows = [
+            {
+                "author": '{"name": "Bob"}',
+                "create_time": 1700000000,
+                "content_preview": "orphan reply",
+                "metadata": None,
+                "is_sys_message": 0,
+                "reply_to_id": "missing",
+                "msg_id": "1",
+            }
+        ]
+        html = render_channel_html(rows, channel_name="General").encode("utf-8")
+        text = render_teams_chat_preview(html)
+        assert "replying to a message not included in this export" in text
+
+    def test_a_deleted_message_shows_the_placeholder_body(self) -> None:
+        rows = [
+            {
+                "author": '{"name": "Alice"}',
+                "create_time": 1700000000,
+                "content_preview": "gone",
+                "metadata": None,
+                "is_sys_message": 0,
+                "is_deleted": 1,
+                "reply_to_id": None,
+                "msg_id": "1",
+            }
+        ]
+        html = render_channel_html(rows, channel_name="General").encode("utf-8")
+        text = render_teams_chat_preview(html)
+        assert "(this message has been deleted)" in text
+        assert "gone" not in text
+
+    def test_a_system_message_is_shown_between_em_dashes_not_as_an_ordinary_message(self) -> None:
+        rows = [
+            {
+                "author": '{"name": "System"}',
+                "create_time": 1700000000,
+                "content_preview": "",
+                "metadata": None,
+                "is_sys_message": 1,
+                "reply_to_id": None,
+                "msg_id": "1",
+            }
+        ]
+        html = render_channel_html(rows, channel_name="General").encode("utf-8")
+        text = render_teams_chat_preview(html)
+        assert "— (system event) —" in text
+
+    def test_nested_divs_inside_an_html_body_dont_truncate_the_message(self) -> None:
+        """Regression test: a real Teams "html" contentType body commonly
+        uses plain, unclassed ``<div>``s for line breaks -- these must
+        keep inheriting the surrounding "body" role, not be mistaken for
+        that role-bearing ``<div>``'s own matching close just because they
+        share a tag name."""
+        rows = [
+            {
+                "author": '{"name": "Alice"}',
+                "create_time": 1700000000,
+                "content_preview": "",
+                "metadata": json.dumps(
+                    {"body": {"contentType": "html", "content": "<div>line one</div><div>line two</div>"}}
+                ),
+                "is_sys_message": 0,
+                "reply_to_id": None,
+                "msg_id": "1",
+            }
+        ]
+        html = render_channel_html(rows, channel_name="General").encode("utf-8")
+        text = render_teams_chat_preview(html)
+        assert "line one" in text
+        assert "line two" in text
+
+    def test_a_sticker_shows_its_own_alt_placeholder_not_raw_base64(self) -> None:
+        rows = [
+            {
+                "author": '{"name": "Alice"}',
+                "create_time": 1700000000,
+                "content_preview": "",
+                "metadata": json.dumps({"body": {"contentType": "html", "content": '<img src="sticker1">'}}),
+                "is_sys_message": 0,
+                "reply_to_id": None,
+                "msg_id": "1",
+            }
+        ]
+        html = render_channel_html(rows, channel_name="General", stickers_by_msg_id={"1": {"sticker1": "AAAA"}}).encode(
+            "utf-8"
+        )
+        text = render_teams_chat_preview(html)
+        assert "[sticker]" in text
+        assert "AAAA" not in text
+
+    def test_an_attachment_with_content_shows_its_header_and_body(self) -> None:
+        rows = [
+            {
+                "author": '{"name": "Alice"}',
+                "create_time": 1700000000,
+                "content_preview": "see attached",
+                "metadata": json.dumps(
+                    {
+                        "body": {"contentType": "text", "content": "see attached"},
+                        "attachments": [
+                            {
+                                "name": "card.json",
+                                "contentType": "application/vnd.microsoft.card.adaptive",
+                                "content": '{"type": "AdaptiveCard"}',
+                            }
+                        ],
+                    }
+                ),
+                "is_sys_message": 0,
+                "reply_to_id": None,
+                "msg_id": "1",
+            }
+        ]
+        html = render_channel_html(rows, channel_name="General").encode("utf-8")
+        text = render_teams_chat_preview(html)
+        assert "card.json" in text
+        assert '{"type": "AdaptiveCard"}' in text
+
+    def test_an_attachment_with_no_content_shows_the_not_included_placeholder(self) -> None:
+        rows = [
+            {
+                "author": '{"name": "Alice"}',
+                "create_time": 1700000000,
+                "content_preview": "see attached",
+                "metadata": json.dumps(
+                    {
+                        "body": {"contentType": "text", "content": "see attached"},
+                        "attachments": [{"name": "report.pdf", "contentType": "application/pdf", "content": None}],
+                    }
+                ),
+                "is_sys_message": 0,
+                "reply_to_id": None,
+                "msg_id": "1",
+            }
+        ]
+        html = render_channel_html(rows, channel_name="General").encode("utf-8")
+        text = render_teams_chat_preview(html)
+        assert "report.pdf" in text
+        assert "content not included in this offline export" in text
+
+    def test_an_empty_channel_shows_the_no_messages_placeholder(self) -> None:
+        html = render_channel_html([], channel_name="Empty").encode("utf-8")
+        assert render_teams_chat_preview(html) == "(no messages)"
+
+    def test_a_read_window_truncated_mid_sticker_shows_a_placeholder_not_raw_base64(self) -> None:
+        # A real sticker sits directly inside its own message's body, with
+        # no other body text ahead of it -- the shape
+        # ``_drop_trailing_unterminated_tag`` expects.
+        rows = [
+            {
+                "author": '{"name": "Alice"}',
+                "create_time": 1700000000,
+                "content_preview": "",
+                "metadata": json.dumps({"body": {"contentType": "html", "content": '<img src="sticker1">'}}),
+                "is_sys_message": 0,
+                "reply_to_id": None,
+                "msg_id": "1",
+            }
+        ]
+        fake_base64 = "AAAA" * 20_000
+        html = render_channel_html(
+            rows, channel_name="General", stickers_by_msg_id={"1": {"sticker1": fake_base64}}
+        ).encode("utf-8")
+        truncated = html[: html.index(b"base64,") + len("base64,") + 5000]
+        text = render_teams_chat_preview(truncated, max_chars=100_000)
+        assert "AAAA" not in text
+        assert "[image, ≥" in text
+        assert "not shown in preview" in text
+
+    def test_long_transcript_is_truncated_with_a_note(self) -> None:
+        rows = [
+            {
+                "author": '{"name": "Alice"}',
+                "create_time": 1700000000 + i,
+                "content_preview": "x" * 200,
+                "metadata": None,
+                "is_sys_message": 0,
+                "reply_to_id": None,
+                "msg_id": str(i),
+            }
+            for i in range(50)
+        ]
+        html = render_channel_html(rows, channel_name="General").encode("utf-8")
+        text = render_teams_chat_preview(html, max_chars=500)
+        assert len(text) < 5000
+        assert "truncated" in text.lower()
+
+    def test_truncation_drops_the_oldest_messages_keeping_the_newest(self) -> None:
+        # The whole point of this renderer's own truncation: a channel's
+        # newest messages are what a user wants visible, not its oldest
+        # ones -- a raw character-count truncation from the tail (the
+        # generic render_html_preview's own approach) would get this
+        # backwards.
+        rows = [
+            {
+                "author": f'{{"name": "User{i}"}}',
+                "create_time": 1700000000 + i * 100,
+                "content_preview": f"message number {i}",
+                "metadata": None,
+                "is_sys_message": 0,
+                "reply_to_id": None,
+                "msg_id": str(i),
+            }
+            for i in range(30)
+        ]
+        html = render_channel_html(rows, channel_name="General").encode("utf-8")
+        text = render_teams_chat_preview(html, max_chars=500)
+        assert "message number 29" in text
+        assert "message number 0" not in text
+        assert "earlier messages truncated" in text.lower()
+        # The note comes before the kept messages, not after -- dropping
+        # from the front means whatever's missing is always older
+        # messages.
+        assert text.index("earlier messages truncated") < text.index("message number")
+
+    def test_truncation_note_appears_only_when_something_was_actually_dropped(self) -> None:
+        rows = [
+            {
+                "author": '{"name": "Alice"}',
+                "create_time": 1700000000,
+                "content_preview": "hi",
+                "metadata": None,
+                "is_sys_message": 0,
+                "reply_to_id": None,
+                "msg_id": "1",
+            }
+        ]
+        html = render_channel_html(rows, channel_name="General").encode("utf-8")
+        text = render_teams_chat_preview(html, max_chars=4000)
+        assert "truncated" not in text.lower()
+
+    def test_a_single_message_longer_than_max_chars_is_still_shown_in_full(self) -> None:
+        # Never cut the one message actually kept -- a long last message
+        # is still more useful shown whole than truncated mid-sentence.
+        rows = [
+            {
+                "author": '{"name": "Alice"}',
+                "create_time": 1700000000,
+                "content_preview": "y" * 3000,
+                "metadata": None,
+                "is_sys_message": 0,
+                "reply_to_id": None,
+                "msg_id": "1",
+            }
+        ]
+        html = render_channel_html(rows, channel_name="General").encode("utf-8")
+        text = render_teams_chat_preview(html, max_chars=500)
+        assert "y" * 3000 in text
 
 
 __all__: list[str] = []

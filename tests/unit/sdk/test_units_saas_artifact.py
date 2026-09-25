@@ -7,7 +7,27 @@ from pathlib import Path
 
 import pytest
 
-from synology_apm_repo.sdk.units.content.saas_artifact import LazyArtifact
+from synology_apm_repo.sdk.errors import DataCorruptError
+from synology_apm_repo.sdk.units.content.saas_artifact import LazyArtifact, parse_meta_json
+
+
+class TestParseMetaJson:
+    def test_parses_a_valid_object(self) -> None:
+        assert parse_meta_json(b'{"a": 1}', "some META") == {"a": 1}
+
+    def test_malformed_json_raises_data_corrupt_error_with_the_given_label(self) -> None:
+        with pytest.raises(DataCorruptError, match="some META did not parse as JSON"):
+            parse_meta_json(b"not json", "some META")
+
+    def test_ref_is_carried_onto_the_raised_error_when_given(self) -> None:
+        with pytest.raises(DataCorruptError) as exc_info:
+            parse_meta_json(b"not json", "some META", ref="the-ref")
+        assert exc_info.value.ref == "the-ref"
+
+    def test_ref_defaults_to_none_when_not_given(self) -> None:
+        with pytest.raises(DataCorruptError) as exc_info:
+            parse_meta_json(b"not json", "some META")
+        assert exc_info.value.ref is None
 
 
 class TestLazyBuild:
@@ -85,6 +105,30 @@ class TestRead:
 
         artifact = LazyArtifact(build)
         assert await artifact.read(6) == b"world"
+
+    async def test_negative_offset_raises(self) -> None:
+        """``ContentSource.read``'s contract requires raising
+        ``ValueError`` for a negative ``offset``/``length``, matching
+        every sibling implementer (``DedupFile``, ``ByteRangeView``,
+        ``VirtualDiskContentSource``, ``disk_fs.py``'s
+        ``_BlockingReadContentSource``) -- without this guard, a negative
+        offset would silently fall into Python's own negative-slice
+        semantics instead of raising."""
+
+        async def build() -> bytes:
+            return b"hello world"
+
+        artifact = LazyArtifact(build)
+        with pytest.raises(ValueError, match="non-negative"):
+            await artifact.read(-1)
+
+    async def test_negative_length_raises(self) -> None:
+        async def build() -> bytes:
+            return b"hello world"
+
+        artifact = LazyArtifact(build)
+        with pytest.raises(ValueError, match="non-negative"):
+            await artifact.read(0, -1)
 
 
 class TestStream:

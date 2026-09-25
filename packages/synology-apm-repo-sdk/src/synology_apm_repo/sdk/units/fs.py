@@ -19,7 +19,7 @@ from __future__ import annotations
 
 import asyncio
 from types import TracebackType
-from typing import Self
+from typing import Any, Self
 
 import aiosqlite
 
@@ -29,7 +29,7 @@ from ..dedup.repository import DedupRepo
 from ..errors import NotFoundError
 from ..storage.sqlite import apply_index_hint
 from ..storage.sqlite_source import SqliteSource, peel
-from .base import Node, RestorableUnit, UnitKind, not_restorable
+from .base import Node, RestorableUnit, UnitKind, dir_first_order_by, mtime_attrs, not_restorable
 from .node_ref import NodeRef, canonical_ref_for
 
 _FILE_TYPE_FILE = 1
@@ -67,13 +67,15 @@ class FsProvider:
         if version_db_rel is None:
             raise NotFoundError(f"version {self._version.version_uid} has no version.db.zst in meta_filenames")
         raw = await self._repo.store.read(f"{meta_dir}/{version_db_rel}")
-        # asyncio.to_thread: peel() itself stays synchronous by design
-        # (storage/sqlite_source.py's own TestPeel docstring), but this
+        # asyncio.to_thread: peel() itself stays synchronous by design --
+        # it is pure bytes work, no I/O -- but this
         # is the highest-risk peel() call site in the codebase --
         # version.db.zst is a full filesystem backup's entire
         # file/directory listing, potentially the largest single payload
-        # this project ever decrypts+decompresses. See dedup/pool.py's
-        # own stated policy for why that belongs off the event loop.
+        # this project ever decrypts+decompresses. Left on the event loop,
+        # a multi-MB decrypt+decompress would stall every other Task for
+        # its duration -- the same responsiveness reasoning behind
+        # dedup/pool's own to_thread hops.
         payload, _envelopes = await asyncio.to_thread(peel, raw, vault_key=self._repo.vault_key)
         self._entry_db = await SqliteSource.from_bytes(payload)
         return self._entry_db.connection
@@ -102,8 +104,9 @@ class FsProvider:
         return canonical_ref_for(self._repo, self._version, segments)
 
     async def close(self) -> None:
-        """Release the sqlite connection(s) this provider opened — see
-        ``DeviceProvider.close``'s own docstring for why this matters."""
+        """Release the sqlite connection(s) this provider opened. Not
+        merely for tidiness: a leaked ``aiosqlite`` connection's own
+        background worker thread keeps the interpreter alive."""
         if self._entry_db is not None:
             await self._entry_db.close()
             self._entry_db = None
@@ -129,13 +132,15 @@ class FsProvider:
         if dirname is None:
             return []
         conn = await self._entry_table_connection()
-        # apply_index_hint() is safe to call unconditionally here (see its
-        # own docstring), applied for the same consistency reasoning as
-        # units/device.py's own calls.
+        # apply_index_hint() is safe to call unconditionally here (a cheap
+        # leading-prefix check skips it when the columns are already
+        # indexed, and a read-only connection just makes CREATE INDEX
+        # raise, caught as a no-op).
         await apply_index_hint(conn, "entry_table", ["dirname"])
+        order_by = dir_first_order_by(f"file_type = {_FILE_TYPE_DIR}", "basename, rowid")
         cursor = await conn.execute(
             "SELECT basename, file_size, file_mtime, file_type, content_dedup_id, xattr "
-            "FROM entry_table WHERE dirname = ? ORDER BY basename, rowid LIMIT ? OFFSET ?",
+            f"FROM entry_table WHERE dirname = ? ORDER BY {order_by} LIMIT ? OFFSET ?",
             (dirname, limit if limit is not None else -1, offset),
         )
         rows = await cursor.fetchall()
@@ -143,7 +148,8 @@ class FsProvider:
         for basename, file_size, file_mtime, file_type, content_dedup_id, xattr in rows:
             is_dir = file_type == _FILE_TYPE_DIR
             child_path = _join_path(dirname, basename)
-            attrs = {"file_mtime": file_mtime, "xattr": xattr, "path": child_path}
+            attrs: dict[str, Any] = {"xattr": xattr, "path": child_path}
+            attrs.update(mtime_attrs(file_mtime))
             if is_dir:
                 attrs["dirname"] = child_path
                 nodes.append(Node(ref=self._ref_for_dir(child_path), name=basename, is_leaf=False, attrs=attrs))

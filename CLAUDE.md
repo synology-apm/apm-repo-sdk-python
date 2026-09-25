@@ -121,8 +121,8 @@ Z% faster") — that belongs in the commit message that established it; a
 constant whose magnitude needs justifying gets the one number that matters,
 not the investigation that produced it. A module docstring orients rather than
 catalogues: state what's in the file and the one or two facts worth knowing
-before touching it, not a restatement of what each class's or function's
-own docstring, one level down, already says.
+before touching it — not a restatement of what its classes' and functions'
+docstrings, one level down, already say.
 
 If a docstring keeps growing, that's a signal to restructure — split it,
 push detail into an inline comment at the line it explains, cut a citation
@@ -130,9 +130,10 @@ push detail into an inline comment at the line it explains, cut a citation
 
 Describe what the code does now, not its history — how it used to work or
 how a bug was found and fixed belongs in the commit message for the change.
-When the same rationale is genuinely needed at more than one call site,
-state it fully once in whichever module or function actually owns the
-mechanism, and reduce every other site to a bare pointer.
+When the same rationale applies at more than one call site, state it
+directly at each one, trimmed to the single fact that site needs — a reader
+looking at any one docstring/comment should get the reason without having
+to chase it through another docstring or comment elsewhere.
 
 SDK docstrings — the only ones built into API docs — are Google-style
 (Napoleon), document the public surface only, and must pass a nitpick build
@@ -182,8 +183,8 @@ See [`tests/CLAUDE.md`](tests/CLAUDE.md).
 
 ---
 
-See [`CONTRIBUTING.md`](CONTRIBUTING.md) for the commit message convention,
-sample-data handling, and the release/publish-channel status.
+See [`CONTRIBUTING.md`](CONTRIBUTING.md) — [`README.md`](README.md)'s
+Documentation Index lists what it covers.
 
 *For detailed change history, see `git log`.*
 

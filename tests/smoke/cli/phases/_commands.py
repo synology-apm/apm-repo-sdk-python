@@ -77,12 +77,11 @@ def run(ctx: SmokeContext) -> None:
 
         ctx.run("commands", f"{prefix}.verify.quick", "verify", ref.repo_path, "--level", "quick", *args)
 
-    # One real, cancellable, real-duration verify --full pass, against
+    # One real, real-duration verify --full pass, against
     # just the first ref -- not every sample, since this is here to
-    # exercise 52fe645's progress-during-verify wiring at least once
-    # against real data volume, not to re-run verify's own findings
-    # correctness per sample (sdk/phases/_diagnostics.py already does
-    # that in-process).
+    # exercise progress-during-verify wiring at least once against real
+    # data volume, not to re-run verify's own findings correctness per
+    # sample (sdk/phases/_diagnostics.py already does that in-process).
     first = refs[0]
     ctx.run(
         "commands",

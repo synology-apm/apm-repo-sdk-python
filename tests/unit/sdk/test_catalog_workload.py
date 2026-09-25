@@ -90,9 +90,9 @@ def _version_spec_json(start_time: object = None, end_time: object = None, statu
     """A minimal real-shaped ``version_spec`` blob — just the
     ``status.start_time``/``status.end_time``/``status.status`` fields
     this module actually reads (real production values are
-    protobuf-JSON int64-as-string, e.g. ``"1786024626"`` — see
-    ``version.proto``'s own real shape); omitted keys model a field
-    genuinely absent from a real row, not just zero/empty."""
+    protobuf-JSON int64-as-string, e.g. ``"1786024626"``); omitted keys
+    model a field genuinely absent from a real row, not just
+    zero/empty."""
     status_obj: dict[str, object] = {}
     if start_time is not None:
         status_obj["start_time"] = str(start_time)
@@ -434,15 +434,12 @@ class TestWorkloads:
 
 
 class TestTenantAndDomain:
-    """Direct coverage for ``Workload.tenant_id``/``domain`` — real
-    fields confirmed present on every real M365/GW workload across
-    every sample checked (see both properties' own docstrings in
-    ``catalog/workload.py`` for the full story, including why
-    ``namespace`` is not the tenant identity). Not folded into the
-    shared ``repo_root`` fixture above — its M365/GW spec fixtures
-    predate this and don't carry either field, and leaving them as
-    they are keeps every existing assertion in this file exactly as
-    fragile (or not) as it already was."""
+    """Direct coverage for ``Workload.tenant_id``/``domain`` — each
+    reads its own real spec key (``tenant_id``, distinct from
+    ``workload_spec``'s top-level ``namespace``; ``domain``, unlike
+    ``tenant_id``, never just a GUID). Not folded into the shared
+    ``repo_root`` fixture above, whose M365/GW spec fixtures don't
+    carry either field."""
 
     async def test_m365_tenant_id_read_from_spec(self, tmp_path: Path) -> None:
         _write_repo_info(tmp_path / "repo_info")

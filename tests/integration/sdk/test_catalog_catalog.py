@@ -44,8 +44,8 @@ _MAIL_PERSONA_WORKLOAD_ID = 5
 @pytest.fixture
 async def repo(record_target: Callable[[str], Awaitable[ObjectStore]]) -> AsyncIterator[DedupRepo]:
     """``ReplayStore`` answers every call from a static in-memory dict keyed
-    by exact call parameters (no call-order tracking at all — see its own
-    docstring), so nothing here is order- or interleaving-sensitive across
+    by exact call parameters, with no call-order tracking at all, so
+    nothing here is order- or interleaving-sensitive across
     tests, and every test below only ever reads, never mutates, the opened
     repository."""
     store = await record_target("catalog_catalog_apv1.json.gz")
@@ -94,8 +94,7 @@ async def test_replayed_saas_workload_sub_type_counts_match_apv_sample_1(repo: D
 
 async def test_replayed_m365_and_gw_workloads_carry_the_real_tenant_id_and_domain(repo: DedupRepo) -> None:
     """Direct lock-in of ``Workload.tenant_id``/``domain`` against
-    apv-sample-1's own real data — see both properties' own docstrings
-    in ``catalog/workload.py`` for the full story. ``tenant_id`` (an M365 tenant
+    apv-sample-1's own real data. ``tenant_id`` (an M365 tenant
     GUID) is never touched by catalog-metadata anonymization, so it's
     safe to hardcode; ``domain`` (a GWS domain string) *is* -- every real
     domain collapses to the same fixed ``gws_domain`` placeholder, so this

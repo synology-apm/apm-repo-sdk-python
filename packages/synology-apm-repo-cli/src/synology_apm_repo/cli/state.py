@@ -33,15 +33,13 @@ class CliState:
     #: See PROGRESS_HELP / progress_render.py.
     progress: ProgressMode = ProgressMode.AUTO
 
-    #: See TRACE_HELP. Off by default: full-detail per-read tracing is
-    #: not something a normal invocation should pay for. See
-    #: ``cli/trace_render.py``.
+    #: See TRACE_HELP. Off by default — full-detail per-call tracing
+    #: isn't something a normal invocation should pay for.
     trace: bool = False
 
-    #: See QUIET_HELP. Gates only a command's own decorative
-    #: success-confirmation lines (``export``'s summary, ``profile
-    #: add``/``remove``'s green confirmations) — never error output,
-    #: never ``--json``, never a command's primary report.
+    #: See QUIET_HELP. Specifically gates ``export``'s summary line and
+    #: ``profile add``/``remove``'s green confirmations; ``--json``
+    #: output is unaffected either way.
     quiet: bool = False
 
     #: See NO_INPUT_HELP. ``profile add``/``profile remove`` are the only

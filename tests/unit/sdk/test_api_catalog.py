@@ -49,6 +49,7 @@ from synology_apm_repo.sdk.identifiers import (
 )
 from synology_apm_repo.sdk.storage.base import ObjectStore
 from synology_apm_repo.sdk.storage.layout import RepoKind, RepoLayout, RepositoryLayout
+from synology_apm_repo.sdk.units.saas.stream import SaasStreamCache
 
 
 class _FakeStore:
@@ -88,10 +89,9 @@ class _FakeDedupRepo:
         self.closed = False
         # Unused by Session.discover() itself now (it probes via the
         # free function dedup.keys.probe_encrypted() against the store,
-        # before any DedupRepo is opened -- see api_session's own
-        # _probe_encrypted); kept for a caller that constructs a
-        # Repository directly with an explicit `encrypted=` and wants
-        # this fake's own probe_encrypted() to agree with it.
+        # before any DedupRepo is opened); kept for a caller that
+        # constructs a Repository directly with an explicit `encrypted=`
+        # and wants this fake's own probe_encrypted() to agree with it.
         self._encrypted = encrypted
 
     async def close(self) -> None:
@@ -118,10 +118,11 @@ def _repository_layout(repo_root: str = "") -> RepositoryLayout:
     bucket/vault, not one already-opened ``DedupRepo``). Every test
     here uses ``RepoKind.VAULT``, matching ``_layout()``'s own default:
     ``catalog_repo_layouts()`` always resolves a ``VAULT``
-    ``RepositoryLayout`` to exactly one derived ``RepoLayout``
-    (``storage.layout``'s own docstring), so a single-catalog fake
-    (``_FakeDedupRepo``) is always the right shape regardless of which of
-    the two layout types a given test builds by hand."""
+    ``RepositoryLayout`` to exactly one derived ``RepoLayout`` (a vault's
+    own catalogs come from querying ``db/connection_config`` after
+    opening, not a separate directory per catalog), so a single-catalog
+    fake (``_FakeDedupRepo``) is always the right shape regardless of
+    which of the two layout types a given test builds by hand."""
     return RepositoryLayout(kind=RepoKind.VAULT, repo_root=repo_root)
 
 
@@ -140,10 +141,11 @@ def _repo_with_fake_dedup(
     ``DedupRepo.open()`` rather than taking one ready-made. Monkeypatches
     ``DedupRepo.open`` to hand back ``fake`` regardless of which derived
     ``RepoLayout`` it's called with — fine for every test here, which only
-    ever has one single-catalog vault layout to open (see
-    ``_repository_layout()``'s own docstring). Construction itself never
+    ever has one single-catalog vault layout to open (every test here
+    builds a ``VAULT`` layout, which always resolves to exactly one
+    ``RepoLayout``). Construction itself never
     opens anything (only ``Session``'s own ``_confirm_real()`` or an
-    explicit ``catalogs()``/``_dedup_catalogs.resolve()`` call does) — a
+    explicit ``catalogs()``/``_open_catalogs.resolve()`` call does) — a
     test that only checks ``key_status``/``is_encrypted`` right after
     construction doesn't need this helper at all, a bare ``api.Repository(
     _as_object_store(_FakeStore()), _repository_layout(), ...)`` is enough."""
@@ -252,9 +254,15 @@ def _make_catalog(
     gate (``_require_key_verified``) — for a test that needs a ``Catalog``
     in isolation, without going through a full ``repo.catalogs()``
     round-trip (which would additionally need ``connections()``/
-    ``DedupRepo.open()`` faked)."""
+    ``DedupRepo.open()`` faked). Builds its own ``SaasStreamCache`` against
+    ``dedup_repo`` — none of this file's tests need to inspect it directly,
+    only that ``Catalog`` has one."""
     return api_catalog.Catalog(
-        dedup_repo, connection or _make_connection(), track=repo._track, require_key_verified=repo._require_key_verified
+        dedup_repo,
+        connection or _make_connection(),
+        saas_streams=SaasStreamCache(dedup_repo),
+        track=repo._track,
+        require_key_verified=repo._require_key_verified,
     )
 
 
@@ -287,7 +295,9 @@ async def test_provider_routes_saas_target_type_via_workload_lookup(monkeypatch:
     sentinel = object()
     captured: list[Any] = []
 
-    async def fake_saas_provider_for(r: object, w: object, v: object, *, object_db_id: object = None) -> object:
+    async def fake_saas_provider_for(
+        r: object, w: object, v: object, saas_streams: object, *, object_db_id: object = None
+    ) -> object:
         captured.append((r, w, v))
         return sentinel
 
@@ -338,12 +348,12 @@ async def test_provider_force_raw_skips_the_workload_lookup_and_saas_candidates_
 
     captured: list[Any] = []
 
-    async def fake_raw_fallback_provider_for(r: object, v: object, *, object_db_id: object = None) -> object:
+    async def fake_raw_fallback_provider_for(
+        r: object, v: object, saas_streams: object, *, object_db_id: object = None
+    ) -> object:
         captured.append((r, v))
         return sentinel
 
-    # This workload genuinely resolves — proving force_raw bypasses the
-    # lookup, not merely that it's a no-op when the lookup would fail anyway.
     monkeypatch.setattr(api_catalog, "workload_by_id", _async_returning(workload))
     monkeypatch.setattr(api_catalog, "saas_provider_for", fake_saas_provider_for)
     monkeypatch.setattr(api_catalog, "raw_fallback_provider_for", fake_raw_fallback_provider_for)
@@ -375,8 +385,9 @@ async def test_provider_force_raw_is_ignored_for_device_fs_target_types(monkeypa
 #
 # A repository that's encrypted and not yet key-verified must refuse to browse
 # workloads/versions rather than silently returning less data than it
-# should. connections() is deliberately exempt (see its own docstring) so
-# it has no equivalent tests here.
+# should. connections() is deliberately exempt -- connection_config rows
+# are plaintext regardless of encryption, so nothing there needs a key --
+# so it has no equivalent tests here.
 
 
 async def test_workloads_raises_key_required_when_no_key_provided() -> None:
@@ -548,7 +559,7 @@ async def test_catalog_verify_delegates_to_the_reachability_walk(monkeypatch: py
 # that filter, from a genuinely non-browsable version. Without this gate,
 # verify() against an encrypted repository with no/wrong key would walk zero
 # versions and report a misleadingly clean result instead of refusing to
-# run -- same "workloads()/versions() gate" shape as the tests above,
+# run -- same "workloads()/versions() gate" shape as the tests above.
 
 
 async def test_catalog_verify_raises_key_required_when_no_key_provided() -> None:
@@ -589,9 +600,9 @@ async def test_versions_delegates_to_catalog_versions(monkeypatch: pytest.Monkey
 
 
 def test_catalog_info_delegates_to_dedup_repo() -> None:
-    """``info`` moved from ``Repository`` to ``Catalog`` — genuinely
+    """``info`` lives on ``Catalog``, not ``Repository`` — genuinely
     per-catalog for object storage (each repo-id has its own marker
-    file); see ``Catalog.info``'s own docstring."""
+    file)."""
     fake_repo = _FakeDedupRepo(_layout(), info="some-repo-info")
     repo = api.Repository(_as_object_store(_FakeStore()), _repository_layout(), keys=None, key_verification=None)
     catalog = _make_catalog(repo, _as_dedup_repo(fake_repo))

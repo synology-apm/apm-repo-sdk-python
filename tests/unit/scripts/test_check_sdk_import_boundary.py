@@ -1,15 +1,19 @@
 """Tests for scripts/check_sdk_import_boundary.py.
 
-``scripts/`` isn't an installed package (same as
-``test_check_actions_versions.py``'s own loading convention), so the module
-under test is loaded by path via ``importlib`` through the
+``scripts/`` isn't an installed package, so the module under test is loaded
+by path via ``importlib`` through the
 ``check_sdk_import_boundary`` fixture. ``TestMain``'s synthetic scenarios
 monkeypatch ``SOURCE_ROOTS`` to a single tmp source tree mapped to the real
 ``synology_apm_repo.cli`` dotted prefix (rather than a made-up package
 name) so a file written at the matching relative path
 (``commands/dump.py``) resolves, via the script's own unmodified
-``_module_name()``, to the exact dotted name ``EXCEPTIONS`` already keys
-on — no need to also monkeypatch ``EXCEPTIONS`` itself.
+``_module_name()``, to the exact dotted name a real ``EXCEPTIONS`` entry
+would key on. ``_patch_source_roots`` also clears ``EXCEPTIONS`` to
+``{}`` — the real dict's ~20 entries name modules nothing in a narrow
+synthetic tmp tree ever resolves to, which the stale-``EXCEPTIONS``-key
+check (``main()``'s own ``stale_keys``) would otherwise flag on every
+synthetic scenario below; a test that needs one specific entry sets it
+explicitly, after calling ``_patch_source_roots``.
 """
 
 from __future__ import annotations
@@ -48,12 +52,15 @@ def _write_source(root: Path, relative: str, text: str) -> Path:
 
 def _patch_source_roots(monkeypatch: pytest.MonkeyPatch, module: ModuleType, tmp_path: Path) -> None:
     """Points the checker at ``tmp_path`` as both its one source root
-    (mapped to the real ``synology_apm_repo.cli`` prefix, not a made-up
-    package name — see this module's own docstring) and its ``ROOT``
+    (mapped to the real ``synology_apm_repo.cli`` prefix) and its ``ROOT``
     (``main()``'s violation messages print paths relative to it, so it
-    must also move for a synthetic tree outside the real repository root)."""
+    must also move for a synthetic tree outside the real repository
+    root). Also clears ``EXCEPTIONS`` to ``{}``; a test that needs one
+    specific entry sets it explicitly, after calling
+    ``_patch_source_roots``."""
     monkeypatch.setattr(module, "ROOT", tmp_path)
     monkeypatch.setattr(module, "SOURCE_ROOTS", [(tmp_path, "synology_apm_repo.cli")])
+    monkeypatch.setattr(module, "EXCEPTIONS", {})
 
 
 class TestMatches:
@@ -164,14 +171,22 @@ class TestMain:
         capsys: pytest.CaptureFixture[str],
         check_sdk_import_boundary: ModuleType,
     ) -> None:
-        # commands/dump.py resolves (via the script's own unmodified
-        # _module_name/EXCEPTIONS) to the real
-        # "synology_apm_repo.cli.commands.dump" exception key -- the
-        # identical import in a sibling file has no such allowance.
+        # commands/dump.py resolves, via the script's own unmodified
+        # _module_name(), to the same dotted name a real EXCEPTIONS entry
+        # for it would key on -- set explicitly here rather than relying
+        # on the real, unmodified dict (_patch_source_roots clears it to
+        # {}, since the real dict's ~20 entries name modules nothing in
+        # this synthetic tmp tree ever resolves to) -- the identical
+        # import in a sibling file has no such allowance.
         text = "from synology_apm_repo.sdk.diagnostics import inspect_bucket\n"
         _write_source(tmp_path, "commands/dump.py", text)
         _write_source(tmp_path, "commands/other.py", text)
         _patch_source_roots(monkeypatch, check_sdk_import_boundary, tmp_path)
+        monkeypatch.setattr(
+            check_sdk_import_boundary,
+            "EXCEPTIONS",
+            {"synology_apm_repo.cli.commands.dump": check_sdk_import_boundary._DIAGNOSTICS_MODULE},
+        )
 
         assert check_sdk_import_boundary.main() == 1
         err = capsys.readouterr().err
@@ -191,6 +206,45 @@ class TestMain:
         assert check_sdk_import_boundary.main() == 1
         err = capsys.readouterr().err
         assert "synology_apm_repo.sdk.catalog.catalog" in err
+
+    def test_a_stale_exceptions_key_is_reported(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+        check_sdk_import_boundary: ModuleType,
+    ) -> None:
+        """A key that no longer names a real module (a rename/move/delete
+        that forgot to update ``EXCEPTIONS`` alongside it) would otherwise
+        pass silently forever -- nothing else in this script ever looks a
+        stale key up."""
+        _write_source(tmp_path, "commands/other.py", "")
+        _patch_source_roots(monkeypatch, check_sdk_import_boundary, tmp_path)
+        monkeypatch.setattr(
+            check_sdk_import_boundary,
+            "EXCEPTIONS",
+            {"synology_apm_repo.cli.commands.renamed_or_deleted": ("synology_apm_repo.sdk.diagnostics",)},
+        )
+
+        assert check_sdk_import_boundary.main() == 1
+        err = capsys.readouterr().err
+        assert "synology_apm_repo.cli.commands.renamed_or_deleted" in err
+
+    def test_an_exceptions_key_matching_a_real_module_is_not_reported_as_stale(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        check_sdk_import_boundary: ModuleType,
+    ) -> None:
+        _write_source(tmp_path, "commands/dump.py", "")
+        _patch_source_roots(monkeypatch, check_sdk_import_boundary, tmp_path)
+        monkeypatch.setattr(
+            check_sdk_import_boundary,
+            "EXCEPTIONS",
+            {"synology_apm_repo.cli.commands.dump": ("synology_apm_repo.sdk.diagnostics",)},
+        )
+
+        assert check_sdk_import_boundary.main() == 0
 
     def test_actual_cli_and_browser_source_has_no_violations(self, check_sdk_import_boundary: ModuleType) -> None:
         """No monkeypatching — this repository's real CLI/browser source trees,

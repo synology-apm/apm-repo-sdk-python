@@ -13,8 +13,7 @@ chunk. A naive one-chunk-at-a-time path exists only as an independent
 correctness oracle in the test suite, never in production.
 
 Every write goes through ``_ExportSink``'s dedicated writer thread when
-running in a single process — see that class's own docstring for the
-queue/threading mechanism, and ``export_to``'s for the
+running in a single process; see ``export_to`` for the
 ``max_concurrent_reads``/``max_concurrent_opens`` concurrency knobs. When
 this repository's store can be reconstructed in a fresh process
 (``dedup.pool_descriptor.PoolDescriptor.from_pool``), every ``DATA``
@@ -24,13 +23,14 @@ path never gets past CPython's GIL for this CPU-bound work — leaving
 ``_ExportSink`` to handle only gap/zero-fill writes (cheap, not worth
 parallelizing) in-process either way. See ``ARCHITECTURE.md``'s
 "Async-native, by design" section for the measurement this is based on —
-see ``_walk_bucket_major``'s own docstring for a cost this windowed path
-specifically, and only it, accepts.
+see ``_walk_bucket_major`` for a cost this windowed path specifically,
+and only it, accepts.
 """
 
 from __future__ import annotations
 
 import asyncio
+import atexit
 import contextlib
 import dataclasses
 import os
@@ -41,20 +41,27 @@ from collections.abc import Awaitable, Callable
 from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
 
-from ..concurrency import default_worker_count, dispatch_to_pool
+from ..concurrency import (
+    close_worker_loop,
+    default_worker_count,
+    dispatch_to_pool,
+    new_process_pool,
+    run_in_worker_loop,
+)
+from ..identifiers import BucketId, StreamId
+from ..storage.base import ObjectStore
 from .chunk_walk import (
     DEFAULT_WINDOW_ENTRIES,
     ChunkPlan,
-    ExportGroupWorkerArgs,
-    build_export_executor,
+    ChunkRun,
+    _exec_one_bucket_group,
     count_planned_bytes,
     exec_chunks,
-    export_bucket_group_worker,
     plan_chunks_windowed,
 )
 from .dedup_file import ByteRangeView, DedupFile, ExportResult
-from .pool import BucketReaderCache, Pool
-from .pool_descriptor import PoolDescriptor
+from .pool import DEFAULT_BUCKET_CACHE_SIZE, BucketReaderCache, Pool
+from .pool_descriptor import PoolDescriptor, aclose_worker_store, build_worker_pool
 from .presized_file import create_presized, open_destination
 
 _WRITER_QUEUE_SIZE = 8
@@ -83,8 +90,10 @@ _SENTINEL = object()
 def _pwrite(fd: int, data: bytes | memoryview, offset: int) -> None:
     """``os.pwrite()`` where available (POSIX); Windows has no positional
     write, so this falls back to ``lseek``+``write`` — safe because every
-    caller of this already serializes its own access to ``fd`` (see
-    ``_ExportSink``'s own docstring for why)."""
+    caller of this already serializes its own access to ``fd``: a single
+    dedicated writer thread in the single-process path, or one task at a
+    time per worker process (each with its own independent fd) in the
+    multiprocess path."""
     if sys.platform != "win32":
         os.pwrite(fd, data, offset)
     else:
@@ -166,8 +175,9 @@ class _ExportSink:
                 # always a multiple of FIXED_CHUNK_LENGTH, decoded from a
                 # chunk-map file_offset that's structurally incapable of
                 # being anything else — see FORMAT-SPEC.md: pcps-fragments), so this
-                # isn't fixing a misalignment; see this class's own
-                # docstring for the actual reason.
+                # isn't fixing a misalignment; dst_offset is deliberately
+                # applied at this last write-side step, not upstream (see
+                # the class docstring's dst_offset paragraph above).
                 match item:
                     case _DataJob():
                         _pwrite(self._fd, item.payload, item.offset + self._dst_offset)
@@ -208,8 +218,8 @@ class _ExportSink:
             await self._put(_GapJob(dest_offset, length))
 
     async def _put(self, job: _WriteJob) -> None:
-        """Hand ``job`` to the writer thread. ``_WRITER_QUEUE_SIZE``'s
-        own docstring notes the queue is almost never actually full — so
+        """Hand ``job`` to the writer thread. The queue (see
+        ``_WRITER_QUEUE_SIZE``) is almost never actually full — so
         the common case is a plain ``put_nowait()`` right here on the
         event-loop thread: a ``queue.Queue`` put is a lock-protected,
         non-blocking operation, not a blocking call that needs to get off
@@ -275,14 +285,14 @@ async def _walk_bucket_major(
     dst_offset: int,
 ) -> tuple[int, int]:
     """Feed ``sink`` every DATA/HOLE/ZERO region in
-    ``[window_start, window_end)``, DATA chunks grouped by bucket — see
-    this module's own docstring and
-    ``chunk_walk`` for the plan/exec
+    ``[window_start, window_end)``, DATA chunks grouped by ``(stream_id,
+    bucket_id)`` so each bucket's needed chunks are fetched with one
+    merged read instead of jumping between buckets in logical-offset
+    order — see ``chunk_walk`` for the plan/exec
     mechanics. Returns ``(holes, zeros)`` byte totals. ``export_cache``/
     ``max_concurrent_opens``/``max_concurrent_reads`` are threaded
     straight through to ``exec_chunks``
-    unchanged — see that function's own docstring for what each does;
-    a prefetch task never spans a window boundary, but a window already
+    unchanged: a prefetch task never spans a window boundary, but a window already
     holds up to ``window_entries`` chunks' worth of bucket groups, plenty
     for it to have real work ahead of the main loop within one window.
 
@@ -293,8 +303,11 @@ async def _walk_bucket_major(
 
     ``executor`` (``None``: this repository's store isn't describable, or the
     caller decided against multiprocess for some other reason) picks
-    which of the two DATA-group dispatch paths runs per window — see this
-    module's own docstring for what each one does. Either way, gap/zero
+    which of the two DATA-group dispatch paths runs per window: the
+    multiprocess path (real multi-core parallelism for this CPU-bound
+    decode work, past what in-process ``asyncio`` concurrency ever gets
+    through CPython's GIL) when given, the in-process ``exec_chunks``
+    fallback otherwise. Either way, gap/zero
     writes go through ``sink.write_gap`` (called from
     ``plan_chunks_windowed`` itself), never through either dispatch path.
 
@@ -346,7 +359,9 @@ async def export_to(
 ) -> ExportResult:
     """The one export entry point for a whole ``DedupFile`` or a
     ``ByteRangeView`` window into one — grouping DATA chunks bucket-major
-    via ``chunk_walk`` (see this module's own docstring).
+    via ``chunk_walk`` so each bucket's needed chunks are fetched with one
+    merged read instead of jumping between hundreds of ``.buk`` files in
+    logical-offset order.
     ``DedupFile.export_to``/``ByteRangeView.export_to`` delegate here.
 
     Progress reports real ``DATA`` bytes written against the range's real
@@ -360,7 +375,7 @@ async def export_to(
     ``concurrency.default_worker_count()`` instead. ``max_concurrent_reads``
     (default 1: serial) is the single knob for every kind of read
     concurrency ``exec_chunks`` can produce on that fallback path,
-    cross-bucket or in-bucket — see that function's own docstring for the
+    cross-bucket or in-bucket — see ``exec_chunks`` for the semaphore
     hand-off mechanics.
 
     ``max_concurrent_opens`` (default ``None``: auto-derived as ``1 +
@@ -368,18 +383,20 @@ async def export_to(
     prefetch, overrides the derivation) prefetches upcoming buckets'
     headers ahead of the main loop instead of overlapping full
     bucket-group executions on the fallback path — see
-    ``_prefetch_bucket_opens``'s own docstring for the mechanism. Whether
+    ``_prefetch_bucket_opens`` for the mechanism. Whether
     raising it helps is backend-dependent (a saturated, low-RTT pipe gains
     nothing; a higher-RTT endpoint with spare bandwidth gains the most),
     but the auto-derived default stays on regardless, since raising it is
     never meaningfully slower even when it doesn't help.
 
-    ``export_cache`` (default ``None``: created here and discarded at the
-    end of this call) routes every fallback-path bucket-major read through
-    a private ``BucketReaderCache`` instead of ``Pool``'s own shared cache
-    — see that class's own docstring for why. ``VirtualDiskContentSource``
-    instead builds **one** instance shared across all its fragments, so
-    bucket-locality reuse persists across them on that path.
+    ``export_cache`` (default ``None``: created here, bounded to
+    ``DEFAULT_BUCKET_CACHE_SIZE`` and discarded at the end of this call)
+    routes every fallback-path bucket-major read through a private
+    ``BucketReaderCache`` instead of ``Pool``'s own shared cache — see
+    ``BucketReaderCache`` for why. ``VirtualDiskContentSource`` instead
+    builds **one** instance (its own separately-bounded default) shared
+    across all its fragments, so bucket-locality reuse persists across them
+    on that path.
 
     ``executor`` (default ``None``: build one here, iff this repository's store
     can be reconstructed in a fresh process, and tear it down before
@@ -392,8 +409,10 @@ async def export_to(
     pool independently.
 
     ``dst_offset``/``create`` (default 0/``True``, the single-file
-    behavior every other caller relies on) — see ``_ExportSink``'s own
-    docstring for the one real caller and for what ``dst_offset`` shifts.
+    behavior every other caller relies on) — ``dst_offset`` shifts every
+    write's destination position by a constant; its one real caller,
+    ``pcps_disk``, assembles several disk-absolute-addressed PC/PS
+    fragments into one combined sparse disk image.
     ``create=False`` skips creating ``dst`` (the caller already created
     it at its own, larger, combined size, and calls this once per
     fragment into the *same* file — re-creating it here would destroy
@@ -413,10 +432,10 @@ async def export_to(
         size = file_like.size
 
     if export_cache is None:
-        export_cache = BucketReaderCache()
+        export_cache = BucketReaderCache(maxsize=DEFAULT_BUCKET_CACHE_SIZE)
 
-    # None (the default) auto-derives from max_concurrent_reads — see this
-    # function's own docstring for the derivation rationale; an explicit
+    # None (the default) auto-derives from max_concurrent_reads (see the
+    # max_concurrent_opens paragraph above); an explicit
     # int (including 1, to disable prefetch) is used as-is.
     resolved_max_concurrent_opens = 1 + max_concurrent_reads if max_concurrent_opens is None else max_concurrent_opens
 
@@ -463,10 +482,11 @@ async def export_to(
     finally:
         if owns_executor and executor is not None:
             # A cancelled in-flight group finishes its own decode/pwrite
-            # rather than being torn down mid-write — see this module's
-            # own docstring's cross-window duplicate-decode note for the
-            # same "a worker's own in-flight unit isn't split" spirit
-            # applied to cancellation instead of windowing. shutdown()
+            # rather than being torn down mid-write — the same "a
+            # worker's own in-flight unit isn't split" principle
+            # _walk_bucket_major's cross-window duplicate-decode cost
+            # already accepts, applied here to cancellation instead of
+            # windowing. shutdown()
             # itself is a plain blocking call — wait=True means it can
             # block for as long as that in-flight worker takes, which
             # would otherwise freeze this whole process's event loop
@@ -479,3 +499,122 @@ async def export_to(
         await asyncio.to_thread(os.close, fd)
 
     return ExportResult(bytes_written=sink.bytes_written, logical_size=size, holes=holes, zeros=zeros)
+
+
+# -- Multiprocess worker: one bucket group, one task ---------------------
+#
+# This module's own multiprocess path (_dispatch_window_multiprocess above)
+# dispatches one `(stream_id, bucket_id)` group per task instead of calling
+# `exec_chunks()` in-process — real multi-core parallelism for the CPU-bound
+# decode work `exec_chunks()`'s own in-process `asyncio` concurrency never
+# actually gets past the GIL. `chunk_walk._exec_one_bucket_group` (a
+# module-private cross-import, deliberate: it's factored out of
+# `chunk_walk.py` specifically so a second caller like this one can drive
+# it without a second, hand-written copy of the same decode/write
+# sequence) is reused **unmodified** here.
+
+
+@dataclasses.dataclass(frozen=True)
+class ExportGroupWorkerArgs:
+    """One ``(stream_id, bucket_id)`` group's worth of work for
+    ``export_bucket_group_worker`` — picklable (``ChunkRun`` is already a
+    plain dataclass of ints)."""
+
+    stream_id: StreamId
+    bucket_id: BucketId
+    runs: list[ChunkRun]
+    size: int
+    dst_offset: int
+
+
+_worker_store: ObjectStore | None = None
+_worker_pool: Pool | None = None
+_worker_dst_fd: int | None = None
+
+
+def _export_worker_init(pool_descriptor: PoolDescriptor, dst_path: str) -> None:
+    """``ProcessPoolExecutor(initializer=...)`` target — builds this
+    worker's own ``Pool`` and opens its own long-lived destination fd once
+    per worker process, not once per task. No ``os.O_TRUNC``: the parent
+    has already pre-sized ``dst_path`` (this module's own
+    ``_create_truncated``) before any worker starts, and every worker
+    shares that one already-open file, each writing only to its own
+    disjoint set of destination offsets via ``os.pwrite`` — the same
+    "positional, no shared file-position state" property that already
+    lets ``_ExportSink``'s single writer thread serve out-of-order
+    bucket-group writes safely in the single-process path."""
+    global _worker_store, _worker_pool, _worker_dst_fd
+    _worker_store, _worker_pool = build_worker_pool(pool_descriptor)
+    _worker_dst_fd = open_destination(dst_path)
+    # Registered last, only once every worker-global above is actually set,
+    # so a shutdown hook never runs against half-initialized state.
+    atexit.register(_export_worker_shutdown)
+
+
+def _export_worker_shutdown() -> None:
+    """Runs once, at this worker process's normal exit (registered by
+    ``_export_worker_init``) — releases ``_worker_store`` (see
+    ``aclose_worker_store()``) before closing this
+    worker's persistent event loop and its destination fd."""
+    run_in_worker_loop(aclose_worker_store(_worker_store))
+    close_worker_loop()
+    if _worker_dst_fd is not None:
+        os.close(_worker_dst_fd)
+
+
+def build_export_executor(descriptor: PoolDescriptor, dst_path: str) -> ProcessPoolExecutor:
+    """The one public factory for an executor this module's own worker
+    functions (above) know how to serve — for a caller
+    (``VirtualDiskContentSource.export_to()``'s own multi-fragment
+    fan-out) that wants to share **one** executor across several
+    ``export_to()`` calls instead of letting each build
+    (and tear down) its own. Kept here, not re-derived by that caller, so
+    ``_export_worker_init`` itself stays module-private."""
+    return new_process_pool(initializer=_export_worker_init, initargs=(descriptor, dst_path))
+
+
+async def _export_bucket_group_worker_async(args: ExportGroupWorkerArgs) -> int:
+    assert _worker_pool is not None
+    assert _worker_dst_fd is not None
+    dst_fd = _worker_dst_fd
+    bytes_written = 0
+
+    async def _on_run(offset: int, payload: bytes | memoryview) -> None:
+        nonlocal bytes_written
+        _pwrite(dst_fd, payload, offset + args.dst_offset)
+        bytes_written += len(payload)
+
+    async def _on_bytes(_flushed: int) -> None:
+        pass  # this worker's own progress is reported by its caller, from the returned byte count.
+
+    # A fresh, per-task BucketReaderCache: unlike verify's own worker (one
+    # bucket per task, so a bucket-lifetime cache would never be reused
+    # anyway), export's own per-window dispatch can, in principle, submit
+    # the same bucket more than once across different windows -- the
+    # accepted cross-window duplicate-decode cost _walk_bucket_major
+    # documents -- nothing here needs those two
+    # occurrences to share a cache entry, so a fresh one per
+    # task is both correct and simpler than threading a worker-lifetime
+    # one through.
+    await _exec_one_bucket_group(
+        args.stream_id,
+        args.bucket_id,
+        args.runs,
+        pool=_worker_pool,
+        on_run=_on_run,
+        size=args.size,
+        on_bytes=_on_bytes,
+        export_cache=BucketReaderCache(),
+    )
+    return bytes_written
+
+
+def export_bucket_group_worker(args: ExportGroupWorkerArgs) -> int:
+    """The multiprocess path's per-bucket-group work item — returns the
+    real number of bytes this group actually wrote (its caller's own
+    progress-reporting figure)."""
+    # asyncio.run() closes its loop when this one call returns, which would
+    # break _worker_pool's cached client (bound to whichever loop first ran
+    # it) on the very next call in this same worker process -- run against
+    # this worker's own persistent loop instead.
+    return run_in_worker_loop(_export_bucket_group_worker_async(args))

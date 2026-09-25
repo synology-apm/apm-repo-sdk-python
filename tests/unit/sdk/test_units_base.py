@@ -4,10 +4,20 @@ from __future__ import annotations
 
 import re
 from collections.abc import AsyncIterator
+from datetime import UTC, datetime
 
 import pytest
 
-from synology_apm_repo.sdk.units.base import Node, RestorableUnit, UnitKind, not_restorable, paginate
+from synology_apm_repo.sdk.units.base import (
+    Node,
+    RestorableUnit,
+    UnitKind,
+    mtime_from_epoch,
+    node_kind_label,
+    node_modified_time,
+    not_restorable,
+    paginate,
+)
 from synology_apm_repo.sdk.units.node_ref import NodeRef
 
 
@@ -48,6 +58,54 @@ def test_node_default_attrs_is_an_independent_dict_per_instance() -> None:
 def test_unit_kind_values_are_stable_strings() -> None:
     assert UnitKind.DISK_IMAGE.value == "disk_image"
     assert UnitKind.RAW_OBJECT.value == "raw_object"
+
+
+def test_node_modified_time_is_none_when_attrs_has_no_mtime() -> None:
+    node = Node(ref=NodeRef("repo", ("a",)), name="a", is_leaf=True)
+    assert node_modified_time(node) is None
+
+
+def test_node_modified_time_is_none_for_a_malformed_value() -> None:
+    node = Node(ref=NodeRef("repo", ("a",)), name="a", is_leaf=True, attrs={"mtime": 12345})
+    assert node_modified_time(node) is None
+
+
+def test_node_modified_time_narrows_a_real_datetime() -> None:
+    dt = datetime.fromtimestamp(0, UTC)
+    node = Node(ref=NodeRef("repo", ("a",)), name="a", is_leaf=True, attrs={"mtime": dt})
+    assert node_modified_time(node) == dt
+
+
+def test_node_kind_label_uses_the_real_kind_when_set() -> None:
+    node = Node(ref=NodeRef("repo", ("a",)), name="a", is_leaf=True, kind=UnitKind.MAIL)
+    assert node_kind_label(node) == UnitKind.MAIL.value
+
+
+def test_node_kind_label_falls_back_to_folder_for_a_kindless_container() -> None:
+    node = Node(ref=NodeRef("repo", ("a",)), name="a", is_leaf=False)
+    assert node_kind_label(node) == "folder"
+
+
+def test_node_kind_label_falls_back_to_item_for_a_kindless_leaf() -> None:
+    node = Node(ref=NodeRef("repo", ("a",)), name="a", is_leaf=True)
+    assert node_kind_label(node) == "item"
+
+
+def test_mtime_from_epoch_is_none_for_none() -> None:
+    assert mtime_from_epoch(None) is None
+
+
+def test_mtime_from_epoch_converts_a_real_epoch() -> None:
+    assert mtime_from_epoch(0) == datetime.fromtimestamp(0, UTC)
+
+
+def test_mtime_from_epoch_degrades_to_none_for_an_out_of_range_value() -> None:
+    """A provider's own raw catalog value is an unvalidated integer --
+    out of ``datetime``'s own representable range must degrade this one
+    node's Modified cell to blank (``None``) rather than raising out of
+    ``children()`` and failing the whole containing folder's listing."""
+    assert mtime_from_epoch(99999999999999) is None  # ValueError: year out of range
+    assert mtime_from_epoch(-(2**62)) is None  # OSError: value too large
 
 
 def test_not_restorable_raises_a_value_error_naming_the_kind_and_ref() -> None:

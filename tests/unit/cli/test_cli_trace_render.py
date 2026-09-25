@@ -1,7 +1,6 @@
-"""Unit tests for ``synology_apm_repo.cli.trace_render`` — mirrors
-``test_cli_progress_render.py``'s approach: the "off" short-circuit and
-the NDJSON payload shape are the parts that don't depend on a real
-terminal, so those are what's tested here.
+"""Unit tests for ``synology_apm_repo.cli.trace_render``: the "off"
+short-circuit and the NDJSON payload shape are the parts that don't depend
+on a real terminal, so those are what's tested here.
 """
 
 from __future__ import annotations

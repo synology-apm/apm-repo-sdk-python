@@ -11,5 +11,5 @@ import json
 def build_values_json(values: dict[str, object]) -> bytes:
     """A list/document-library row with no attachment has no
     ``content_list`` entry — its own field values become its content
-    instead (see ``units/saas/site.py``'s own module docstring)."""
+    instead."""
     return json.dumps(values).encode("utf-8")

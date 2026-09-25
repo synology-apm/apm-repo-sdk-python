@@ -44,17 +44,17 @@ _VM_WORKLOAD_ID = 3
 async def test_replayed_encrypted_repo_passes_two_layer_key_verification(
     record_target: Callable[..., Awaitable[ObjectStore]],
 ) -> None:
-    """Both layers matter: ``KeyMaterial.verify`` (the GCM layer, by itself
-    already the whole answer to "is this key correct," see
-    ``sdk.dedup.keys``'s own module docstring) plus a real chunk read with
-    ``Pool.read_chunk``'s own ``verify_fingerprint=True`` option. Opening
-    the repository with
-    ``verify_fingerprint=True`` makes it the default for every read this
-    test then does, so reading a real MBR back successfully is itself
-    proof the fingerprint layer passed too, not just the GCM one."""
+    """Both layers matter: ``KeyMaterial.verify()`` (the GCM layer) already
+    proves key correctness on its own — GCM tag success means the key pair
+    unwraps the correct VaultKey record, and since a VaultKey never changes
+    after first initialization, that same VaultKey is, by construction, the
+    one used for every real chunk. Opening the repository with
+    ``verify_fingerprint=True`` makes ``Pool.read_chunk``'s own fingerprint
+    check the default for every read this test then does, so successfully
+    reading a real MBR back is itself proof the fingerprint layer passed
+    too, not just the GCM one."""
     # allow_content=True: reads only the disk's MBR/GPT signature bytes --
-    # a structural oracle (also proving the fingerprint layer passed, per
-    # this function's own docstring), never the disk's own real content.
+    # a structural oracle, never the disk's own real content.
     store = await record_target("vm_key_verification_apv2_encrypted.json.gz", allow_content=True)
     layout = await detect_layout(store)
     keys = KeyMaterial.from_key_string(_APV2_ENCRYPTED_KEY_STRING)

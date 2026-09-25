@@ -1,9 +1,13 @@
 """Screen titles + key-press hints — the presentation-layer strings this
 package owns. Centralized for the same reason ``cli/strings.py`` exists:
 without an owner these get duplicated with slightly different wording
-across screens (every navigable screen's status-bar hint line
-independently spelling out "j/k move · l/Enter open · h/Esc back"), and
-CLI and TUI displaying the same thing differently is a bug.
+across screens, and CLI and TUI displaying the same thing differently is
+a bug. Per-key hints (what shows in each screen's own ``Footer``, and in
+``?``'s help table) are stated once, as each ``Binding``'s own
+description in ``keymap.py``/each screen's own ``BINDINGS`` — never
+duplicated here as a second, hand-maintained status-bar string, which
+drifts from the real bindings silently (a screen's ``Footer`` is built
+from ``Screen.active_bindings``, the single source of truth both read).
 
 Dynamic, runtime-composed messages (an error string built from a real
 exception, a status line embedding a real filename) stay inline next to
@@ -13,22 +17,10 @@ line ``cli/strings.py`` draws for docstrings vs. flag help text.
 
 from __future__ import annotations
 
-# Key-hint fragments shared verbatim across BROWSE_STATUS_BAR/UNIT_STATUS_BAR/
-# HELP_KEYS_TEXT below — composing those three from these instead of each
-# re-spelling the same hint keeps a future key-hint rename from silently
-# missing one of the near-duplicate literals. Fragments that actually differ
-# between screens (e.g. "l/Enter open" vs. "l/Enter expand/open") stay
-# spelled out at each call site rather than forced into a shared fragment.
-_NAV_MOVE = "j/k move"
-_NAV_BACK = "h/Esc back"
-_FILTER_KEYS = "v verify · r refresh · / filter"
-_GOTO_KEY = "g goto"
-
 # -- BrowseScreen (repository/backup-source picking now lives entirely in
-# ConnectDialog, auto-opened on launch — see that screen's own module
-# docstring) ------------------------------------------------------------
+# ConnectDialog, auto-opened once on app start and reopened later with
+# ``c``; BrowseScreen itself has no path field of its own) --------------
 
-BROWSE_STATUS_BAR = f"{_NAV_MOVE} · l/Enter open · {_NAV_BACK} · {_FILTER_KEYS} · {_GOTO_KEY} · c connect · d verbose"
 BROWSE_FILTER_PLACEHOLDER = "filter (Esc to clear)"
 BROWSE_VERSIONS_EMPTY_LABEL = "(no available versions)"
 
@@ -48,6 +40,8 @@ CONNECT_BACKEND_SMB_LABEL = "SMB"
 CONNECT_LOCAL_PROMPT = 'Browse or type a directory path (select ".." to go up):'
 CONNECT_SUBMIT_LABEL = "Connect"
 CONNECT_SUBMIT_LABEL_LOCAL = "Open"
+CONNECT_CANCEL_LABEL = "Cancel"
+CONNECT_CANCELLING_STATUS = "cancelling..."
 CONNECT_NO_PATH_WARNING = "enter a directory path"
 CONNECT_PATH_NOT_A_DIRECTORY_WARNING = "not a directory"
 CONNECT_S3_BUCKET_PLACEHOLDER = "bucket name"
@@ -86,10 +80,6 @@ CONNECT_SMB_INVALID_PORT_WARNING = "port must be a whole number"
 
 # -- UnitScreen ---------------------------------------------------------
 
-UNIT_STATUS_BAR = (
-    f"{_NAV_MOVE} · l/Enter expand/open · {_NAV_BACK} · e export · i detail · "
-    f"{_FILTER_KEYS} · y copy ref · {_GOTO_KEY} · + load more"
-)
 UNIT_NOTHING_SELECTED_WARNING = "select an item to export first"
 UNIT_FILTER_PLACEHOLDER = "filter (Esc to clear)"
 UNIT_HEX_NOTHING_SELECTED_WARNING = "select a leaf item first"
@@ -101,6 +91,7 @@ UNIT_COPY_REF_NOTIFY = "copied ref to clipboard"
 UNIT_LOAD_MORE_NOTIFY = "loaded {loaded} more ({total} total)"
 UNIT_LOAD_MORE_NOTHING_TO_LOAD_WARNING = "nothing loaded under this level yet — expand it first"
 UNIT_LOAD_MORE_ALREADY_COMPLETE_WARNING = "everything at this level is already loaded"
+UNIT_LOAD_MORE_ALREADY_LOADING_WARNING = "already loading more — please wait"
 UNIT_FILTER_PARTIAL_LOAD_WARNING = "filtering only the {loaded} items loaded so far — press + to load more first"
 
 # -- goto-ref (``g``) -------------------------------------------------------
@@ -114,7 +105,6 @@ GOTO_REF_NOT_FOUND_WARNING = "ref not found in this repository"
 
 # -- HexPreviewScreen -----------------------------------------------------
 
-HEX_STATUS_BAR = "+/- page · x/X page · Esc/h back"
 HEX_WINDOW_SIZE = 512
 
 # -- ExportScreen -----------------------------------------------------
@@ -134,24 +124,28 @@ EXPORT_NO_DESTINATION_WARNING = "enter a destination path"
 EXPORT_NOTHING_RUNNING_WARNING = "nothing exporting yet"
 EXPORT_NOTIFY_TITLE = "Export"
 EXPORT_BACKGROUNDED_TITLE = "Backgrounded"
+#: Shown both as the toast Notify (StartExport's own update() branch) and
+#: verbatim in ExportScreen's in-dialog status line -- one constant, not
+#: two, since both spots show the identical text and nothing should be
+#: able to let them drift apart.
+EXPORT_QUEUED_MESSAGE = "queued — will start once the current job finishes"
+EXPORT_RUNNING_STATUS_TEXT = "exporting..."
 
 # -- DiagnosticsScreen ----------------------------------------------------
 
 DIAGNOSTICS_COLUMNS = ("stage", "symptom", "path", "detail")
 DIAGNOSTICS_QUICK_STATUS = "Integrity check — quick level. Press f for a full check."
 DIAGNOSTICS_FULL_RUNNING_STATUS = "Integrity check — full level (this may take a while)..."
+DIAGNOSTICS_EXPORT_BUSY_WARNING = "an export is currently running — try again once it finishes"
+DIAGNOSTICS_FULL_ALREADY_RUNNING_WARNING = "a full check is already running — try again once it finishes"
+DIAGNOSTICS_QUICK_STILL_RUNNING_WARNING = "still checking — try again in a moment"
 
 # -- WorklistScreen -------------------------------------------------------
 
-WORKLIST_COLUMNS = ("job", "progress", "status")
-WORKLIST_STATUS_BAR = "Background jobs — x to cancel the selected one, Esc to go back"
+WORKLIST_COLUMNS = ("name", "size", "progress", "speed", "eta", "elapsed", "status")
 WORKLIST_EMPTY_STATUS = "No background jobs. Esc to go back."
+WORKLIST_HINT = "x: cancel job · Esc: close"
 
 # -- HelpScreen (app.py's ``?`` key) ---------------------------------------
 
 HELP_TITLE = "Keys"
-HELP_COLUMNS = ("key", "action")
-HELP_VERBOSE_NOTE = (
-    "d toggles verbose mode: internal identifiers, canonical NodeRef form, "
-    "hex previews, and verify findings — off by default."
-)

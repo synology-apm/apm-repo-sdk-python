@@ -2,7 +2,7 @@
 
 The synthetic SizeStore fixture is *encoded* independently of the module's
 own decoder (writing bits with an OR-into-window loop, mirroring the
-write-side formula in on-disk-format.md §4.5, rather than calling anything
+write-side formula in FORMAT-SPEC.md: SizeStore, rather than calling anything
 in ``bucket.py``) so encode/decode bugs can't share a blind spot.
 """
 
@@ -137,9 +137,8 @@ class TestParseSizeStore:
     def test_round_trip(self) -> None:
         # traps #2 (compression is per-chunk, not repository-wide),
         # #5 (``CompressType.NONE``'s size==0 means a full 4096 bytes, not
-        # "empty" — see ``test_dedup_pool.py``'s ``TestCompacted`` for the
-        # Compacted-means-unreadable other half) and #29 (``stored_len`` !=
-        # ``effective_len`` for ``CompressType.NONE``/``CompressType.COMPACTED``).
+        # "empty") and #29 (``stored_len`` != ``effective_len`` for
+        # ``CompressType.NONE``/``CompressType.COMPACTED``).
         data = _build_bucket(_MIXED_ENTRIES)
         header = parse_bucket_header(data)
         sizestore_region = data[64:16384]
@@ -379,8 +378,7 @@ class TestChunkCrcStore:
 
     def test_index_for_a_plain_list_not_the_array_fast_path(self) -> None:
         """Cross-checks ``chunk_crc_store_index()`` against a plain list,
-        not just ``parse_size_store()``'s array fast path -- same shape as
-        ``TestExpectedBucketSize``'s own plain-list cross-check."""
+        not just ``parse_size_store()``'s array fast path."""
         data = _build_bucket(_MIXED_ENTRIES)
         header = parse_bucket_header(data)
         array_entries = parse_size_store(data[64:16384], header.chunk_num, verify_crc=header.chunk_size_crc)
@@ -406,11 +404,8 @@ class TestChunkCrcStore:
         """``chunk_crc_store_positions()`` (the O(n)-once batch form) must
         agree with ``chunk_crc_store_index()`` (the O(chunk_idx)-per-call
         single lookup) for every chunk, both array-fast-path and
-        plain-list entries — the exact correctness property a caller
-        switching from the latter to the former in a hot loop (a real
-        regression found this way: ``dedup/pool.py``'s own per-chunk
-        ciphertext-CRC check was calling ``chunk_crc_store_index`` once
-        per chunk, making one bucket's own check quadratic) depends on.
+        plain-list entries -- the correctness property a caller switching
+        from the latter to the former in a hot loop depends on.
         """
         data = _build_bucket(_MIXED_ENTRIES)
         header = parse_bucket_header(data)

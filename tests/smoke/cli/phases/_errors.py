@@ -4,7 +4,9 @@ never a leaked internal method name (``KeyRequiredError``/
 ``KeyMismatchError``'s wording) or a raw traceback. A wrong
 key surfaces from ``Repository.catalogs()`` itself (each catalog's own
 ``DedupRepo.open()`` raises ``KeyMismatchError`` when the supplied key
-fails its GCM-tag check -- see that method's own docstring), rendered by
+fails its GCM-tag check, rather than handing back a repository that would
+silently decrypt every chunk into garbage later -- AES-CTR has no
+integrity check of its own), rendered by
 the CLI's ``friendly_message()`` as "the key given was rejected", not a
 raw traceback or the whole-repository-browsing gate's own wording.
 """

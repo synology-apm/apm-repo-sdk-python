@@ -118,7 +118,7 @@ class SizeStoreEntry(NamedTuple):
     plain ``NamedTuple`` build has identical attribute access with no
     introspection callers to break, at lower construction cost than
     ``@dataclass``. ``parse_size_store`` hands these out lazily via
-    ``_SizeStoreArray`` — see that class's own docstring.
+    ``_SizeStoreArray`` rather than building every entry up front.
     """
 
     compress_type: CompressType
@@ -259,9 +259,9 @@ def _decode_size_store_group(
 ) -> int:
     """Decode ``count`` (``<= _SIZE_STORE_GROUP_RECORDS``) SizeStore records
     packed into the 15-byte group at ``padded[byte_pos:]``, writing into
-    ``compress_types``/``stored_lens`` starting at ``chunk_idx`` — see
-    ``_SIZE_STORE_GROUP_RECORDS``'s own docstring for the bit-packing this
-    relies on. Shared by ``parse_size_store``'s full-group and
+    ``compress_types``/``stored_lens`` starting at ``chunk_idx`` (see
+    ``_SIZE_STORE_GROUP_RECORDS`` for the bit-packing this relies on).
+    Shared by ``parse_size_store``'s full-group and
     remainder-group loops, which differ only in ``count``.
 
     Returns:
@@ -286,9 +286,9 @@ def parse_size_store(data: bytes, chunk_num: int, *, verify_crc: int | None = No
     ``chunk_size_store_tight_length`` bytes plus a little slack are
     actually read.
 
-    Decodes ``_SIZE_STORE_GROUP_RECORDS`` (8) records at a time — see that
-    constant's own docstring for the bit-packing this relies on. Each
-    record's decoded ``compress_type``/``stored_len`` still gets eager
+    Decodes ``_SIZE_STORE_GROUP_RECORDS`` (8) records at a time (see that
+    constant for the bit-packing this relies on). Each record's decoded
+    ``compress_type``/``stored_len`` still gets eager
     validation (raising ``DataCorruptError`` immediately for an unknown
     ``CompressType``) — only building a ``SizeStoreEntry`` object is
     deferred, to ``_SizeStoreArray``'s own ``__getitem__``.
@@ -342,8 +342,8 @@ class ChunkLocator(NamedTuple):
     as ``SizeStoreEntry`` above — see there for the reasoning.
 
     ``chunk_locators`` hands these out lazily too, via
-    ``_ChunkLocatorArray``, when it's fed a ``_SizeStoreArray`` — see that
-    class's own docstring.
+    ``_ChunkLocatorArray``, when it's fed a ``_SizeStoreArray``: a real
+    ``ChunkLocator`` is built only for the index actually asked for.
     """
 
     offset: int
@@ -352,8 +352,8 @@ class ChunkLocator(NamedTuple):
 
 class _ChunkLocatorArray(_ArrayBackedSequence[ChunkLocator]):
     """``array.array``-backed substitute for ``list[ChunkLocator]``, the
-    other half of ``_SizeStoreArray``'s construction-cost saving (see that
-    class's own docstring): ``chunk_locators`` returns one of
+    other half of ``_SizeStoreArray``'s construction-cost saving:
+    ``chunk_locators`` returns one of
     these instead of a ``list[ChunkLocator]`` when its ``entries`` argument
     is a ``_SizeStoreArray``, so the cumulative ``offset`` pass never
     constructs a ``ChunkLocator`` for a chunk nobody ends up asking for
@@ -372,17 +372,19 @@ class _ChunkLocatorArray(_ArrayBackedSequence[ChunkLocator]):
         return ChunkLocator(offset=self._offsets[index], length=self._lengths[index])
 
     def raw_offsets(self) -> array.array[int]:
-        """The raw per-chunk ``offset`` values, zero-copy — see
-        ``_SizeStoreArray.raw_compress_types``'s own docstring for the same
-        reasoning. See ``raw_chunk_arrays``, the intended way to reach
-        this."""
+        """The raw per-chunk ``offset`` values, zero-copy — for a caller
+        that needs O(1) access to every chunk's offset without
+        constructing a single ``ChunkLocator``, unlike even this class's
+        own lazy ``__getitem__``. See ``raw_chunk_arrays``, the intended
+        way to reach this."""
         return self._offsets
 
     def raw_lengths(self) -> array.array[int]:
-        """The raw per-chunk ``length`` values, zero-copy — see
-        ``_SizeStoreArray.raw_compress_types``'s own docstring for the same
-        reasoning. See ``raw_chunk_arrays``, the intended way to reach
-        this."""
+        """The raw per-chunk ``length`` values, zero-copy — for a caller
+        that needs O(1) access to every chunk's length without
+        constructing a single ``ChunkLocator``, unlike even this class's
+        own lazy ``__getitem__``. See ``raw_chunk_arrays``, the intended
+        way to reach this."""
         return self._lengths
 
 
@@ -465,7 +467,7 @@ def _effective_totals(entries: Sequence[SizeStoreEntry]) -> tuple[int, int]:
     case is ambiguous in the spec — ``chunk_num`` verbatim vs.
     ``effective_len > 0`` are indistinguishable without a real Compacted
     chunk to test against. This takes the spec-literal reading: one entry
-    per chunk whose ``effective_len > 0``. Callers (``verify.py``) treat a
+    per chunk whose ``effective_len > 0``. Callers (``dedup/verify_checks.py``) treat a
     mismatch stemming from this ambiguity as a warning, not a hard
     failure, until real data exercising compaction settles it.
     """

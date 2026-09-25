@@ -7,17 +7,28 @@ this one exists specifically to exercise the "load more" keybinding and
 the partial-load filter hint). Real end-to-end coverage against real recorded sample data lives in
 ``tests/integration/browser/test_browser_pilot_hex_filter_refresh.py``'s own ``/``
 filter test.
-"""
+
+Every child fixture here is an ordinary leaf, so it's the *file table* --
+never the folder tree, which excludes leaves entirely -- that renders the
+paginated results. ``action_load_more``/``action_filter`` resolve their
+target via ``model.selected`` directly (not a tree cursor), so no cursor
+navigation is needed before pressing ``+``/``/``: root is already
+``model.selected`` the moment it loads."""
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, cast
 
 from textual.app import App, ComposeResult
-from textual.widgets import Tree
+from textual.coordinate import Coordinate
+from textual.widgets import DataTable
 
-from synology_apm_repo.browser.screens.unit_screen import _CHILDREN_PAGE_SIZE, UnitScreen
-from synology_apm_repo.sdk.api import Version
+from synology_apm_repo.browser.core.app.model import Job
+from synology_apm_repo.browser.core.keys import JobId, RepoHandle
+from synology_apm_repo.browser.core.unit.update import CHILDREN_PAGE_SIZE
+from synology_apm_repo.browser.runtime.resources import ResourceTable
+from synology_apm_repo.browser.screens.unit_screen import UnitScreen
+from synology_apm_repo.sdk.api import Repository, Session, Version
 from synology_apm_repo.sdk.identifiers import (
     ConnectionConfigId,
     SaasVersionId,
@@ -31,7 +42,7 @@ from synology_apm_repo.sdk.identifiers import (
 from synology_apm_repo.sdk.units.base import Node
 from synology_apm_repo.sdk.units.node_ref import NodeRef
 
-_TOTAL_CHILDREN = _CHILDREN_PAGE_SIZE + 10
+_TOTAL_CHILDREN = CHILDREN_PAGE_SIZE + 10
 
 
 def _version() -> Version:
@@ -88,20 +99,27 @@ class _FakeApp(App[None]):
     """A minimal host for ``UnitScreen`` — deliberately not
     ``ApmRepoBrowserApp`` itself, which auto-pushes ``BrowseScreen`` +
     ``ConnectDialog`` on mount and owns a real ``Session``; ``UnitScreen``
-    only ever reads ``app_state.repo``/``app_state.verbose``
-    (``NavigableScreen.app_state`` is just ``self.app``, duck-typed, no
-    runtime type check), so any ``App`` subclass exposing those two
-    attributes satisfies it. ``self.repo`` only needs to be non-``None``
-    here — none of this file's tests exercise ``action_refresh``'s
+    only ever reads ``app_state.repo_handle``/``app_state.verbose``/
+    ``app_state.jobs`` (``NavigableScreen.app_state`` is just
+    ``self.app``, duck-typed, no runtime type check), so any ``App``
+    subclass exposing those attributes satisfies it. ``self.repo_handle``
+    only needs to resolve to something non-``None`` here — none of this
+    file's tests exercise ``action_refresh``'s
     ``invalidate_directory_cache()`` call, the one thing ``_load_root``
     itself still reads off it."""
 
     def __init__(self, version: Version, catalog: _FakeCatalog) -> None:
         super().__init__()
-        self.repo = object()
         self.verbose = False
+        self.jobs: dict[JobId, Job] = {}
+        self.resources = ResourceTable(cast(Session, object()))
+        self.repo_handle: RepoHandle | None = self.resources.put_repo(cast(Repository, object()))
         self._version = version
         self._catalog = catalog
+
+    @property
+    def current_repo(self) -> Repository | None:
+        return self.resources.repo(self.repo_handle) if self.repo_handle is not None else None
 
     def compose(self) -> ComposeResult:
         return iter(())
@@ -120,37 +138,40 @@ def _build_root_and_children() -> tuple[Node, dict[str, list[Node]]]:
     return root, {str(root_ref): children}
 
 
-async def test_first_expand_loads_only_one_page(wait_until: Any, move_cursor_to: Any) -> None:
+async def test_first_expand_loads_only_one_page(wait_until: Any, sdk_timeout: float) -> None:
     root, children_by_ref = _build_root_and_children()
     provider = _PaginatingFakeProvider(root, children_by_ref)
     app = _FakeApp(_version(), _FakeCatalog(provider))
     async with app.run_test() as pilot:
-        tree = app.screen.query_one("#unit-tree", Tree)
-        await wait_until(pilot, lambda: len(tree.root.children) > 0, timeout=1.5, interval=0.05)
-        assert len(tree.root.children) == _CHILDREN_PAGE_SIZE
+        screen = app.screen
+        assert isinstance(screen, UnitScreen)
+        await wait_until(pilot, lambda: root.ref in screen.store.model.loaded, timeout=sdk_timeout, interval=0.05)
+        assert len(screen.store.model.loaded[root.ref].children) == CHILDREN_PAGE_SIZE
+        assert len(screen._file_table._nodes) == CHILDREN_PAGE_SIZE
 
 
-async def test_load_more_fetches_the_rest_and_then_reports_exhausted(wait_until: Any, move_cursor_to: Any) -> None:
+async def test_load_more_fetches_the_rest_and_then_reports_exhausted(wait_until: Any, sdk_timeout: float) -> None:
     root, children_by_ref = _build_root_and_children()
     provider = _PaginatingFakeProvider(root, children_by_ref)
     app = _FakeApp(_version(), _FakeCatalog(provider))
     async with app.run_test() as pilot:
-        tree = app.screen.query_one("#unit-tree", Tree)
-        await wait_until(pilot, lambda: len(tree.root.children) > 0, timeout=1.5, interval=0.05)
-        assert len(tree.root.children) == _CHILDREN_PAGE_SIZE
-
-        notifications: list[tuple[str, str]] = []
         unit_screen = app.screen
         assert isinstance(unit_screen, UnitScreen)
+        await wait_until(pilot, lambda: root.ref in unit_screen.store.model.loaded, timeout=sdk_timeout, interval=0.05)
+        assert len(unit_screen._file_table._nodes) == CHILDREN_PAGE_SIZE
+
+        notifications: list[tuple[str, str]] = []
         unit_screen.notify = lambda message, *, severity="information", **kw: notifications.append(  # type: ignore[method-assign]
             (message, severity)
         )
 
-        first = tree.root.children[0]
-        await move_cursor_to(pilot, tree, first)
+        # model.selected is already root.ref the moment it loads -- no
+        # cursor navigation needed before pressing "+".
         await pilot.press("plus")
-        await wait_until(pilot, lambda: len(tree.root.children) == _TOTAL_CHILDREN, timeout=1.5, interval=0.05)
-        assert len(tree.root.children) == _TOTAL_CHILDREN
+        await wait_until(
+            pilot, lambda: len(unit_screen._file_table._nodes) == _TOTAL_CHILDREN, timeout=sdk_timeout, interval=0.05
+        )
+        assert len(unit_screen._file_table._nodes) == _TOTAL_CHILDREN
         assert any("loaded" in msg for msg, _sev in notifications)
 
         notifications.clear()
@@ -158,58 +179,98 @@ async def test_load_more_fetches_the_rest_and_then_reports_exhausted(wait_until:
         # The warning is what says the keypress was handled; without it there
         # is nothing to assert about yet.
         await wait_until(
-            pilot, lambda: notifications, timeout=0.5, interval=0.05, message="no notification for a second plus"
+            pilot,
+            lambda: notifications,
+            timeout=sdk_timeout,
+            interval=0.05,
+            message="no notification for a second plus",
         )
-        assert len(tree.root.children) == _TOTAL_CHILDREN  # nothing more to add
+        assert len(unit_screen._file_table._nodes) == _TOTAL_CHILDREN  # nothing more to add
         assert any("already loaded" in msg for msg, sev in notifications if sev == "warning")
 
 
-async def test_filter_on_a_partially_loaded_level_warns_it_is_incomplete(wait_until: Any, move_cursor_to: Any) -> None:
+async def test_load_more_appends_in_place_without_resetting_scroll_position(
+    wait_until: Any, sdk_timeout: float
+) -> None:
+    """The new page is a pure append onto what's already on screen --
+    ``FileTableView.render`` must extend the table in place rather than
+    ``clear()``+rebuild every prior row, since ``clear()`` unconditionally
+    resets scroll position too. Without this, pressing ``+`` on a large,
+    already-scrolled-down folder would snap the view back to the top on
+    every further page."""
     root, children_by_ref = _build_root_and_children()
     provider = _PaginatingFakeProvider(root, children_by_ref)
     app = _FakeApp(_version(), _FakeCatalog(provider))
     async with app.run_test() as pilot:
-        tree = app.screen.query_one("#unit-tree", Tree)
-        await wait_until(pilot, lambda: len(tree.root.children) > 0, timeout=1.5, interval=0.05)
-        assert len(tree.root.children) == _CHILDREN_PAGE_SIZE  # not exhausted yet
-
         unit_screen = app.screen
         assert isinstance(unit_screen, UnitScreen)
+        await wait_until(pilot, lambda: root.ref in unit_screen.store.model.loaded, timeout=sdk_timeout, interval=0.05)
+
+        table = unit_screen.file_table
+        table.scroll_y = 5.0  # simulate the user having scrolled down the first page
+        first_page = list(unit_screen._file_table._nodes)
+
+        await pilot.press("plus")
+        await wait_until(
+            pilot, lambda: len(unit_screen._file_table._nodes) == _TOTAL_CHILDREN, timeout=sdk_timeout, interval=0.05
+        )
+
+        assert unit_screen._file_table._nodes[: len(first_page)] == first_page
+        assert table.scroll_y == 5.0, "load-more must not reset the table's own scroll position"
+
+
+async def test_filter_on_a_partially_loaded_level_warns_it_is_incomplete(wait_until: Any, sdk_timeout: float) -> None:
+    root, children_by_ref = _build_root_and_children()
+    provider = _PaginatingFakeProvider(root, children_by_ref)
+    app = _FakeApp(_version(), _FakeCatalog(provider))
+    async with app.run_test() as pilot:
+        unit_screen = app.screen
+        assert isinstance(unit_screen, UnitScreen)
+        await wait_until(pilot, lambda: root.ref in unit_screen.store.model.loaded, timeout=sdk_timeout, interval=0.05)
+        assert len(unit_screen._file_table._nodes) == CHILDREN_PAGE_SIZE  # not exhausted yet
+
         notifications: list[tuple[str, str]] = []
         unit_screen.notify = lambda message, *, severity="information", **kw: notifications.append(  # type: ignore[method-assign]
             (message, severity)
         )
 
-        first = tree.root.children[0]
-        await move_cursor_to(pilot, tree, first)
         await pilot.press("slash")
         await pilot.pause(0.05)
-        assert any(sev == "warning" and str(_CHILDREN_PAGE_SIZE) in msg for msg, sev in notifications)
+        assert any(sev == "warning" and str(CHILDREN_PAGE_SIZE) in msg for msg, sev in notifications)
 
 
 async def test_goto_ref_past_the_root_s_already_loaded_first_page_does_not_crash(
-    wait_until: Any, move_cursor_to: Any
+    wait_until: Any, sdk_timeout: float
 ) -> None:
     """The root gets marked loaded by the ordinary auto-expand on mount,
-    but only up to one ``_CHILDREN_PAGE_SIZE`` page — a goto-ref target
+    but only up to one ``CHILDREN_PAGE_SIZE`` page — a goto-ref target
     beyond that page must still be found, not raise ``StopIteration``
     out of the ``_walk_to_target`` worker's own
-    ``GotoChainWalker.expand_to_chain`` call."""
+    ``GotoChainWalker.expand_to_chain`` call. The target is a leaf, so it
+    never becomes a tree node at all -- ``_walk_to_target`` parks the
+    file table's own cursor on it instead (the folder tree's cursor stays
+    on root, its parent)."""
     root, children_by_ref = _build_root_and_children()
     provider = _PaginatingFakeProvider(root, children_by_ref)
     app = _FakeApp(_version(), _FakeCatalog(provider))
     async with app.run_test() as pilot:
-        tree = app.screen.query_one("#unit-tree", Tree)
-        await wait_until(pilot, lambda: len(tree.root.children) > 0, timeout=1.5, interval=0.05)
-        assert len(tree.root.children) == _CHILDREN_PAGE_SIZE  # root already "loaded", but only one page
-
         unit_screen = app.screen
         assert isinstance(unit_screen, UnitScreen)
+        await wait_until(pilot, lambda: root.ref in unit_screen.store.model.loaded, timeout=sdk_timeout, interval=0.05)
+        assert len(unit_screen._file_table._nodes) == CHILDREN_PAGE_SIZE  # root "loaded", one page
+
         target = children_by_ref[str(root.ref)][-1]  # past the first page's own last item
-        unit_screen._walk_to_target(unit_screen._provider, target.ref)
+        unit_screen._walk_to_target(unit_screen._current_provider(), target.ref)
         await wait_until(
-            pilot, lambda: tree.cursor_node is not None and tree.cursor_node.data == target, timeout=1.5, interval=0.05
+            pilot,
+            lambda: target in unit_screen._file_table._nodes,
+            timeout=sdk_timeout,
+            interval=0.05,
         )
-        assert tree.cursor_node is not None
-        assert tree.cursor_node.data == target
-        assert len(tree.root.children) == _TOTAL_CHILDREN  # topped up to the full, exhaustive list
+        row_index = unit_screen._file_table._nodes.index(target)
+        table = unit_screen.query_one("#file-table", DataTable)
+        assert table.cursor_coordinate == Coordinate(row_index, 0)
+        assert len(unit_screen._file_table._nodes) == _TOTAL_CHILDREN  # topped up to the full, exhaustive list
+
+
+__all__: list[str] = []

@@ -1,6 +1,6 @@
 """``Session``: repository discovery, key material, and the store/repository
-lifetime it owns — see ``synology_apm_repo.sdk.api``'s own module
-docstring for the whole Repository Layer's scope. Hands out
+lifetime it owns, part of the Repository Layer (the ``Session``/
+``Repository``/``Catalog`` split CLI/TUI code imports directly). Hands out
 ``Repository`` instances (``api.repository``) it discovered/opened;
 never the other way around.
 """
@@ -40,10 +40,20 @@ async def _resolve_key_verification(
     return await keys.verify(store, layout)
 
 
+def _backing_of(store: ObjectStore) -> object:
+    """The real store identity behind a possible ``TracingStore`` wrap --
+    two separate ``discover()``/``discover_remote()`` calls against the same
+    backing store each get their own ``TracingStore`` instance when
+    ``trace=`` is given, so comparing wrapper identity alone would miss that
+    they still share one live connector underneath (see
+    ``Session.close_repo()``)."""
+    return store.backing if isinstance(store, TracingStore) else store
+
+
 class Session:
-    """Owns the repositories it discovers/opens and closes them all
-    together. Use as a context manager, or call ``close`` explicitly when
-    done.
+    """Use as a context manager, or call ``close`` explicitly when done --
+    or ``close_repo`` to release just one repository (and its store, if
+    unshared) ahead of the rest of a longer-running session.
     """
 
     def __init__(self) -> None:
@@ -75,8 +85,7 @@ class Session:
         one marker check already ran when the layout was built). Neither
         kind's own corrupt ``repo_info`` is caught here — that surfaces
         later instead, scoped to the one broken catalog, the first time
-        ``Repository.catalogs()`` actually opens it — see both methods'
-        own docstrings for the full contract.
+        ``Repository.catalogs()`` actually opens it.
 
         Local paths only — see ``discover_remote`` for an
         already-constructed ``ObjectStore`` (S3/Azure/...).
@@ -84,7 +93,7 @@ class Session:
         Args:
             key: When omitted, each yielded repository's encryption status is
                 still resolved eagerly via
-                ``DedupRepo.probe_encrypted`` (see ``KeyStatus``);
+                ``dedup.keys.probe_encrypted`` (see ``KeyStatus``);
                 skipped when a key *is* given, since
                 ``Repository.key_verification`` already answers it.
             trace: When given, every ``ObjectStore`` call any repository
@@ -213,14 +222,15 @@ class Session:
         progress: Callable[[Progress], Awaitable[None]] | None = None,
         trace: Callable[[TraceEvent], None] | None = None,
     ) -> list[Repository]:
-        """``discover_remote``, fully drained — see ``open``'s own docstring
-        for why this convenience form exists."""
+        """``discover_remote``, fully drained — the blocking convenience
+        form for a caller that wants the final list but still needs
+        progress/cancel support during a possibly slow scan."""
         return [repo async for repo in self.discover_remote(store, key, root=root, progress=progress, trace=trace)]
 
     async def resolve(self, ref: str | NodeRef) -> Node | RestorableUnit:
-        """Turn a ``NodeRef`` (or its string form — either shape) back into
-        a live node, re-derived from cheap catalog lookups and provider
-        tree calls rather than stored anywhere.
+        """Turn a ``NodeRef`` (or its string form) back into a live node,
+        re-derived from cheap catalog lookups and provider tree calls
+        rather than stored anywhere.
 
         This is two jobs stacked: **which open** ``Repository`` ``ref``
         belongs to (this method's own job — matches ``ref.repo_path``
@@ -229,7 +239,7 @@ class Session:
         open in one long-lived ``Session``, e.g. a TUI), then **what node
         inside it** ``ref`` names
         (``Repository.resolve``'s job — see its docstring for the
-        canonical/raw/human dispatch and the Drive flat-id caveat). A
+        canonical/raw/human dispatch). A
         caller that already has the right ``Repository`` in hand (the
         common case for a one-shot CLI invocation, which opens exactly one
         repository per run) should call ``Repository.resolve`` directly and skip
@@ -243,6 +253,60 @@ class Session:
             if repo.owns_repo_path(node_ref.repo_path):
                 return repo
         raise NotFoundError(f"no open repository matches ref: {node_ref}", ref=str(node_ref))
+
+    async def close_repo(self, repo: Repository) -> None:
+        """Close and forget one repository this session tracks, releasing its
+        own store too if no other still-tracked repository shares it.
+
+        Unlike a bare ``repo.close()`` (idempotent, safe ahead of
+        ``Session.close()``), this also removes
+        ``repo`` from this session's bookkeeping and, when its store isn't
+        shared with another repository this session still tracks, actually
+        releases that store's connector/session instead of waiting for
+        ``Session.close()`` at process end. For a caller that discards one
+        repository at a time from a longer-running session — the TUI
+        reconnecting to a different profile, or a tool walking many
+        repositories sequentially — rather than tearing the whole session
+        down at once.
+
+        The caller must have finished draining the ``discover()``/
+        ``discover_remote()`` call that yielded ``repo`` before calling this
+        — a not-yet-yielded sibling repository sharing the same store isn't
+        in ``self._repos`` yet, so the shared-store check below would
+        false-negative and close the store out from under it. Both of this
+        session's real callers (a fully-drained sample loop, a fully-drained
+        reconnect scan) already satisfy this.
+
+        Every tracked store sharing ``repo``'s own backing store (there can
+        be more than one distinct ``TracingStore`` wrapper around the same
+        backing, from separate ``discover()``/``discover_remote()`` calls)
+        is released together once
+        nothing in ``self._repos`` still references it, not just the one
+        wrapper ``repo`` itself used — otherwise a sibling wrapper from an
+        earlier call would sit in ``self._stores`` forever, never reachable
+        by identity again.
+        """
+        errors: list[Exception] = []
+        try:
+            await repo.close()
+        except Exception as exc:
+            errors.append(exc)
+        if repo in self._repos:
+            self._repos.remove(repo)
+        backing = _backing_of(repo._store)  # noqa: SLF001 - Session constructs and owns every Repository it yields, so reaching into its own _store here is an accepted crossing of the normal encapsulation boundary
+        if not any(_backing_of(r._store) is backing for r in self._repos):  # noqa: SLF001
+            for store in [s for s in self._stores if _backing_of(s) is backing]:
+                try:
+                    await aclose_if_possible(store)
+                except Exception as exc:
+                    errors.append(exc)
+                # Removed only after aclose_if_possible returns or raises, never
+                # before it starts, so a cancellation arriving mid-close leaves
+                # the store still tracked for Session.close() to pick up later
+                # instead of orphaned.
+                self._stores.remove(store)
+        if errors:
+            raise ExceptionGroup("Session.close_repo() failed to close every tracked resource", errors)
 
     async def close(self) -> None:
         """Close every repository this session opened, then release any
@@ -285,9 +349,10 @@ async def _open_repository(store: ObjectStore, keys: KeyMaterial | None, layout:
     otherwise.
 
     Deliberately identical in shape for ``VAULT``/``OBJECT_STORE`` — key/
-    encryption status is resolved from ``layout`` alone (see
-    ``storage.layout.key_probe_layout``'s own docstring for why neither
-    backend needs a specific opened catalog for that), and
+    encryption status is resolved from ``layout`` alone (``key_probe_layout``
+    only needs ``repo_root`` for a ``VAULT`` or ``key_root`` for
+    ``OBJECT_STORE``, shared by every sibling catalog, so neither backend
+    needs a specific opened catalog for that), and
     ``Repository._confirm_real()`` trusts each kind's own marker check
     (already performed by ``iter_repository_layouts``) rather than
     opening a real ``DedupRepo`` here to double-check it, for either
@@ -297,9 +362,8 @@ async def _open_repository(store: ObjectStore, keys: KeyMaterial | None, layout:
     skip as ``_confirm_real()`` itself: a half-written layout can have
     ``iter_repository_layouts``'s own cheap marker check pass while its
     key/encryption record (e.g. a truncated ``db/vault_encryption_key``)
-    is genuinely unreadable — that's exactly the same "found something
-    that isn't actually valid" case ``discover()``'s own docstring
-    documents, just caught here instead of in ``_confirm_real()``."""
+    is genuinely unreadable — the same false-positive-layout case described
+    above, just caught here instead of in ``_confirm_real()``."""
     key_layout = key_probe_layout(layout)
     try:
         key_verification = await _resolve_key_verification(keys, store, key_layout)
@@ -307,7 +371,7 @@ async def _open_repository(store: ObjectStore, keys: KeyMaterial | None, layout:
     except ApmRepoError:
         return None
     repo = Repository(store, layout, keys, key_verification, encrypted=encrypted)
-    if not await repo._confirm_real():  # noqa: SLF001 - session/repository are an acknowledged pair, see both modules' own docstrings
+    if not await repo._confirm_real():  # noqa: SLF001 - Session constructs every Repository via this factory, so calling its own _confirm_real() here before yielding it is an accepted crossing of the normal encapsulation boundary
         return None
     return repo
 

@@ -1,7 +1,7 @@
 """Regression test for ``synology-apm-repo-cli verify`` — replayed from committed
 fixtures recorded against real bytes, with **no external dependency** —
-same ``patch_profile_store`` fixture (``tests/conftest.py``) every
-sibling in this directory uses.
+same ``patch_profile_store`` fixture (``tests/integration/cli/conftest.py``)
+every sibling in this directory uses.
 
 Fixture: ``cli_verify_sample1.json.gz``, this file's own dedicated
 recording against ``sample-1`` — a small (~12 MB), 2-catalog SaaS
@@ -20,7 +20,9 @@ sample-1 carries 2 real, pre-existing GW versions whose own
 ``(snapshot_id, version_id)`` — a genuine gap (the stream's own metadata
 never recorded these versions, not a superseded generation
 ``SaasStream.open_saas_obj``'s forward resolution could substitute for —
-see ``units/saas/stream.py``'s own module docstring), so sample-1 is
+``open_saas_obj`` only forward-resolves a stale ``stream_version`` to a
+later, still-live generation, it can't invent a ``version_info`` row that
+was simply never written), so sample-1 is
 *not* clean: it always reports exactly these same 2 findings, at both
 levels, with nothing on top of them. Both share one ``ref`` (one
 stream), so they collapse to a single group in the CLI's own grouped
@@ -30,8 +32,8 @@ what ``VerifyLevel.QUICK`` touches) is this fixture's recording recipe.
 Every scenario sharing this fixture passes ``allow_content=True`` since
 its recording recipe (``test_full_level_flag_replayed``) is FULL, which
 genuinely decodes real chunk content — ``VerifyLevel.QUICK`` itself reads
-no chunk content at all (see ``units/verify_reachable.py``'s own
-docstring) and needs no such guard on its own, but shares this fixture's
+no chunk content at all (only each touched bucket's own structural
+checks) and needs no such guard on its own, but shares this fixture's
 name/recording session with the FULL scenario above.
 """
 
@@ -42,7 +44,7 @@ from collections.abc import Callable
 
 from typer.testing import CliRunner
 
-import synology_apm_repo.cli.browse as browse_mod
+import synology_apm_repo.cli.repo_session as repo_session_mod
 from synology_apm_repo.cli.main import app
 
 runner = CliRunner()
@@ -52,8 +54,9 @@ runner = CliRunner()
 _SAMPLE1_KEY_STRING = "wLeLZp9tnAYw@s9m9JIplgBRHN4IPJ+75W8ttZ5okHyFjswEYwGc1K+o="
 
 #: The known-gap findings sample-1 always reports -- 2 real, pre-existing
-#: GW versions with no version_info row at all, per this module's own
-#: docstring. Not the individual ``path``/``detail`` strings themselves
+#: GW versions whose ``saas_snapshot`` has no ``version_info`` row at all
+#: for their ``(snapshot_id, version_id)`` -- a genuine metadata gap, not
+#: routine stream-version rotation. Not the individual ``path``/``detail`` strings themselves
 #: (those carry catalog-metadata-anonymized display names --
 #: tests/CLAUDE.md's own "never hardcode an anonymized display-name
 #: string" rule), only the shape every one of them shares.
@@ -83,14 +86,14 @@ def _assert_expected_genuine_gap_findings(findings: list[dict[str, str]]) -> Non
 def test_quick_level_reports_known_genuine_gap_findings_replayed(
     patch_profile_store: Callable[..., None],
 ) -> None:
-    patch_profile_store("cli_verify_sample1.json.gz", browse_mod, allow_content=True)
+    patch_profile_store("cli_verify_sample1.json.gz", repo_session_mod, allow_content=True)
     result = runner.invoke(app, ["--json", "verify", "--profile", "anything", "--key", _SAMPLE1_KEY_STRING])
     assert result.exit_code == 0, result.output
     _assert_expected_genuine_gap_findings(json.loads(result.stdout))
 
 
 def test_full_level_flag_replayed(patch_profile_store: Callable[..., None]) -> None:
-    patch_profile_store("cli_verify_sample1.json.gz", browse_mod, allow_content=True)
+    patch_profile_store("cli_verify_sample1.json.gz", repo_session_mod, allow_content=True)
     result = runner.invoke(
         app,
         ["--json", "verify", "--profile", "anything", "--key", _SAMPLE1_KEY_STRING, "--level", "full"],
@@ -100,7 +103,7 @@ def test_full_level_flag_replayed(patch_profile_store: Callable[..., None]) -> N
 
 
 def test_human_output_reports_the_same_findings_replayed(patch_profile_store: Callable[..., None]) -> None:
-    patch_profile_store("cli_verify_sample1.json.gz", browse_mod, allow_content=True)
+    patch_profile_store("cli_verify_sample1.json.gz", repo_session_mod, allow_content=True)
     json_result = runner.invoke(app, ["--json", "verify", "--profile", "anything", "--key", _SAMPLE1_KEY_STRING])
     assert json_result.exit_code == 0, json_result.output
     findings = json.loads(json_result.stdout)
@@ -111,14 +114,11 @@ def test_human_output_reports_the_same_findings_replayed(patch_profile_store: Ca
     assert "level=quick" in result.output
     # Rich wraps long lines at the terminal width CliRunner reports --
     # collapse that back out before counting/searching, so this only pins
-    # down content, not incidental wrap placement (same technique
-    # test_cli_verify.py's own bracket-literal test uses).
+    # down content, not incidental wrap placement.
     unwrapped = result.output.replace("\n", "")
     # Grouping collapses the shared ref's own sentence down to one header
     # line (with its own "(N versions)" annotation, both findings being
-    # Stage.VERSION) instead of one full line per finding -- see
-    # _EXPECTED_TEMPLATE_COUNT's own comment for why 1, not 2, is the
-    # right count here.
+    # Stage.VERSION) instead of one full line per finding.
     assert unwrapped.count(_SAAS_GENUINE_GAP_TEXT) == _EXPECTED_TEMPLATE_COUNT
     assert unwrapped.count("versions)") == _EXPECTED_TEMPLATE_COUNT
     # Every finding's own path (an anonymized display name, fetched fresh
@@ -144,7 +144,7 @@ def test_clean_repo_reports_no_findings_replayed(patch_profile_store: Callable[.
     recording this fixture without it is itself a structural proof
     (enforced by ``ContentRecordingBlocked``) that QUICK genuinely touches
     none."""
-    patch_profile_store("cli_verify_apv1_vault_clean.json.gz", browse_mod)
+    patch_profile_store("cli_verify_apv1_vault_clean.json.gz", repo_session_mod)
     result = runner.invoke(app, ["--json", "verify", "--profile", "anything"])
     assert result.exit_code == 0, result.output
     assert json.loads(result.stdout) == []

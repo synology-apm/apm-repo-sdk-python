@@ -16,7 +16,7 @@ from ._shared import wait_until
 
 
 async def run(ctx: SmokeContext, app: Any, pilot: Any) -> None:
-    if app.repo is None:
+    if app.repo_handle is None:
         ctx.skip(
             "diagnostics_and_verbose", "diagnostics_and_verbose.no_repo", "navigate phase never connected a repository"
         )

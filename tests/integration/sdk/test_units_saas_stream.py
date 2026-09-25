@@ -139,8 +139,7 @@ async def test_replayed_open_saas_obj_resolves_a_real_object_for_every_non_delet
 ) -> None:
     """Every real, non-deleted M365/GW version in this fixture resolves to
     a real, non-empty ``saas_obj`` via ``open_saas_obj`` -- deliberately
-    narrow: it never reads any of these objects' real body content (see
-    this module's own docstring)."""
+    narrow: it never reads any of these objects' real body content."""
     async with await _open_repo(record_target) as repo:
         all_workloads = [w for c in await connections(repo) for w in await workloads(repo, c)]
         checked = 0
@@ -165,11 +164,11 @@ async def _assert_agent_repo_is_empty(store: ObjectStore) -> None:
     assert not await store.exists("@data/Pool")
 
 
-#: One test per real sample with a ``saas/agent_repo`` -- see this
-#: module's own docstring for why these stay four separate tests/fixtures
-#: rather than one merged fixture read in a loop: each needs its own real
-#: backend root (``<sample_root>/@ActiveProtectVault/saas/agent_repo``),
-#: so each is independently recordable via ``--record-against`` + ``-k``.
+#: One test per real sample with a ``saas/agent_repo`` -- these stay four
+#: separate tests/fixtures rather than one merged fixture read in a loop
+#: because each needs its own real backend root
+#: (``<sample_root>/@ActiveProtectVault/saas/agent_repo``), so each is
+#: independently recordable via ``--record-against`` + ``-k``.
 async def test_replayed_apv_sample_1_agent_repo_is_always_empty_of_restorable_content(
     record_target: Callable[[str], Awaitable[ObjectStore]],
 ) -> None:

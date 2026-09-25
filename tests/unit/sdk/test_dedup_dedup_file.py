@@ -23,6 +23,7 @@ import asyncio
 import os
 import struct
 import zlib
+from collections.abc import Sequence
 from pathlib import Path
 
 import pytest
@@ -31,7 +32,7 @@ from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 
 from synology_apm_repo.sdk.dedup.composition_reader import CompositionReader
 from synology_apm_repo.sdk.dedup.dedup_file import DedupFile, ExtentKind
-from synology_apm_repo.sdk.dedup.pool import Pool
+from synology_apm_repo.sdk.dedup.pool import BucketReader, Pool
 from synology_apm_repo.sdk.format import addressing
 from synology_apm_repo.sdk.format.addressing import ChunkAddress
 from synology_apm_repo.sdk.format.bucket import MODE_CHUNK_CRC, MODE_COMPRESS
@@ -257,7 +258,7 @@ class TestExtents:
         assert extents[-1].kind is not ExtentKind.HOLE or extents[-1].offset != 40960
 
     async def test_zero_length_entry_is_skipped_not_yielded_as_an_empty_extent(self, tmp_path: Path) -> None:
-        # a Type::Zero record with zero_num=0 carries no coverage at all —
+        # a ChunkMapKind.ZERO record with zero_num=0 carries no coverage at all —
         # it must not produce a spurious zero-length Extent nor break the
         # cursor tracking for the record that follows it.
         entries = (
@@ -378,11 +379,13 @@ class TestRead:
 
 
 class TestReadAcrossBuckets:
-    """``_fill_data_extent()``'s cross-bucket batch path — see that
-    function's own docstring: more than one distinct chunk needed within
-    a single ``read()`` call is grouped by ``(stream_id, bucket_id)`` and
-    fetched via one ``BucketReader.read_chunks()`` call per bucket instead
-    of one ``Pool.read_chunk()`` per chunk."""
+    """``_fill_data_extent()``'s cross-bucket batch path, via
+    ``_resolve_bucket_group()``: more than one distinct chunk needed
+    within a single ``read()`` call is grouped by ``(stream_id, bucket_id)``
+    and resolved via one ``BucketReader.read_chunks()`` call per bucket
+    for whatever isn't already cached, instead of one ``Pool.read_chunk()``
+    per chunk — but still consults/backfills ``Pool``'s own cross-call
+    chunk cache."""
 
     async def test_read_spanning_two_buckets_via_a_single_extents_carry(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -422,10 +425,75 @@ class TestReadAcrossBuckets:
         result = await file.read(0, 2 * 4096)
         assert result == _CHUNK_PLAINTEXTS[1] + bucket_1_chunk0
         # 2 distinct chunks needed -> the batch path (BucketReader.read_chunks()
-        # per bucket), never Pool.read_chunk() -- and it bypasses Pool's own
-        # chunk cache the same way cache=False already does.
+        # per bucket), never Pool.read_chunk() directly for the fetch itself.
         assert calls == []
-        assert pool._chunks == {}  # asserting the documented cache-bypass directly
+        # Both chunks this batch fetched are backfilled into Pool's own
+        # cross-call cache via _resolve_bucket_group's Pool.backfill_chunk.
+        assert pool._chunks[(StreamId(0), BucketId(0), ChunkIdx(1))] == _CHUNK_PLAINTEXTS[1]
+        assert pool._chunks[(StreamId(0), BucketId(1), ChunkIdx(0))] == bucket_1_chunk0
+
+        # A later single-chunk Pool.read_chunk() for one of those same
+        # chunks is now a genuine cache hit: it never touches the store.
+        store_reads: list[int] = []
+        real_store_read = LocalFsStore.read
+
+        async def counting_store_read(self: LocalFsStore, *args: object, **kwargs: object) -> bytes:
+            store_reads.append(1)
+            return await real_store_read(self, *args, **kwargs)  # type: ignore[arg-type]
+
+        monkeypatch.setattr(LocalFsStore, "read", counting_store_read)
+        again = await pool.read_chunk(ChunkAddress(StreamId(0), BucketId(0), ChunkIdx(1)))
+        assert again == _CHUNK_PLAINTEXTS[1]
+        assert store_reads == []
+
+    async def test_a_release_caches_racing_the_fetch_skips_the_backfill(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Exercises the ``Pool.release_epoch`` guard directly: a
+        ``release_caches()`` landing while the multi-chunk batch fetch is
+        in flight must not resurrect a backfilled entry into the
+        now-emptied ``Pool``."""
+        monkeypatch.setattr(addressing, "BUCKET_MAX_CHUNK_NUM", 2)
+        entries = _mapping_record(0, 0, 1, map_num=2)
+        record_bytes = _record_head_bytes(map_num=1) + entries
+        comp_path = tmp_path / "Composition" / str(_STREAM_ID) / f"{_SESSION_ID}.com" / "c0"
+        comp_path.parent.mkdir(parents=True, exist_ok=True)
+        comp_path.write_bytes(_composition_header_bytes() + record_bytes)
+        _write_bucket(tmp_path / "Pool" / "0" / "0.buk", _CHUNK_PLAINTEXTS[:2])
+        bucket_1_chunk0 = bytes([200]) * 4096
+        _write_bucket(tmp_path / "Pool" / "0" / "1.buk", [bucket_1_chunk0])
+
+        store = LocalFsStore(tmp_path)
+        dir_cache = DirCache(store)
+        comp_reader = CompositionReader(store, dir_cache, "Composition", _STREAM_ID, _SESSION_ID)
+        pool = Pool(store, "Pool", dir_cache)
+        file = DedupFile(comp_reader, pool, _HEAD_OFF, size=2 * 4096)
+
+        real_read_chunks = BucketReader.read_chunks
+
+        async def releasing_read_chunks(
+            self: BucketReader,
+            requests: Sequence[tuple[int, ChunkAddress | None]],
+            *,
+            semaphore: asyncio.Semaphore | None = None,
+            verify_ciphertext_crc: bool | None = None,
+        ) -> dict[int, bytes | memoryview]:
+            # Simulates a concurrent caller's release_caches() landing
+            # while this fetch (never itself tracked by Pool._chunks) was
+            # still in flight.
+            result = await real_read_chunks(
+                self, requests, semaphore=semaphore, verify_ciphertext_crc=verify_ciphertext_crc
+            )
+            pool.release_caches()
+            return result
+
+        monkeypatch.setattr(BucketReader, "read_chunks", releasing_read_chunks)
+
+        result = await file.read(0, 2 * 4096)
+
+        assert result == _CHUNK_PLAINTEXTS[1] + bucket_1_chunk0  # correct regardless of the race
+        assert (StreamId(0), BucketId(0), ChunkIdx(1)) not in pool._chunks
+        assert (StreamId(0), BucketId(1), ChunkIdx(0)) not in pool._chunks
 
     async def test_read_spanning_two_separate_bucket_backed_extents(self, tmp_path: Path) -> None:
         # bucket 0: chunk 0 at [0, 4096); bucket 1: chunk 0 at [4096, 8192)
@@ -465,9 +533,8 @@ class TestStream:
 
     async def test_stream_is_cancellable_via_its_surrounding_task(self, tmp_path: Path) -> None:
         """Cancelled via the surrounding Task, not a ``cancel=``
-        parameter (see ``_BlockingStore``) — must propagate
-        ``asyncio.CancelledError`` out of the async generator's
-        consumer."""
+        parameter — must propagate ``asyncio.CancelledError`` out of the
+        async generator's consumer."""
         file, store = _build_blocking_dedup_file(tmp_path)
 
         async def consume() -> list[int]:
@@ -527,10 +594,9 @@ class TestExportTo:
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         """Cancelled via the surrounding Task, not a ``cancel=``
-        parameter (see ``_BlockingStore``). The partial destination
-        file must not leak an open fd: ``export_scheduler.export_to()``
-        closes it in ``finally``, which runs on
-        ``asyncio.CancelledError`` too."""
+        parameter. The partial destination file must not leak an open
+        fd: ``export_scheduler.export_to()`` closes it in ``finally``,
+        which runs on ``asyncio.CancelledError`` too."""
         file, store = _build_blocking_dedup_file(tmp_path)
         dst = tmp_path / "out.bin"
 
@@ -568,7 +634,7 @@ class TestExportTo:
 
     async def test_export_clips_a_trailing_data_extent_that_runs_past_size(self, tmp_path: Path) -> None:
         """``extents()`` doesn't truncate its own boundary entries to
-        size (see its own docstring), so the logical-order export walk
+        size, so the logical-order export walk
         must clip a trailing DATA extent that runs past the file's declared size —
         reproduced here by cutting the standard fixture's size 100 bytes
         into its last DATA extent (``[24576, 40960)``, not the trailing

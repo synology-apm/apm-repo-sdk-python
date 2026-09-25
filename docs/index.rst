@@ -36,6 +36,7 @@ repository formats.
    :caption: Repository & catalog
 
    api/synology_apm_repo.sdk.api.repository
+   api/synology_apm_repo.sdk.api.key_manager
    api/synology_apm_repo.sdk.api.catalog
    api/synology_apm_repo.sdk.api.session
    api/synology_apm_repo.sdk.diagnostics
@@ -63,6 +64,7 @@ repository formats.
    api/synology_apm_repo.sdk.dedup.fingerprint
    api/synology_apm_repo.sdk.dedup.keys
    api/synology_apm_repo.sdk.dedup.verify_checks
+   api/synology_apm_repo.sdk.dedup.verify_report
 
 .. toctree::
    :maxdepth: 2
@@ -115,6 +117,8 @@ repository formats.
    api/synology_apm_repo.sdk.units.resolve
    api/synology_apm_repo.sdk.units.file_map_tree
    api/synology_apm_repo.sdk.units.verify_reachable
+   api/synology_apm_repo.sdk.units.verify_extents
+   api/synology_apm_repo.sdk.units.verify_bucket_check
 
 .. toctree::
    :maxdepth: 2
@@ -134,8 +138,14 @@ repository formats.
    :caption: SaaS workloads (M365 / GWS)
 
    api/synology_apm_repo.sdk.units.saas.provider
+   api/synology_apm_repo.sdk.units.saas.composite_provider
    api/synology_apm_repo.sdk.units.saas.stream
-   api/synology_apm_repo.sdk.units.saas.tree_strategy
+   api/synology_apm_repo.sdk.units.saas.tree_strategy.synthetic_grouped
+   api/synology_apm_repo.sdk.units.saas.tree_strategy.named_group_flat
+   api/synology_apm_repo.sdk.units.saas.tree_strategy.recursive
+   api/synology_apm_repo.sdk.units.saas.tree_strategy.named_group_recursive
+   api/synology_apm_repo.sdk.units.saas.tree_strategy.recursive_group_flat
+   api/synology_apm_repo.sdk.units.saas.tree_strategy.categorized
    api/synology_apm_repo.sdk.units.saas.mail
    api/synology_apm_repo.sdk.units.saas.calendar
    api/synology_apm_repo.sdk.units.saas.contact
@@ -155,3 +165,6 @@ repository formats.
    api/synology_apm_repo.sdk.presentation.format
    api/synology_apm_repo.sdk.presentation.progress
    api/synology_apm_repo.sdk.presentation.markup
+   api/synology_apm_repo.sdk.presentation.icons
+   api/synology_apm_repo.sdk.presentation.logging_setup
+   api/synology_apm_repo.sdk.presentation.export_target

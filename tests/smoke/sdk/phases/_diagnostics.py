@@ -86,7 +86,7 @@ async def run_for_repo(ctx: SmokeContext, ri: RepoInfo) -> None:
 
         Each candidate carries the ``CatalogId`` of the specific
         ``Catalog`` its own ``version`` came from -- resolved fresh
-        via ``resolve_catalog`` every time (see its own docstring):
+        via ``resolve_catalog`` every time:
         re-deriving "some catalog" from ``ri.repo.catalogs()[0]`` is
         wrong the moment a repository holds more than one, and caching the
         ``Catalog`` object itself (as ``ctx.data["workloads"]``

@@ -18,58 +18,13 @@ from synology_apm_repo.browser.repo_labels import (
     _strip_internal_marker,
 )
 from synology_apm_repo.browser.workload_grouping import _TYPE_LABELS, _humanize_type
-from synology_apm_repo.sdk.api import Catalog, KeyStatus, Repository
-from synology_apm_repo.sdk.storage.base import ObjectStore
+from synology_apm_repo.sdk.api import Catalog, KeyStatus
 from synology_apm_repo.sdk.storage.layout import RepoKind, RepositoryLayout
 from synology_apm_repo.sdk.units.dispatch import SUPPORTED_SAAS_SUB_TYPES
 
 
-def _fake_repo(*, repo_root: str, key_status: KeyStatus) -> Repository:
-    """A real ``Repository``, backed by a placeholder store/layout —
-    ``Repository.__init__`` does no I/O itself (``catalog_repo_layouts()``
-    is a pure function of ``layout``), so a bare placeholder store/keys is
-    enough to drive these pure functions, avoiding a real (and here
-    pointless) repository open."""
-    keys: object | None = None
-    key_verification: object | None = None
-    encrypted: bool | None = None
-    # key_status/is_encrypted are trivial projections of the resolved
-    # _key_status Repository.__init__ computes from keys/key_verification/
-    # encrypted — construct whichever combination of those three inputs
-    # yields the state under test, the same way a real caller would have
-    # arrived at it.
-    if key_status is KeyStatus.NOT_ENCRYPTED:
-        keys = _FakeKeys(is_no_encryption=True)
-    elif key_status is KeyStatus.VERIFIED:
-        keys = _FakeKeys(is_no_encryption=False)
-        key_verification = _FakeVerification(ok=True)
-    elif key_status is KeyStatus.INVALID:
-        keys = _FakeKeys(is_no_encryption=False)
-        key_verification = _FakeVerification(ok=False)
-    else:
-        # KeyStatus.NO_KEY_PROVIDED: keys stays None, and encrypted
-        # must be True (confirmed encrypted, no key tried) — never left
-        # at None (the "couldn't tell" edge case), since that's not what
-        # this state is standing in for in any of this file's tests.
-        assert key_status is KeyStatus.NO_KEY_PROVIDED
-        encrypted = True
-    return Repository(
-        cast(ObjectStore, object()),
-        RepositoryLayout(kind=RepoKind.VAULT, repo_root=repo_root),
-        keys,  # type: ignore[arg-type]
-        key_verification,  # type: ignore[arg-type]
-        encrypted=encrypted,
-    )
-
-
-class _FakeKeys:
-    def __init__(self, *, is_no_encryption: bool) -> None:
-        self.is_no_encryption = is_no_encryption
-
-
-class _FakeVerification:
-    def __init__(self, *, ok: bool) -> None:
-        self.ok = ok
+def _layout(repo_root: str) -> RepositoryLayout:
+    return RepositoryLayout(kind=RepoKind.VAULT, repo_root=repo_root)
 
 
 class TestStripInternalMarker:
@@ -98,20 +53,17 @@ class TestStripInternalMarker:
 
 class TestRepoPathComponent:
     def test_single_vault_shows_just_the_scanned_directory_name(self) -> None:
-        repo = _fake_repo(repo_root="@ActiveProtectVault", key_status=KeyStatus.NO_KEY_PROVIDED)
-        label = _repo_path_component(repo, "/Users/someone/samples/apv-sample-1")
+        label = _repo_path_component(_layout("@ActiveProtectVault"), "/Users/someone/samples/apv-sample-1")
         assert label == "apv-sample-1"
         assert "@ActiveProtectVault" not in label
 
     def test_object_store_appends_the_repo_id_after_the_directory_name(self) -> None:
-        repo = _fake_repo(repo_root="@ActiveProtectData/gqDuTMuityBf", key_status=KeyStatus.NO_KEY_PROVIDED)
-        label = _repo_path_component(repo, "/Users/someone/samples/sample-1")
+        label = _repo_path_component(_layout("@ActiveProtectData/gqDuTMuityBf"), "/Users/someone/samples/sample-1")
         assert label == "sample-1/gqDuTMuityBf"
         assert "@ActiveProtectData" not in label
 
     def test_trailing_slash_in_scan_path_does_not_leave_an_empty_name(self) -> None:
-        repo = _fake_repo(repo_root="@ActiveProtectVault", key_status=KeyStatus.NO_KEY_PROVIDED)
-        label = _repo_path_component(repo, "/Users/someone/samples/apv-sample-1/")
+        label = _repo_path_component(_layout("@ActiveProtectVault"), "/Users/someone/samples/apv-sample-1/")
         assert label == "apv-sample-1"
 
     def test_scanning_a_directory_of_multiple_repos_still_hides_the_marker(self) -> None:
@@ -119,8 +71,7 @@ class TestRepoPathComponent:
         subdirectory name in front of the marker in ``repo_root``; the
         marker is stripped by segment, not just leading-prefix, so the
         real neighboring segment survives."""
-        repo = _fake_repo(repo_root="apv-sample-1/@ActiveProtectVault", key_status=KeyStatus.NO_KEY_PROVIDED)
-        label = _repo_path_component(repo, "/Users/someone/samples")
+        label = _repo_path_component(_layout("apv-sample-1/@ActiveProtectVault"), "/Users/someone/samples")
         assert label == "samples/apv-sample-1"
         assert "@ActiveProtectVault" not in label
 
@@ -129,32 +80,49 @@ class TestRepoLabel:
     def test_no_key_provided_shows_key_needed(self) -> None:
         """NO_KEY_PROVIDED is only reachable once discover() has resolved
         it, so the hint is honest here."""
-        repo = _fake_repo(repo_root="@ActiveProtectVault", key_status=KeyStatus.NO_KEY_PROVIDED)
-        label = _repo_label(repo, "/samples/apv-sample-2-encrypted", verbose=False)
+        label = _repo_label(
+            _layout("@ActiveProtectVault"), KeyStatus.NO_KEY_PROVIDED, "/samples/apv-sample-2-encrypted", verbose=False
+        )
         assert label == "apv-sample-2-encrypted · key needed"
 
     def test_not_encrypted_shows_that_fact_once_known(self) -> None:
-        repo = _fake_repo(repo_root="@ActiveProtectVault", key_status=KeyStatus.NOT_ENCRYPTED)
-        label = _repo_label(repo, "/samples/apv-sample-1", verbose=False)
+        label = _repo_label(
+            _layout("@ActiveProtectVault"), KeyStatus.NOT_ENCRYPTED, "/samples/apv-sample-1", verbose=False
+        )
         assert label == "apv-sample-1 · not encrypted"
 
     def test_verified_key_shows_that_fact(self) -> None:
-        repo = _fake_repo(repo_root="@ActiveProtectVault", key_status=KeyStatus.VERIFIED)
-        label = _repo_label(repo, "/samples/apv-sample-2-encrypted", verbose=False)
+        label = _repo_label(
+            _layout("@ActiveProtectVault"), KeyStatus.VERIFIED, "/samples/apv-sample-2-encrypted", verbose=False
+        )
         assert label == "apv-sample-2-encrypted · key verified"
 
     def test_invalid_key_shows_that_fact(self) -> None:
-        repo = _fake_repo(repo_root="@ActiveProtectVault", key_status=KeyStatus.INVALID)
-        label = _repo_label(repo, "/samples/apv-sample-2-encrypted", verbose=False)
+        label = _repo_label(
+            _layout("@ActiveProtectVault"), KeyStatus.INVALID, "/samples/apv-sample-2-encrypted", verbose=False
+        )
         assert label == "apv-sample-2-encrypted · invalid key"
 
     def test_verbose_mode_appends_layout_regardless_of_key_status(self) -> None:
         # No per-repository uuid any more -- that moved to per-catalog (see
         # Catalog.info) -- only the layout-kind suffix is added here.
-        repo = _fake_repo(repo_root="@ActiveProtectVault", key_status=KeyStatus.NO_KEY_PROVIDED)
-        label = _repo_label(repo, "/samples/apv-sample-1", verbose=True)
+        label = _repo_label(
+            _layout("@ActiveProtectVault"), KeyStatus.NO_KEY_PROVIDED, "/samples/apv-sample-1", verbose=True
+        )
         assert "layout: vault" in label
         assert "apv-sample-1" in label
+
+    def test_a_scanned_directory_name_shaped_like_rich_markup_is_escaped(self) -> None:
+        """The scanned directory's own real name reaches this label via
+        ``_repo_path_component`` -- both ``Tree`` and ``Static`` re-parse
+        a plain ``str`` as Rich markup, so a directory literally named
+        ``"a[x]b"`` must not reach either unescaped: an unmatched closing
+        tag or an unresolvable tag body crashes the widget outright with a
+        markup error. No embedded
+        ``/`` here -- that would itself be a real path separator
+        (``Path.name`` only keeps the last segment), not a markup test."""
+        label = _repo_label(_layout("@ActiveProtectVault"), KeyStatus.NOT_ENCRYPTED, "/samples/a[x]b", verbose=False)
+        assert label == r"a\[x]b · not encrypted"
 
 
 class _FakeCatalogInfo:
@@ -187,6 +155,10 @@ class TestCatalogLabel:
         assert label.startswith("Source 1 (")
         assert "uuid: fake-uuid-0000" in label
         assert "id: fake-conn-id" in label
+
+    def test_a_catalog_display_name_shaped_like_rich_markup_is_escaped(self) -> None:
+        catalog = cast(Catalog, _FakeCatalogForLabel(uuid="fake-uuid", connection_id="fake-conn-id"))
+        assert _catalog_label(catalog, "a[/]b", verbose=False) == r"a\[/]b"
 
 
 class TestHumanizeType:

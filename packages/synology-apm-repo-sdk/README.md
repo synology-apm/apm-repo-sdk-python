@@ -41,9 +41,9 @@ asyncio.run(main())
 ```
 
 Everything the SDK does is `async def`; `Session`/`Repository` (both usable
-as async context managers) are the entry point for a normal consumer —
-`Repository` is one opened bucket or vault, `Catalog` (from
-`Repository.catalogs()`) is one connection's worth of data within it.
+as async context managers) are the entry point for a normal consumer. See
+`ARCHITECTURE.md`'s Repository Layer section for what `Repository`/
+`Catalog` each represent.
 
 ## Requirements
 

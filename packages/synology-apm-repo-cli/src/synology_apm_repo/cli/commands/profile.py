@@ -22,7 +22,8 @@ import typer
 from rich.console import Console
 
 from synology_apm_repo.cli.asyncio_support import typer_async
-from synology_apm_repo.cli.errors import fail, unwrap
+from synology_apm_repo.cli.errors import fail, fail_from_apm_error, unwrap
+from synology_apm_repo.cli.paging import render
 from synology_apm_repo.cli.progress_render import build_progress_meter, finish_live_progress
 from synology_apm_repo.cli.state import CliState
 from synology_apm_repo.cli.strings import (
@@ -51,7 +52,7 @@ from synology_apm_repo.sdk.profiles import (
     config_from_fields,
     delete_profile,
     get_profile,
-    list_profiles,
+    list_profiles_full,
     save_profile,
     store_from_config,
 )
@@ -85,39 +86,59 @@ def _read_secret(label: str, *, no_input: bool) -> str:
     return sys.stdin.readline().rstrip("\n")
 
 
+def _collect_fields(
+    base: dict[str, str | bool],
+    optional: dict[str, str | None],
+    secrets: list[tuple[str, str]],
+    *,
+    no_input: bool,
+) -> dict[str, str | bool]:
+    """The shape ``_collect_s3_fields``/``_collect_azure_fields``/
+    ``_collect_smb_fields`` each repeat: start from ``base``'s required
+    fields, add each of ``optional``'s fields only when it's truthy, then
+    read one or more secrets in the order a script piping input on stdin
+    needs to supply them (``secrets`` is ``[(field_name, prompt_label),
+    ...]``, in that order)."""
+    fields: dict[str, str | bool] = {**base, **{name: value for name, value in optional.items() if value}}
+    for name, label in secrets:
+        fields[name] = _read_secret(label, no_input=no_input)
+    return fields
+
+
 def _collect_s3_fields(
     bucket: str, endpoint: str | None, region: str | None, *, verify_tls: bool, no_input: bool
 ) -> dict[str, str | bool]:
-    fields: dict[str, str | bool] = {"bucket": bucket, "verify_tls": verify_tls}
-    if endpoint:
-        fields["endpoint"] = endpoint
-    if region:
-        fields["region"] = region
-    fields["access_key"] = _read_secret("Access key (blank for ambient credential chain)", no_input=no_input)
-    fields["secret_key"] = _read_secret("Secret key (blank for ambient credential chain)", no_input=no_input)
-    return fields
+    return _collect_fields(
+        {"bucket": bucket, "verify_tls": verify_tls},
+        {"endpoint": endpoint, "region": region},
+        [
+            ("access_key", "Access key (blank for ambient credential chain)"),
+            ("secret_key", "Secret key (blank for ambient credential chain)"),
+        ],
+        no_input=no_input,
+    )
 
 
 def _collect_azure_fields(
     container: str, account_url: str | None, *, verify_tls: bool, no_input: bool
 ) -> dict[str, str | bool]:
-    fields: dict[str, str | bool] = {"container": container, "verify_tls": verify_tls}
-    if account_url:
-        fields["account_url"] = account_url
-    fields["credential"] = _read_secret(
-        "Credential — account key or SAS token (blank for ambient credential chain)", no_input=no_input
+    return _collect_fields(
+        {"container": container, "verify_tls": verify_tls},
+        {"account_url": account_url},
+        [("credential", "Credential — account key or SAS token (blank for ambient credential chain)")],
+        no_input=no_input,
     )
-    return fields
 
 
 def _collect_smb_fields(
     server: str, share: str, port: int, username: str | None, *, no_input: bool
 ) -> dict[str, str | bool]:
-    fields: dict[str, str | bool] = {"server": server, "share": share, "port": str(port)}
-    if username:
-        fields["username"] = username
-    fields["password"] = _read_secret("Password (blank for an anonymous/guest session)", no_input=no_input)
-    return fields
+    return _collect_fields(
+        {"server": server, "share": share, "port": str(port)},
+        {"username": username},
+        [("password", "Password (blank for an anonymous/guest session)")],
+        no_input=no_input,
+    )
 
 
 async def _store_from_fields(kind: BackendKind, fields: dict[str, str | bool]) -> ObjectStore:
@@ -145,10 +166,10 @@ async def _verify_connectivity(state: CliState, backend: BackendKind, fields: di
     try:
         store = await _store_from_fields(backend, fields)
     except Exception as exc:  # AzureStore's own client construction validates its
-        # account_url/credential shape synchronously (no network I/O — see its own
-        # docstring) and can raise several exception types (e.g. ValueError for a
-        # malformed URL or an unresolvable account name); S3Store defers all of this
-        # to first read/listdir.
+        # account_url/credential shape synchronously (no network I/O) and can raise
+        # several exception types (e.g. ValueError for a malformed URL or an
+        # unresolvable account name); S3Store defers all of this to first
+        # read/listdir.
         fail(f"connectivity check failed: {exc}", cause=exc)
     session = Session()
     meter = build_progress_meter(state)
@@ -156,13 +177,11 @@ async def _verify_connectivity(state: CliState, backend: BackendKind, fields: di
     try:
         repos = await session.open_remote(store, progress=meter.update, trace=trace)
     except ApmRepoError as exc:
-        finish_live_progress(state)
-        fail(f"connectivity check failed: {exc}", cause=exc)
+        fail_from_apm_error(exc, state, prefix="connectivity check failed: ")
     finally:
         # Covers the success path (this line only clears something once,
         # even though the except branch above already called it once for
-        # its own timing needs — see browse.py's opened_repo docstring for
-        # why both are needed) and, unlike that branch, also a
+        # its own timing needs) and, unlike that branch, also a
         # non-ApmRepoError exception this function doesn't otherwise catch.
         finish_live_progress(state)
         await session.close()
@@ -234,18 +253,43 @@ async def add(
 
 @typer_async
 async def list_profiles_command(ctx: typer.Context) -> None:
-    """List every saved profile's name and backend. Never touches the
-    keyring."""
+    """List every saved profile's name and backend, plus (under
+    --verbose) the same per-backend fields ``show`` prints for one
+    profile. Never touches the keyring."""
     state: CliState = ctx.obj
-    summaries = await list_profiles()
-    if state.json:
-        console.print_json(data=[{"name": s.name, "kind": s.kind.value} for s in summaries])
+    # One read either way: list_profiles_full() already returns every
+    # saved profile in full, so --verbose needs no further per-name
+    # get_profile() call each re-reading and re-parsing the same
+    # profiles.json a second (third, ...) time.
+    profiles = await list_profiles_full()
+    if not state.verbose:
+        render(
+            console,
+            state,
+            json=[{"name": p.name, "kind": p.kind.value} for p in profiles],
+            human=lambda: _render_summary_lines(profiles),
+        )
         return
-    if not summaries:
+
+    render(console, state, json=[_build_report(p) for p in profiles], human=lambda: _render_verbose_list(profiles))
+
+
+def _render_summary_lines(profiles: list[Profile]) -> None:
+    if not profiles:
         console.print("[dim](no saved profiles)[/dim]")
         return
-    for summary in summaries:
-        console.print(f"{summary.name}  [dim]{summary.kind.value}[/dim]")
+    for profile in profiles:
+        console.print(f"{profile.name}  [dim]{profile.kind.value}[/dim]")
+
+
+def _render_verbose_list(profiles: list[Profile]) -> None:
+    if not profiles:
+        console.print("[dim](no saved profiles)[/dim]")
+        return
+    for i, profile in enumerate(profiles):
+        if i:
+            console.print()
+        _render_human(profile)
 
 
 def _build_report(profile: Profile) -> dict[str, object]:
@@ -254,9 +298,8 @@ def _build_report(profile: Profile) -> dict[str, object]:
     # username for SMB) — reading it here instead of branching on
     # isinstance(profile.config, ...) is what lets both renderers below
     # stay backend-agnostic. verify_tls is S3/Azure-only (SMB has no TLS
-    # concept the way their endpoints do — see SmbProfileConfig's own
-    # docstring), so it's read via getattr and omitted rather than
-    # assumed present on every config.
+    # concept the way their endpoints do), so it's read via getattr and
+    # omitted rather than assumed present on every config.
     report: dict[str, object] = {"name": profile.name, "kind": profile.kind.value}
     verify_tls = getattr(profile.config, "verify_tls", None)
     if verify_tls is not None:
@@ -282,10 +325,7 @@ async def show(ctx: typer.Context, name: str = typer.Argument(..., help=PROFILE_
     state: CliState = ctx.obj
     profile = await unwrap(get_profile(name), verbose=state.verbose)
 
-    if state.json:
-        console.print_json(data=_build_report(profile))
-    else:
-        _render_human(profile)
+    render(console, state, json=_build_report(profile), human=lambda: _render_human(profile))
 
 
 @typer_async

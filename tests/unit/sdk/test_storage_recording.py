@@ -202,15 +202,17 @@ async def test_tracing_passes_through_to_backing(backing: LocalFsStore) -> None:
 
 
 async def test_tracing_aclose_is_a_no_op_over_a_backing_store_with_nothing_to_close(backing: LocalFsStore) -> None:
-    # See test_recording_aclose_is_a_no_op_...'s own comment -- identical
-    # regression, for --trace's TracingStore instead of RecordingStore.
+    # TracingStore always satisfies AsyncCloseable now, regardless of
+    # what it wraps, so this must stay a safe no-op even over a backing
+    # store (LocalFsStore) with no aclose() of its own.
     await TracingStore(backing, lambda _event: None).aclose()
 
 
 async def test_tracing_aclose_forwards_to_an_asynccloseable_backing_store() -> None:
-    # See test_recording_aclose_forwards_to_...'s own comment -- this is
-    # the exact path a `--trace`d (or this project's own smoke tooling,
-    # which always traces) real S3Store/AzureStore goes through.
+    # TracingStore's aclose() must forward to its backing store's own,
+    # not just swallow it -- the exact path a `--trace`d (or this
+    # project's own smoke tooling, which always traces) real
+    # S3Store/AzureStore goes through.
     fake = _FakeCloseableStore()
     await TracingStore(fake, lambda _event: None).aclose()
     assert fake.closed is True

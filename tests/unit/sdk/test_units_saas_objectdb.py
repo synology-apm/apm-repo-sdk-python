@@ -4,9 +4,9 @@ a lightweight fake ``DedupFile`` backed by an in-memory buffer for
 override string parsing.
 
 Every real caller (every application-layer provider, and
-``RawObjectProvider`` too) resolves its content through the
-connector's own object-name index instead, never a scan (see
-``units/saas/raw_object.py``'s own module docstring)."""
+``RawObjectProvider`` too, which shows the same index's entries raw
+instead of through a service-level schema) resolves its content through
+the connector's own object-name index instead, never a scan."""
 
 from __future__ import annotations
 
@@ -101,8 +101,7 @@ class TestObjectDbOpenAndLookup:
 
 
 class TestParseObjectDbId:
-    """The manual-override string, ``<streamUuid>_<offset>_<length>``
-    (this module's own docstring)."""
+    """The manual-override string, ``<streamUuid>_<offset>_<length>``."""
 
     def test_parses_the_documented_shape(self) -> None:
         assert parse_object_db_id("DRMdjvEJPzoxQiUC_27467776_12288") == ("DRMdjvEJPzoxQiUC", 27467776, 12288)

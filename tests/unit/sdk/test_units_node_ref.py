@@ -10,13 +10,16 @@ import pytest
 from hypothesis import given
 from hypothesis import strategies as st
 
-from synology_apm_repo.sdk.identifiers import CatalogId, VersionUid, WorkloadId
+from synology_apm_repo.sdk.identifiers import CatalogId, VersionUid, WorkloadId, WorkloadUid
 from synology_apm_repo.sdk.units.node_ref import (
     NodeRef,
     RefKind,
     ambiguous_matches,
     canonical_ref_for,
     disambiguate,
+    disambiguate_catalogs,
+    disambiguate_versions,
+    disambiguate_workloads,
     match_display_name,
 )
 
@@ -119,9 +122,8 @@ class TestCanonicalIds:
         assert ref.canonical_ids is None
 
     def test_none_for_a_malformed_canonical_prefix(self) -> None:
-        # catalog_id is a plain string (never int-parsed -- see
-        # canonical_ids's own docstring), so only workload_id can still be
-        # malformed this way.
+        # catalog_id is a plain string, never int-parsed, so only
+        # workload_id can still be malformed this way.
         ref = NodeRef("repo", ("cat:1", "wl:notanumber", "ver:x"))
         assert ref.canonical_ids is None
 
@@ -271,6 +273,59 @@ class TestDisambiguate:
     def test_hint_does_not_affect_non_colliding_names(self) -> None:
         result = disambiguate([("solo", "id-1")], hints=["MAIL"])
         assert result == ["solo"]
+
+
+class TestDisambiguateCatalogsWorkloadsVersions:
+    """``disambiguate_catalogs``/``disambiguate_workloads``/
+    ``disambiguate_versions`` — the "build pairs, ``disambiguate()``" step
+    ``catalog_pairs``/``workload_pairs``/``version_pairs`` each fed
+    independently in the CLI and the browser before these existed.
+    ``TestDisambiguate`` above already covers ``disambiguate()``'s own
+    collision/hint/hash logic in full; these only check that each
+    wrapper builds the right pairs (and, for workloads, the right hint)
+    from real-shaped objects and returns names in the same order."""
+
+    def test_disambiguate_catalogs_disambiguates_colliding_display_names(self) -> None:
+        catalogs = [
+            SimpleNamespace(display_name="dup", catalog_id=CatalogId("cat-1")),
+            SimpleNamespace(display_name="dup", catalog_id=CatalogId("cat-2")),
+            SimpleNamespace(display_name="unique", catalog_id=CatalogId("cat-3")),
+        ]
+        result = disambiguate_catalogs(cast(Any, catalogs))
+        assert result[2] == "unique"
+        assert result[0] != result[1]
+        assert result[0].startswith("dup #") and result[1].startswith("dup #")
+
+    def test_disambiguate_workloads_uses_type_hint_by_default(self) -> None:
+        workloads = [
+            SimpleNamespace(display_name="Alice", workload_uid=WorkloadUid("wl-1"), type_hint="MAIL"),
+            SimpleNamespace(display_name="Alice", workload_uid=WorkloadUid("wl-2"), type_hint="DRIVE"),
+        ]
+        result = disambiguate_workloads(cast(Any, workloads))
+        assert result == ["Alice · MAIL", "Alice · DRIVE"]
+
+    def test_disambiguate_workloads_use_type_hint_false_skips_the_hint(self) -> None:
+        """The browser's own per-sub_type leaf list: every sibling already
+        shares one ``type_hint`` by construction, so showing it again
+        would be redundant -- ``use_type_hint=False`` falls back straight
+        to the hash suffix instead, same as passing no hints at all."""
+        workloads = [
+            SimpleNamespace(display_name="Alice", workload_uid=WorkloadUid("wl-1"), type_hint="MAIL"),
+            SimpleNamespace(display_name="Alice", workload_uid=WorkloadUid("wl-2"), type_hint="MAIL"),
+        ]
+        result = disambiguate_workloads(cast(Any, workloads), use_type_hint=False)
+        assert "·" not in result[0] and "·" not in result[1]
+        assert result[0] != result[1]
+        assert result[0].startswith("Alice #") and result[1].startswith("Alice #")
+
+    def test_disambiguate_versions_disambiguates_colliding_display_names(self) -> None:
+        versions = [
+            SimpleNamespace(display_name="2026-01-01 00:00", version_uid=VersionUid("v-1")),
+            SimpleNamespace(display_name="2026-01-01 00:00", version_uid=VersionUid("v-2")),
+        ]
+        result = disambiguate_versions(cast(Any, versions))
+        assert result[0] != result[1]
+        assert result[0].startswith("2026-01-01 00:00 #") and result[1].startswith("2026-01-01 00:00 #")
 
 
 class TestMatchDisplayName:

@@ -55,7 +55,6 @@ def test_major_beyond_max_raises_unsupported_version() -> None:
 
 
 def test_minor_is_never_checked_on_read() -> None:
-    # "Version check on read is major-only. Accept any minor."
     data = _build(major=3, minor=99)
     parsed = parse_index_header(data, expect_magic=b"bFiL", max_major=3)
     assert parsed.minor == 99

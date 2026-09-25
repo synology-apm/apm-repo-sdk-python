@@ -34,8 +34,8 @@ _SPEC_HEADER = "FORMAT-SPEC.md: composition-splitting"
 _SPEC_RECORD = "FORMAT-SPEC.md: RecordHead"
 
 _COMPOSITION_MAJOR = 1
-"""``CompMajor::Advance`` — the only value ever written or supported;
-``CompMajor::Basic`` (0) is explicitly obsolete on both read and write."""
+"""The only composition major version ever written or supported; major=0
+is an obsolete, no-longer-supported composition format."""
 
 _OFF_SUB_FILE_SIZE = 8
 
@@ -45,7 +45,7 @@ _MODE_REDUNDANCY = 0x0001
 
 @dataclasses.dataclass(frozen=True)
 class CompositionHeader:
-    """Parsed composition sub-file header (present only at ``subID=0``)."""
+    """Parsed composition sub-file header."""
 
     major: int
     minor: int
@@ -160,17 +160,18 @@ _CRC_THREAD_HOP_MIN_BYTES = 1 << 18  # 256 KiB
 """``zlib.crc32`` runs on the order of 1+ GB/s; an ``asyncio.to_thread()``
 dispatch/context-switch costs on the order of 100us — below this many
 bytes, calling ``verify_chunk_map_crc`` directly is faster than the hop
-itself, the same "too small to bother" reasoning ``dedup/pool.py``'s
-``read_chunk``/``units/saas/objectdb.py`` already document for a
-decrypt+decompress pass. Most ``file_map`` rows' chunk-map arrays are
-well under this; the rare multi-hundred-MB array
-(``verify_chunk_map_crc``'s own docstring) is what actually needs it."""
+itself, the same "too small to bother" reasoning
+``dedup/pool/_bucket_reader.py``'s ``read_chunk``/``units/saas/objectdb.py``
+already document for a decrypt+decompress pass. Most ``file_map`` rows'
+chunk-map arrays are
+well under this; the rare multi-hundred-MB array is what actually needs
+it."""
 
 
 def should_thread_chunk_map_crc(map_array_bytes: bytes) -> bool:
     """Whether ``verify_chunk_map_crc(map_array_bytes, ...)`` is worth
     running via ``asyncio.to_thread()`` rather than calling directly —
-    see ``_CRC_THREAD_HOP_MIN_BYTES``'s own docstring. This module stays
+    see ``_CRC_THREAD_HOP_MIN_BYTES``. This module stays
     synchronous throughout (the Codec Layer never does I/O or threading
     itself), so both async callers (``dedup/verify_checks.py``,
     ``diagnostics.py``) that CRC-verify a chunk-map array make this same

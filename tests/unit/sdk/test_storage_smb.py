@@ -466,13 +466,12 @@ class TestErrorMapping:
     async def test_status_access_denied_with_no_errno_mapping_maps_to_permission_denied(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """Regression: reproduced live against a real SMB server denying
-        access to a real directory — smbclient's own ``SMBOSError`` has no
-        errno mapping at all for ``STATUS_ACCESS_DENIED`` (the actual NT
-        status an SMB server sends for this), so it comes back as plain
-        ``errno=0`` with the raw NT status on ``.ntstatus`` instead. Before
-        this was recognized, that error propagated as a raw, uncaught
-        ``OSError`` and crashed the TUI's worker outright."""
+        """``smbclient``'s own ``SMBOSError`` has no errno mapping at all
+        for ``STATUS_ACCESS_DENIED`` (the actual NT status a real SMB
+        server sends for a plain access-denied failure), so it comes back
+        as plain ``errno=0`` with the raw NT status on ``.ntstatus``
+        instead — recognized here via ``.ntstatus``, not ``errno`` alone
+        (see ``_is_permission_denied``)."""
         exc = OSError(0, "Unknown NtStatus error returned 'STATUS_ACCESS_DENIED'")
         exc.ntstatus = 0xC0000022  # type: ignore[attr-defined]
         fake = _FakeSmbClientModule(fail_with=exc)
@@ -524,9 +523,9 @@ class TestErrorMapping:
         assert await store.exists("nope.txt") is False
 
     async def test_exists_returns_false_on_permission_denied(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        """Unlike ``read``/``size``/``listdir``, ``exists()`` never raises —
-        see ``ObjectStore.exists()``'s own docstring for why a probe over
-        many candidates must not abort on one inaccessible sibling."""
+        """Unlike ``read``/``size``/``listdir``, ``exists()`` never raises:
+        callers probe many candidate paths per real hit, and raising on
+        access-denied would abort that search over one bad sibling."""
         fake = _FakeSmbClientModule(fail_with=OSError(errno.EACCES, "permission denied"))
         _patch_smbclient(monkeypatch, fake)
         store = SmbStore("share", server="host")

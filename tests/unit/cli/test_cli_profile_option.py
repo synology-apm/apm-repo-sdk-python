@@ -1,11 +1,10 @@
 """Unit tests for ``--profile`` wired through ``ls``/``doctor`` — a fake
-``Session``/``detect_layout`` stands in for
-real storage, and ``resolve_profile_store`` is monkeypatched so no real
-profile, keyring, or network access is needed. Both ``ls`` and ``doctor``
-are built on ``cli.browse.opened_repo()``, so both commands' own
-``Session``/``resolve_profile_store`` patches target ``cli.browse``, not
-the command modules themselves. See ``tests/unit/cli/test_cli_browse.py``
-for ``open_single_repo``'s own ``store``-branch unit coverage."""
+``Session``/``detect_layout`` stands in for real storage, and
+``resolve_profile_store`` is monkeypatched so no real profile, keyring, or
+network access is needed. Both ``ls`` and ``doctor`` are built on
+``cli.repo_session.opened_repo()``, so both commands' own
+``Session``/``resolve_profile_store`` patches target ``cli.repo_session``,
+not the command modules themselves."""
 
 from __future__ import annotations
 
@@ -14,7 +13,7 @@ from typing import Any, cast
 import pytest
 from typer.testing import CliRunner
 
-import synology_apm_repo.cli.browse as browse
+import synology_apm_repo.cli.repo_session as repo_session
 from synology_apm_repo.cli.main import app
 from synology_apm_repo.sdk.api import Connection, Frame, KeyStatus
 from synology_apm_repo.sdk.format.repo_info import RepoInfo
@@ -57,8 +56,8 @@ class _FakeSession:
 
 def test_ls_with_profile_opens_via_open_remote(monkeypatch: pytest.MonkeyPatch) -> None:
     fake_session = _FakeSession()
-    monkeypatch.setattr(browse, "resolve_profile_store", _fake_resolve_profile_store)
-    monkeypatch.setattr(browse, "Session", lambda: fake_session)
+    monkeypatch.setattr(repo_session, "resolve_profile_store", _fake_resolve_profile_store)
+    monkeypatch.setattr(repo_session, "Session", lambda: fake_session)
 
     result = runner.invoke(app, ["ls", "--profile", "demo", ""])
     assert result.exit_code == 0, result.output
@@ -72,7 +71,7 @@ def test_ls_without_profile_never_calls_resolve_profile_store(monkeypatch: pytes
     def _fail_if_called(name: str) -> object:
         raise AssertionError("resolve_profile_store must not be called without --profile")
 
-    monkeypatch.setattr(browse, "resolve_profile_store", _fail_if_called)
+    monkeypatch.setattr(repo_session, "resolve_profile_store", _fail_if_called)
 
     class _FakeLocalSession:
         async def open(self, *args: object, **kwargs: object) -> list[object]:
@@ -81,16 +80,15 @@ def test_ls_without_profile_never_calls_resolve_profile_store(monkeypatch: pytes
         async def close(self) -> None:
             pass
 
-    monkeypatch.setattr(browse, "Session", lambda: cast(Any, _FakeLocalSession()))
+    monkeypatch.setattr(repo_session, "Session", lambda: cast(Any, _FakeLocalSession()))
 
     result = runner.invoke(app, ["ls", "/some/local/path"])
     assert result.exit_code == 0, result.output
 
 
 # -- doctor --profile -----------------------------------------------------
-# doctor's own --verbose output absorbs what a separate ``info`` command
-# used to report (repo_root/repo_id/repo_uuid/repo_type) — see
-# commands/doctor.py's module docstring.
+# doctor's own --verbose output surfaces repo_root (repository-wide) plus
+# each catalog's own catalog_id/namespaces/repo_uuid/repo_type.
 
 _FAKE_REPO_INFO = RepoInfo(
     uuid="fake-uuid",
@@ -155,8 +153,8 @@ class _FakeDoctorSession:
 
 
 def test_doctor_with_profile_resolves_store(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(browse, "resolve_profile_store", _fake_resolve_profile_store)
-    monkeypatch.setattr(browse, "Session", lambda: _FakeDoctorSession())
+    monkeypatch.setattr(repo_session, "resolve_profile_store", _fake_resolve_profile_store)
+    monkeypatch.setattr(repo_session, "Session", lambda: _FakeDoctorSession())
 
     result = runner.invoke(app, ["--verbose", "doctor", "--profile", "demo"])
     assert result.exit_code == 0, result.output
@@ -165,10 +163,9 @@ def test_doctor_with_profile_resolves_store(monkeypatch: pytest.MonkeyPatch) -> 
 
 def test_doctor_shows_catalog_id_when_verbose(monkeypatch: pytest.MonkeyPatch) -> None:
     """``catalog_id`` (an object-storage catalog's own repo-id, or a
-    vault's ``connection_config_id`` stringified — see
-    ``identifiers.CatalogId``) is the ``--verbose``-only per-catalog
-    replacement for what used to be a single, repository-wide
-    ``repo_id`` on the layout itself."""
+    vault's ``connection_config_id`` stringified) is the
+    ``--verbose``-only per-catalog identifier asserted on here, since a
+    repository's catalogs can each have their own."""
 
     class _FakeDoctorRepoWithId:
         layout = RepositoryLayout(kind=RepoKind.OBJECT_STORE, repo_root="")
@@ -188,8 +185,8 @@ def test_doctor_shows_catalog_id_when_verbose(monkeypatch: pytest.MonkeyPatch) -
         async def close(self) -> None:
             pass
 
-    monkeypatch.setattr(browse, "resolve_profile_store", _fake_resolve_profile_store)
-    monkeypatch.setattr(browse, "Session", lambda: _FakeDoctorSessionWithId())
+    monkeypatch.setattr(repo_session, "resolve_profile_store", _fake_resolve_profile_store)
+    monkeypatch.setattr(repo_session, "Session", lambda: _FakeDoctorSessionWithId())
 
     result = runner.invoke(app, ["--verbose", "doctor", "--profile", "demo"])
     assert result.exit_code == 0, result.output

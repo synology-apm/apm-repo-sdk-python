@@ -39,7 +39,8 @@ def test_valid_progress_values_reach_the_subcommand(value: str) -> None:
 
 def test_dash_h_is_an_alias_for_help_at_the_root() -> None:
     # Click's own default help_option_names is ["--help"] only — main.py's
-    # Typer() adds "-h" explicitly (see its own context_settings comment).
+    # Typer() sets context_settings={"help_option_names": ["-h", "--help"]}
+    # to accept "-h" as the other half of that pair.
     result = runner.invoke(app, ["-h"])
     assert result.exit_code == 0
     assert result.output == runner.invoke(app, ["--help"]).output

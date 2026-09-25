@@ -8,10 +8,10 @@ reviewer/tool until something actually breaks. ``tests/unit/sdk``/
 internals directly, which is the whole point of that half of the suite, not
 a CLI/TUI-boundary question.
 
-``synology_apm_repo.sdk.api``'s own module docstring states the contract:
-CLI and TUI code should only ever import from ``sdk.api``, plus a short,
-fixed list of cross-cutting/foundational modules (``units.base``,
-``units.node_ref``, ``presentation``, ``storage``, ``profiles``, ``errors``,
+The contract this checks (also documented in ``synology_apm_repo.sdk.api``'s
+module docstring): CLI and TUI code should only ever import from
+``sdk.api``, plus a short, fixed list of cross-cutting/foundational
+modules (``units.base``, ``units.node_ref``, ``presentation``, ``storage``, ``profiles``, ``errors``,
 ``identifiers``) that either predate the facade or are needed to construct
 values a facade method takes/returns (e.g. ``Session.open_remote()``'s
 ``ObjectStore`` argument). Everything else under ``sdk`` (``catalog``,
@@ -21,16 +21,8 @@ radius of any future change to those internals, with nothing else in the
 toolchain (ruff's rule set has no banned-import check) to catch a new
 violation before review.
 
-Three exceptions are hardcoded below, matching the ones ``sdk.api``'s own
-docstring names explicitly: the CLI's ``dump`` command (a diagnostics-only
-escape hatch already isolated into its own sibling module, ``sdk.diagnostics``,
-rather than folded into the ``api`` package), the TUI's ``UnitScreen``
-(three Unit-layer node-navigation helpers with no Repository-layer
-equivalent), and the TUI's own entry point, ``browser.app``, calling
-``concurrency.preload_resource_tracker()`` before ``App.run()`` (see that
-call site's own comment). All three are call-site-specific, not general
-CLI/TUI vocabulary, which is why they're exceptions here rather than
-additions to the allowed prefix list above.
+The exceptions hardcoded below match the ones ``sdk.api``'s docstring
+names explicitly.
 
 Exit code 0 = clean; non-zero = violations printed to stderr.
 """
@@ -74,15 +66,15 @@ ALLOWED_SDK_PREFIXES = (
 #: identical depth for the identical reason -- kept as one definition each
 #: so a future rename/edit to one doesn't have to be hand-copied into
 #: every duplicate.
-_UNIT_SCREEN_HELPERS = (
-    "synology_apm_repo.sdk.units.device_disk_fs",
-    "synology_apm_repo.sdk.units.resolve",
-    "synology_apm_repo.sdk.units.saas.site",
-)
+_UNIT_GOTO_HELPER = ("synology_apm_repo.sdk.units.resolve",)
+_UNIT_LIST_OVERVIEW_HELPER = ("synology_apm_repo.sdk.units.saas.site",)
+_UNIT_DISK_FS_SIBLING_HELPER = ("synology_apm_repo.sdk.units.device_disk_fs",)
 _DEDUP_REPO_FIXTURE = ("synology_apm_repo.sdk.dedup.repository",)
 _REPO_INFO_FIXTURE = ("synology_apm_repo.sdk.format.repo_info",)
+_SAAS_STREAM_CACHE_FIXTURE = ("synology_apm_repo.sdk.units.saas.stream",)
 _DIAGNOSTICS_MODULE = ("synology_apm_repo.sdk.diagnostics",)
 _DEVICE_MODULE_MONKEYPATCH = ("synology_apm_repo.sdk.units.device",)
+_CONCURRENCY_MODULE = ("synology_apm_repo.sdk.concurrency",)
 _DUMP_FORMAT_PRIMITIVES = (
     "synology_apm_repo.sdk.format.addressing",
     "synology_apm_repo.sdk.format.bucket",
@@ -92,15 +84,21 @@ _DUMP_FORMAT_PRIMITIVES = (
 )
 
 #: Per-importing-module extra allowances, each scoped to exactly the one
-#: call site that needs it -- see this module's own docstring. To add an
-#: entry: find (or add) a shared tuple above for the reason, then key it
-#: by the importing module's own dotted name (production packages resolve
-#: normally; a test file's is `tests.<unit|integration>.<cli|browser>.<module>`,
-#: matching this script's own `SOURCE_ROOTS`/`_module_name`).
+#: call site that needs it, since each is call-site-specific rather than
+#: general CLI/TUI vocabulary. To add an entry: find (or add) a shared
+#: tuple above for the reason, then key it by the importing module's own
+#: dotted name (production packages resolve normally; a test file's is
+#: `tests.<unit|integration>.<cli|browser>.<module>`, matching this
+#: script's own `SOURCE_ROOTS`/`_module_name`).
 EXCEPTIONS: dict[str, tuple[str, ...]] = {
     "synology_apm_repo.cli.commands.dump": _DIAGNOSTICS_MODULE,
-    "synology_apm_repo.browser.screens.unit_screen": _UNIT_SCREEN_HELPERS,
-    "synology_apm_repo.browser.app": ("synology_apm_repo.sdk.concurrency",),
+    "synology_apm_repo.browser.screens.unit_screen": (
+        *_UNIT_GOTO_HELPER,
+        *_UNIT_LIST_OVERVIEW_HELPER,
+        *_CONCURRENCY_MODULE,
+    ),
+    "synology_apm_repo.browser.core.unit.select": _UNIT_LIST_OVERVIEW_HELPER,
+    "synology_apm_repo.browser.app": _CONCURRENCY_MODULE,
     # Test-only whitebox exceptions -- each reaches past the facade for a
     # name with no facade equivalent (unlike a real boundary violation,
     # where a facade alternative already exists and the import should
@@ -116,15 +114,30 @@ EXCEPTIONS: dict[str, tuple[str, ...]] = {
     # Fixture/fake construction needing DedupRepo itself (e.g. a
     # _FakeDedupRepo standing in for one) -- no facade equivalent exists;
     # production CLI/TUI code never imports the class name at all, only
-    # ever holds an already-opened instance handed to it internally.
-    "tests.unit.cli.test_cli_browse": _DEDUP_REPO_FIXTURE,
-    "tests.unit.cli.test_cli_ls": _DEDUP_REPO_FIXTURE,
-    "tests.unit.cli.test_cli_tree": _DEDUP_REPO_FIXTURE,
-    "tests.unit.browser.test_browser_browse_screen_gaps": _DEDUP_REPO_FIXTURE,
+    # ever holds an already-opened instance handed to it internally. Each
+    # also needs SaasStreamCache: constructing a real Catalog directly
+    # (these are whitebox Catalog subclasses/fakes, not the facade's own
+    # Repository.catalogs()) now requires one, the same "no facade
+    # equivalent" reasoning as DedupRepo -- production CLI/TUI code never
+    # constructs a Catalog directly either.
+    "tests.unit.cli.test_cli_browse": (*_DEDUP_REPO_FIXTURE, *_SAAS_STREAM_CACHE_FIXTURE),
+    "tests.unit.cli.test_cli_ls": (*_DEDUP_REPO_FIXTURE, *_SAAS_STREAM_CACHE_FIXTURE),
+    "tests.unit.cli.test_cli_tree": (*_DEDUP_REPO_FIXTURE, *_SAAS_STREAM_CACHE_FIXTURE),
+    "tests.unit.browser.test_browser_browse_screen_gaps": (*_DEDUP_REPO_FIXTURE, *_SAAS_STREAM_CACHE_FIXTURE),
     # RepoInfo construction for a synthetic Connection/repo fixture -- no
     # facade equivalent; same reasoning as DedupRepo above.
     "tests.unit.cli.test_cli_doctor_report": _REPO_INFO_FIXTURE,
     "tests.unit.cli.test_cli_profile_option": _REPO_INFO_FIXTURE,
+    # A real (not duck-typed) Catalog for verbose-label formatting, which
+    # reaches catalog.info/.connection -- same DedupRepo/RepoInfo/
+    # SaasStreamCache fixture depth as the exceptions immediately above,
+    # applied to a single test in this file rather than the whole
+    # module's own fixtures.
+    "tests.unit.browser.test_browser_core_browse_select": (
+        *_DEDUP_REPO_FIXTURE,
+        *_REPO_INFO_FIXTURE,
+        *_SAAS_STREAM_CACHE_FIXTURE,
+    ),
     # test_cli_dump.py tests the CLI's own dump command, which itself
     # carries the identical exception above (raw format-level inspection
     # is this command's whole purpose) -- its test needs the same depth
@@ -143,12 +156,19 @@ EXCEPTIONS: dict[str, tuple[str, ...]] = {
         *_DUMP_FORMAT_PRIMITIVES,
         "synology_apm_repo.sdk.format.chunkmap",
     ),
-    # These two test UnitScreen directly and need the identical
-    # node-navigation helpers UnitScreen's own production exception above
-    # already names -- same call site, exercised from its test instead of
-    # from the screen itself.
-    "tests.unit.browser.test_browser_unit_screen_disk_fs_nesting": _UNIT_SCREEN_HELPERS,
-    "tests.unit.browser.test_browser_unit_screen_gaps": _UNIT_SCREEN_HELPERS,
+    # These test UnitScreen/select.py directly. _UNIT_LIST_OVERVIEW_HELPER
+    # here is the same call site as those modules' own production
+    # exceptions above, exercised from a test instead. _UNIT_DISK_FS_
+    # SIBLING_HELPER has no production counterpart -- neither module
+    # imports device_disk_fs in production at all -- but these tests need
+    # DISK_FS_SIBLING_REF_ATTR itself to construct/assert the sibling-ref
+    # attribute device_disk_fs.py attaches to a node.
+    "tests.unit.browser.test_browser_unit_screen_disk_fs_nesting": _UNIT_DISK_FS_SIBLING_HELPER,
+    "tests.unit.browser.test_browser_unit_screen_gaps": (*_UNIT_DISK_FS_SIBLING_HELPER, *_UNIT_LIST_OVERVIEW_HELPER),
+    "tests.unit.browser.test_browser_core_unit_select": (
+        *_UNIT_DISK_FS_SIBLING_HELPER,
+        *_UNIT_LIST_OVERVIEW_HELPER,
+    ),
 }
 
 
@@ -180,9 +200,11 @@ def _sdk_imports(tree: ast.Module) -> list[tuple[int, str]]:
 
 def main() -> int:
     violations: list[str] = []
+    seen_modules: set[str] = set()
     for root, root_package in SOURCE_ROOTS:
         for path in sorted(root.rglob("*.py")):
             module_name = _module_name(path, root, root_package)
+            seen_modules.add(module_name)
             allowed_extra = EXCEPTIONS.get(module_name, ())
             tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
             for lineno, imported in _sdk_imports(tree):
@@ -192,15 +214,30 @@ def main() -> int:
                 # every platform, so it should not switch to backslashes on Windows.
                 violations.append(f"{path.relative_to(ROOT).as_posix()}:{lineno}: imports {imported!r}")
 
-    if violations:
-        print(
-            "ERROR: import outside the SDK's documented CLI/TUI surface (see sdk/api/__init__.py). "
-            "If this import is a genuine, scoped exception (no facade alternative exists), add it to "
-            "this script's own EXCEPTIONS dict rather than repointing it -- see EXCEPTIONS' own comment:",
-            file=sys.stderr,
-        )
-        for violation in violations:
-            print(f"  {violation}", file=sys.stderr)
+    # A key that no longer names a real module (a rename/move/delete that
+    # forgot to update EXCEPTIONS alongside it) would otherwise pass
+    # silently forever -- nothing above ever looks a stale key up, so
+    # there's no other way this script would ever notice one on its own.
+    stale_keys = sorted(k for k in EXCEPTIONS if k not in seen_modules)
+
+    if violations or stale_keys:
+        if violations:
+            print(
+                "ERROR: import outside the SDK's documented CLI/TUI surface (see sdk/api/__init__.py). "
+                "If this import is a genuine, scoped exception (no facade alternative exists), add it to "
+                "this script's own EXCEPTIONS dict instead of repointing it:",
+                file=sys.stderr,
+            )
+            for violation in violations:
+                print(f"  {violation}", file=sys.stderr)
+        if stale_keys:
+            print(
+                "ERROR: EXCEPTIONS key(s) that no longer match any real module -- "
+                "the module was renamed/moved/deleted without updating this dict:",
+                file=sys.stderr,
+            )
+            for key in stale_keys:
+                print(f"  {key}", file=sys.stderr)
         return 1
 
     print("OK: every CLI/TUI import of the SDK stays within the documented surface.")

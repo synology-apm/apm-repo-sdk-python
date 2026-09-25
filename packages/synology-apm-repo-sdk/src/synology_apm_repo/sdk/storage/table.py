@@ -167,13 +167,21 @@ def as_int(value: object) -> int:
     """Narrow one of ``Table.select``'s ``object | None`` values to
     ``int`` — a thin, explicit boundary between a caller's typed
     dataclasses and the untyped ``dict`` rows SQLite hands back, rather
-    than scattering ``# type: ignore`` at every call site."""
-    assert isinstance(value, int)
+    than scattering ``# type: ignore`` at every call site. Raises
+    ``DataCorruptError``, the same exception this module's own
+    ``Table.create`` already raises for a schema mismatch, rather than a
+    bare ``AssertionError`` a caller's ``except (..., DataCorruptError,
+    ...)`` degrade path wouldn't catch."""
+    if not isinstance(value, int):
+        raise DataCorruptError(f"expected an int column value, got {value!r}")
     return value
 
 
 def as_str(value: object) -> str:
-    assert isinstance(value, str)
+    """Narrow one of ``Table.select``'s ``object | None`` values to
+    ``str``, the same way ``as_int`` narrows to ``int``."""
+    if not isinstance(value, str):
+        raise DataCorruptError(f"expected a str column value, got {value!r}")
     return value
 
 

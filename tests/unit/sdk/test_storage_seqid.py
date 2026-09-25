@@ -40,7 +40,7 @@ def test_bare_name_wins_when_alone() -> None:
 
 
 def test_suffixed_wins_over_bare() -> None:
-    # on-disk-format.md §3.4: a bare name is *also* valid, but on-disk it
+    # FORMAT-SPEC.md: sequence-id-suffix -- a bare name is *also* valid, but on-disk it
     # coexists with suffixed generations only as a stale/earlier artifact —
     # the largest suffix always wins when both are present.
     index = {"0.buk": ["0.buk", "0.buk.5"]}

@@ -48,8 +48,10 @@ the S3/Azure prefix-probing behavior.
 
 Unlike ``S3Store``/``AzureStore``, ``smbprotocol`` gives this module no
 timeout/retry knobs of its own to configure past the initial connect —
-see the module-level ``_DEFAULT_*`` constants below for what this module
-adds in their place and why.
+a stalled share would otherwise block a call forever, and neither a
+connect nor a later operation failure carries any signal distinguishing
+"worth retrying" from "never will be" — so this module adds both itself,
+via ``_DEFAULT_OPERATION_TIMEOUT``/``_DEFAULT_MAX_ATTEMPTS`` below.
 """
 
 from __future__ import annotations
@@ -71,9 +73,10 @@ _DEFAULT_PORT = 445
 
 # smbprotocol's own default connect timeout (60s, smbclient.register_session's
 # own connection_timeout parameter) is tuned for a long-running batch job, not
-# an interactive "is this share even reachable" probe — the same rationale
-# storage/s3.py's/storage/azure.py's own module docstrings give for their own
-# equivalent constants.
+# an interactive "is this share even reachable" probe — S3Store/AzureStore cap
+# their own long batch-job default timeouts the same way, down to a value an
+# interactive caller (the TUI's connect dialog, in particular) can actually
+# wait through when an endpoint is unreachable.
 _DEFAULT_CONNECTION_TIMEOUT = 5
 
 # smbprotocol has no timeout of its own for anything *after* a successful
@@ -114,10 +117,10 @@ _DEFAULT_CONNECTION_POOL_SIZE = 2
 
 # A short pause before retrying a credit-exhaustion race (see
 # _is_credit_exhaustion) rather than immediately re-attempting — gives
-# whatever briefly held the sole credit (see that function's own docstring)
-# a moment to return it. Deliberately much shorter than a real reconnect: the
-# connection itself is healthy here, this is only ever waiting out a
-# transient flow-control condition.
+# whatever raced this store's own request for the connection's sole
+# starting credit a moment to return it. Deliberately much shorter than a
+# real reconnect: the connection itself is healthy here, this is only ever
+# waiting out a transient flow-control condition.
 _CREDIT_RETRY_DELAY = 0.1
 
 #: ``OSError.errno`` values ``smbclient`` raises for "this path doesn't
@@ -141,8 +144,9 @@ _PERMISSION_DENIED_ERRNOS = frozenset({errno.EACCES})
 
 #: ``smbprotocol``'s own ``NtStatus.STATUS_ACCESS_DENIED`` (0xC0000022) —
 #: hardcoded rather than importing ``smbprotocol.header.NtStatus`` at
-#: module scope, the same lazy-import reasoning as this module's own
-#: docstring (and the same trade-off ``storage/local.py``'s
+#: module scope, the same lazy-import policy the module docstring above
+#: gives for ``smbprotocol`` itself (and the same trade-off
+#: ``storage/local.py``'s
 #: ``_DARWIN_F_RDADVISE`` constant already makes). This is the actual NT
 #: status an SMB server sends for a plain "access denied" (an unlistable
 #: directory's real-world response) — yet ``SMBOSError``'s own mapping
@@ -158,10 +162,11 @@ def _is_permission_denied(exc: OSError) -> bool:
     ``smbclient`` does map to one (``EACCES``, from
     ``STATUS_PRIVILEGE_NOT_HELD``), or the raw NT status it currently maps
     to no errno at all (``STATUS_ACCESS_DENIED`` — see
-    ``_STATUS_ACCESS_DENIED``'s own comment). ``.ntstatus`` is
-    ``SMBOSError``-specific, not a plain ``OSError`` attribute — absent on
-    any other ``OSError`` this might be, hence ``getattr`` with a default
-    rather than a plain attribute access."""
+    ``_STATUS_ACCESS_DENIED``'s comment above for why that one has no
+    errno). ``.ntstatus`` is ``SMBOSError``-specific, not a plain
+    ``OSError`` attribute — absent on any other ``OSError`` this might be,
+    hence ``getattr`` with a default rather than a plain attribute
+    access."""
     return exc.errno in _PERMISSION_DENIED_ERRNOS or getattr(exc, "ntstatus", None) == _STATUS_ACCESS_DENIED
 
 
@@ -174,8 +179,9 @@ def _is_credit_exhaustion(exc: Exception) -> bool:
     ``_is_permission_denied`` above matching on a raw NT status where
     ``smbprotocol`` gives no dedicated errno — this matches on the fixed
     message text ``_send()`` always raises with. Each pooled slot normally
-    handles one request at a time (see the module docstring), so this
-    should be rare in practice; it's a defense-in-depth catch for whatever
+    handles one request at a time — the pool exists specifically so no two
+    requests ever race the same connection's single starting credit — so
+    this should be rare in practice; it's a defense-in-depth catch for whatever
     the pool doesn't cover (a fresh connection's own background
     keepalive/echo traffic racing this store's first real request on it,
     say), not the primary fix."""
@@ -185,9 +191,9 @@ def _is_credit_exhaustion(exc: Exception) -> bool:
 
 
 def _import_smbclient() -> Any:
-    """Lazy ``import smbclient`` — see the module docstring for why. Shared
-    by every method here so the choice of what to import lives in one
-    place."""
+    """Lazy ``import smbclient``, same rationale as the module docstring
+    above. Shared by every method here so the choice of what to import
+    lives in one place."""
     import smbclient
 
     return smbclient
@@ -241,13 +247,15 @@ class SmbStore:
     own ambient credential chains.
 
     Backed by a small pool of ``_DEFAULT_CONNECTION_POOL_SIZE`` independent
-    SMB sessions (see the module docstring for why: SMB2's own per-connection
-    concurrency is conservatively ~1), each created lazily on first checkout
-    rather than in ``__init__`` (which does no I/O). A call checks out
-    whichever slot is currently free — preferring one already connected,
-    via a LIFO free-stack, so sequential, non-overlapping calls keep reusing
-    the same session instead of needlessly spreading across the whole pool —
-    and holds it exclusively until that call (including any of its own
+    SMB sessions, not one shared session — an SMB2 connection's own
+    client-side flow-control window starts at exactly 1, so two requests
+    in flight at once on one connection would race for that single
+    credit — each created lazily on first checkout rather than in
+    ``__init__`` (which does no I/O). A call checks out whichever slot is
+    currently free — preferring one already connected, via a LIFO
+    free-stack, so sequential, non-overlapping calls keep reusing the same
+    session instead of needlessly spreading across the whole pool — and
+    holds it exclusively until that call (including any of its own
     retries) finishes.
     """
 
@@ -376,7 +384,8 @@ class SmbStore:
         """Tear down every pooled slot's own SMB session that was ever
         used — safe to call more than once, and scoped to this instance's
         own slots alone (each with its own private ``connection_cache``,
-        see the module docstring), so it never disturbs another
+        rather than sharing ``smbclient``'s process-wide, server-keyed
+        session bookkeeping), so it never disturbs another
         ``SmbStore`` sharing the same server.
 
         Acquires every slot's own checkout permit first (the same
@@ -463,10 +472,9 @@ class SmbStore:
         try:
             return bool(smbclient.path.exists(self._unc(path), connection_cache=connection_cache))
         except OSError as exc:
-            # See ObjectStore.exists()'s own docstring: a probe that can
-            # raise on a denied sibling would abort a caller's whole
-            # candidate search, so this reads as "not found" instead —
-            # matching LocalFsStore's own _exists_sync.
+            # A probe that can raise on a denied sibling would abort a
+            # caller's whole candidate search, so this reads as "not found"
+            # instead — matching LocalFsStore's own _exists_sync.
             if _is_permission_denied(exc):
                 return False
             raise

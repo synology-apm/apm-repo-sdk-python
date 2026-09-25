@@ -19,7 +19,8 @@ CLI command should call, never ``ProgressMeter()`` directly.
 
 ``finish_live_progress`` is the other entry point every command with
 progress-bearing work must call, exactly once, right before it prints its
-own first real report line — see that function's own docstring for why.
+own first real report line, to clear any live progress line still
+sitting on the terminal row it would otherwise print over.
 """
 
 from __future__ import annotations

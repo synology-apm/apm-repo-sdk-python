@@ -23,11 +23,11 @@ def patch_profile_store(
     "resolve_profile_store", _resolve)`` block every
     ``tests/integration/cli/test_*.py`` file used to copy-paste for
     itself. Call it once per module that needs patching — most files
-    patch only ``cli.browse``; ``test_cli_export.py`` patches
+    patch only ``cli.repo_session``; ``test_cli_export.py`` patches
     ``cli.commands.export`` instead, and
     ``test_cli_canonical_ref_roundtrip.py`` patches both.
 
-    Routes through ``record_target`` (see its own docstring) rather than a
+    Routes through ``record_target`` rather than a
     bare ``ReplayStore.from_path`` so these CLI tests get ``--record-against``
     support for free, the same as every other replay test — including its
     real-content recording guard, so ``allow_content`` forwards straight

@@ -112,7 +112,10 @@ class SmokeContext:
 
     def check(self, domain: str, step: str, condition: bool, *, note: str = "") -> bool:
         """Record a pure, no-subprocess assertion over already-captured
-        output -- PASSED/FAILED, never SKIPPED."""
+        output -- PASSED/FAILED, never SKIPPED. ``condition`` must already
+        be a safe value to evaluate -- anything that could itself raise (an
+        attribute chain into a real domain object, ...) belongs inside its
+        own ``ctx.call``-wrapped helper first."""
         stats = self.stats[domain]
         self._mark(domain, step)
         if condition:

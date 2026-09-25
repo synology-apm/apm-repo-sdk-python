@@ -13,7 +13,7 @@ enforced by its own dataclass instead of by validation code here.
 ``S3ProfileConfig``/``AzureProfileConfig``/``SmbProfileConfig``/secret-field-name
 constants (rather than re-declaring ``bucket``/``container``/``server``/...
 itself) so it maps straight onto ``sdk.profiles.store_from_config()`` with
-no translation layer of its own -- see that dataclass's own docstring.
+no translation layer of its own.
 """
 
 from __future__ import annotations

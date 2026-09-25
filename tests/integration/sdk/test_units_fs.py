@@ -82,8 +82,10 @@ async def test_replayed_fs_tree_resolves_to_a_known_json_config_file(
             assert config.size == 2420
 
             # .open() only reports metadata (no real I/O) -- this test
-            # deliberately never reads the file's real content; see this
-            # module's own docstring.
+            # deliberately never reads the file's real Composition/Pool
+            # chunk content: DedupFile.read()'s own decoding correctness
+            # is already covered synthetically, with zero real data, by
+            # tests/unit/sdk/test_units_fs.py.
             content = (await provider.unit(config)).open()
             assert content.size == 2420
 

@@ -4,9 +4,7 @@
 ``test_format_chunkmap.py``, written to real ``tmp_path`` files for the
 local (non-``--profile``) case, since that's what ``dump`` operates on
 without a store of its own; ``TestDumpProfile`` below covers the
-``--profile`` case against an in-memory fake ``ObjectStore`` instead). See
-``tests/integration/cli/test_cli_dump.py`` for the cross-check against real
-``apv-sample-1`` bucket/composition files.
+``--profile`` case against an in-memory fake ``ObjectStore`` instead).
 """
 
 from __future__ import annotations

@@ -14,14 +14,14 @@ from __future__ import annotations
 
 from ...errors import NotFoundError
 from ...storage.table import Column, Table, as_int
-from ..base import RestorableUnit, UnitKind, not_restorable
+from ..base import RestorableUnit, UnitKind, mtime_attrs, not_restorable
 from .provider import (
     RecursiveTreeSaasProvider,
     SaasWorkloadConfig,
     SaasWorkloadProvider,
     make_saas_provider,
 )
-from .tree_strategy import RecursiveTree
+from .tree_strategy import FolderPredicate, RecursiveTree
 
 _ITEM_TABLE = "item_table"
 # item_table.type: 0=folder, 1=file. Real data: a folder row always has
@@ -69,10 +69,10 @@ async def _build_tree(provider: SaasWorkloadProvider) -> RecursiveTree:
         # an opaque empty key; Drive's is a real id read off a third
         # table (config_table).
         root_id=await _root_folder_id(provider),
-        is_folder=lambda row: as_int(row["type"]) == _TYPE_FOLDER,
+        folder=FolderPredicate(is_folder=lambda row: as_int(row["type"]) == _TYPE_FOLDER, sql=f"type = {_TYPE_FOLDER}"),
         display_name=lambda row: str(row["name"]),
         # "name" is the natural file-browser sort (required, always
-        # present); tree_strategy.py's _resolve_order_by() appends
+        # present); tree_strategy/_base.py's _resolve_order_by() appends
         # SQLite's own implicit ``rowid`` as the deterministic pagination
         # tiebreaker regardless.
         order_by=["name"],
@@ -80,15 +80,19 @@ async def _build_tree(provider: SaasWorkloadProvider) -> RecursiveTree:
 
 
 def _extra_attrs(provider: SaasWorkloadProvider, row: _Row) -> dict[str, object]:
-    # Doesn't need ``provider`` — row-only reshaping (see
-    # SaasWorkloadConfig.extra_attrs's own docstring for why the
-    # signature carries a provider param at all: other workloads' extras
-    # need it, this one doesn't).
+    # Doesn't need ``provider`` — row-only reshaping (the shared
+    # extra_attrs callback signature always carries a provider param
+    # regardless: other workloads' extras need it, this one doesn't).
     del provider
     # item_table.hash is byte-identical to the file's own meta_object_id
     # JSON's client_metadata.md5Checksum — exposed as node.attrs["hash"]
     # for a caller's own restore-integrity cross-check.
-    return {"content_object_id": row["content_object_id"], "hash": row.get("hash"), "mtime": row["mtime"]}
+    attrs: dict[str, object] = {"content_object_id": row["content_object_id"], "hash": row.get("hash")}
+    attrs.update(mtime_attrs(row["mtime"]))
+    # ``extra_attrs`` only ever runs for a leaf row (``provider.py``'s own
+    # ``_node_for``) — a Drive folder's ``mtime`` is never surfaced, even
+    # though ``item_table`` carries one for every row regardless of type.
+    return attrs
 
 
 def _item_size(row: _Row) -> int | None:
@@ -135,9 +139,10 @@ DRIVE_CONFIG = SaasWorkloadConfig(
 )
 
 
-#: Constructor-style factory over ``DRIVE_CONFIG`` — see
-#: ``make_saas_provider``'s own docstring for what "constructor-style
-#: factory" and "no scan" mean here. ``shared`` is accepted only for
+#: Constructor-style factory over ``DRIVE_CONFIG`` — callable exactly
+#: like a constructor (``await DriveProvider(repo, version, saas_streams)``),
+#: resolving the service DB via the connector's own object-name index
+#: only, never a scan. ``shared`` is accepted only for
 #: calling-convention uniformity with ``units/dispatch.py``'s
 #: ``_ProviderFactory`` — no ``DRIVE``/``USER_DRIVE``/``TEAM_DRIVE``
 #: ``sub_type`` ever offers more than this one candidate, so it is

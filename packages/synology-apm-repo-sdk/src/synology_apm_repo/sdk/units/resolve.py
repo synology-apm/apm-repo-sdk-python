@@ -5,8 +5,8 @@ ancestor chain and each ancestor's own children, to repopulate a ``Tree``
 widget).
 
 For a provider whose ``extra_segments`` grow by exactly one new segment per
-tree level (true for every provider except Drive/Team Drive — see
-``SupportsDirectRefLookup``'s own docstring), a target's ``extra_segments``
+tree level (true for every provider except Drive/Team Drive, which key
+every node by a single, depth-independent id instead), a target's ``extra_segments``
 is a real, checkable prefix relationship: a child is only worth
 descending into when its own ref is a prefix of the target's.
 ``find_node``/``find_path_with_children`` use exactly that to visit only the
@@ -27,7 +27,7 @@ from .node_ref import NodeRef
 
 _PAGE_SIZE = 500
 """Matches the TUI's own children-pagination page size
-(``browser/screens/unit_screen.py``'s ``_CHILDREN_PAGE_SIZE``) — large
+(``browser/core/unit/update.py``'s ``CHILDREN_PAGE_SIZE``) — large
 enough that a real tree level almost always resolves in one page, small
 enough that a single pathologically wide level doesn't force one huge
 fetch before a match found early in it can short-circuit (``find_node``'s
@@ -126,10 +126,10 @@ async def _descend(
         return None
     exact, children, candidates = await _children_matching(provider, node, target_extra, need_full_list=need_full_list)
     # An exact match is unambiguous — try only it. Otherwise try each
-    # non-leaf prefix candidate in turn (normally just one; see
-    # _children_matching's own docstring for the real exception), moving
-    # on rather than giving up when an earlier one's own subtree turns
-    # out not to actually contain the target.
+    # non-leaf prefix candidate in turn (normally just one -- a
+    # disk-image node's own "(filesystem)" sibling is the real exception),
+    # moving on rather than giving up when an earlier one's own subtree
+    # turns out not to actually contain the target.
     for child in [exact] if exact is not None else candidates:
         deeper = await _descend(provider, child, target, need_full_list=need_full_list)
         if deeper is not None:

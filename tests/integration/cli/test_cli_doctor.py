@@ -1,7 +1,7 @@
 """Regression test for ``synology-apm-repo-cli doctor`` — replayed from committed
 fixtures recorded against real bytes, with **no external dependency**:
-same ``patch_profile_store`` fixture (``tests/conftest.py``) every
-sibling in this directory uses.
+same ``patch_profile_store`` fixture (``tests/integration/cli/conftest.py``)
+every sibling in this directory uses.
 
 ``doctor.py``'s own ``_run()`` builds the exact same ``report`` dict
 regardless of ``--verbose``/``--json`` (those flags only change how
@@ -45,7 +45,7 @@ from types import ModuleType
 
 from typer.testing import CliRunner
 
-import synology_apm_repo.cli.browse as browse_mod
+import synology_apm_repo.cli.repo_session as repo_session_mod
 from synology_apm_repo.cli.main import app
 
 runner = CliRunner()
@@ -62,7 +62,7 @@ _WINDOWS_VM_WORKLOAD_ID = 2
 def test_doctor_human_output_hides_internal_ids_replayed(
     patch_profile_store: Callable[[str, ModuleType], None],
 ) -> None:
-    patch_profile_store("cli_doctor_apv1_vault.json.gz", browse_mod)
+    patch_profile_store("cli_doctor_apv1_vault.json.gz", repo_session_mod)
     result = runner.invoke(app, ["doctor", "--profile", "anything"])
     assert result.exit_code == 0, result.output
     assert "Windows 10 (64-bit)" in result.output  # a real, never-anonymized OS-name subtitle
@@ -73,7 +73,7 @@ def test_doctor_human_output_hides_internal_ids_replayed(
 def test_doctor_verbose_output_shows_internal_ids_replayed(
     patch_profile_store: Callable[[str, ModuleType], None],
 ) -> None:
-    patch_profile_store("cli_doctor_apv1_vault.json.gz", browse_mod)
+    patch_profile_store("cli_doctor_apv1_vault.json.gz", repo_session_mod)
     result = runner.invoke(app, ["--verbose", "doctor", "--profile", "anything"])
     assert result.exit_code == 0, result.output
     assert "repo_uuid" in result.output
@@ -98,10 +98,10 @@ def test_doctor_json_output_hides_internal_ids_without_verbose_replayed(
 ) -> None:
     """``--json`` must hide the same internal ids human mode does without
     ``--verbose`` — the two must never disagree about what's exposed by
-    default (see ``_DoctorReport``'s own docstring: these fields are
-    ``NotRequired``, present only ``if state.verbose``, so both renderers
-    read the exact same already-filtered dict)."""
-    patch_profile_store("cli_doctor_apv1_vault.json.gz", browse_mod)
+    default (these report fields are ``NotRequired``, present only
+    ``if state.verbose``, so both renderers read the exact same
+    already-filtered dict)."""
+    patch_profile_store("cli_doctor_apv1_vault.json.gz", repo_session_mod)
     result = runner.invoke(app, ["--json", "doctor", "--profile", "anything"])
     assert result.exit_code == 0, result.output
     report = json.loads(result.stdout)
@@ -120,7 +120,7 @@ def test_doctor_json_output_hides_internal_ids_without_verbose_replayed(
 def test_doctor_verbose_json_output_is_valid_and_keyed_by_stable_fields_replayed(
     patch_profile_store: Callable[[str, ModuleType], None],
 ) -> None:
-    patch_profile_store("cli_doctor_apv1_vault.json.gz", browse_mod)
+    patch_profile_store("cli_doctor_apv1_vault.json.gz", repo_session_mod)
     result = runner.invoke(app, ["--verbose", "--json", "doctor", "--profile", "anything"])
     assert result.exit_code == 0, result.output
     report = json.loads(result.stdout)
@@ -140,7 +140,7 @@ def test_doctor_verbose_json_output_is_valid_and_keyed_by_stable_fields_replayed
 def test_doctor_marks_saas_sub_types_supported_or_unsupported_correctly_replayed(
     patch_profile_store: Callable[[str, ModuleType], None],
 ) -> None:
-    patch_profile_store("cli_doctor_apv1_vault.json.gz", browse_mod)
+    patch_profile_store("cli_doctor_apv1_vault.json.gz", repo_session_mod)
     result = runner.invoke(app, ["--verbose", "--json", "doctor", "--profile", "anything"])
     report = json.loads(result.stdout)
     all_workloads = [wl for cat in report["catalogs"] for wl in cat["workloads"]]
@@ -160,7 +160,7 @@ def test_doctor_marks_saas_sub_types_supported_or_unsupported_correctly_replayed
 def test_doctor_reports_not_encrypted_for_an_unencrypted_repo_even_without_a_key_replayed(
     patch_profile_store: Callable[[str, ModuleType], None],
 ) -> None:
-    patch_profile_store("cli_doctor_apv1_vault.json.gz", browse_mod)
+    patch_profile_store("cli_doctor_apv1_vault.json.gz", repo_session_mod)
     result = runner.invoke(app, ["--json", "doctor", "--profile", "anything"])
     report = json.loads(result.stdout)
     assert report["key"]["status"] == "not_encrypted"
@@ -170,18 +170,18 @@ def test_doctor_reports_not_encrypted_for_an_unencrypted_repo_even_without_a_key
 def test_doctor_fails_cleanly_for_an_encrypted_repo_given_no_key_replayed(
     patch_profile_store: Callable[[str, ModuleType], None],
 ) -> None:
-    """``Repository.workloads()``/``.versions()`` now raise ``KeyRequiredError``
+    """``Repository.workloads()``/``.versions()`` raise ``KeyRequiredError``
     before any catalog I/O for a confirmed-encrypted, not-yet-keyed repository
     (see ``api/repository.py``'s ``_require_key_verified``) — `doctor`
     gets no special carve-out for this, the same as every other command;
     it fails cleanly via the shared ``opened_repo()`` handler rather than
     printing a report that includes a ``no_key_provided`` key status
-    alongside real workload data, which is what this test asserted before
-    that gate existed. ``errors.py``'s ``friendly_message()`` rephrases
+    alongside real workload data. ``errors.py``'s ``friendly_message()`` rephrases
     the SDK's own ``KeyRequiredError`` wording (aimed at a caller who'd call
     ``set_key()`` directly) into CLI language before it reaches here —
-    see that function's own docstring."""
-    patch_profile_store("cli_doctor_apv2_vault.json.gz", browse_mod)
+    ``--key``/``synology-apm-repo-cli key``, never the internal
+    ``set_key()`` method name."""
+    patch_profile_store("cli_doctor_apv2_vault.json.gz", repo_session_mod)
     result = runner.invoke(app, ["--json", "doctor", "--profile", "anything"])
     assert result.exit_code == 1
     assert "this repository is encrypted" in result.output
@@ -192,7 +192,7 @@ def test_doctor_fails_cleanly_for_an_encrypted_repo_given_no_key_replayed(
 def test_doctor_verifies_a_correct_key_for_an_encrypted_repo_replayed(
     patch_profile_store: Callable[[str, ModuleType], None],
 ) -> None:
-    patch_profile_store("cli_doctor_apv2_vault.json.gz", browse_mod)
+    patch_profile_store("cli_doctor_apv2_vault.json.gz", repo_session_mod)
     result = runner.invoke(app, ["--json", "doctor", "--profile", "anything", "--key", _APV2_ENCRYPTED_KEY_STRING])
     assert result.exit_code == 0, result.output
     report = json.loads(result.stdout)
@@ -203,9 +203,8 @@ def test_doctor_verifies_a_correct_key_for_an_encrypted_repo_replayed(
 
 
 def test_doctor_on_nonexistent_path_fails_cleanly(tmp_path: Path) -> None:
-    # Zero real-sample dependency to begin with (an empty tmp_path
-    # directory, no --profile/ReplayStore involved) — moved here as-is
-    # rather than left in tests/integration/, which it never needed.
+    # Zero real-sample dependency (an empty tmp_path directory, no
+    # --profile/ReplayStore involved).
     empty = tmp_path / "not_a_repo"
     empty.mkdir()
     result = runner.invoke(app, ["doctor", str(empty)])

@@ -45,9 +45,8 @@ def _make_in_memory_keyring() -> object:
 @pytest.fixture
 def fake_keyring() -> Iterator[None]:
     """Installs an in-memory keyring backend for the duration of one test,
-    restoring whatever backend was active before — see this module's own
-    docstring for which tests use it, so they never touch the real OS
-    Keychain/Credential Manager/Secret Service."""
+    restoring whatever backend was active before, so it never touches the
+    real OS Keychain/Credential Manager/Secret Service."""
     import keyring
 
     previous = keyring.get_keyring()

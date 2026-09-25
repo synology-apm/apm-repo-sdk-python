@@ -1,9 +1,10 @@
-"""``DiskFsSibling``: the ``units/content/disk_fs.py``-backed "filesystem
+"""``DiskFsSibling``: the ``units/content/disk_fs/``-backed "filesystem
 inside a disk image" axis, additive to a disk-image leaf built by either
 of ``units/device.py``'s two disk axes (VM's own ``_object_nodes()``, or
-``units/device_pcps.py``'s ``PcpsDiskTree``) — see ``units/device.py``'s own
-module docstring for the whole-picture rationale (what "additive" means,
-and what happens when Dissect can't recognize a disk's filesystem).
+``units/device_pcps.py``'s ``PcpsDiskTree``) — the whole-image node keeps
+working unchanged either way: when Dissect can't recognize any filesystem
+on a disk, this sibling is simply absent or shows one diagnostic leaf
+explaining why, never affecting the disk-image node itself.
 
 Resolution goes through the owning ``DeviceProvider``'s own ``unit`` (never
 duplicated here) so this class never needs to know whether the disk
@@ -14,13 +15,12 @@ image it's parsing came from the VM path or a PC/PS
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, TypedDict, cast
+from typing import TYPE_CHECKING, Any, TypedDict, cast
 
 from ..errors import NotFoundError
-from .base import Node, RestorableUnit, UnitKind, diagnostic_node, paginate
+from .base import FileState, Node, RestorableUnit, UnitKind, diagnostic_node, paginate
 from .content.disk_fs import DiskFilesystem, DiskFilesystemUnavailableError
 from .device_kind import _NodeKind
-from .node_ref import NodeRef
 
 if TYPE_CHECKING:
     from .device import DeviceProvider
@@ -29,8 +29,8 @@ if TYPE_CHECKING:
 #: A disk-fs sibling's own stable cache key — either ``("object",
 #: object_id)`` (VM/FS, ``object_id`` a real ``object_table.object_id``
 #: int) or ``("pcps", disk_uuid, disk_index)`` (PC/PS, both real strings
-#: — see ``units/device_pcps.py``'s own ``_pcps_disk_key``). This alias
-#: lets mypy catch a wrong-shape tuple introduced anywhere along that
+#: parsed out of the fragment filename by ``device_pcps._pcps_disk_key``).
+#: This alias lets mypy catch a wrong-shape tuple introduced anywhere along that
 #: flow, even though the ultimate ``object_id`` value itself still
 #: originates from an untyped sqlite row unpack (a separate, much
 #: broader gap this alias doesn't attempt to close).
@@ -43,14 +43,13 @@ class _DiskFsSharedAttrs(TypedDict):
     — narrows the base ``Node``'s own ``attrs: dict[str, Any]`` at this
     family's read/write sites so a typo'd key string (``"disk_uid"`` vs
     ``"disk_uuid"``) or a missing key is a ``mypy`` error, not a runtime
-    ``KeyError`` (see ``children()``'s own comment on ``source_node`` for
-    why every key must be carried forward). Never used to change
+    ``KeyError`` — every key here must be carried forward to every child
+    node ``children()`` builds. Never used to change
     ``Node.attrs``'s own declared type: different ``_kind`` values
-    genuinely carry different, incompatible attrs (see
-    ``units/device.py``'s own diagnostic node builders), and downstream
-    code already dispatches on ``_kind`` before reading anything else —
-    the fix belongs at construction/read sites, not the field's own
-    type."""
+    genuinely carry different, incompatible attrs (``_DiskFsDiagnosticAttrs``
+    below shares no keys with this one at all), and downstream code
+    already dispatches on ``_kind`` before reading anything else — the
+    fix belongs at construction/read sites, not the field's own type."""
 
     _kind: _NodeKind
     disk_key: DiskKey
@@ -65,6 +64,14 @@ class _DiskFsEntryAttrs(_DiskFsSharedAttrs):
 
     partition_addr: int
     path: str
+    #: This file's cloud-sync/encryption state (see disk_fs.py's
+    #: ``_Format.content_unavailable``/``_apfs_is_dataless``/
+    #: ``_ntfs_is_encrypted``), surfaced to presentation layers as
+    #: ``Node.attrs["file_state"]``. Not the icon a presentation layer
+    #: renders for it (``sdk.presentation.icons.FILE_STATE_ICON``) —
+    #: always ``FileState.NORMAL`` for a partition/directory node, or for
+    #: a file this SDK has no reason to flag.
+    file_state: FileState
 
 
 class _DiskFsDiagnosticAttrs(TypedDict):
@@ -82,18 +89,11 @@ class _DiskFsDiagnosticAttrs(TypedDict):
 #: Public ``Node.attrs`` key (unlike ``_DiskFsSharedAttrs``'s own keys, this
 #: one is part of the cross-layer contract): set on a "``<name>``
 #: (filesystem)" sibling root to the disk-image ``Node``'s own ``ref`` it
-#: sits beside. Lets a caller associate the two — e.g. to present the
-#: sibling nested under the disk image rather than next to it — without
-#: parsing ``name`` text or assuming list adjacency.
+#: sits beside. Lets a caller associate the two — e.g. a verbose-mode
+#: attrs dump, or a future CLI/TUI feature that wants to relate a disk
+#: image to its own parsed filesystem — without parsing ``name`` text or
+#: assuming list adjacency.
 DISK_FS_SIBLING_REF_ATTR = "disk_fs_sibling_ref"
-
-
-def disk_fs_sibling_ref(node: Node) -> NodeRef | None:
-    """The disk-image sibling's own ``NodeRef`` if ``node`` is a
-    "(filesystem)" root built by ``DiskFsSibling.root_node``, else
-    ``None``."""
-    ref = node.attrs.get(DISK_FS_SIBLING_REF_ATTR)
-    return ref if isinstance(ref, NodeRef) else None
 
 
 class DiskFsSibling:
@@ -114,19 +114,17 @@ class DiskFsSibling:
         # Populated only when a disk's DiskFilesystem resolved to None
         # because opening its real content raised NotFoundError (data simply
         # absent from this repository copy), rather than Dissect recognizing
-        # nothing — see resolve()'s own comment.
+        # nothing.
         self._diagnostic_reasons: dict[DiskKey, str] = {}
 
     def root_node(self, *, disk_key: DiskKey, source_node: Node, name: str) -> Node:
         """The "``<name>`` (filesystem)" sibling next to a disk-image leaf
-        — pure construction, no I/O (whether Dissect can actually parse
-        anything on this disk is only resolved lazily, the first time
-        someone navigates into this node — see ``resolve``). ``source_node``
-        is the disk-image ``Node`` the caller already built for the *same*
-        disk — stashed here (not re-derived) so ``resolve`` can reuse the
-        owning ``DeviceProvider``'s own existing ``unit()`` dispatch to get
-        that disk's already-correct ``ContentSource``, instead of
-        duplicating VM/PC-PS resolution logic a third time."""
+        — pure construction, no I/O (``resolve`` is what actually parses).
+        ``source_node`` is the disk-image ``Node`` the caller already built
+        for the *same* disk — stashed here (not re-derived) so ``resolve``
+        can reuse the owning ``DeviceProvider``'s own existing ``unit()``
+        dispatch to get that disk's already-correct ``ContentSource``,
+        instead of duplicating VM/PC-PS resolution logic a third time."""
         ref = source_node.ref.child("fs")
         attrs: _DiskFsSharedAttrs = {"_kind": _NodeKind.DISK_FS_ROOT, "disk_key": disk_key, "source_node": source_node}
         return Node(
@@ -176,10 +174,8 @@ class DiskFsSibling:
     def diagnostic_node(self, node: Node) -> Node:
         # The raw reason (an internal store-relative path, when this
         # came from a NotFoundError) is kept out of the user-facing
-        # name/diagnostic text (Presentation principle,
-        # ARCHITECTURE.md) and only exposed via
-        # attrs["_raw_reason"] — same restraint the other diagnostic
-        # node builders in units/device.py/units/device_pcps.py use.
+        # name/diagnostic text (Presentation principle, ARCHITECTURE.md)
+        # and only exposed via attrs["_raw_reason"].
         raw_reason = self._diagnostic_reasons.get(cast("_DiskFsSharedAttrs", node.attrs)["disk_key"])
         diagnostic_attrs: _DiskFsDiagnosticAttrs = {
             "_kind": _NodeKind.DISK_FS_DIAGNOSTIC,
@@ -229,6 +225,7 @@ class DiskFsSibling:
                             source_node=source_node,
                             partition_addr=addr,
                             path="/",
+                            file_state=FileState.NORMAL,
                         )
                     ),
                 )
@@ -241,25 +238,35 @@ class DiskFsSibling:
         entries = await disk_fs.list_dir(partition_addr, path)
         dir_window = paginate(entries, offset, limit)
         parent = "" if path == "/" else path
-        return [
-            Node(
-                ref=node.ref.child(child_name),
-                name=child_name,
-                is_leaf=not is_dir,
-                kind=UnitKind.DISK_FILESYSTEM if is_dir else UnitKind.DISK_FILE,
-                size=size,
-                attrs=dict(
-                    _DiskFsEntryAttrs(
-                        _kind=_NodeKind.DISK_FS_ENTRY,
-                        disk_key=disk_key,
-                        source_node=source_node,
-                        partition_addr=partition_addr,
-                        path=f"{parent}/{child_name}",
-                    )
-                ),
+        children_nodes = []
+        for entry in dir_window:
+            attrs: dict[str, Any] = dict(
+                _DiskFsEntryAttrs(
+                    _kind=_NodeKind.DISK_FS_ENTRY,
+                    disk_key=disk_key,
+                    source_node=source_node,
+                    partition_addr=partition_addr,
+                    path=f"{parent}/{entry.name}",
+                    file_state=entry.file_state,
+                )
             )
-            for child_name, is_dir, size in dir_window
-        ]
+            # Not through mtime_attrs() (units/base.py): that helper converts
+            # a raw epoch int, but entry.mtime already arrives as a real
+            # datetime from _DirEntry -- set directly, omitted when None,
+            # the same {}-when-absent shape mtime_attrs() itself produces.
+            if entry.mtime is not None:
+                attrs["mtime"] = entry.mtime
+            children_nodes.append(
+                Node(
+                    ref=node.ref.child(entry.name),
+                    name=entry.name,
+                    is_leaf=not entry.is_dir,
+                    kind=UnitKind.DISK_FILESYSTEM if entry.is_dir else UnitKind.DISK_FILE,
+                    size=entry.size,
+                    attrs=attrs,
+                )
+            )
+        return children_nodes
 
     async def open_entry(self, node: Node) -> RestorableUnit:
         entry_attrs = cast("_DiskFsEntryAttrs", node.attrs)

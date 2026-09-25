@@ -30,11 +30,14 @@ from synology_apm_repo.sdk.storage.layout import detect_layout
 from synology_apm_repo.sdk.units.base import UnitKind
 from synology_apm_repo.sdk.units.dispatch import raw_fallback_provider_for
 from synology_apm_repo.sdk.units.saas.raw_object import RawObjectProvider
+from synology_apm_repo.sdk.units.saas.stream import SaasStreamCache
 
 _STREAM_UUID = "DRMdjvEJPzoxQiUC"
 
 
-async def _open_provider(repo: DedupRepo, *, sub_type: str, version_id: int) -> RawObjectProvider:
+async def _open_provider(
+    repo: DedupRepo, saas_streams: SaasStreamCache, *, sub_type: str, version_id: int
+) -> RawObjectProvider:
     all_workloads = [w for c in await connections(repo) for w in await workloads(repo, c)]
     version = await anext(
         v
@@ -42,7 +45,7 @@ async def _open_provider(repo: DedupRepo, *, sub_type: str, version_id: int) -> 
         for v in await versions(repo, w)
         if w.sub_type == sub_type and v.saas_stream_uuid == _STREAM_UUID and v.version_id == version_id
     )
-    provider = await raw_fallback_provider_for(repo, version)
+    provider = await raw_fallback_provider_for(repo, version, saas_streams)
     assert isinstance(provider, RawObjectProvider)
     return provider
 
@@ -55,8 +58,8 @@ async def test_replayed_root_is_not_a_leaf_and_named_after_the_stream(
     # root/is_leaf check even begins.
     store = await record_target("units_saas_raw_object_apv1.json.gz", allow_content=True)
     layout = await detect_layout(store)
-    async with await DedupRepo.open(store, layout) as repo:
-        provider = await _open_provider(repo, sub_type="TEAMS", version_id=111)
+    async with await DedupRepo.open(store, layout) as repo, SaasStreamCache(repo) as saas_streams:
+        provider = await _open_provider(repo, saas_streams, sub_type="TEAMS", version_id=111)
         try:
             root = provider.root()
             assert root.name == _STREAM_UUID
@@ -72,8 +75,8 @@ async def test_replayed_teams_root_shows_the_indexs_own_index_entry_and_reads_ba
     # index -- internal repository structure, not backed-up user content.
     store = await record_target("units_saas_raw_object_apv1.json.gz", allow_content=True)
     layout = await detect_layout(store)
-    async with await DedupRepo.open(store, layout) as repo:
-        provider = await _open_provider(repo, sub_type="TEAMS", version_id=111)
+    async with await DedupRepo.open(store, layout) as repo, SaasStreamCache(repo) as saas_streams:
+        provider = await _open_provider(repo, saas_streams, sub_type="TEAMS", version_id=111)
         try:
             nodes = await provider.children(provider.root())
             assert {n.name for n in nodes} == {"db_infos_in_snapshot"}
@@ -95,8 +98,8 @@ async def test_replayed_site_root_shows_the_catalogs_own_named_table_entries(
     # structural oracle, never the content's own meaning.
     store = await record_target("units_saas_raw_object_apv1.json.gz", allow_content=True)
     layout = await detect_layout(store)
-    async with await DedupRepo.open(store, layout) as repo:
-        provider = await _open_provider(repo, sub_type="SITE", version_id=110)
+    async with await DedupRepo.open(store, layout) as repo, SaasStreamCache(repo) as saas_streams:
+        provider = await _open_provider(repo, saas_streams, sub_type="SITE", version_id=110)
         try:
             nodes = await provider.children(provider.root())
             # The real, deterministic node set this fixture recorded for

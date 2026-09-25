@@ -33,8 +33,7 @@ content instead of a fake or replayed one.
   in `test_browser_export_screen.py` and SDK-level `test_dedup_dedup_
   file.py` -- `export_worklist.py` runs a single pass at the default
   `default_sparse=True`, checking the background-job-lifecycle plumbing
-  instead (see that phase's own docstring for why re-deriving the sparse
-  mechanism here would be redundant).
+  instead.
 
 ## Running it
 
@@ -87,9 +86,11 @@ session and one connected repository (`ctx.data["main_ref"]`, picked from
 `ConnectDialog` via `connect_local()`, which takes a filesystem path;
 preferring an unencrypted sample so key-unlocking stays `key_dialog`'s own,
 deliberate job). `key_dialog` opens its own, separate session against
-`ctx.data["encrypted_ref"]` (also `[[local]]`-only, same reason) -- see
-`.._shared_refs.list_representative_refs`'s own docstring for how a
-representative ref is picked, and `tests/smoke/cli/README.md`'s "Ref
+`ctx.data["encrypted_ref"]` (also `[[local]]`-only, same reason) --
+`.._shared_refs.list_representative_refs` picks one representative, real
+leaf per (sample, workload type), preferring a readable repository and
+skipping any that's unkeyed or wrong-keyed; see also
+`tests/smoke/cli/README.md`'s "Ref
 selection and shared-bucket siblings" section for how a shared-bucket
 sibling now resolves via `--key` at its own `narrow_repo_ref` like any
 other repository. `remote_connect` opens one fresh session
@@ -113,7 +114,7 @@ directly from each sample's own config rather than from a
    `_MAIN_SESSION_PHASES` or, if it needs its own `App.run_test()`
    session the way `key_dialog`/`remote_connect` do (see "Session shape"
    above), `_OWN_SESSION_PHASES`; add its coverage expectations to the
-   relevant sample(s)' own comments in your `smoke_samples.toml`.
+   relevant sample(s)' comments in your `smoke_samples.toml`.
 3. **A new named sample surfaces** -- see `tests/smoke/sdk/README.md`'s
    "How to extend" for the shared `smoke_samples.toml.example` recipe;
    nothing about it is browser-specific.

@@ -16,7 +16,11 @@ from typing import Any
 import pytest
 
 from synology_apm_repo.sdk.catalog.connection import connections
-from synology_apm_repo.sdk.catalog.version import versions
+from synology_apm_repo.sdk.catalog.version import (
+    ParsedVersionStatus,
+    _version_display_name,
+    versions,
+)
 from synology_apm_repo.sdk.catalog.workload import workloads
 from synology_apm_repo.sdk.dedup.repository import DedupRepo
 from synology_apm_repo.sdk.identifiers import (
@@ -94,9 +98,9 @@ def _version_spec_json(start_time: object = None, end_time: object = None, statu
     """A minimal real-shaped ``version_spec`` blob — just the
     ``status.start_time``/``status.end_time``/``status.status`` fields
     this module actually reads (real production values are
-    protobuf-JSON int64-as-string, e.g. ``"1786024626"`` — see
-    ``version.proto``'s own real shape); omitted keys model a field
-    genuinely absent from a real row, not just zero/empty."""
+    protobuf-JSON int64-as-string, e.g. ``"1786024626"``); omitted keys
+    model a field genuinely absent from a real row, not just
+    zero/empty."""
     status_obj: dict[str, object] = {}
     if start_time is not None:
         status_obj["start_time"] = str(start_time)
@@ -259,6 +263,17 @@ async def repo(repo_root: Path) -> AsyncIterator[DedupRepo]:
     layout = RepoLayout(kind=RepoKind.VAULT, repo_root="")
     async with await DedupRepo.open(store, layout) as opened:
         yield opened
+
+
+def test_version_display_name_degrades_to_version_uid_for_an_out_of_range_epoch() -> None:
+    """``_as_epoch_seconds`` narrows ``start_time``'s own protobuf-JSON
+    string to ``int`` with no range check of its own -- an out-of-
+    ``datetime``-range value (corrupt ``version_spec`` data) must degrade
+    to the raw ``version_uid``, the same "degrade on any failure"
+    contract ``_version_display_name`` uses for undecryptable/
+    unparseable/absent timestamps too."""
+    status = ParsedVersionStatus(start_time="99999999999999")
+    assert _version_display_name(status, "vuid-100") == "vuid-100"
 
 
 class TestVersions:
@@ -538,8 +553,7 @@ class TestBrowsableVersionStatusFilter:
     async def test_missing_status_field_is_excluded_not_kept(self, tmp_path: Path) -> None:
         # A version whose status can't be determined at all (no
         # status.status key present) is excluded right alongside a
-        # known-bad status string, not kept — see
-        # _BROWSABLE_VERSION_STATUSES's own docstring.
+        # known-bad status string, not kept.
         assert await self._versions_for_statuses(tmp_path, [None]) == []
 
     async def test_mixed_statuses_only_the_browsable_ones_survive(self, tmp_path: Path) -> None:
@@ -621,10 +635,10 @@ class TestParseVersionStatus:
         assert _parse_version_status(json.dumps({"spec": {}}), "vuid-100", None) is None
 
     def test_malformed_json_returns_none(self) -> None:
-        # Deliberately *not* a crtime fallback — see
-        # catalog/version.py's own docstring: version_spec is NOT NULL on
-        # every real row, so this path is a degrade for corrupt data, not
-        # a normal branch.
+        # Deliberately *not* a crtime fallback — version_spec is expected
+        # to always be present and parseable, so this path is a rare
+        # degrade for corrupt data, not a normal branch to design a
+        # second timestamp source around.
         from synology_apm_repo.sdk.catalog.version import _parse_version_status
 
         assert _parse_version_status("not-json-at-all", "vuid-100", None) is None
@@ -684,9 +698,8 @@ class TestVersionDisplayName:
 
     def test_falls_back_to_end_time_when_start_time_is_zero(self) -> None:
         # Real proto convention: "0" is the field's own not-set sentinel
-        # (status.copy_time's own comment says so explicitly; the same
-        # convention applies to start_time/end_time), not a real 1970
-        # epoch value to format literally.
+        # for start_time/end_time alike, not a real 1970 epoch value to
+        # format literally.
         from synology_apm_repo.sdk.catalog.version import ParsedVersionStatus, _version_display_name
 
         status = ParsedVersionStatus(start_time="0", end_time="1786024626")
@@ -709,7 +722,7 @@ class TestVersionDisplayName:
 class TestAsEpochSeconds:
     """Direct unit tests for ``_as_epoch_seconds`` — real
     ``version_spec`` data always has ``start_time``/``end_time`` as
-    **strings** (the module's own comment on why), so
+    **strings** (protobuf-JSON's own int64-as-string convention), so
     ``TestVersionDisplayName`` above only ever exercises the
     ``str`` branch with well-formed digits; these pin down the
     ``bool``/``int``/malformed-``str`` branches its own defensive

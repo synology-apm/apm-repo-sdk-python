@@ -72,7 +72,7 @@ async def _enumerate_catalog(ctx: SmokeContext, ri: RepoInfo) -> None:
     entries, and records its own ``ctx.data["bootstrap_elapsed"]`` wall-
     clock cost (``catalog.py``'s own enumeration-budget check reads it).
     Always runs, for every domain's ``run_for_repo`` to read, regardless
-    of ``--group`` (see module docstring)."""
+    of ``--group``."""
     started = time.monotonic()
 
     async def _list_workloads(ri: RepoInfo = ri) -> list[tuple[Catalog, list[Workload]]]:
@@ -131,12 +131,13 @@ async def _process_entry(
 ) -> int:
     """Discover, catalog-enumerate, run every domain in ``domains``, and
     close every repository this one sample entry yields -- one at a time,
-    so no repository's own resources (``SaasStreamCache``, ``Pool``
-    caches, its ``db/<name>`` connections, ...) ever need to stay open
-    past its own turn, and no other repository's need to already exist
-    yet either (see module docstring). Returns how many repositories this
-    entry actually yielded, for ``_run()``'s own "nothing was ever
-    discovered" fallback."""
+    via ``session.close_repo()`` rather than a bare ``ri.repo.close()``, so
+    no repository's own resources (``SaasStreamCache``, ``Pool`` caches, its
+    ``db/<name>`` connections, its own ``ObjectStore`` connector/session,
+    ...) ever need to stay open past its own turn, and no other
+    repository's need to already exist yet either.
+    Returns how many repositories this entry actually yielded, for
+    ``_run()``'s own "nothing was ever discovered" fallback."""
 
     async def _discover_one() -> list[RepoInfo]:
         return await discover_repos(session, [entry], trace=write_trace)
@@ -153,7 +154,7 @@ async def _process_entry(
         await _enumerate_catalog(ctx, ri)
         for domain in domains:
             await _PHASES[domain].run_for_repo(ctx, ri)
-        await ri.repo.close()
+        await session.close_repo(ri.repo)
         # Drop this repository's own entries once every domain has had them:
         # each one holds the RepoInfo, so leaving them in the shared list
         # would pin every repository (closed or not) for the whole run, which
@@ -210,6 +211,7 @@ async def _run(args: argparse.Namespace) -> int:
                 finished_at=finished_at,
                 stats=ctx.stats,
                 step_results=ctx.step_results,
+                trace_files=("store_trace.jsonl",),
             )
             ctx.close()
 
