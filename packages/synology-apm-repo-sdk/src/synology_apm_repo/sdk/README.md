@@ -158,9 +158,9 @@ Most SaaS workload types (Mail/Drive/Contact/Calendar/Site) are a
 `SaasWorkloadProvider` base (`units/saas/provider.py`) — not a new provider
 class. Before writing a new one:
 
-1. Confirm which `TreeStrategy` (`units/saas/tree_strategy.py`) matches the new
+1. Confirm which `TreeStrategy` (`units/saas/tree_strategy/`) matches the new
    workload's actual tree shape against real sample data — don't guess; there
-   are already four distinct real shapes represented, and forcing a new one
+   are already five distinct real shapes represented, and forcing a new one
    into the wrong shape produces subtly wrong navigation, not an error.
 2. Write `assemble()` against real, sniffed sample bytes for that workload
    type before trusting any assumption about its service-DB schema — SaaS
@@ -188,5 +188,6 @@ This SDK decodes an on-disk format, not a versioned API — compatibility is
 governed by which sections of `FORMAT-SPEC.md` a given repository sample
 actually matches, not by a version number the SDK negotiates. When a
 schema/format difference shows up across samples, that's exactly what
-`storage/table.py`'s schema tolerance and the trap list in
-`ARCHITECTURE.md` exist to absorb.
+`storage/table.py`'s schema tolerance exists to absorb — see
+`ARCHITECTURE.md`'s Storage Layer section for why schema drift across
+connector versions is a given here, not an edge case.

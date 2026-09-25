@@ -285,10 +285,9 @@ def _message_from_row(
     # separate code path from the regular-message body below, entirely
     # unchanged); pre-rendering them here too would double-escape.
     # Deleted messages show the placeholder instead of the emptied real
-    # body — metadata.body.content is "" for a deleted row (see
-    # _DELETED_MESSAGE_LABEL's own comment), which would otherwise
-    # render as a blank message with no indication anything was ever
-    # there.
+    # body — metadata.body.content is emptied to "" by the connector for
+    # a deleted row, which would otherwise render as a blank message with
+    # no indication anything was ever there.
     if is_deleted:
         content = _DELETED_MESSAGE_LABEL
     elif is_system:
@@ -390,8 +389,7 @@ def _render_message_html(message: _RenderedMessage, by_msg_id: Mapping[str, _Ren
         # here — _message_from_row built it via _render_message_body_html,
         # which either escaped the raw content outright (plain "text"
         # contentType) or ran it through _MessageBodyRenderer's own safe
-        # tag allowlist (see that class's own docstring). Escaping it
-        # *again* here would turn every real
+        # tag allowlist. Escaping it *again* here would turn every real
         # structural tag/sticker/mention/emoji it already rendered back
         # into visible, useless markup text.
         body = f'<div class="body">{message.content}</div>'
@@ -456,7 +454,17 @@ def render_channel_html(
     ``_read_stickers`` — defaults to ``{}``. Messages sort by
     timestamp (undated rows first), group under a date separator, and
     resolve a real ``reply_to_id`` to its parent's sender/preview
-    rather than a bare id."""
+    rather than a bare id.
+
+    Known limitation: ``rows`` is the caller's *entire* channel/chat
+    history (``units/saas/teams_chat.py``'s own ``unit()`` reads every
+    ``msg_info_table`` row, no cap), and this function's whole result is
+    then held in memory at once as one string inside a ``LazyArtifact``
+    (sized for "a small, fully in-memory blob," which a genuinely large
+    channel's transcript is not). Not
+    fixed speculatively — would need a streaming rendering shape, a real
+    architectural change — until a real large-channel sample actually
+    shows this as a practical problem."""
     stickers_by_msg_id = stickers_by_msg_id or {}
     messages = sorted((_message_from_row(row, stickers_by_msg_id) for row in rows), key=lambda m: m.created or "")
     by_msg_id = {m.msg_id: m for m in messages if m.msg_id is not None}

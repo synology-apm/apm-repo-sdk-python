@@ -3,14 +3,15 @@ profile management, backed by ``browser/screens/profile_manager.py``:
 per-tab profile listing/filtering, selecting a saved profile to refill
 its fields (secrets included), and the save/delete flows and their
 error paths — all against an in-memory fake standing in for
-``profiles.json`` + the OS keyring. See
-``test_browser_pilot_connect_dialog.py`` for the dialog's core
-mounting/tabs/local-backend/scan-and-submit mechanics, and
-``test_browser_pilot_remote_browser.py`` for S3/Azure/SMB field
-validation and remote bucket/container browsing — both duplicate this
-file's own ``_open_connect_dialog``/``_activate_backend`` helpers
-verbatim rather than importing them (see ``tests/CLAUDE.md``'s "no test
-module ever imports from another").
+``profiles.json`` + the OS keyring. The dialog's core
+mounting/tabs/local-backend/scan-and-submit mechanics are covered in
+``test_browser_pilot_connect_dialog.py``, and S3/Azure/SMB field
+validation and remote bucket/container browsing in
+``test_browser_pilot_remote_browser.py`` — both duplicate this file's own
+``_open_connect_dialog`` helper verbatim rather than importing it, since
+backend activation itself is shared through
+``tests/unit/browser/conftest.py``'s ``activate_backend_and_settle``
+fixture instead.
 """
 
 from __future__ import annotations
@@ -23,7 +24,7 @@ from typing import Any
 
 import pytest
 from textual.pilot import Pilot
-from textual.widgets import Button, Checkbox, Input, Select, Static, Tabs
+from textual.widgets import Button, Checkbox, Input, Select, Static
 
 from synology_apm_repo.browser.app import ApmRepoBrowserApp
 from synology_apm_repo.browser.screens import profile_manager as profile_manager_module
@@ -49,34 +50,6 @@ async def _open_connect_dialog() -> AsyncIterator[tuple[ApmRepoBrowserApp, Pilot
         yield app, pilot, app.screen
 
 
-def _activate_backend(dialog: ConnectDialog, backend: str) -> None:
-    """Drives the backend ``Tabs`` strip the same way
-    a real activation does — setting ``active`` posts the same
-    ``Tabs.TabActivated`` message ``ConnectDialog.on_tabs_tab_activated``
-    reacts to, so this is equivalent to a user pressing/arrowing onto the
-    given tab, not a backdoor into ``_switch_backend``."""
-    dialog.query_one("#connect-backend-tabs", Tabs).active = backend
-
-
-async def _activate_backend_and_settle(
-    dialog: ConnectDialog, backend: str, pilot: Pilot[None], wait_until: Any
-) -> None:
-    """``_activate_backend`` plus the wait its callers all need.
-
-    Setting ``Tabs.active`` only posts ``TabActivated``; the pane swap happens
-    when ``ConnectDialog`` handles it, a later event-loop turn. The pane
-    carrying the ``active`` class is that swap having happened.
-    """
-    _activate_backend(dialog, backend)
-    await wait_until(
-        pilot,
-        lambda: dialog.query_one(f"#connect-{backend}-fields").has_class("active"),
-        timeout=0.6,
-        interval=0.02,
-        message=f"{backend} pane never became active",
-    )
-
-
 def _select_option_values(select: Select[str]) -> list[str]:
     """The real (non-blank) option values currently loaded into a
     ``Select`` — there is no public listing accessor, so this reads the
@@ -85,26 +58,30 @@ def _select_option_values(select: Select[str]) -> list[str]:
     return [value for _, value in select._options if isinstance(value, str)]
 
 
-async def _wait_for_profile_options(dialog: ConnectDialog, backend: str, pilot: Pilot[None], wait_until: Any) -> None:
+async def _wait_for_profile_options(
+    dialog: ConnectDialog, backend: str, pilot: Pilot[None], wait_until: Any, sdk_timeout: float
+) -> None:
+    """The picker is populated by a real (faked) ``list_profiles()`` async
+    dispatch, not a synchronous widget-attribute change -- hence
+    ``sdk_timeout`` rather than ``ui_timeout`` here."""
     select = dialog.query_one(f"#connect-{backend}-profile-select", Select)
-    await wait_until(pilot, lambda: bool(_select_option_values(select)), timeout=1.5, interval=0.05)
+    await wait_until(pilot, lambda: bool(_select_option_values(select)), timeout=sdk_timeout, interval=0.05)
 
 
-async def _wait_for_status_containing(dialog: ConnectDialog, pilot: Pilot[None], wait_until: Any, needle: str) -> str:
-    """Polls ``#connect-status`` until its rendered text contains
-    ``needle`` (case-insensitive), returning that final text — same
-    contract as ``_wait_for_detail_text`` in
-    ``test_browser_pilot_preview.py``, but for this dialog's own
-    status line."""
-    status = ""
-
-    def _matches() -> bool:
-        nonlocal status
-        status = str(dialog.query_one("#connect-status", Static).render())
-        return needle in status.lower()
-
-    await wait_until(pilot, _matches, timeout=1.5, interval=0.05)
-    return status
+async def _wait_for_profile_name_row_visible(
+    dialog: ConnectDialog, pilot: Pilot[None], wait_until: Any, ui_timeout: float, backend: str
+) -> None:
+    """Polls the "Save as profile..." name row until it actually appears —
+    every save flow below presses that button then immediately types into
+    the row it opens, so this replaces a fixed guess at how long that
+    reveal takes."""
+    await wait_until(
+        pilot,
+        lambda: dialog.query_one(f"#connect-{backend}-profile-name-row").has_class("-visible"),
+        timeout=ui_timeout,
+        interval=0.02,
+        message=f"the {backend} profile-name row never appeared",
+    )
 
 
 def _make_fake_profile_store(
@@ -140,7 +117,7 @@ def _make_fake_profile_store(
 
 class TestProfileManagement:
     def test_connect_dialog_profile_select_filters_by_tab(
-        self, monkeypatch: pytest.MonkeyPatch, wait_until: Any
+        self, monkeypatch: pytest.MonkeyPatch, wait_until: Any, sdk_timeout: float
     ) -> None:
         """Each tab's picker only ever offers profiles of its own backend
         kind — a saved profile of one kind must never show up in another
@@ -152,9 +129,9 @@ class TestProfileManagement:
 
         async def scenario() -> tuple[list[str], list[str], list[str]]:
             async with _open_connect_dialog() as (app, pilot, dialog):
-                await _wait_for_profile_options(dialog, "s3", pilot, wait_until)
-                await _wait_for_profile_options(dialog, "azure", pilot, wait_until)
-                await _wait_for_profile_options(dialog, "smb", pilot, wait_until)
+                await _wait_for_profile_options(dialog, "s3", pilot, wait_until, sdk_timeout)
+                await _wait_for_profile_options(dialog, "azure", pilot, wait_until, sdk_timeout)
+                await _wait_for_profile_options(dialog, "smb", pilot, wait_until, sdk_timeout)
                 s3_select = dialog.query_one("#connect-s3-profile-select", Select)
                 azure_select = dialog.query_one("#connect-azure-profile-select", Select)
                 smb_select = dialog.query_one("#connect-smb-profile-select", Select)
@@ -170,7 +147,7 @@ class TestProfileManagement:
         assert smb_names == ["my-smb"], smb_names
 
     def test_connect_dialog_selecting_s3_profile_refills_fields_including_secret(
-        self, monkeypatch: pytest.MonkeyPatch, wait_until: Any
+        self, monkeypatch: pytest.MonkeyPatch, wait_until: Any, sdk_timeout: float, activate_backend_and_settle: Any
     ) -> None:
         """Selecting a saved profile refills every field of that tab —
         including the secret landing, unmasked, in the ``password=True``
@@ -191,14 +168,14 @@ class TestProfileManagement:
 
         async def scenario() -> tuple[str, str, str, str, str, bool]:
             async with _open_connect_dialog() as (app, pilot, dialog):
-                await _activate_backend_and_settle(dialog, "s3", pilot, wait_until)
-                await _wait_for_profile_options(dialog, "s3", pilot, wait_until)
+                await activate_backend_and_settle(dialog, "s3", pilot)
+                await _wait_for_profile_options(dialog, "s3", pilot, wait_until, sdk_timeout)
                 select = dialog.query_one("#connect-s3-profile-select", Select)
                 select.value = "my-s3"
                 await wait_until(
                     pilot,
                     lambda: dialog.query_one("#connect-s3-bucket", Input).value,
-                    timeout=0.6,
+                    timeout=sdk_timeout,
                     interval=0.02,
                     message="selecting a profile never filled the fields",
                 )
@@ -220,7 +197,7 @@ class TestProfileManagement:
         assert verify_tls is False
 
     def test_connect_dialog_save_profile_validates_fields_before_showing_name_row(
-        self, monkeypatch: pytest.MonkeyPatch, wait_until: Any
+        self, monkeypatch: pytest.MonkeyPatch, wait_until: Any, activate_backend_and_settle: Any, ui_timeout: float
     ) -> None:
         """ "Save as profile..." validates the tab's fields the same no-I/O
         way ``_build_s3_store()`` does before ever showing the name prompt —
@@ -230,7 +207,7 @@ class TestProfileManagement:
 
         async def scenario() -> tuple[bool, str]:
             async with _open_connect_dialog() as (app, pilot, dialog):
-                await _activate_backend_and_settle(dialog, "s3", pilot, wait_until)
+                await activate_backend_and_settle(dialog, "s3", pilot)
                 dialog.query_one("#connect-s3-save-profile-button", Button).press()
                 # The inline warning is the readiness signal here -- this case
                 # asserts the name row *stays hidden*, so waiting for the row
@@ -238,7 +215,7 @@ class TestProfileManagement:
                 await wait_until(
                     pilot,
                     lambda: str(dialog.query_one("#connect-status", Static).render()),
-                    timeout=0.6,
+                    timeout=ui_timeout,
                     interval=0.02,
                     message="validation never reported anything",
                 )
@@ -251,7 +228,14 @@ class TestProfileManagement:
         assert "bucket" in status.lower(), status
         assert not store
 
-    def test_connect_dialog_save_profile_flow(self, monkeypatch: pytest.MonkeyPatch, wait_until: Any) -> None:
+    def test_connect_dialog_save_profile_flow(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        wait_until: Any,
+        activate_backend_and_settle: Any,
+        ui_timeout: float,
+        sdk_timeout: float,
+    ) -> None:
         """ "Save as profile...": reveals the inline name row; confirming
         calls ``save_profile()`` with the tab's current fields and hides the
         row again, without ever requiring a live connection first."""
@@ -259,14 +243,14 @@ class TestProfileManagement:
 
         async def scenario() -> tuple[bool, bool, str]:
             async with _open_connect_dialog() as (app, pilot, dialog):
-                await _activate_backend_and_settle(dialog, "s3", pilot, wait_until)
+                await activate_backend_and_settle(dialog, "s3", pilot)
                 dialog.query_one("#connect-s3-bucket", Input).value = "bucket-a"
                 dialog.query_one("#connect-s3-access-key", Input).value = "AKIAEXAMPLE"
                 dialog.query_one("#connect-s3-save-profile-button", Button).press()
                 await wait_until(
                     pilot,
                     lambda: dialog.query_one("#connect-s3-profile-name-row").has_class("-visible"),
-                    timeout=0.6,
+                    timeout=ui_timeout,
                     interval=0.02,
                     message="the profile-name row never appeared",
                 )
@@ -274,7 +258,7 @@ class TestProfileManagement:
 
                 dialog.query_one("#connect-s3-profile-name-input", Input).value = "new-profile"
                 dialog.query_one("#connect-s3-profile-name-confirm", Button).press()
-                await wait_until(pilot, lambda: "new-profile" in store, timeout=1.5, interval=0.05)
+                await wait_until(pilot, lambda: "new-profile" in store, timeout=sdk_timeout, interval=0.05)
                 row_visible_after = dialog.query_one("#connect-s3-profile-name-row").has_class("-visible")
                 status = str(dialog.query_one("#connect-status", Static).render())
                 return row_visible_before, row_visible_after, status
@@ -288,7 +272,14 @@ class TestProfileManagement:
         assert fields["bucket"] == "bucket-a"
         assert fields["access_key"] == "AKIAEXAMPLE"
 
-    def test_connect_dialog_delete_profile_flow(self, monkeypatch: pytest.MonkeyPatch, wait_until: Any) -> None:
+    def test_connect_dialog_delete_profile_flow(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        wait_until: Any,
+        sdk_timeout: float,
+        activate_backend_and_settle: Any,
+        ui_timeout: float,
+    ) -> None:
         """Deleting is immediate, no confirmation dialog — matches
         ``WorklistScreen``'s own precedent for a destructive action."""
         store = _make_fake_profile_store(monkeypatch)
@@ -296,21 +287,21 @@ class TestProfileManagement:
 
         async def scenario() -> tuple[bool, list[str]]:
             async with _open_connect_dialog() as (app, pilot, dialog):
-                await _activate_backend_and_settle(dialog, "s3", pilot, wait_until)
-                await _wait_for_profile_options(dialog, "s3", pilot, wait_until)
+                await activate_backend_and_settle(dialog, "s3", pilot)
+                await _wait_for_profile_options(dialog, "s3", pilot, wait_until, sdk_timeout)
                 select = dialog.query_one("#connect-s3-profile-select", Select)
                 select.value = "doomed"
                 await wait_until(
                     pilot,
                     lambda: not dialog.query_one("#connect-s3-delete-profile-button", Button).disabled,
-                    timeout=0.6,
+                    timeout=ui_timeout,
                     interval=0.02,
                     message="delete never became available for the selected profile",
                 )
                 delete_button = dialog.query_one("#connect-s3-delete-profile-button", Button)
                 delete_button_enabled = not delete_button.disabled
                 delete_button.press()
-                await wait_until(pilot, lambda: "doomed" not in store, timeout=1.5, interval=0.05)
+                await wait_until(pilot, lambda: "doomed" not in store, timeout=sdk_timeout, interval=0.05)
                 return delete_button_enabled, _select_option_values(select)
 
         delete_button_enabled, remaining_names = asyncio.run(scenario())
@@ -319,7 +310,7 @@ class TestProfileManagement:
         assert remaining_names == []
 
     def test_connect_dialog_profile_load_failure_shows_inline_error(
-        self, monkeypatch: pytest.MonkeyPatch, wait_until: Any
+        self, monkeypatch: pytest.MonkeyPatch, wait_until: Any, sdk_timeout: float, activate_backend_and_settle: Any
     ) -> None:
         """A corrupt config file or locked keyring surfacing from
         ``load_profile()`` must show inline in ``#connect-status``, not crash
@@ -334,14 +325,14 @@ class TestProfileManagement:
 
         async def scenario() -> tuple[bool, str]:
             async with _open_connect_dialog() as (app, pilot, dialog):
-                await _activate_backend_and_settle(dialog, "s3", pilot, wait_until)
-                await _wait_for_profile_options(dialog, "s3", pilot, wait_until)
+                await activate_backend_and_settle(dialog, "s3", pilot)
+                await _wait_for_profile_options(dialog, "s3", pilot, wait_until, sdk_timeout)
                 select = dialog.query_one("#connect-s3-profile-select", Select)
                 select.value = "broken"
                 await wait_until(
                     pilot,
                     lambda: str(dialog.query_one("#connect-status", Static).render()),
-                    timeout=0.6,
+                    timeout=sdk_timeout,
                     interval=0.02,
                     message="a broken profile never reported anything",
                 )
@@ -353,7 +344,7 @@ class TestProfileManagement:
         assert "error" in status.lower(), status
 
     def test_connect_dialog_escape_while_naming_profile_closes_only_the_name_row(
-        self, monkeypatch: pytest.MonkeyPatch, wait_until: Any
+        self, monkeypatch: pytest.MonkeyPatch, wait_until: Any, activate_backend_and_settle: Any, ui_timeout: float
     ) -> None:
         """Esc while the inline name row is open must close only that row —
         the dialog itself (and whatever was already typed in the other
@@ -362,13 +353,13 @@ class TestProfileManagement:
 
         async def scenario() -> tuple[bool, bool, str]:
             async with _open_connect_dialog() as (app, pilot, dialog):
-                await _activate_backend_and_settle(dialog, "s3", pilot, wait_until)
+                await activate_backend_and_settle(dialog, "s3", pilot)
                 dialog.query_one("#connect-s3-bucket", Input).value = "bucket-a"
                 dialog.query_one("#connect-s3-save-profile-button", Button).press()
                 await wait_until(
                     pilot,
                     lambda: dialog.query_one("#connect-s3-profile-name-row").has_class("-visible"),
-                    timeout=0.6,
+                    timeout=ui_timeout,
                     interval=0.02,
                     message="the profile-name row never appeared",
                 )
@@ -378,7 +369,7 @@ class TestProfileManagement:
                 await wait_until(
                     pilot,
                     lambda: not dialog.query_one("#connect-s3-profile-name-row").has_class("-visible"),
-                    timeout=0.6,
+                    timeout=ui_timeout,
                     interval=0.02,
                     message="the profile-name row never went away",
                 )
@@ -393,19 +384,24 @@ class TestProfileManagement:
         assert bucket_value == "bucket-a", "the rest of the form must be untouched by that Esc"
 
     def test_connect_dialog_save_profile_empty_name_warns_and_does_not_save(
-        self, monkeypatch: pytest.MonkeyPatch, wait_until: Any
+        self, monkeypatch: pytest.MonkeyPatch, wait_until: Any, activate_backend_and_settle: Any, ui_timeout: float
     ) -> None:
         store = _make_fake_profile_store(monkeypatch)
 
         async def scenario() -> str:
             async with _open_connect_dialog() as (app, pilot, dialog):
-                await _activate_backend_and_settle(dialog, "s3", pilot, wait_until)
+                await activate_backend_and_settle(dialog, "s3", pilot)
                 dialog.query_one("#connect-s3-bucket", Input).value = "bucket-a"
                 dialog.query_one("#connect-s3-save-profile-button", Button).press()
-                await pilot.pause(0.1)
+                await _wait_for_profile_name_row_visible(dialog, pilot, wait_until, ui_timeout, "s3")
                 dialog.query_one("#connect-s3-profile-name-input", Input).value = ""
                 dialog.query_one("#connect-s3-profile-name-confirm", Button).press()
-                await pilot.pause(0.1)
+                await wait_until(
+                    pilot,
+                    lambda: "name" in str(dialog.query_one("#connect-status", Static).render()).lower(),
+                    timeout=ui_timeout,
+                    interval=0.02,
+                )
                 return str(dialog.query_one("#connect-status", Static).render())
 
         status = asyncio.run(scenario())
@@ -413,7 +409,12 @@ class TestProfileManagement:
         assert "name" in status.lower()
 
     def test_connect_dialog_save_profile_failure_shows_inline_error(
-        self, monkeypatch: pytest.MonkeyPatch, wait_until: Any
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        wait_until: Any,
+        activate_backend_and_settle: Any,
+        wait_for_status_containing: Any,
+        ui_timeout: float,
     ) -> None:
         _make_fake_profile_store(monkeypatch)
 
@@ -426,13 +427,13 @@ class TestProfileManagement:
 
         async def scenario() -> tuple[bool, str]:
             async with _open_connect_dialog() as (app, pilot, dialog):
-                await _activate_backend_and_settle(dialog, "s3", pilot, wait_until)
+                await activate_backend_and_settle(dialog, "s3", pilot)
                 dialog.query_one("#connect-s3-bucket", Input).value = "bucket-a"
                 dialog.query_one("#connect-s3-save-profile-button", Button).press()
-                await pilot.pause(0.1)
+                await _wait_for_profile_name_row_visible(dialog, pilot, wait_until, ui_timeout, "s3")
                 dialog.query_one("#connect-s3-profile-name-input", Input).value = "new-profile"
                 dialog.query_one("#connect-s3-profile-name-confirm", Button).press()
-                status = await _wait_for_status_containing(dialog, pilot, wait_until, "error")
+                status = await wait_for_status_containing(pilot, dialog, "error")
                 row_still_open = dialog.query_one("#connect-s3-profile-name-row").has_class("-visible")
                 return row_still_open, status
 
@@ -441,27 +442,38 @@ class TestProfileManagement:
         assert "disk full" in status
 
     def test_connect_dialog_pressing_enter_in_the_profile_name_field_confirms(
-        self, monkeypatch: pytest.MonkeyPatch, wait_until: Any
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        wait_until: Any,
+        activate_backend_and_settle: Any,
+        ui_timeout: float,
+        sdk_timeout: float,
     ) -> None:
         store = _make_fake_profile_store(monkeypatch)
 
         async def scenario() -> None:
             async with _open_connect_dialog() as (app, pilot, dialog):
-                await _activate_backend_and_settle(dialog, "s3", pilot, wait_until)
+                await activate_backend_and_settle(dialog, "s3", pilot)
                 dialog.query_one("#connect-s3-bucket", Input).value = "bucket-a"
                 dialog.query_one("#connect-s3-save-profile-button", Button).press()
-                await pilot.pause(0.1)
+                await _wait_for_profile_name_row_visible(dialog, pilot, wait_until, ui_timeout, "s3")
                 name_input = dialog.query_one("#connect-s3-profile-name-input", Input)
                 name_input.value = "enter-confirmed"
                 name_input.focus()
                 await pilot.press("enter")
-                await wait_until(pilot, lambda: "enter-confirmed" in store, timeout=1.5, interval=0.05)
+                await wait_until(pilot, lambda: "enter-confirmed" in store, timeout=sdk_timeout, interval=0.05)
 
         asyncio.run(scenario())
         assert "enter-confirmed" in store
 
     def test_connect_dialog_delete_profile_failure_shows_inline_error(
-        self, monkeypatch: pytest.MonkeyPatch, wait_until: Any
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        wait_until: Any,
+        sdk_timeout: float,
+        activate_backend_and_settle: Any,
+        wait_for_status_containing: Any,
+        ui_timeout: float,
     ) -> None:
         store = _make_fake_profile_store(monkeypatch)
         store["doomed"] = (BackendKind.S3, {"bucket": "bucket-a"})
@@ -473,13 +485,14 @@ class TestProfileManagement:
 
         async def scenario() -> tuple[bool, str]:
             async with _open_connect_dialog() as (app, pilot, dialog):
-                await _activate_backend_and_settle(dialog, "s3", pilot, wait_until)
-                await _wait_for_profile_options(dialog, "s3", pilot, wait_until)
+                await activate_backend_and_settle(dialog, "s3", pilot)
+                await _wait_for_profile_options(dialog, "s3", pilot, wait_until, sdk_timeout)
                 select = dialog.query_one("#connect-s3-profile-select", Select)
                 select.value = "doomed"
-                await pilot.pause(0.1)
-                dialog.query_one("#connect-s3-delete-profile-button", Button).press()
-                status = await _wait_for_status_containing(dialog, pilot, wait_until, "error")
+                delete_button = dialog.query_one("#connect-s3-delete-profile-button", Button)
+                await wait_until(pilot, lambda: not delete_button.disabled, timeout=ui_timeout, interval=0.02)
+                delete_button.press()
+                status = await wait_for_status_containing(pilot, dialog, "error")
                 return isinstance(app.screen, ConnectDialog), status
 
         still_open, status = asyncio.run(scenario())
@@ -505,7 +518,7 @@ class TestProfileManagement:
         asyncio.run(scenario())  # must not raise
 
     def test_connect_dialog_profile_list_refresh_failure_shows_inline_error(
-        self, monkeypatch: pytest.MonkeyPatch, wait_until: Any
+        self, monkeypatch: pytest.MonkeyPatch, wait_for_status_containing: Any
     ) -> None:
         async def fake_list_profiles_raises() -> list[ProfileSummary]:
             raise RuntimeError("config file corrupt")
@@ -514,7 +527,7 @@ class TestProfileManagement:
 
         async def scenario() -> tuple[bool, str]:
             async with _open_connect_dialog() as (app, pilot, dialog):
-                status = await _wait_for_status_containing(dialog, pilot, wait_until, "error")
+                status = await wait_for_status_containing(pilot, dialog, "error")
                 return isinstance(app.screen, ConnectDialog), status
 
         still_open, status = asyncio.run(scenario())
@@ -522,7 +535,7 @@ class TestProfileManagement:
         assert "config file corrupt" in status
 
     def test_connect_dialog_selecting_an_azure_profile_refills_its_own_fields(
-        self, monkeypatch: pytest.MonkeyPatch, wait_until: Any
+        self, monkeypatch: pytest.MonkeyPatch, wait_until: Any, sdk_timeout: float, activate_backend_and_settle: Any
     ) -> None:
         store = _make_fake_profile_store(monkeypatch)
         store["my-azure"] = (
@@ -532,12 +545,15 @@ class TestProfileManagement:
 
         async def scenario() -> tuple[str, bool]:
             async with _open_connect_dialog() as (app, pilot, dialog):
-                await _activate_backend_and_settle(dialog, "azure", pilot, wait_until)
-                await _wait_for_profile_options(dialog, "azure", pilot, wait_until)
+                await activate_backend_and_settle(dialog, "azure", pilot)
+                await _wait_for_profile_options(dialog, "azure", pilot, wait_until, sdk_timeout)
                 select = dialog.query_one("#connect-azure-profile-select", Select)
                 select.value = "my-azure"
                 await wait_until(
-                    pilot, lambda: dialog.query_one("#connect-azure-container", Input).value, timeout=1.5, interval=0.05
+                    pilot,
+                    lambda: dialog.query_one("#connect-azure-container", Input).value,
+                    timeout=sdk_timeout,
+                    interval=0.05,
                 )
                 container_value = dialog.query_one("#connect-azure-container", Input).value
                 delete_enabled = not dialog.query_one("#connect-azure-delete-profile-button", Button).disabled
@@ -548,7 +564,7 @@ class TestProfileManagement:
         assert delete_enabled
 
     def test_connect_dialog_selecting_an_smb_profile_refills_fields_including_secret(
-        self, monkeypatch: pytest.MonkeyPatch, wait_until: Any
+        self, monkeypatch: pytest.MonkeyPatch, wait_until: Any, sdk_timeout: float, activate_backend_and_settle: Any
     ) -> None:
         store = _make_fake_profile_store(monkeypatch)
         store["my-smb"] = (
@@ -564,12 +580,15 @@ class TestProfileManagement:
 
         async def scenario() -> tuple[str, str, str, str, str, bool]:
             async with _open_connect_dialog() as (app, pilot, dialog):
-                await _activate_backend_and_settle(dialog, "smb", pilot, wait_until)
-                await _wait_for_profile_options(dialog, "smb", pilot, wait_until)
+                await activate_backend_and_settle(dialog, "smb", pilot)
+                await _wait_for_profile_options(dialog, "smb", pilot, wait_until, sdk_timeout)
                 select = dialog.query_one("#connect-smb-profile-select", Select)
                 select.value = "my-smb"
                 await wait_until(
-                    pilot, lambda: dialog.query_one("#connect-smb-server", Input).value, timeout=1.5, interval=0.05
+                    pilot,
+                    lambda: dialog.query_one("#connect-smb-server", Input).value,
+                    timeout=sdk_timeout,
+                    interval=0.05,
                 )
                 return (
                     dialog.query_one("#connect-smb-server", Input).value,
@@ -588,7 +607,14 @@ class TestProfileManagement:
         assert password == "hunter2"
         assert delete_enabled
 
-    def test_connect_dialog_azure_save_profile_flow(self, monkeypatch: pytest.MonkeyPatch, wait_until: Any) -> None:
+    def test_connect_dialog_azure_save_profile_flow(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        wait_until: Any,
+        activate_backend_and_settle: Any,
+        ui_timeout: float,
+        sdk_timeout: float,
+    ) -> None:
         """Azure's own counterpart to ``test_connect_dialog_save_profile_flow``
         (S3's) — the "Save as profile..." button's own flow (as opposed to
         selecting an already-saved profile, which
@@ -598,7 +624,7 @@ class TestProfileManagement:
 
         async def scenario() -> tuple[bool, bool, str]:
             async with _open_connect_dialog() as (app, pilot, dialog):
-                await _activate_backend_and_settle(dialog, "azure", pilot, wait_until)
+                await activate_backend_and_settle(dialog, "azure", pilot)
                 dialog.query_one("#connect-azure-container", Input).value = "container-a"
                 # AzureStore's constructor (unlike S3Store's fully-lazy one)
                 # validates account_url synchronously, so an empty one would
@@ -606,12 +632,12 @@ class TestProfileManagement:
                 # name row - see _build_azure_store's own real construction.
                 dialog.query_one("#connect-azure-account-url", Input).value = "https://example.blob.core.windows.net"
                 dialog.query_one("#connect-azure-save-profile-button", Button).press()
-                await pilot.pause(0.1)
+                await _wait_for_profile_name_row_visible(dialog, pilot, wait_until, ui_timeout, "azure")
                 row_visible_before = dialog.query_one("#connect-azure-profile-name-row").has_class("-visible")
 
                 dialog.query_one("#connect-azure-profile-name-input", Input).value = "new-azure-profile"
                 dialog.query_one("#connect-azure-profile-name-confirm", Button).press()
-                await wait_until(pilot, lambda: "new-azure-profile" in store, timeout=1.5, interval=0.05)
+                await wait_until(pilot, lambda: "new-azure-profile" in store, timeout=sdk_timeout, interval=0.05)
                 row_visible_after = dialog.query_one("#connect-azure-profile-name-row").has_class("-visible")
                 status = str(dialog.query_one("#connect-status", Static).render())
                 return row_visible_before, row_visible_after, status
@@ -624,7 +650,14 @@ class TestProfileManagement:
         assert kind is BackendKind.AZURE
         assert fields["container"] == "container-a"
 
-    def test_connect_dialog_smb_save_profile_flow(self, monkeypatch: pytest.MonkeyPatch, wait_until: Any) -> None:
+    def test_connect_dialog_smb_save_profile_flow(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        wait_until: Any,
+        activate_backend_and_settle: Any,
+        ui_timeout: float,
+        sdk_timeout: float,
+    ) -> None:
         """SMB's own counterpart to ``test_connect_dialog_save_profile_flow``
         (S3's) — confirms the save flow works identically for the third
         backend, not just the two the mechanism was originally built for."""
@@ -632,16 +665,16 @@ class TestProfileManagement:
 
         async def scenario() -> tuple[bool, bool, str]:
             async with _open_connect_dialog() as (app, pilot, dialog):
-                await _activate_backend_and_settle(dialog, "smb", pilot, wait_until)
+                await activate_backend_and_settle(dialog, "smb", pilot)
                 dialog.query_one("#connect-smb-server", Input).value = "nas.example.com"
                 dialog.query_one("#connect-smb-share", Input).value = "backups"
                 dialog.query_one("#connect-smb-save-profile-button", Button).press()
-                await pilot.pause(0.1)
+                await _wait_for_profile_name_row_visible(dialog, pilot, wait_until, ui_timeout, "smb")
                 row_visible_before = dialog.query_one("#connect-smb-profile-name-row").has_class("-visible")
 
                 dialog.query_one("#connect-smb-profile-name-input", Input).value = "new-smb-profile"
                 dialog.query_one("#connect-smb-profile-name-confirm", Button).press()
-                await wait_until(pilot, lambda: "new-smb-profile" in store, timeout=1.5, interval=0.05)
+                await wait_until(pilot, lambda: "new-smb-profile" in store, timeout=sdk_timeout, interval=0.05)
                 row_visible_after = dialog.query_one("#connect-smb-profile-name-row").has_class("-visible")
                 status = str(dialog.query_one("#connect-status", Static).render())
                 return row_visible_before, row_visible_after, status

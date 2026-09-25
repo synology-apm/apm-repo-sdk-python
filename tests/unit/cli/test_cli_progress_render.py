@@ -6,7 +6,7 @@ force_terminal=...)`` (real terminal detection overridden, no actual tty
 needed) and a duck-typed ``_FakeMeter`` (plain, controllable ``rate``/
 ``eta``/``elapsed`` attributes standing in for a real ``ProgressMeter``'s,
 which derives them from real elapsed wall-clock time). The size/duration
-formatting helpers this module uses now live in
+formatting helpers this module uses live in
 ``synology_apm_repo.sdk.presentation.format`` (shared with the TUI's
 ``ExportScreen``) and are tested there, not here.
 """

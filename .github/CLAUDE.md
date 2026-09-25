@@ -31,20 +31,6 @@ run manually, not on a schedule.
 > create a real GitHub Release (`contents: write`), which a local `act` run can not and
 > should not exercise.
 >
-> `ci.yml`'s own `test` and `test-compatible-python` (3-leg matrix) jobs carry no `needs:`
-> between them, so real GitHub Actions runs all four on their own dedicated VM, concurrently;
-> `act` instead runs every job it's given on the *one* local machine, defaulting to as many
-> concurrent jobs as that machine has CPUs — four `pytest -n auto` runs (each itself spawning
-> one worker per CPU) genuinely do share that one machine's CPU/memory, unlike on real,
-> per-job-dedicated runners. The test suite is written to tolerate that: large fixtures are
-> file-backed rather than fully loaded into memory (`tests/unit/sdk/test_units_disk_fs.py`'s
-> own module docstring), and a test proving real concurrency waits on the real condition
-> (an `asyncio.Event`) rather than a fixed tick/sleep count that only holds up when nothing
-> else contends for the CPU. If a future addition to either the workflows or the test suite
-> reintroduces this kind of resource sensitivity, `--concurrent-jobs 1` (serializing every job
-> instead of sharing this one machine among them) isolates whether a failure is a local-only
-> contention artifact or a real regression, before assuming it's the latter.
->
 > `.github/workflows/dependabot-auto-merge.yml` has no local `act` simulation target —
 > its entire logic is a one-line author check gating a real `gh pr merge --auto` call
 > against a real pull request, which `act` cannot meaningfully fabricate.

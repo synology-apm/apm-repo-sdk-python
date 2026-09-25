@@ -1,7 +1,7 @@
 """``PcpsDiskTree``: the PC/PS disk-fragment listing/assembly axis, split
-out of ``units/device.py``'s ``DeviceProvider`` — see that module's own
-docstring for the VM-vs-PC/PS dispatch rule and why PC/PS has no
-``target.db`` at all.
+out of ``units/device.py``'s ``DeviceProvider``, which dispatches to it
+based on ``Version.target_type`` alone, never by probing which files
+exist.
 
 **PC/PS disk grouping:** one physical disk can land as several
 independently-registered fragment objects, not one — see
@@ -19,7 +19,7 @@ from typing import TYPE_CHECKING, TypedDict
 from ..errors import NotFoundError
 from ..storage.sqlite import apply_index_hint
 from ..storage.table import sql_placeholders
-from .base import Node, RestorableUnit, UnitKind, diagnostic_node, paginate
+from .base import Node, RestorableUnit, UnitKind, diagnostic_node, disk_fs_containers_before_leaves, paginate
 from .content.disk_fs import disk_fs_available
 from .content.pcps_disk import DiskFragment, VirtualDiskContentSource
 from .device_kind import _NodeKind
@@ -45,9 +45,7 @@ def _missing_fids_diagnostic(fids: list[int], *, scope: str, table: str) -> str:
     """Shared wording for "some of ``copy_target_file``'s registered fids
     are absent from the currently committed generation" — ``scope`` names
     what's missing them (``"this version"``/``"this disk"``), ``table``
-    names which db table (``"file_meta"``/``"file_map"``). See
-    ``_disk_nodes``'s/``open_disk``'s own docstrings for why this SDK
-    reports the observation rather than guessing a cause."""
+    names which db table (``"file_meta"``/``"file_map"``)."""
     return (
         f"copy_target_file registers {len(fids)} more object(s) for {scope} "
         f"({_format_fids(fids)}), but they are absent from {table}'s currently committed "
@@ -67,6 +65,23 @@ def _missing_fids_diagnostic(fids: list[int], *, scope: str, table: str) -> str:
 # missing either isn't identifiable as belonging to one particular
 # physical disk anyway.
 _PCPS_NAME_RE = re.compile(r"D\(([^()]*)\)(?:O\([^()]*\))?(?:V\([^()]*\))?S\(([^()]*)\)")
+
+
+def _pcps_disk_sort_key(key: tuple[str, str]) -> tuple[int, int, str]:
+    """Display order for one ``_pcps_disk_key()`` group: real disks with a
+    numeric ``diskIndex`` (FORMAT-SPEC.md: pcps-fragments) first, ordered
+    by that index rather than by ``disk_uuid`` — two disks' UUIDs sort in
+    an order unrelated to which one a user would call "Disk 0" vs "Disk 1".
+    Anything else — a non-numeric ``diskIndex``, or a ``_pcps_disk_key()``
+    singleton fallback (``disk_uuid == "_single"``) — sorts after every
+    real disk instead."""
+    disk_uuid, disk_index = key
+    if disk_uuid == "_single":
+        return (1, int(disk_index), disk_uuid)
+    try:
+        return (0, int(disk_index), disk_uuid)
+    except ValueError:
+        return (1, -1, disk_uuid)
 
 
 def _pcps_disk_key(fid: int, path: str) -> tuple[str, str]:
@@ -149,15 +164,13 @@ class PcpsDiskTree:
         return nodes
 
     async def _build_nodes(self) -> tuple[list[Node], list[int]]:
-        """Resolves ``copy_target_version`` → ``copy_target_file`` →
-        ``file_meta`` (FORMAT-SPEC.md: version-meta-mapping) and groups every
-        resolved fragment by disk (``_pcps_disk_key()``) into one ``Node``
-        each — no ``locate_file()``/composition I/O yet, that happens
-        lazily in ``open_disk``. Returns ``(all disk nodes, fids registered
-        in copy_target_file but never resolved in file_meta)``;
-        ``object_nodes`` (this method's only caller) owns pagination and
-        the diagnostic node, caching this pair on ``self`` since it never
-        changes for the life of the owning provider."""
+        """Groups every resolved fragment by disk (``_pcps_disk_key()``)
+        into one ``Node`` each — no ``locate_file()``/composition I/O yet,
+        that happens lazily in ``open_disk``. Returns ``(all disk nodes,
+        fids registered in copy_target_file but never resolved in
+        file_meta)``; ``object_nodes`` (this method's only caller) owns
+        pagination and the diagnostic node, caching this pair on ``self``
+        since it never changes for the life of the owning provider."""
         repo = self._provider.repo
         version = self._provider.version
         try:
@@ -165,10 +178,12 @@ class PcpsDiskTree:
         except NotFoundError:
             return [], []
         # This ``repo.db(name)`` connection may be the real, immutable
-        # on-disk repository file (see storage/sqlite.py's own module
-        # docstring for the fast-path/slow-path split) — apply_index_hint()
-        # is safe to call unconditionally here (see its own docstring),
-        # applied uniformly rather than reasoned about per call site.
+        # on-disk repository file, opened read-only via storage/sqlite.py's
+        # own fast path when no non-zero ``-wal`` sidecar exists —
+        # apply_index_hint() is safe to call unconditionally here (a
+        # genuinely read-only connection just makes CREATE INDEX raise,
+        # caught and treated as a quiet no-op), applied uniformly rather
+        # than reasoned about per call site.
         await apply_index_hint(ctv_conn, "copy_target_version", ["version_uid"])
         version_cursor = await ctv_conn.execute(
             "SELECT version_id FROM copy_target_version WHERE version_uid = ?", (version.version_uid,)
@@ -223,10 +238,13 @@ class PcpsDiskTree:
         # for object_table: a disk with a "(filesystem)" sibling contributes
         # two nodes for one key, so windowing by key first wouldn't
         # produce exactly ``limit`` nodes per page.
-        ordered_keys = sorted(disks.keys())
+        ordered_keys = sorted(disks.keys(), key=_pcps_disk_sort_key)
         all_nodes: list[Node] = []
         for key in ordered_keys:
             all_nodes.extend(self._disk_nodes(key, disks[key]))
+        # disk_fs_containers_before_leaves(): each "(filesystem)" sibling
+        # keeps its own disk-index-ordered position relative to its peers.
+        all_nodes = disk_fs_containers_before_leaves(all_nodes)
 
         # An old version's own registrations can age out of
         # file_meta/file_map's generation-selection window
@@ -240,9 +258,9 @@ class PcpsDiskTree:
 
     def _disk_nodes(self, key: tuple[str, str], fragments: list[tuple[int, str, int | None]]) -> list[Node]:
         """Build one disk's listing node, plus its "(filesystem)" sibling
-        when ``disk-fs`` is available (see ``units/device.py``'s own
-        docstring) — pure construction, no I/O (see ``object_nodes``'s own
-        docstring for why). ``disk_size`` comes straight from
+        when ``disk-fs`` is available — pure construction, no I/O
+        (fragment resolution/opening happens lazily, only in
+        ``open_disk``). ``disk_size`` comes straight from
         ``file_meta.file_size`` (identical across every sibling fragment,
         FORMAT-SPEC.md: pcps-fragments) with no fallback here — a real per-fragment
         ``extent()``-based fallback only makes sense once a fragment's
@@ -300,9 +318,10 @@ class PcpsDiskTree:
         landing in its range come back as an ordinary hole.
 
         A successful assembly is cached on ``self`` by ``(disk_uuid,
-        disk_index)`` — see ``self._disk_units``'s own comment — so a
-        second ``unit()`` call on the same disk skips straight to the
-        cached ``RestorableUnit``. A failed assembly (every fragment
+        disk_index)`` — safe to hand the same frozen ``RestorableUnit`` to
+        more than one caller — so a second ``unit()`` call on the same
+        disk skips straight to the cached ``RestorableUnit``. A failed
+        assembly (every fragment
         unresolvable) is not cached and is retried from scratch on the
         next call.
 
@@ -331,7 +350,7 @@ class PcpsDiskTree:
                 return fid, None
             size = location.file_size if location.file_size is not None else file_size
             content = repo.open_composition(location.stream_id, location.session_id, location.comp_offset, size=size)
-            record = await content._get_record()  # noqa: SLF001 - DedupFile/CompositionRecord are one cohesive unit
+            record = await content.cached_record()
             start, end = await record.extent()
             return fid, DiskFragment(fid=fid, start=start, end=end, dedup_file=content, src_file_path=path)
 

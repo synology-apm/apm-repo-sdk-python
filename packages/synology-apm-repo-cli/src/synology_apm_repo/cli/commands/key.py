@@ -1,7 +1,9 @@
 """``synology-apm-repo-cli key <repo> --key <str>`` — verify a key string against a
 repository. ``gcm_ok`` alone is the whole answer to "is this key
-correct" (see ``sdk.dedup.keys``'s own module docstring for why) — there
-is no separate, deeper check this command runs. A caller who additionally
+correct" — a successful AES-256-GCM authentication tag is already
+cryptographic proof of the key for every chunk in the repository, not a
+probabilistic check — there is no separate, deeper check this command
+runs. A caller who additionally
 wants every chunk *read* verified against its stored fingerprint should
 reach for ``verify --level full`` or ``DedupRepo.open(...,
 verify_fingerprint=True)`` directly — a data-integrity property of
@@ -16,9 +18,10 @@ import typer
 from rich.console import Console
 
 from synology_apm_repo.cli.asyncio_support import typer_async
-from synology_apm_repo.cli.browse import opened_repo_or_profile
 from synology_apm_repo.cli.errors import err_console
 from synology_apm_repo.cli.options import ProfileOption, RepoArgument
+from synology_apm_repo.cli.paging import render
+from synology_apm_repo.cli.repo_session import opened_repo_or_profile
 from synology_apm_repo.cli.state import CliState
 from synology_apm_repo.cli.strings import KEY_HELP
 from synology_apm_repo.sdk.api import KeyStatus, KeyVerification, Repository
@@ -67,10 +70,11 @@ async def key(
             # Repository.set_key() raises this only when the key itself
             # verified fine but reopening/closing one specific
             # already-opened sibling catalog independently failed --
-            # repository.key_status is already VERIFIED/INVALID by the
-            # time this is raised (set_key()'s own docstring), so this is
-            # a genuinely accepted key with a partial cleanup failure
-            # alongside it, not a rejected one. Warn rather than fail --
+            # set_key() records key_status from verification.ok before
+            # raising this ExceptionGroup, so repository.key_status is
+            # already VERIFIED/INVALID by the time this is caught, and
+            # this is a genuinely accepted key with a partial cleanup
+            # failure alongside it, not a rejected one. Warn rather than fail --
             # same posture as the TUI's own KeyDialog._verify.
             err_console.print(f"[yellow]warning: {exc}[/yellow]")
             maybe_verification = repository.key_verification
@@ -78,7 +82,4 @@ async def key(
             verification = maybe_verification
         report = _build_report(repository, verification)
 
-    if state.json:
-        console.print_json(data=report)
-    else:
-        _render_human(report, repository)
+    render(console, state, json=report, human=lambda: _render_human(report, repository))

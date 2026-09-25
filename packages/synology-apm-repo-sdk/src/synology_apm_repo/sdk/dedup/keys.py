@@ -60,9 +60,9 @@ async def _vault_db_row(
 
 @dataclasses.dataclass(frozen=True)
 class KeyVerification:
-    """Result of ``KeyMaterial.verify`` — the GCM-unwrap outcome.
-    See this module's own docstring for why that alone answers "is this
-    key correct."
+    """Result of ``KeyMaterial.verify``. ``vault_key`` holds the resolved
+    DEK only when ``gcm_ok`` and encryption is actually in use; it's
+    ``None`` both for an unencrypted repository and for a failed unwrap.
     """
 
     gcm_ok: bool
@@ -159,14 +159,14 @@ class KeyMaterial:
             raise DataCorruptError(f"{path} is not a readable userKey file", ref=path) from exc
 
     async def verify(self, store: ObjectStore, layout: RepoLayout) -> KeyVerification:
-        """The whole answer to "is this key correct" — see this module's
-        own docstring for why the GCM-unwrap layer alone is sufficient.
-        Never raises for an ordinary "wrong key" outcome — that is
-        reported via the returned ``KeyVerification``, not an
-        exception; the caller decides what a failed verification means
-        for its flow (CLI/TUI report it, ``Repository.set_key`` may
-        choose to reject it). Touches only the wrapped-VaultKey record
-        itself (one sqlite row or one small key file) — never the Pool.
+        """The whole answer to "is this key correct" — no separate
+        per-chunk check follows this. Never raises for an ordinary "wrong
+        key" outcome — that is reported via the returned
+        ``KeyVerification``, not an exception; the caller decides what a
+        failed verification means for its flow (CLI/TUI report it,
+        ``Repository.set_key`` may choose to reject it). Touches only the
+        wrapped-VaultKey record itself (one sqlite row or one small key
+        file) — never the Pool.
         """
         if self.is_no_encryption:
             return KeyVerification(gcm_ok=True, vault_key=None)
@@ -198,7 +198,8 @@ async def probe_encrypted(store: ObjectStore, layout: RepoLayout) -> bool | None
     key-rotation log, never updated in place. Its last-inserted row's
     ``user_key_uuid`` is the currently-active key, ``"NoEncryption"`` iff
     this vault has never been encrypted (Encryption↔NoEncryption cannot
-    toggle after first initialization — see this module's own docstring).
+    toggle after first initialization — the DEK/``vaultKey`` itself never
+    changes once set, per FORMAT-SPEC.md: vaultkey-custody).
 
     OBJECT_STORE layout: the equivalent record lives as individual
     objects named by ``userKeyID`` under ``<key_root>/userKey/`` rather

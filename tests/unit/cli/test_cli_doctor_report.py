@@ -5,14 +5,18 @@ verbose-only internal-id gating, and Rich-markup-literal rendering."""
 
 from __future__ import annotations
 
+import asyncio
+from collections.abc import Sequence
 from typing import Any, cast
 
 import pytest
 
-from synology_apm_repo.cli.commands.doctor import _catalog_report, _render_human, _workload_report
-from synology_apm_repo.sdk.api import Connection, Workload
+from synology_apm_repo.cli.commands.doctor import _build_report, _catalog_report, _render_human, _workload_report
+from synology_apm_repo.cli.state import CliState
+from synology_apm_repo.sdk.api import Connection, KeyStatus, Workload
 from synology_apm_repo.sdk.format.repo_info import RepoInfo
 from synology_apm_repo.sdk.identifiers import CatalogId, ConnectionConfigId, ConnectionId, WorkloadId, WorkloadUid
+from synology_apm_repo.sdk.storage.layout import RepoKind, RepositoryLayout
 
 _SENSITIVE_WORKLOAD_NAME = "alice@customer-corp.example.com"
 _SENSITIVE_SUBTITLE = "Windows 10 (64-bit) · customer-hostname-01"
@@ -39,6 +43,17 @@ def _connection() -> Connection:
         namespaces=("customer-namespace-guid",),
         workload_count=1,
         version_count=1,
+    )
+
+
+def _connection_named(name: str) -> Connection:
+    return Connection(
+        connection_config_id=ConnectionConfigId(1),
+        connection_id=ConnectionId(name),
+        display_name=name,
+        namespaces=(),
+        workload_count=0,
+        version_count=0,
     )
 
 
@@ -120,6 +135,105 @@ class TestCatalogReport:
         assert report["repo_type"] == 2
 
 
+class _FakeDoctorRepository:
+    """A minimal stand-in for ``api.repository.Repository``, exposing just
+    what ``_build_report``/``_key_report`` read: ``layout``, the plain
+    key-status properties, ``catalogs()``, and ``workload_is_supported()``
+    (delegated to from each fake catalog's own ``workloads()``)."""
+
+    layout = RepositoryLayout(kind=RepoKind.OBJECT_STORE, repo_root="")
+    key_status = KeyStatus.NOT_ENCRYPTED
+    is_encrypted = False
+    key_verification = None
+
+    def __init__(self, catalogs: Sequence[object]) -> None:
+        self._catalogs = catalogs
+
+    async def catalogs(self) -> Sequence[object]:
+        return self._catalogs
+
+    def workload_is_supported(self, wl: Workload) -> bool:
+        return True
+
+
+class _EventGatedCatalog:
+    """A fake ``Catalog`` whose own ``workloads()`` only resolves once
+    ``started`` records that *every* sibling catalog in the same
+    ``_build_report`` call has itself started -- the last one to start
+    sets ``release``, waking every earlier one. Under today's concurrent
+    ``asyncio.gather`` this always resolves; under a regression back to
+    the old serial ``for`` loop, the first catalog would block forever
+    waiting on a sibling that never gets a chance to run."""
+
+    def __init__(self, connection: Connection, *, started: list[str], total: int, release: asyncio.Event) -> None:
+        self.connection = connection
+        self.catalog_id = CatalogId(f"catalog-{connection.display_name}")
+        self.info = RepoInfo(
+            uuid="u",
+            major=1,
+            minor=0,
+            repo_type=None,
+            repo_flag=None,
+            is_global_dedup_supported=None,
+            is_worm_supported=None,
+            compress_algorithm=None,
+            encrypt_algorithm=None,
+            raw={},
+        )
+        self._started = started
+        self._total = total
+        self._release = release
+
+    async def workloads(self) -> list[Workload]:
+        self._started.append(self.connection.display_name)
+        if len(self._started) >= self._total:
+            self._release.set()
+        else:
+            await self._release.wait()
+        return []
+
+
+class TestBuildReport:
+    async def test_catalogs_are_awaited_concurrently_not_serially(self) -> None:
+        started: list[str] = []
+        release = asyncio.Event()
+        catalogs = [
+            _EventGatedCatalog(_connection_named("a"), started=started, total=2, release=release),
+            _EventGatedCatalog(_connection_named("b"), started=started, total=2, release=release),
+        ]
+        report = await _build_report(cast(Any, _FakeDoctorRepository(catalogs)), CliState())
+        # Both catalogs' workloads() had to have started before either
+        # returned -- a serial for-loop would deadlock here instead
+        # (release.wait() with nothing left to set it), so reaching this
+        # assertion at all is itself part of the proof.
+        assert set(started) == {"a", "b"}
+        assert len(report["catalogs"]) == 2
+
+    async def test_output_order_matches_repository_catalogs_order_regardless_of_resolution_order(self) -> None:
+        started: list[str] = []
+        release = asyncio.Event()
+        # "second" is the one that flips the release event (it's the
+        # second to record itself in ``started``), so it's also the one
+        # whose own `workloads()` coroutine actually finishes first --
+        # order must still follow repository.catalogs()'s own list order.
+        first, second = (
+            _EventGatedCatalog(_connection_named("first"), started=started, total=2, release=release),
+            _EventGatedCatalog(_connection_named("second"), started=started, total=2, release=release),
+        )
+        report = await _build_report(cast(Any, _FakeDoctorRepository([first, second])), CliState())
+        assert [c["display_name"] for c in report["catalogs"]] == ["first", "second"]
+
+    async def test_a_single_catalog_exception_still_aborts_the_whole_report(self) -> None:
+        class _RaisingCatalog:
+            connection = _connection_named("boom")
+
+            async def workloads(self) -> list[Workload]:
+                raise RuntimeError("catalog workloads() blew up")
+
+        with pytest.raises(RuntimeError, match="blew up"):
+            await _build_report(cast(Any, _FakeDoctorRepository([_RaisingCatalog()])), CliState())
+
+
 def test_render_human_shows_gcm_ok_when_the_key_is_invalid(capsys: pytest.CaptureFixture[str]) -> None:
     report: object = {
         "layout": "object_store",
@@ -165,7 +279,8 @@ def test_render_human_shows_internal_ids_when_verbose(capsys: pytest.CaptureFixt
     ``--json --verbose``) actually shows them, not just computes and
     discards them. The verbose-only fields are present in ``report`` at
     all (rather than a separate ``verbose`` check re-deriving the same
-    gate) — see ``_DoctorReport``'s own docstring."""
+    gate) — they're ``NotRequired`` TypedDict fields, populated only
+    under ``state.verbose``."""
     report: object = {
         "layout": "vault",
         "repo_root": "/repo",

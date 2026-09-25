@@ -50,9 +50,8 @@ from .model import (
 
 def _non_secret_fields(config: S3ProfileConfig | AzureProfileConfig | SmbProfileConfig) -> dict[str, str | bool | int]:
     """Every one of ``config``'s fields (already exactly the non-secret,
-    canonical field names ``load_profile``/``save_profile`` use — see
-    ``S3ProfileConfig``/``AzureProfileConfig``/``SmbProfileConfig``'s own
-    docstrings) except a ``None`` optional (``endpoint``/``region``/
+    canonical field names ``load_profile``/``save_profile`` use) except a
+    ``None`` optional (``endpoint``/``region``/
     ``account_url``/``username``), which means "never set"."""
     return {k: v for k, v in dataclasses.asdict(config).items() if v is not None}
 
@@ -108,6 +107,18 @@ async def list_profiles(*, config_dir: Path | None = None) -> list[ProfileSummar
     touches the keyring."""
     profiles = await asyncio.to_thread(config_file.read_profiles, config_dir=config_dir)
     return [ProfileSummary(name=p.name, kind=p.kind) for p in sorted(profiles.values(), key=lambda p: p.name)]
+
+
+async def list_profiles_full(*, config_dir: Path | None = None) -> list[Profile]:
+    """Every saved profile, sorted by name, as a full ``Profile`` rather
+    than ``list_profiles()``'s own name+kind summary — for a caller that
+    wants every profile's own backend fields (``profile list --verbose``)
+    without one ``get_profile()`` call per name each re-reading and
+    re-parsing the same ``profiles.json`` that a single call here already
+    read once. Never touches the keyring, same guarantee as
+    ``get_profile()``."""
+    profiles = await asyncio.to_thread(config_file.read_profiles, config_dir=config_dir)
+    return sorted(profiles.values(), key=lambda p: p.name)
 
 
 async def get_profile(name: str, *, config_dir: Path | None = None) -> Profile:
@@ -256,6 +267,7 @@ __all__ = [
     "form_fields_for",
     "get_profile",
     "list_profiles",
+    "list_profiles_full",
     "list_remote_items",
     "load_profile",
     "save_profile",

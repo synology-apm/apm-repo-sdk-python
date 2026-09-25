@@ -53,6 +53,7 @@ from synology_apm_repo.sdk.units.base import UnitKind
 from synology_apm_repo.sdk.units.content.saas_mail import build_eml
 from synology_apm_repo.sdk.units.saas.mail import MAIL_CONFIG, ArchiveMailProvider, MailProvider, _mail_display_name
 from synology_apm_repo.sdk.units.saas.provider import SaasWorkloadProvider
+from synology_apm_repo.sdk.units.saas.stream import SaasStreamCache
 from synology_apm_repo.sdk.units.saas.tree_strategy import TreeStrategy
 
 _STREAM_ID = 16
@@ -294,8 +295,15 @@ def _write_saas_version_db(path: Path, target_type: str = "M365") -> None:
 def _write_copy_target_version_db(
     path: Path, *, version_uid: str, object_db_id: str, db_objects: list[tuple[str, str]]
 ) -> None:
-    """See test_units_dispatch_saas.py's own
-    ``_write_copy_target_version_db`` docstring."""
+    """The connector's own index bookkeeping
+    (``synology_apm_repo.sdk.units.saas.object_name_index``) — every
+    ``SaasWorkloadProvider``/``TeamsChatProvider`` construction resolves
+    its service DB(s) *only* through this table, with no
+    scan-based fallback, so a fixture repository that wants a table found
+    must record it here rather than merely embedding the bytes
+    somewhere in ``saas_obj``. Plain, unencrypted JSON — these fixture
+    repositories never configure a vault_key, matching every other db this
+    file writes."""
     path.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(path)
     conn.execute("CREATE TABLE copy_target_version(version_uid TEXT PRIMARY KEY, version_spec TEXT)")
@@ -391,12 +399,12 @@ def _build_mail_folder_hierarchy_db(folders: list[tuple[str, str, str, int]]) ->
 
 
 def _build_gws_mail_db(mails: list[tuple[str, str, str]], memberships: list[tuple[int, str, str]]) -> bytes:
-    """GWS's own ``mail_table`` — no ``parent_folder_id`` column at all
-    (module docstring: "GWS has no folder hierarchy at all") — plus,
-    inside this same object, the label *membership* half of
-    ``mail_label_table`` (the module docstring's own "membership join...
-    inside mail_db itself"). ``mails``: (mail_id, subject,
-    meta_object_id); ``memberships``: (row_id, mail_id, label_id)."""
+    """GWS's own ``mail_table`` — no ``parent_folder_id`` column at all,
+    since GWS has no folder hierarchy, only many-to-many label membership
+    — plus, inside this same object, the label *membership* half of
+    ``mail_label_table`` (the join itself lives inside ``mail_db``, not a
+    separate label db). ``mails``: (mail_id, subject, meta_object_id);
+    ``memberships``: (row_id, mail_id, label_id)."""
     with tempfile.TemporaryDirectory() as td:
         path = Path(td) / "mail.db"
         conn = sqlite3.connect(path)
@@ -687,8 +695,8 @@ async def provider(tmp_path: Path) -> AsyncIterator[SaasWorkloadProvider]:
     _build_mail_repo(tmp_path)
     store = LocalFsStore(tmp_path)
     layout = RepoLayout(kind=RepoKind.VAULT, repo_root="")
-    async with await DedupRepo.open(store, layout) as repo:
-        p = await MailProvider(repo, _version())
+    async with await DedupRepo.open(store, layout) as repo, SaasStreamCache(repo) as saas_streams:
+        p = await MailProvider(repo, _version(), saas_streams)
         try:
             yield p
         finally:
@@ -715,8 +723,9 @@ def _gws_version() -> Version:
 def _build_gws_mail_repo(tmp_path: Path, *, session_id: int = 15) -> None:
     """A GWS mailbox with two messages: ``mail-1`` carries one real
     label, ``mail-2`` carries none at all — the "no membership row for
-    this mail_id" boundary ``extras_attr`` degrades on (no ``"labels"``
-    key at all, not an empty list — see that function's own docstring)."""
+    this mail_id" boundary ``extras_attr`` degrades on: a missing lookup
+    returns ``{}``, so the result has no ``"labels"`` key at all, not an
+    empty list."""
     _write_repo_info(tmp_path / "repo_info")
     _write_vault_encryption_key_db(tmp_path / "db" / "vault_encryption_key")
     _write_connection_config(tmp_path / "db" / "connection_config", [(_CCID, _CONNECTION_ID)])
@@ -745,8 +754,8 @@ async def gws_provider(tmp_path: Path) -> AsyncIterator[SaasWorkloadProvider]:
     _build_gws_mail_repo(tmp_path)
     store = LocalFsStore(tmp_path)
     layout = RepoLayout(kind=RepoKind.VAULT, repo_root="")
-    async with await DedupRepo.open(store, layout) as repo:
-        p = await MailProvider(repo, _gws_version())
+    async with await DedupRepo.open(store, layout) as repo, SaasStreamCache(repo) as saas_streams:
+        p = await MailProvider(repo, _gws_version(), saas_streams)
         try:
             yield p
         finally:
@@ -779,9 +788,10 @@ class TestGwsTree:
 
 
 class TestMailDisplayName:
-    """Direct unit tests for ``_mail_display_name`` -- no test anywhere in
-    this file builds a mail row with an empty or null subject, so
-    ``_NO_SUBJECT_LABEL`` was never actually produced."""
+    """Direct unit tests for ``_mail_display_name`` -- isolated from
+    ``MailProvider``'s own end-to-end wiring, which exercises the same
+    empty-subject fallback via ``TestTree.test_folder_lists_an_empty_
+    subject_mail_as_no_subject_not_the_raw_id`` below."""
 
     def test_empty_string_subject_gets_the_no_subject_label(self) -> None:
         assert _mail_display_name({"subject": ""}) == "(no subject)"
@@ -808,8 +818,8 @@ class TestTree:
         _build_mail_repo(tmp_path, include_folder_names=True)
         store = LocalFsStore(tmp_path)
         layout = RepoLayout(kind=RepoKind.VAULT, repo_root="")
-        async with await DedupRepo.open(store, layout) as repo:
-            provider = await MailProvider(repo, _version())
+        async with await DedupRepo.open(store, layout) as repo, SaasStreamCache(repo) as saas_streams:
+            provider = await MailProvider(repo, _version(), saas_streams)
             try:
                 folders = await provider.children(provider.root())
                 assert len(folders) == 1
@@ -830,8 +840,8 @@ class TestTree:
         _build_mail_repo(tmp_path, subject="")
         store = LocalFsStore(tmp_path)
         layout = RepoLayout(kind=RepoKind.VAULT, repo_root="")
-        async with await DedupRepo.open(store, layout) as repo:
-            provider = await MailProvider(repo, _version())
+        async with await DedupRepo.open(store, layout) as repo, SaasStreamCache(repo) as saas_streams:
+            provider = await MailProvider(repo, _version(), saas_streams)
             try:
                 [folder] = await provider.children(provider.root())
                 [mail] = await provider.children(folder)
@@ -856,8 +866,8 @@ class TestTree:
         )
         store = LocalFsStore(tmp_path)
         layout = RepoLayout(kind=RepoKind.VAULT, repo_root="")
-        async with await DedupRepo.open(store, layout) as repo:
-            provider = await MailProvider(repo, _version())
+        async with await DedupRepo.open(store, layout) as repo, SaasStreamCache(repo) as saas_streams:
+            provider = await MailProvider(repo, _version(), saas_streams)
             try:
                 [folder] = await provider.children(provider.root())
                 mails = await provider.children(folder)
@@ -904,8 +914,8 @@ class TestM365RealFolderHierarchy:
         _build_mail_repo_with_folder_hierarchy(tmp_path)
         store = LocalFsStore(tmp_path)
         layout = RepoLayout(kind=RepoKind.VAULT, repo_root="")
-        async with await DedupRepo.open(store, layout) as repo:
-            provider = await MailProvider(repo, _version())
+        async with await DedupRepo.open(store, layout) as repo, SaasStreamCache(repo) as saas_streams:
+            provider = await MailProvider(repo, _version(), saas_streams)
             try:
                 folders = await provider.children(provider.root())
                 # Inbox has zero direct mail -- it must still appear.
@@ -918,8 +928,8 @@ class TestM365RealFolderHierarchy:
         _build_mail_repo_with_folder_hierarchy(tmp_path)
         store = LocalFsStore(tmp_path)
         layout = RepoLayout(kind=RepoKind.VAULT, repo_root="")
-        async with await DedupRepo.open(store, layout) as repo:
-            provider = await MailProvider(repo, _version())
+        async with await DedupRepo.open(store, layout) as repo, SaasStreamCache(repo) as saas_streams:
+            provider = await MailProvider(repo, _version(), saas_streams)
             try:
                 [inbox] = [f for f in await provider.children(provider.root()) if f.name == "Inbox"]
                 children = await provider.children(inbox)
@@ -932,8 +942,8 @@ class TestM365RealFolderHierarchy:
         _build_mail_repo_with_folder_hierarchy(tmp_path)
         store = LocalFsStore(tmp_path)
         layout = RepoLayout(kind=RepoKind.VAULT, repo_root="")
-        async with await DedupRepo.open(store, layout) as repo:
-            provider = await MailProvider(repo, _version())
+        async with await DedupRepo.open(store, layout) as repo, SaasStreamCache(repo) as saas_streams:
+            provider = await MailProvider(repo, _version(), saas_streams)
             try:
                 [inbox] = [f for f in await provider.children(provider.root()) if f.name == "Inbox"]
                 [haha] = await provider.children(inbox)
@@ -947,8 +957,8 @@ class TestM365RealFolderHierarchy:
         _build_mail_repo_with_folder_hierarchy(tmp_path)
         store = LocalFsStore(tmp_path)
         layout = RepoLayout(kind=RepoKind.VAULT, repo_root="")
-        async with await DedupRepo.open(store, layout) as repo:
-            provider = await MailProvider(repo, _version())
+        async with await DedupRepo.open(store, layout) as repo, SaasStreamCache(repo) as saas_streams:
+            provider = await MailProvider(repo, _version(), saas_streams)
             try:
                 [sent] = [f for f in await provider.children(provider.root()) if f.name == "Sent"]
                 mails = await provider.children(sent)
@@ -960,8 +970,8 @@ class TestM365RealFolderHierarchy:
         _build_mail_repo_with_folder_hierarchy(tmp_path)
         store = LocalFsStore(tmp_path)
         layout = RepoLayout(kind=RepoKind.VAULT, repo_root="")
-        async with await DedupRepo.open(store, layout) as repo:
-            provider = await MailProvider(repo, _version())
+        async with await DedupRepo.open(store, layout) as repo, SaasStreamCache(repo) as saas_streams:
+            provider = await MailProvider(repo, _version(), saas_streams)
             try:
                 [inbox] = [f for f in await provider.children(provider.root()) if f.name == "Inbox"]
                 with pytest.raises(ValueError, match="not a restorable unit"):
@@ -1005,8 +1015,8 @@ class TestArchiveMailFolderHierarchy:
 
         store = LocalFsStore(tmp_path)
         layout = RepoLayout(kind=RepoKind.VAULT, repo_root="")
-        async with await DedupRepo.open(store, layout) as repo:
-            provider = await ArchiveMailProvider(repo, _version())
+        async with await DedupRepo.open(store, layout) as repo, SaasStreamCache(repo) as saas_streams:
+            provider = await ArchiveMailProvider(repo, _version(), saas_streams)
             try:
                 [inbox] = await provider.children(provider.root())
                 assert inbox.name == "Inbox"
@@ -1043,8 +1053,8 @@ class TestUnit:
         _build_mail_repo(tmp_path, subject="")
         store = LocalFsStore(tmp_path)
         layout = RepoLayout(kind=RepoKind.VAULT, repo_root="")
-        async with await DedupRepo.open(store, layout) as repo:
-            provider = await MailProvider(repo, _version())
+        async with await DedupRepo.open(store, layout) as repo, SaasStreamCache(repo) as saas_streams:
+            provider = await MailProvider(repo, _version(), saas_streams)
             try:
                 [folder] = await provider.children(provider.root())
                 [mail] = await provider.children(folder)
@@ -1059,8 +1069,8 @@ class TestAssembleEmlErrors:
         _build_mail_repo_without_skeleton(tmp_path)
         store = LocalFsStore(tmp_path)
         layout = RepoLayout(kind=RepoKind.VAULT, repo_root="")
-        async with await DedupRepo.open(store, layout) as repo:
-            p = await MailProvider(repo, _version())
+        async with await DedupRepo.open(store, layout) as repo, SaasStreamCache(repo) as saas_streams:
+            p = await MailProvider(repo, _version(), saas_streams)
             try:
                 [folder] = await p.children(p.root())
                 [mail] = await p.children(folder)
@@ -1074,8 +1084,8 @@ class TestAssembleEmlErrors:
         _build_mail_repo_with_malformed_meta(tmp_path)
         store = LocalFsStore(tmp_path)
         layout = RepoLayout(kind=RepoKind.VAULT, repo_root="")
-        async with await DedupRepo.open(store, layout) as repo:
-            p = await MailProvider(repo, _version())
+        async with await DedupRepo.open(store, layout) as repo, SaasStreamCache(repo) as saas_streams:
+            p = await MailProvider(repo, _version(), saas_streams)
             try:
                 [folder] = await p.children(p.root())
                 [mail] = await p.children(folder)
@@ -1153,9 +1163,9 @@ class TestDegradation:
 
         store = LocalFsStore(tmp_path)
         layout = RepoLayout(kind=RepoKind.VAULT, repo_root="")
-        async with await DedupRepo.open(store, layout) as repo:
+        async with await DedupRepo.open(store, layout) as repo, SaasStreamCache(repo) as saas_streams:
             with pytest.raises(UnsupportedDataFormatError):
-                await MailProvider(repo, _version())
+                await MailProvider(repo, _version(), saas_streams)
 
     async def test_tree_factory_failure_closes_resources_instead_of_leaking_them(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -1182,17 +1192,16 @@ class TestDegradation:
 
         store = LocalFsStore(tmp_path)
         layout = RepoLayout(kind=RepoKind.VAULT, repo_root="")
-        async with await DedupRepo.open(store, layout) as repo:
+        async with await DedupRepo.open(store, layout) as repo, SaasStreamCache(repo) as saas_streams:
             with pytest.raises(RuntimeError, match="synthetic tree_factory failure"):
-                await SaasWorkloadProvider.create(repo, _version(), failing_config)
+                await SaasWorkloadProvider.create(repo, _version(), failing_config, saas_streams)
         assert len(closed_instances) == 1
 
     async def test_tree_factory_schema_drift_degrades_to_unsupported_data_format(self, tmp_path: Path) -> None:
         """A ``tree_factory`` reading its own secondary table
         (``DataCorruptError``/``sqlite3.DatabaseError``, the same shape a
-        connector-version schema mismatch produces — see Drive's own
-        ``config_table`` lookup, Site's own ``list_version_table`` scan)
-        must convert to ``UnsupportedDataFormatError``, matching
+        connector-version schema mismatch produces) must convert to
+        ``UnsupportedDataFormatError``, matching
         ``_open_table_via_index``'s own conversion, so one candidate's
         schema drift degrades like any other non-match instead of
         crashing ``saas_provider_for``'s whole dispatch loop."""
@@ -1205,27 +1214,25 @@ class TestDegradation:
 
         store = LocalFsStore(tmp_path)
         layout = RepoLayout(kind=RepoKind.VAULT, repo_root="")
-        async with await DedupRepo.open(store, layout) as repo:
+        async with await DedupRepo.open(store, layout) as repo, SaasStreamCache(repo) as saas_streams:
             with pytest.raises(UnsupportedDataFormatError):
-                await SaasWorkloadProvider.create(repo, _version(), failing_config)
+                await SaasWorkloadProvider.create(repo, _version(), failing_config, saas_streams)
 
 
 class TestArchiveMailProvider:
     """Direct tests for ``ArchiveMailProvider``/``ARCHIVE_MAIL_CONFIG`` --
     zero coverage anywhere else in this file despite being a real,
-    separate M365 mailbox coexisting with regular Mail (module
-    docstring). Same real mail_table schema as ``MailProvider`` (module
-    docstring: "implemented generically from that schema alone"), just
-    resolved under the index's ``archive_mail_db`` name instead of
-    ``mail_db`` -- reuses ``_build_mail_repo`` with
+    separate M365-only mailbox with a schema byte-for-byte identical to
+    regular Mail's, just resolved under the index's ``archive_mail_db``
+    name instead of ``mail_db`` -- reuses ``_build_mail_repo`` with
     ``index_db_name="archive_mail_db"``."""
 
     async def test_root_group_is_named_archive_not_all_mail(self, tmp_path: Path) -> None:
         _build_mail_repo(tmp_path, index_db_name="archive_mail_db")
         store = LocalFsStore(tmp_path)
         layout = RepoLayout(kind=RepoKind.VAULT, repo_root="")
-        async with await DedupRepo.open(store, layout) as repo:
-            provider = await ArchiveMailProvider(repo, _version())
+        async with await DedupRepo.open(store, layout) as repo, SaasStreamCache(repo) as saas_streams:
+            provider = await ArchiveMailProvider(repo, _version(), saas_streams)
             try:
                 assert provider.root().name == "Archive"
                 folders = await provider.children(provider.root())
@@ -1245,6 +1252,6 @@ class TestArchiveMailProvider:
         _build_mail_repo(tmp_path)  # index_db_name defaults to "mail_db"
         store = LocalFsStore(tmp_path)
         layout = RepoLayout(kind=RepoKind.VAULT, repo_root="")
-        async with await DedupRepo.open(store, layout) as repo:
+        async with await DedupRepo.open(store, layout) as repo, SaasStreamCache(repo) as saas_streams:
             with pytest.raises(UnsupportedDataFormatError):
-                await ArchiveMailProvider(repo, _version())
+                await ArchiveMailProvider(repo, _version(), saas_streams)

@@ -1,14 +1,17 @@
 """Unit tests for ``synology_apm_repo.cli.commands.ls``'s own
 catalog-level/workload-level row-building (``case "catalog":``/
-``case "workload":`` in ``ls()`` itself) — no existing
-``tests/integration/cli/test_cli_ls.py`` scenario reaches these
-branches (see that file's own docstring: the human-ref/catalog- and
-workload-level navigation those two branches serve is proven here,
-synthetically, rather than against a real backend)."""
+``case "workload":`` in ``ls()`` itself), plus the ``Node.attrs["file_state"]``
+hint below — none of which any existing
+``tests/integration/cli/test_cli_ls.py`` scenario reaches (the
+human-ref/catalog- and workload-level navigation, and a cloud-sync
+placeholder file, aren't things a real sample fixture is expected to
+contain), so both are proven here, synthetically, rather than against a
+real backend."""
 
 from __future__ import annotations
 
-from typing import cast
+import json
+from typing import Any, cast
 
 import pytest
 from typer.testing import CliRunner
@@ -31,6 +34,9 @@ from synology_apm_repo.sdk.identifiers import (
     WorkloadUid,
 )
 from synology_apm_repo.sdk.storage.layout import RepoKind, RepoLayout
+from synology_apm_repo.sdk.units.base import FileState, Node, diagnostic_node
+from synology_apm_repo.sdk.units.node_ref import NodeRef
+from synology_apm_repo.sdk.units.saas.stream import SaasStreamCache
 
 runner = CliRunner()
 
@@ -96,8 +102,13 @@ class _FakeCatalog(Catalog):
         workloads: list[Workload] | None = None,
         versions: list[Version] | None = None,
     ) -> None:
+        dedup_repo = cast(DedupRepo, _FakeDedupRepo())
         super().__init__(
-            cast(DedupRepo, _FakeDedupRepo()), connection, track=lambda p: p, require_key_verified=lambda: None
+            dedup_repo,
+            connection,
+            saas_streams=SaasStreamCache(dedup_repo),
+            track=lambda p: p,
+            require_key_verified=lambda: None,
         )
         self._fake_workloads = workloads or []
         self._fake_versions = versions or []
@@ -204,6 +215,94 @@ def test_ls_without_verbose_or_ref_omits_stable_id(monkeypatch: pytest.MonkeyPat
     result = runner.invoke(app, ["ls", "/some/path#Source/Workload"])
     assert result.exit_code == 0, result.output
     assert "id=" not in result.output
+
+
+# -- ls command: cloud-sync/EFS hint (Node.attrs["file_state"]) ------------
+
+
+class _FakeNodeProvider:
+    def __init__(self, root_node: Node, children: list[Node]) -> None:
+        self._root_node = root_node
+        self._children = children
+
+    def root(self) -> Node:
+        return self._root_node
+
+    async def children(self, node: Node, offset: int = 0, limit: int | None = None) -> list[Node]:
+        return self._children if node == self._root_node else []
+
+    async def unit(self, node: Node) -> Any:
+        raise NotImplementedError
+
+
+def test_ls_shows_the_cloud_file_icon_in_human_and_json_output(monkeypatch: pytest.MonkeyPatch) -> None:
+    root_node = Node(ref=NodeRef("repo", ("ver",)), name="root", is_leaf=False)
+    normal_child = Node(ref=NodeRef("repo", ("ver", "normal.txt")), name="normal.txt", is_leaf=True, size=1)
+    cloud_child = Node(
+        ref=NodeRef("repo", ("ver", "cloud.txt")),
+        name="cloud.txt",
+        is_leaf=True,
+        size=1,
+        attrs={"file_state": FileState.CLOUD_ONLY},
+    )
+    provider = _FakeNodeProvider(root_node, [normal_child, cloud_child])
+    _patch_frame(monkeypatch, _FakeRepo(), Frame(level="node", node=root_node, provider=cast(Any, provider)))
+
+    result = runner.invoke(app, ["ls", "/some/path#ver"])
+    assert result.exit_code == 0, result.output
+    assert "normal.txt (1 B)\n" in result.output  # no hint suffix on this line
+    assert "cloud.txt (1 B) ☁" in result.output
+
+    json_result = runner.invoke(app, ["--json", "ls", "/some/path#ver"])
+    assert json_result.exit_code == 0, json_result.output
+    rows_by_name = {row["name"]: row for row in json.loads(json_result.output)}
+    assert "file_state" not in rows_by_name["normal.txt"]
+    assert rows_by_name["cloud.txt"]["file_state"] == "cloud_only"
+
+
+def test_ls_shows_the_encrypted_icon_in_human_and_json_output(monkeypatch: pytest.MonkeyPatch) -> None:
+    root_node = Node(ref=NodeRef("repo", ("ver",)), name="root", is_leaf=False)
+    encrypted_child = Node(
+        ref=NodeRef("repo", ("ver", "secret.docx")),
+        name="secret.docx",
+        is_leaf=True,
+        size=1,
+        attrs={"file_state": FileState.ENCRYPTED},
+    )
+    provider = _FakeNodeProvider(root_node, [encrypted_child])
+    _patch_frame(monkeypatch, _FakeRepo(), Frame(level="node", node=root_node, provider=cast(Any, provider)))
+
+    result = runner.invoke(app, ["ls", "/some/path#ver"])
+    assert result.exit_code == 0, result.output
+    assert "secret.docx (1 B) 🔒" in result.output
+
+    json_result = runner.invoke(app, ["--json", "ls", "/some/path#ver"])
+    assert json_result.exit_code == 0, json_result.output
+    rows_by_name = {row["name"]: row for row in json.loads(json_result.output)}
+    assert rows_by_name["secret.docx"]["file_state"] == "encrypted"
+
+
+def test_ls_shows_the_diagnostic_marker_for_a_diagnostic_node_placeholder(monkeypatch: pytest.MonkeyPatch) -> None:
+    root_node = Node(ref=NodeRef("repo", ("ver",)), name="root", is_leaf=False)
+    normal_child = Node(ref=NodeRef("repo", ("ver", "normal.txt")), name="normal.txt", is_leaf=True, size=1)
+    diagnostic_child = diagnostic_node(
+        NodeRef("repo", ("ver", "(missing fragments)")),
+        "(2 registered object(s) not found in current data)",
+        {"diagnostic": "some fragments never resolved"},
+    )
+    provider = _FakeNodeProvider(root_node, [normal_child, diagnostic_child])
+    _patch_frame(monkeypatch, _FakeRepo(), Frame(level="node", node=root_node, provider=cast(Any, provider)))
+
+    result = runner.invoke(app, ["ls", "/some/path#ver"])
+    assert result.exit_code == 0, result.output
+    assert "normal.txt (1 B)\n" in result.output  # no diagnostic marker on this line
+    assert "(2 registered object(s) not found in current data) ⚠" in result.output
+
+    json_result = runner.invoke(app, ["--json", "ls", "/some/path#ver"])
+    assert json_result.exit_code == 0, json_result.output
+    rows_by_name = {row["name"]: row for row in json.loads(json_result.output)}
+    assert "diagnostic" not in rows_by_name["normal.txt"]
+    assert rows_by_name["(2 registered object(s) not found in current data)"]["diagnostic"] is True
 
 
 __all__: list[str] = []

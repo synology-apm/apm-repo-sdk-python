@@ -31,7 +31,9 @@ def test_wrapped_function_turns_an_unexpected_exception_into_a_clean_exit(capsys
     # into a typer.Exit itself no longer propagates as a raw exception —
     # fail_unexpected() turns it into a typer.Exit(code=1), the same clean
     # failure shape every *expected* command error already produces via
-    # fail()/unwrap(). See errors.py::fail_unexpected's own docstring.
+    # fail()/unwrap(). It's the last-resort handler wired in at
+    # typer_async, the one chokepoint every command callback passes
+    # through, so a bug never surfaces as a bare, unexplained traceback.
     @typer_async
     async def raises() -> None:
         raise ValueError("boom")

@@ -36,12 +36,15 @@ def write_index(
     finished_at: datetime,
     stats: dict[str, DomainStats],
     step_results: dict[str, list[StepResult]],
+    trace_files: Sequence[str] = (),
 ) -> None:
     """Write ``index.md``: run metadata, per-domain stats table, full
     checklist, file pointers. ``title`` and ``domains`` are the one thing
     that differs per distribution (``sdk/``'s own five domains, ``cli/``'s
     and ``browser/``'s own, different sets) -- everything else about the
-    rendering is shared as-is."""
+    rendering is shared as-is. ``trace_files`` lists extra trace artifacts
+    this run wrote (e.g. ``store_trace.jsonl``) to link from ``## Files`` --
+    empty for a tool that writes none."""
     lines: list[str] = [
         f"# {title}",
         "",
@@ -82,8 +85,9 @@ def write_index(
     domains_with_detail = [d for d in domains if any(r.has_detail for r in step_results[d])]
     for domain in domains_with_detail:
         lines.append(f"- [{domain}.md]({domain}.md)")
+    for trace_file in trace_files:
+        lines.append(f"- [{trace_file}]({trace_file})")
     lines += [
-        "- [store_trace.jsonl](store_trace.jsonl)",
         "",
         "## Test data",
         "",

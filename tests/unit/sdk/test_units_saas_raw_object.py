@@ -23,7 +23,7 @@ import zstandard
 
 from synology_apm_repo.sdk.catalog.version import Version
 from synology_apm_repo.sdk.dedup.repository import DedupRepo
-from synology_apm_repo.sdk.errors import NotFoundError
+from synology_apm_repo.sdk.errors import DataCorruptError, NotFoundError
 from synology_apm_repo.sdk.format.addressing import ChunkAddress
 from synology_apm_repo.sdk.format.bucket import MODE_CHUNK_CRC, MODE_COMPRESS
 from synology_apm_repo.sdk.format.chunkmap import ChunkMapKind
@@ -46,7 +46,9 @@ from synology_apm_repo.sdk.identifiers import (
 from synology_apm_repo.sdk.storage.layout import RepoKind, RepoLayout
 from synology_apm_repo.sdk.storage.local import LocalFsStore
 from synology_apm_repo.sdk.units.base import UnitKind
+from synology_apm_repo.sdk.units.saas.objectdb import ObjectDb
 from synology_apm_repo.sdk.units.saas.raw_object import RawObjectProvider
+from synology_apm_repo.sdk.units.saas.stream import SaasStreamCache
 
 _STREAM_ID = 11
 _CCID = 1
@@ -130,8 +132,13 @@ def _write_saas_version_db(path: Path) -> None:
 def _write_copy_target_version_db(
     path: Path, *, version_uid: str, object_db_id: str, db_objects: list[tuple[str, str]]
 ) -> None:
-    """See test_units_dispatch_saas.py's own
-    ``_write_copy_target_version_db`` docstring."""
+    """The connector's own index bookkeeping
+    (``synology_apm_repo.sdk.units.saas.object_name_index``) -- every
+    ``SaasWorkloadProvider``/``TeamsChatProvider`` construction resolves
+    its service DB(s) only through this table, with no scan-based
+    fallback, so a fixture repository that wants a table found must
+    record it here. Plain, unencrypted JSON -- these fixture repositories
+    never configure a vault_key."""
     path.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(path)
     conn.execute("CREATE TABLE copy_target_version(version_uid TEXT PRIMARY KEY, version_spec TEXT)")
@@ -329,7 +336,11 @@ async def manual_object_db_id(tmp_path: Path) -> str:
 async def provider(tmp_path: Path, manual_object_db_id: str) -> AsyncIterator[RawObjectProvider]:
     store = LocalFsStore(tmp_path)
     layout = RepoLayout(kind=RepoKind.VAULT, repo_root="")
-    async with await DedupRepo.open(store, layout) as repo, await RawObjectProvider.create(repo, _version()) as p:
+    async with (
+        await DedupRepo.open(store, layout) as repo,
+        SaasStreamCache(repo) as saas_streams,
+        await RawObjectProvider.create(repo, _version(), saas_streams) as p,
+    ):
         yield p
 
 
@@ -379,7 +390,8 @@ class TestTree:
         layout = RepoLayout(kind=RepoKind.VAULT, repo_root="")
         async with (
             await DedupRepo.open(store, layout) as repo,
-            await RawObjectProvider.create(repo, _version()) as provider,
+            SaasStreamCache(repo) as saas_streams,
+            await RawObjectProvider.create(repo, _version(), saas_streams) as provider,
         ):
             nodes = await provider.children(provider.root())
             assert {n.name for n in nodes} == {"cat_a", "cat_b"}
@@ -428,7 +440,8 @@ class TestNoCatalogIndex:
         layout = RepoLayout(kind=RepoKind.VAULT, repo_root="")
         async with (
             await DedupRepo.open(store, layout) as repo,
-            await RawObjectProvider.create(repo, _version()) as provider,
+            SaasStreamCache(repo) as saas_streams,
+            await RawObjectProvider.create(repo, _version(), saas_streams) as provider,
         ):
             assert await provider.children(provider.root()) == []
 
@@ -443,10 +456,15 @@ class TestObjectDbIdOverride:
         self, opened_repo: DedupRepo, manual_object_db_id: str
     ) -> None:
         # The manual ObjectDB is deliberately never named by the index
-        # index at all -- the exact-set assertion below (not just
+        # at all -- the exact-set assertion below (not just
         # "cat_a" absent) proves reaching its one real object doesn't
         # merely re-derive the index's own choice.
-        async with await RawObjectProvider.create(opened_repo, _version(), object_db_id=manual_object_db_id) as manual:
+        async with (
+            SaasStreamCache(opened_repo) as saas_streams,
+            await RawObjectProvider.create(
+                opened_repo, _version(), saas_streams, object_db_id=manual_object_db_id
+            ) as manual,
+        ):
             children = await manual.children(manual.root())
             assert {n.name for n in children} == {"b_object_1"}
             assert all(n.is_leaf for n in children)
@@ -454,18 +472,27 @@ class TestObjectDbIdOverride:
     async def test_manual_mode_unit_reads_back_the_real_content(
         self, opened_repo: DedupRepo, manual_object_db_id: str
     ) -> None:
-        async with await RawObjectProvider.create(opened_repo, _version(), object_db_id=manual_object_db_id) as manual:
+        async with (
+            SaasStreamCache(opened_repo) as saas_streams,
+            await RawObjectProvider.create(
+                opened_repo, _version(), saas_streams, object_db_id=manual_object_db_id
+            ) as manual,
+        ):
             [node] = await manual.children(manual.root())
             content = (await manual.unit(node)).open()
             assert await content.read(0, content.size or 0) == b'{"meta": "b1"}'
 
     async def test_mismatched_stream_uuid_raises_not_found(self, opened_repo: DedupRepo) -> None:
-        with pytest.raises(NotFoundError, match="names stream"):
-            await RawObjectProvider.create(opened_repo, _version(), object_db_id="wrong-stream_0_100")
+        async with SaasStreamCache(opened_repo) as saas_streams:
+            with pytest.raises(NotFoundError, match="names stream"):
+                await RawObjectProvider.create(opened_repo, _version(), saas_streams, object_db_id="wrong-stream_0_100")
 
     async def test_malformed_object_db_id_raises_not_found(self, opened_repo: DedupRepo) -> None:
-        with pytest.raises(NotFoundError, match="malformed"):
-            await RawObjectProvider.create(opened_repo, _version(), object_db_id="not-shaped-like-one")
+        async with SaasStreamCache(opened_repo) as saas_streams:
+            with pytest.raises(NotFoundError, match="malformed"):
+                await RawObjectProvider.create(
+                    opened_repo, _version(), saas_streams, object_db_id="not-shaped-like-one"
+                )
 
     async def test_mismatched_stream_uuid_closes_its_stream_instead_of_leaking_it(
         self, opened_repo: DedupRepo, monkeypatch: pytest.MonkeyPatch
@@ -474,8 +501,8 @@ class TestObjectDbIdOverride:
         ``_indexed_db`` are ever assigned (this provider's own instance
         attrs), and this is the guaranteed-to-succeed fallback provider,
         reachable directly from CLI/TUI diagnostic tooling's
-        ``--object-db-id`` — create() must close self._stream on this
-        failure path rather than only on success."""
+        ``--object-db-id`` — create() must call close() on this failure
+        path rather than only on success."""
         closed_instances = []
         original_close = RawObjectProvider.close
 
@@ -484,6 +511,39 @@ class TestObjectDbIdOverride:
             await original_close(self)
 
         monkeypatch.setattr(RawObjectProvider, "close", spy_close)
-        with pytest.raises(NotFoundError, match="names stream"):
-            await RawObjectProvider.create(opened_repo, _version(), object_db_id="wrong-stream_0_100")
+        async with SaasStreamCache(opened_repo) as saas_streams:
+            with pytest.raises(NotFoundError, match="names stream"):
+                await RawObjectProvider.create(opened_repo, _version(), saas_streams, object_db_id="wrong-stream_0_100")
+        assert len(closed_instances) == 1
+
+
+class TestCreateFailureCleanup:
+    """``create()``'s own broad ``except Exception: await self.close();
+    raise`` (unlike the narrower, already-tested mismatched-``--object-db-id``
+    case above) — a real, unexpected failure loading the *indexed* ObjectDB
+    (a stale/corrupt index entry, not a missing index) must still call
+    close() rather than leak whatever it already opened, the same as every
+    sibling application-layer provider's (Drive, Mail, Calendar, Site)
+    equivalent test of a real corrupt/failing load during its own
+    ``create()``."""
+
+    async def test_a_corrupt_indexed_objectdb_closes_the_stream_instead_of_leaking_it(
+        self, opened_repo: DedupRepo, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        closed_instances = []
+        original_close = RawObjectProvider.close
+
+        async def spy_close(self: RawObjectProvider) -> None:
+            closed_instances.append(self)
+            await original_close(self)
+
+        async def failing_load(dedup_file: object, offset: int, length: int) -> None:
+            raise DataCorruptError("synthetic corruption for this test")
+
+        monkeypatch.setattr(RawObjectProvider, "close", spy_close)
+        monkeypatch.setattr(ObjectDb, "load", failing_load)
+
+        async with SaasStreamCache(opened_repo) as saas_streams:
+            with pytest.raises(DataCorruptError, match="synthetic corruption"):
+                await RawObjectProvider.create(opened_repo, _version(), saas_streams)
         assert len(closed_instances) == 1

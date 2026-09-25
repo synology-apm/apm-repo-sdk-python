@@ -53,8 +53,8 @@ class ChunkAddress(NamedTuple):
 
     @classmethod
     def from_int(cls, data: int) -> ChunkAddress:
-        """Unpack a raw ``uint64`` chunk address. See the class's own
-        docstring for why this doesn't range-check the result."""
+        """Unpack a raw ``uint64`` chunk address — doesn't range-check the
+        result, same as construction (see the class docstring)."""
         chunk_idx = data & _CHUNK_IDX_MASK
         addr_id = data >> CHUNK_BIT_NUM
         bucket_id = addr_id & _BUCKET_ID_MASK
@@ -72,7 +72,7 @@ class ChunkAddress(NamedTuple):
     def advance(self, k: int) -> ChunkAddress:
         """Advance by ``k`` chunks, carrying into ``bucket_id`` when
         ``chunk_idx`` would reach ``BUCKET_MAX_CHUNK_NUM`` (8192).
-        This is the semantics needed to expand a ``Type::Mapping``
+        This is the semantics needed to expand a ``ChunkMapKind.MAPPING``
         chunk-map entry's ``map_num * (1 + repeat)`` run of chunks starting
         from this address; it must never be approximated as "add k to the
         raw 64-bit integer", which would misplace the carry at the packed

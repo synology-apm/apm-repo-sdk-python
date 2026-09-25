@@ -6,8 +6,7 @@ through ``ReplayStore`` instead of a real ``LocalFsStore``.
 Fixtures (``tests/fixtures/``, recorded once by ``RecordingStore`` via each
 test's own ``record_target()`` call — see ``tests/conftest.py`` and
 ``tests/CLAUDE.md``'s "Recording a fixture" section for the ``pytest
---record-against=...`` workflow that (re-)records these; there is no
-separate recipe module anymore):
+--record-against=...`` workflow that (re-)records these):
 
 - ``api_apv1_walk.json.gz`` — ``apv-sample-1`` opened via
   ``Session.open_remote()``: the discover-from-a-parent-directory VM disk
@@ -32,9 +31,8 @@ separate recipe module anymore):
   data) rather than read from a real sample tree at test time.
 
 ``test_repository_provider_falls_back_to_raw_object_provider_via_the_object_name_index``
-isn't reproduced via ``ReplayStore`` at all: it already has zero
-real-sample dependency in the original (a synthetic on-disk repository built
-fresh under ``tmp_path``) — moved here as-is.
+doesn't go through ``ReplayStore`` at all: it builds a synthetic on-disk
+repository fresh under ``tmp_path``, with zero real-sample dependency.
 """
 
 from __future__ import annotations
@@ -118,13 +116,9 @@ async def test_replayed_repository_connections_workloads_versions_match_apv_samp
         assert len(workload_pairs) == 25
 
         all_versions = [v for c, w in workload_pairs for v in await c.versions(w, include_deleted=True)]
-        # Catalog.versions() is the raw copy_target_version read now --
-        # nothing filtered out in advance (a version whose content turns
-        # out unresolvable raises when actually opened instead). The real
-        # count across all 25 workloads is 109; the previous, much lower
-        # 12 reflected the retired listing-time availability filter
-        # silently excluding most real rows whose meta/generation
-        # happened not to resolve, not this fixture recording fewer rows.
+        # Catalog.versions() is the raw copy_target_version read: nothing is
+        # filtered out in advance -- a version whose content turns out
+        # unresolvable raises when actually opened instead.
         assert len(all_versions) == 109
 
 
@@ -170,9 +164,9 @@ async def test_replayed_repository_raw_file_and_file_map_tree_fallback_axes(
 async def test_replayed_repository_is_encrypted_matches_every_real_sample(
     record_target: Callable[[str], Awaitable[ObjectStore]],
 ) -> None:
-    """See this file's own docstring for why all 6 samples share one
-    fixture: ``Repository.is_encrypted`` resolves purely from the cheap
-    ``probe_encrypted()`` check, no key ever given."""
+    """All 6 samples share one fixture because ``Repository.is_encrypted``
+    resolves purely from the cheap ``probe_encrypted()`` check (no Pool
+    scan), no key ever given."""
     store = await record_target("api_is_encrypted_six_samples.json.gz")
     async with api.Session() as session:
         assert (await session.open_remote(store, root="apv-sample-1"))[0].is_encrypted is False
@@ -259,11 +253,9 @@ async def test_replayed_repository_is_encrypted_agrees_with_key_status(
 
 # -- synthetic degraded-SaaS-workload fixture -------------------------------
 #
-# Zero real-sample dependency in the original (an on-disk repository built
-# fresh under tmp_path, no ReplayStore/samples_dir involved at all) —
-# moved here as-is rather than left in tests/integration/, which it never
-# needed. Exercises the RawObjectProvider fallback path, since no real
-# sample workload reaches it.
+# An on-disk repository built fresh under tmp_path, with zero real-sample
+# dependency (no ReplayStore/samples_dir involved) -- exercises the
+# RawObjectProvider fallback path, since no real sample workload reaches it.
 _STREAM_ID = 40
 _CCID = 5
 _CONNECTION_ID = "conn-synthetic"
@@ -564,9 +556,9 @@ async def test_repository_provider_falls_back_to_raw_object_provider_via_the_obj
     ``sub_type``), through the full ``Session``/``Repository`` facade
     every real CLI/TUI invocation actually goes through — not
     ``RawObjectProvider`` constructed directly, and not any lower-level
-    scan. ``resolve_object_name_index()`` names all 3 real objects this
-    synthetic repository's ``ObjectDB`` holds (see ``_build_degraded_saas_repo``'s
-    own docstring); every one of them must actually be listed and read
+    scan. ``resolve_object_name_index()`` names all 3 objects this synthetic
+    repository's real-shaped ``ObjectDB`` defines (``obj_1``/``obj_2``/
+    ``obj_3``); every one of them must actually be listed and read
     back correctly through the public facade alone."""
     repo_root = tmp_path / "repo"
     _build_degraded_saas_repo(repo_root)

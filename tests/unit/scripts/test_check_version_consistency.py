@@ -1,13 +1,11 @@
 """Tests for scripts/check_version_consistency.py.
 
-``scripts/`` isn't an installed package (same as
-``test_check_actions_versions.py``'s own loading convention), so the module
-under test is loaded by path via ``importlib`` through the
-``check_version_consistency`` fixture. Every scenario here is offline
-(unlike ``check_actions_versions.py``, this checker only ever reads local
-``pyproject.toml`` files, so — unlike that sibling's own docstring note —
-a "regression guard against the real repository files" test is possible and
-included below as ``TestMain.test_actual_repo_pyproject_files_are_consistent``.
+``scripts/`` isn't an installed package, so the module under test is loaded
+by path via ``importlib`` through the ``check_version_consistency`` fixture.
+This checker only ever reads local ``pyproject.toml`` files, never the
+network, so every scenario here is offline, including a "regression guard
+against the real repository files" test,
+``TestMain.test_actual_repo_pyproject_files_are_consistent``.
 """
 
 from __future__ import annotations

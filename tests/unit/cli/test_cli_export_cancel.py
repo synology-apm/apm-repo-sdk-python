@@ -48,6 +48,17 @@ class TestHandleCancelled:
         message = handle_cancelled(part, keep_partial=False)  # must not raise
         assert "removed" in message
 
+    def test_keep_partial_never_claims_a_file_exists_when_it_does_not(self, tmp_path: Path) -> None:
+        """export_to() defers creating ``part_path`` until its first block
+        reads successfully -- a cancellation landing before that (e.g. a
+        cloud-sync placeholder) must not be reported as having kept a
+        file that was never written."""
+        part = tmp_path / "never-written.part"
+        message = handle_cancelled(part, keep_partial=True)
+        assert not part.exists()
+        assert "kept" not in message
+        assert part.name not in message
+
 
 def test_first_sigint_cancels_the_task_and_can_be_restored() -> None:
     """The *first*-press branch of ``_install_sigint_cancel``'s handler —
@@ -55,7 +66,8 @@ def test_first_sigint_cancels_the_task_and_can_be_restored() -> None:
     and calling it directly with a synthetic ``(signum, frame)``, exactly
     like a real ``SIGINT`` delivery would, but without sending an actual
     signal. The *second*-press branch (``os._exit(130)``) is deliberately
-    never invoked here — see this module's own docstring for why."""
+    never invoked here — actually calling it would force-quit the test
+    runner itself, so it's verified by inspection instead."""
 
     async def scenario() -> None:
         task = asyncio.ensure_future(asyncio.sleep(10))

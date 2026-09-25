@@ -22,13 +22,11 @@ _DUMMY_KEY = "DUMMYKEYID12@" + base64.b64encode(bytes(32)).decode()
 
 #: Wall-clock budget for one sample's own catalog enumeration
 #: (``__main__.py``'s per-repo loop, ``ctx.data["bootstrap_elapsed"]``) --
-#: calibrated against the slowest real sample this project has measured
-#: (`nas-Mia_test1`: 228+221 workloads, ~9300 versions, over a real SMB
-#: mount: 14.1s measured), with real headroom above that for ordinary
-#: run-to-run/network variance, not tuned tight to that one number. Not
-#: about small samples at all -- catches a genuine performance
-#: regression (a query that stops batching, say) before it's only
-#: noticed by someone waiting on a real, large repository.
+#: set with generous headroom above a large repository's real
+#: enumeration cost over a slow network mount, for ordinary
+#: run-to-run/network variance. Not about small samples at all -- catches
+#: a genuine performance regression (a query that stops batching, say)
+#: before it's only noticed by someone waiting on a real, large repository.
 _ENUMERATION_BUDGET_SECONDS = 60.0
 
 

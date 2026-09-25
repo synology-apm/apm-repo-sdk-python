@@ -10,8 +10,8 @@ it back) — ``Repository.resolve()`` against a *canonical* ref is yet
 another distinct call shape from ``walk()``/``walk_ref()``, on top of
 the already-established "different consumer methods need their own
 recording" lesson. Both entry refs below are themselves already
-canonical (immune to catalog-metadata anonymization — see
-``test_cli_ls.py``'s own docstring) rather than human display-name
+canonical — internal catalog identifiers, immune to
+catalog-metadata anonymization — rather than human display-name
 paths: the round-trip property under test — a ref ``ls``/``tree`` prints
 resolves cleanly when pasted into ``cat``/``export`` — doesn't depend on
 how the CLI reached that node in the first place, only on what gets
@@ -44,8 +44,8 @@ from pathlib import Path
 import pytest
 from typer.testing import CliRunner
 
-import synology_apm_repo.cli.browse as browse_mod
 import synology_apm_repo.cli.commands.export as export_mod
+import synology_apm_repo.cli.repo_session as repo_session_mod
 import synology_apm_repo.sdk.units.device as device_module
 from synology_apm_repo.cli.main import app
 
@@ -62,7 +62,7 @@ def _no_disk_fs_sibling(monkeypatch: pytest.MonkeyPatch) -> None:
     depth, including units/device.py's own additive "(filesystem)"
     sibling — needing real pytsk3 reads this fixture predates. This
     file is about the canonical-ref round-trip contract, not
-    units/content/disk_fs.py — see tests/unit/sdk/test_units_disk_fs.py for that
+    units/content/disk_fs/ — see tests/unit/sdk/test_units_disk_fs.py for that
     feature's own tests."""
     monkeypatch.setattr(device_module, "disk_fs_available", lambda: False)
 
@@ -70,7 +70,7 @@ def _no_disk_fs_sibling(monkeypatch: pytest.MonkeyPatch) -> None:
 def test_ref_printed_by_ls_can_be_pasted_straight_into_cat_replayed(
     patch_profile_store: Callable[..., None],
 ) -> None:
-    patch_profile_store("cli_canonical_ref_roundtrip_apv1_vault.json.gz", browse_mod, allow_content=True)
+    patch_profile_store("cli_canonical_ref_roundtrip_apv1_vault.json.gz", repo_session_mod, allow_content=True)
 
     listed = runner.invoke(app, ["--verbose", "--json", "ls", _DISK_REF, "--profile", "anything"])
     assert listed.exit_code == 0, listed.output
@@ -90,17 +90,16 @@ def test_ref_printed_by_tree_can_be_pasted_straight_into_export_replayed(
     patch_profile_store: Callable[..., None], tmp_path: Path
 ) -> None:
     fixture_name = "cli_canonical_ref_roundtrip_apv1_vault.json.gz"
-    patch_profile_store(fixture_name, browse_mod, allow_content=True)
+    patch_profile_store(fixture_name, repo_session_mod, allow_content=True)
     patch_profile_store(fixture_name, export_mod, allow_content=True)
 
     result = runner.invoke(app, ["--json", "tree", _VM_REF, "--depth", "2", "--ref", "--profile", "anything"])
     assert result.exit_code == 0, result.output
     # _VM_REF names no item-level segments, landing tree()'s own walk
     # right at the provider's root (units/device.py's "Devices" node) --
-    # a synthetic placeholder that no longer wraps its children in a
-    # printed heading (see tree.py's own module-level comments), so
-    # --json here is a bare array of that root's own children directly,
-    # not {"children": [...]}.
+    # a synthetic placeholder the walk peels rather than prints as a
+    # heading, so --json here is a bare array of that root's own children
+    # directly, not {"children": [...]}.
     entries = json.loads(result.stdout)
     delta_entry = next(c for device in entries for c in device["children"] if c["name"].endswith(".img.delta"))
     canonical_ref = delta_entry["ref"]

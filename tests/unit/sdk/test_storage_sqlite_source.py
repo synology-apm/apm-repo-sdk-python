@@ -99,9 +99,9 @@ class TestPeel:
 
 
 class TestSqliteSource:
-    """Direct ``SqliteSource(data)`` construction is gone — opening the
-    connection is itself an ``await`` — so every case below goes through
-    the ``await SqliteSource.from_bytes(...)`` factory that replaced it."""
+    """Opening the connection is itself an ``await``, so ``SqliteSource``
+    takes no constructor arguments — every case below goes through the
+    ``await SqliteSource.from_bytes(...)`` factory instead."""
 
     async def test_opens_a_working_connection(self) -> None:
         data = _real_sqlite_bytes()
@@ -224,8 +224,6 @@ class TestSqliteSource:
             assert await _fetchone(src.connection, "SELECT x FROM t") == (1,)
 
     async def test_from_bytes_is_the_only_bytes_facing_factory(self) -> None:
-        # A bare SqliteSource() instance is deliberately not usable —
-        # from_bytes() is the only thing that produces a working one.
         assert not hasattr(SqliteSource(), "connection")
         data = _real_sqlite_bytes()
         async with await SqliteSource.from_bytes(data) as src:
@@ -326,7 +324,7 @@ class TestFromRawStore:
 class TestFromEnvelopedStore:
     """``from_enveloped_store`` — the entry point for a caller whose
     source may be ``aHlT``-enveloped *and* may have a real ``-wal``/``-shm``
-    sidecar (``copy_meta_file/*/target.db``, FORMAT-SPEC.md §6.1;
+    sidecar (``copy_meta_file/*/target.db``, FORMAT-SPEC.md: copy_meta_file-layout;
     ``catalog/version.py``'s ``open_target_db()`` is the one real call
     site)."""
 

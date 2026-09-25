@@ -165,10 +165,10 @@ class RecordingStore:
         return await self._instrumented.listdir(path)
 
     async def aclose(self) -> None:
-        """See ``_InstrumentedStore.aclose``'s own docstring — needed so a
-        real ``S3Store``/``AzureStore`` recorded against (``--record-
-        against=profile:<name>``) still gets its ``aiohttp`` connector
-        closed once recording is done."""
+        """Delegates to ``_InstrumentedStore.aclose()`` so a real
+        ``S3Store``/``AzureStore`` recorded against
+        (``--record-against=profile:<name>``) still gets its ``aiohttp``
+        connector closed once recording is done."""
         await self._instrumented.aclose()
 
     def dump(self) -> str:
@@ -278,6 +278,14 @@ class TracingStore:
         self._on_event = on_event
         self._instrumented = _InstrumentedStore(backing, self._on_call)
 
+    @property
+    def backing(self) -> ObjectStore:
+        """The real store this instance forwards to -- lets a caller tracking
+        store identity (``Session.close_repo()``) recognize two separate
+        ``TracingStore`` wraps of the same backing connector as one shared
+        resource, not two."""
+        return self._instrumented._backing  # noqa: SLF001 - _InstrumentedStore is this class's own private helper
+
     def _on_call(
         self, method: str, path: str, *, offset: int = 0, length: int | None = None, result: Any, elapsed: float
     ) -> None:
@@ -303,8 +311,8 @@ class TracingStore:
         return await self._instrumented.listdir(path)
 
     async def aclose(self) -> None:
-        """See ``_InstrumentedStore.aclose``'s own docstring — needed so a
-        real ``S3Store``/``AzureStore`` wrapped for ``--trace`` (or by this
+        """Delegates to ``_InstrumentedStore.aclose()`` so a real
+        ``S3Store``/``AzureStore`` wrapped for ``--trace`` (or by this
         project's own smoke tooling, which always traces) still gets its
         ``aiohttp`` connector closed by ``Session.close()``."""
         await self._instrumented.aclose()

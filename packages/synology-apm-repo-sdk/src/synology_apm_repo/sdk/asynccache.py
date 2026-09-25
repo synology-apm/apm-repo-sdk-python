@@ -2,10 +2,13 @@
 reinventing by hand.
 
 ``Pool._buckets``/``._chunks`` (bounded LRU, locked, session-wide shared),
-``dedup.pool.BucketReaderCache`` (see that class's own docstring),
-``storage.dircache.DirCache`` (unbounded, session-wide
-shared), and ``dedup.composition_reader.CompositionRecord``'s page cache
-(unbounded, scoped to one record) are all the exact same operation —
+``dedup.pool.BucketReaderCache`` (unbounded by default, private to one
+bulk sweep so it doesn't evict ``Pool``'s own shared cache),
+``storage.dircache.DirCache`` (unbounded, session-wide shared),
+``dedup.composition_reader.CompositionRecord``'s page cache (bounded LRU,
+scoped to one record), and ``units.verify_reachable._ReachabilityWalker
+._composition_records`` (bounded LRU, one run's worth of shared records)
+are all the exact same operation —
 check a dict, ``await`` a fetch on miss, store the result, optionally
 evict the oldest entry once over a cap — each written independently with
 its own, slightly different correctness properties (some lock, some
@@ -34,10 +37,8 @@ V = TypeVar("V")
 
 
 class AsyncKeyedCache(Mapping[K, V], Generic[K, V]):
-    """A ``key -> value`` cache backed by an async ``fetch`` callback — the
-    one memoizing-cache shape this SDK's various hand-rolled caches
-    (bounded/unbounded, locked/unlocked, shared/private) all reduce to;
-    see ``resolve`` for the actual operation.
+    """A ``key -> value`` cache backed by an async ``fetch`` callback —
+    ``resolve`` is the fetch-and-store operation.
 
     The ``Mapping`` interface (``len()``, ``in``, iteration,
     ``.keys()``/``.items()``/``.values()``, sync ``.get()``) is a live,
@@ -63,8 +64,7 @@ class AsyncKeyedCache(Mapping[K, V], Generic[K, V]):
         # One counter per key that's ever started a fetch, bumped by
         # invalidate() -- lets resolve()'s owner path notice "this key
         # was invalidated while my fetch was still running" and skip
-        # writing a stale result to _store (see resolve()'s own comment
-        # at the write-back site).
+        # writing a stale result to _store.
         self._generation: dict[K, int] = {}
 
     # -- Mapping (sync, read-only, never fetches) ---------------------------
@@ -88,6 +88,28 @@ class AsyncKeyedCache(Mapping[K, V], Generic[K, V]):
         return list({*self._store.keys(), *self._inflight.keys()})
 
     # -- the actual cache operation ------------------------------------------
+
+    def put(self, key: K, value: V) -> None:
+        """Insert ``key`` -> ``value`` directly, no fetch involved — for a
+        caller that already has a value in hand (e.g. decoded as a
+        byproduct of a batched fetch elsewhere) and wants it remembered
+        here too, without paying for the ``Future``/in-flight-dedup
+        machinery ``resolve()`` needs to await a real fetch on miss. Safe
+        with no lock, the same reason ``invalidate()`` needs none: plain
+        sync code can't be preempted mid-call on asyncio's single-threaded
+        event loop. Overwrites an existing entry for ``key`` rather than
+        leaving it — fine for every current caller, where the same key
+        always maps to the same value."""
+        self._store_and_evict(key, value)
+
+    def _store_and_evict(self, key: K, value: V) -> None:
+        """The maxsize-eviction bookkeeping shared by ``resolve()``'s own
+        write-back and ``put()`` — one home for it instead of two copies."""
+        self._store[key] = value
+        self._store.move_to_end(key)
+        if self.maxsize is not None:
+            while len(self._store) > self.maxsize:
+                self._store.popitem(last=False)
 
     async def resolve(self, key: K, fetch: Callable[[K], Awaitable[V]] | None = None) -> V:
         """Return the cached value for ``key``, fetching and storing it
@@ -169,11 +191,7 @@ class AsyncKeyedCache(Mapping[K, V], Generic[K, V]):
             # invalidation, so handing them the answer that was already
             # committed to fetching is still the right value for *them*.
             if self._generation.get(key, 0) == epoch:
-                self._store[key] = value
-                self._store.move_to_end(key)
-                if self.maxsize is not None:
-                    while len(self._store) > self.maxsize:
-                        self._store.popitem(last=False)
+                self._store_and_evict(key, value)
             del self._inflight[key]
         if not future.done():
             future.set_result(value)
@@ -185,8 +203,7 @@ class AsyncKeyedCache(Mapping[K, V], Generic[K, V]):
         Also discards the result of any fetch already in flight for the
         affected key(s): without this, a ``resolve()`` that started
         before this call could still land its now-stale result in the
-        cache afterward, silently undoing the invalidation (see
-        ``resolve()``'s own write-back comment).
+        cache afterward, silently undoing the invalidation.
         """
         if key is None:
             self._store.clear()

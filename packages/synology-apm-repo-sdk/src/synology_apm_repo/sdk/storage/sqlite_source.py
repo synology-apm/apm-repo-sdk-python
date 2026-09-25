@@ -162,7 +162,7 @@ class SqliteSource:
     async def from_enveloped_store(cls, store: ObjectStore, path: str, *, vault_key: bytes | None) -> Self:
         """Read, ``peel()``, and open ``path`` from ``store`` — for a source
         that may be ``aHlT``-enveloped (``copy_meta_file/*/target.db``,
-        FORMAT-SPEC.md §6.1) and may have a real ``-wal``/``-shm`` sidecar,
+        FORMAT-SPEC.md: copy_meta_file-layout) and may have a real ``-wal``/``-shm`` sidecar,
         each peeled independently."""
 
         def _peel(raw: bytes) -> bytes:

@@ -83,8 +83,7 @@ class AzureProfileConfig:
 
     @property
     def display_fields(self) -> dict[str, str | None]:
-        """Same role as ``S3ProfileConfig.display_fields`` — see its own
-        docstring."""
+        """Same role as ``S3ProfileConfig.display_fields``."""
         return {"container": self.container, "account_url": self.account_url}
 
 
@@ -117,9 +116,7 @@ class SmbProfileConfig:
 
     @property
     def display_fields(self) -> dict[str, str | int | None]:
-        """Ordered field-name -> value pairs for CLI/TUI display, same
-        role as ``S3ProfileConfig.display_fields`` — see its own
-        docstring."""
+        """Same role as ``S3ProfileConfig.display_fields``."""
         return {"server": self.server, "share": self.share, "port": self.port, "username": self.username}
 
 
@@ -255,10 +252,10 @@ def client_kwargs_with_secrets(
     truthy value for — the shared shape behind every "resolve one
     profile's config plus its secrets into constructor kwargs" call site
     (``profiles.build_store``, ``cli/commands/profile.py::_store_from_fields``,
-    ``browser/screens/connect_dialog.py``'s ``_s3_client_kwargs``/
-    ``_azure_client_kwargs`` — SMB has no bucket-less/container-less
-    "Browse" counterpart calling this directly, only its own
-    ``_smb_config_and_secrets`` feeding ``store_from_config``).
+    ``browser/screens/connect_dialog.py``'s ``s3_client_kwargs``/
+    ``azure_client_kwargs`` — SMB has no bucket-less/container-less
+    "Browse" counterpart calling this directly, only ``smb_config_and_secrets``
+    feeding ``store_from_config`` straight from ``_build_smb_store``).
     ``secrets`` may be a superset of what applies here (a not-yet-saved
     connection form carries every backend's fields at once) — only the
     keys ``secret_fields_for`` names for ``config``'s own kind are ever

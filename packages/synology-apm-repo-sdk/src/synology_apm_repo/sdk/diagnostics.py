@@ -147,9 +147,9 @@ async def inspect_bucket(store: ObjectStore, rel: str, *, chunk: int | None = No
 @dataclasses.dataclass(frozen=True)
 class CompositionRecordInspection:
     """One composition record's own fields, mirroring
-    ``ChunkMapEntryInspection``'s shape one section down: ``map_crc_ok`` is
-    only present when ``verify_map`` was given (see ``walk_composition``'s
-    own body), never a placeholder ``None`` otherwise."""
+    ``ChunkMapEntryInspection``'s shape one section down: ``map_crc_ok``
+    holds a real bool only when ``verify_map`` was given (set by
+    ``_walk_composition_records``), staying ``None`` otherwise."""
 
     head_off: int
     status: str
@@ -196,9 +196,9 @@ async def _walk_composition_records(
     """Walks up to ``limit`` composition records starting at ``start``,
     never past ``file_size``. Stops cleanly (not raising) the moment a
     record fails to parse, since that's the normal end-of-walk boundary
-    for a file with no trailing padding, not necessarily corruption — see
-    ``walk_composition``'s own docstring for how the caller decides whether
-    that failure is fatal.
+    for a file with no trailing padding, not necessarily corruption —
+    ``walk_composition`` decides whether the stopping error is actually
+    fatal.
 
     Returns ``(records, next_offset, stopping_error)`` — ``stopping_error``
     is ``None`` only when the walk stopped because it reached ``limit``
@@ -288,9 +288,9 @@ class ChunkMapAddrInspection:
 
 @dataclasses.dataclass(frozen=True)
 class ChunkMapEntryInspection:
-    """One ``ChunkMapRecord`` entry — ``addr`` only present for a
-    ``ChunkMapKind.MAPPING`` record, every other kind omits it entirely
-    rather than carrying a placeholder ``None``."""
+    """One ``ChunkMapRecord`` entry — ``addr`` only carries a real value
+    for a ``ChunkMapKind.MAPPING`` record; every other kind leaves it
+    ``None``."""
 
     index: int
     kind: str

@@ -2,7 +2,8 @@
 
 Centralized here specifically because these are *cross-module* constants
 (used by ``addressing.py``, ``bucket.py``, ``composition.py``,
-``dedup/pool.py``, ``dedup/dedup_file.py``). Per-format *header field offsets*
+``dedup/pool/_bucket_reader.py``, ``dedup/dedup_file.py``). Per-format
+*header field offsets*
 (e.g. ``bucket.py``'s ``_OFF_MODE``) are local to their own module instead —
 those aren't shared, so centralizing them would just add a layer of
 indirection with no reuse benefit.

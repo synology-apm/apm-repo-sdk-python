@@ -10,6 +10,8 @@ import time
 from collections.abc import Iterable
 from pathlib import Path
 
+from rich.cells import cell_len
+from rich.text import Text
 from textual import events
 from textual.widgets import DirectoryTree
 from textual.widgets._directory_tree import DirEntry  # private: no public "directories only" hook exists at all
@@ -25,11 +27,10 @@ class DirsOnlyTree(DirectoryTree):
     point for at all -- both reach into private Textual internals
     (``_populate_node``, ``DirEntry``), flagged here since either could break
     on a Textual upgrade: going up out of the rooted directory via a
-    synthetic ``".."`` leaf (``_populate_node``, selection handled by the
-    caller's own ``on_directory_tree_directory_selected``); and
-    type-ahead, jumping the cursor to the first sibling whose name starts
-    with what's been typed so far (``_on_key``, since neither ``Tree`` nor
-    ``DirectoryTree`` define one of their own).
+    synthetic ``".."`` leaf (``_populate_node``); and type-ahead, jumping
+    the cursor to the first sibling whose name starts with what's been
+    typed so far (``_on_key``, since neither ``Tree`` nor ``DirectoryTree``
+    define one of their own).
     """
 
     #: Reset the type-ahead search buffer after this long without a
@@ -37,6 +38,31 @@ class DirsOnlyTree(DirectoryTree):
     #: view, GTK's "interactive search") for a short-lived buffer
     #: rather than one that lasts the whole time this dialog is open.
     _TYPEAHEAD_TIMEOUT = 1.0
+
+    #: Computed once from the actual icon glyphs (not hardcoded), so an
+    #: override still measures correctly -- measures ``DirectoryTree``'s
+    #: own icons, since this class needs its filesystem-listing machinery
+    #: instead of subclassing ``FastLabelTree``.
+    _icon_folder_width = cell_len(DirectoryTree.ICON_NODE)
+    _icon_folder_expanded_width = cell_len(DirectoryTree.ICON_NODE_EXPANDED)
+    #: Unlike a plain ``Tree`` leaf (no prefix at all), every
+    #: ``DirectoryTree`` leaf -- a real file, or this class's own
+    #: synthetic ``".."`` entry -- gets ``ICON_FILE``'s prefix too.
+    _icon_file_width = cell_len(DirectoryTree.ICON_FILE)
+
+    def get_label_width(self, node: TreeNode[DirEntry]) -> int:
+        """Overrides the base ``Tree.get_label_width`` for the same reason
+        ``FastLabelTree`` does: avoid building a throwaway ``Text`` via
+        ``render_label`` just to measure it, on every visible line on every
+        cache invalidation. ``DirectoryTree.render_label``'s icon-prefix
+        rule differs from plain ``Tree``'s, measured here directly instead
+        via ``_icon_file_width``."""
+        label = node.label
+        label_width = label.cell_len if isinstance(label, Text) else cell_len(label)
+        if not node.allow_expand:
+            return label_width + self._icon_file_width
+        prefix_width = self._icon_folder_expanded_width if node.is_expanded else self._icon_folder_width
+        return label_width + prefix_width
 
     def __init__(self, *args: object, **kwargs: object) -> None:
         super().__init__(*args, **kwargs)  # type: ignore[arg-type]
@@ -70,9 +96,9 @@ class DirsOnlyTree(DirectoryTree):
         node.expand()
 
     async def _on_key(self, event: events.Key) -> None:
-        # Only genuinely printable keys feed the type-ahead buffer -- same
-        # ``is_printable`` check Input's own ``_on_key`` uses, and for the same
-        # reason: arrows, Enter, Tab, etc. must fall through untouched.
+        # Only genuinely printable keys feed the type-ahead buffer (the same
+        # ``is_printable`` check ``Input._on_key`` uses), so arrows, Enter,
+        # Tab, etc. fall through untouched.
         if not event.is_printable:
             return
         assert event.character is not None

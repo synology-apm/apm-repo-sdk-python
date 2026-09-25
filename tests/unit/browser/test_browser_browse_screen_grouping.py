@@ -4,7 +4,7 @@ tree, extracted specifically so it's testable without a running Textual
 app/real ``Tree`` widget (``BrowseScreen._set_workloads`` is just the
 thin rendering layer on top of this). Real end-to-end tree-rendering
 coverage (headers, expand-to-first-match, cursor) lives in
-``tests/integration/browser/test_browser_pilot_hex_filter_refresh.py`` against real
+``tests/integration/browser/test_browser_pilot.py`` against real
 recorded sample data."""
 
 from __future__ import annotations

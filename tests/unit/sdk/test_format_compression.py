@@ -65,10 +65,9 @@ def test_zstd_wrong_length_raises_data_corrupt() -> None:
 
 def test_zstd_oversized_chunk_raises_data_corrupt_without_fully_materializing_it() -> None:
     """A corrupt or hostile bucket chunk whose zstd frame declares far
-    more than ``FIXED_CHUNK_LENGTH`` (4096) — must be rejected, and
-    (see the next test for the specific regression this guards against)
-    without ``decompress()`` first decompressing the whole declared size
-    into memory before noticing the mismatch."""
+    more than ``FIXED_CHUNK_LENGTH`` (4096) must be rejected without
+    ``decompress()`` first decompressing the whole declared size into
+    memory."""
     oversized_plaintext = b"x" * (2 * 1024 * 1024)
     compressed = zstandard.ZstdCompressor().compress(oversized_plaintext)
     with pytest.raises(DataCorruptError):
@@ -76,17 +75,13 @@ def test_zstd_oversized_chunk_raises_data_corrupt_without_fully_materializing_it
 
 
 def test_zstd_branch_never_calls_the_one_shot_decompress_api(monkeypatch: pytest.MonkeyPatch) -> None:
-    """The regression this guards against: ``zstandard``'s one-shot
-    ``ZstdDecompressor.decompress(data, max_output_size=N)`` silently
-    ignores ``max_output_size`` for a frame that declares its own
-    content size (the common case — see
-    ``test_decompress_zstd_stream_max_output_size_rejects_a_declared_size_frame_over_the_cap``'s
-    own docstring for the verified zstandard behavior), so a hostile
+    """``zstandard``'s one-shot ``ZstdDecompressor.decompress(data,
+    max_output_size=N)`` silently ignores ``max_output_size`` when the
+    frame declares its own content size (the common case), so a hostile
     chunk claiming a huge declared size would decompress in full before
-    ``decompress()``'s own length check ever gets a chance to catch it.
-    ``decompress()``'s ZSTD branch must never call that one-shot method
-    at all — only the streaming reader, bounded to one
-    ``FIXED_CHUNK_LENGTH + 1``-byte read."""
+    any length check runs. ``decompress()``'s ZSTD branch must never
+    call that one-shot method at all -- only the streaming reader,
+    bounded to one ``FIXED_CHUNK_LENGTH + 1``-byte read."""
 
     def _must_not_be_called(self: zstandard.ZstdDecompressor, data: bytes, *, max_output_size: int = 0) -> bytes:
         raise AssertionError("one-shot decompress() must not be called from the ZSTD branch")
@@ -106,12 +101,11 @@ def test_decompress_zstd_stream_unbounded() -> None:
 
 
 def test_decompress_zstd_stream_unbounded_handles_a_frame_with_no_declared_content_size() -> None:
-    """A zstd frame with no declared content size (see
-    ``_compress_without_content_size``, below) must still decompress
-    correctly via the streaming reader — the case
-    ``test_decompress_zstd_stream_unbounded`` above never exercises,
-    since the one-shot ``zstandard`` API's own unbounded mode needs the
-    frame to declare a content size and raises otherwise."""
+    """A zstd frame with no declared content size must still decompress
+    correctly via the streaming reader -- the one-shot ``zstandard``
+    API's own unbounded mode needs the frame to declare a content size
+    and raises otherwise, so ``test_decompress_zstd_stream_unbounded``
+    above never exercises this path."""
     plaintext = b"y" * (10 * 1024 * 1024)
     compressed = _compress_without_content_size(plaintext)
     assert zstandard.get_frame_parameters(compressed).content_size == zstandard.CONTENTSIZE_UNKNOWN
@@ -126,16 +120,13 @@ def test_decompress_zstd_stream_max_output_size_allows_content_within_the_cap() 
 
 def test_decompress_zstd_stream_max_output_size_rejects_a_declared_size_frame_over_the_cap() -> None:
     """The realistic case: a normal ``ZstdCompressor().compress()`` frame
-    (the shape every real frame this project reads has — it declares its
-    own decompressed content size in its header) whose declared size
-    exceeds the cap. ``zstandard``'s own one-shot
-    ``ZstdDecompressor.decompress(data, max_output_size=N)`` silently
-    ignores ``max_output_size`` for exactly this frame shape and
-    decompresses in full regardless — confirmed directly against
-    zstandard 0.25.0 — which is why ``decompress_zstd_stream`` never
-    calls that API when ``max_output_size`` is given; it reads through
-    the streaming reader and checks the running total itself instead, so
-    this is enforced independent of what the frame's header claims."""
+    -- the shape every real frame this project reads has -- whose
+    declared size exceeds the cap. ``zstandard``'s one-shot
+    ``decompress()`` ignores ``max_output_size`` for a frame that
+    declares its own content size, so ``decompress_zstd_stream`` never
+    calls that API when ``max_output_size`` is given either; it reads
+    through the streaming reader and checks the running total itself,
+    enforced independent of what the frame's header claims."""
     plaintext = b"z" * (2 * 1024 * 1024)
     compressed = zstandard.ZstdCompressor().compress(plaintext)
     assert zstandard.get_frame_parameters(compressed).content_size == len(plaintext)
@@ -146,11 +137,11 @@ def test_decompress_zstd_stream_max_output_size_rejects_a_declared_size_frame_ov
 def test_decompress_zstd_stream_bounded_path_never_calls_the_one_shot_decompress_api(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Same regression as
-    ``test_decompress_zstd_stream_max_output_size_rejects_a_declared_size_frame_over_the_cap``,
-    verified the other way round: the bounded path must never call
-    ``zstandard``'s own one-shot ``decompress()`` at all, only the
-    streaming reader — not merely "it happens to still raise correctly"."""
+    """Verifies the same regression as the declared-size-over-the-cap
+    test above by mocking rather than observing the outcome: the bounded
+    path must never call ``zstandard``'s own one-shot ``decompress()``
+    at all, only the streaming reader -- not merely "it happens to still
+    raise correctly"."""
 
     def _must_not_be_called(self: zstandard.ZstdDecompressor, data: bytes, *, max_output_size: int = 0) -> bytes:
         raise AssertionError("one-shot decompress() must not be called when max_output_size is given")
@@ -165,11 +156,9 @@ def test_decompress_zstd_stream_bounded_path_never_calls_the_one_shot_decompress
 
 def _compress_without_content_size(data: bytes) -> bytes:
     # No declared content size in the frame header — the other real
-    # frame shape a caller might see (a maliciously, or just
-    # differently-, constructed frame), covered separately from the
-    # declared-size case above since decompress_zstd_stream's own
-    # unbounded path (test_decompress_zstd_stream_unbounded_handles_a_frame_with_no_declared_content_size)
-    # needs it too.
+    # frame shape a caller might see (deliberately, or just differently,
+    # constructed), used by both the unbounded and bounded-cap tests
+    # below.
     buf = io.BytesIO()
     writer = zstandard.ZstdCompressor(write_content_size=False).stream_writer(buf, closefd=False)
     writer.write(data)

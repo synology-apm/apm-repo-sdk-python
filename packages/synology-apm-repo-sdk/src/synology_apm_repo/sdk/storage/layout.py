@@ -22,9 +22,9 @@ nested arbitrarily deep:
   marker by itself — it may carry a ``.<N>`` generation suffix and have no
   bare-named file at all. ``db/`` and ``@data`` are both always present as
   bare-named directories regardless of generation suffixing, so the pair
-  of them is the marker used here (see
-  ``_looks_like_object_store_repo``'s own comment for why both, not just
-  one).
+  of them is the marker used here — requiring both, not just ``db``,
+  reduces the chance of a false positive on some unrelated directory that
+  merely happens to contain a ``db`` subdirectory of its own.
 
 Since neither shape is ever nested more than one level under whatever an
 admin actually provisioned (a shared folder, a bucket), a connection
@@ -184,8 +184,8 @@ async def iter_layouts(
     Cheap by construction: only ``exists()``/``listdir()`` calls at each
     level, never a scan into ``Pool``/``Composition``/``db``. A vault root
     or object-store bucket root ends the walk along that branch (no repository
-    nests inside another); ``max_depth`` bounds how far it goes otherwise
-    (see this module's own docstring for why exactly this far).
+    nests inside another); ``max_depth`` bounds how far it goes otherwise, at
+    the 2-level default derived in this module's docstring above.
 
     Total result count is unknowable in advance — callers doing interactive
     discovery should treat this as an indeterminate-progress operation and
@@ -228,28 +228,27 @@ async def detect_layout(store: ObjectStore, root: str = "") -> RepoLayout:
     return layouts[0]
 
 
-# -- Repository/Catalog model (see the project's own plan file) ------------
+# -- Repository/Catalog model ------------------------------------------
 #
 # `RepositoryLayout` below is the Repository-level counterpart to
-# `RepoLayout` above. The internal switch-over is done (`api/session.py`/
-# `api/repository.py` build exclusively on the functions below now) --
-# `RepoLayout`/`iter_layouts`/`detect_layout` stay only as public SDK
-# exports (`sdk/__init__.py`/`sdk/storage/__init__.py`), kept for an
-# external caller that still wants the narrower, one-catalog-at-a-time
-# shape rather than removed outright. Where `RepoLayout` represents one
-# *catalog*-level location (one vault, or one individual `<repo-id>`
-# directory -- the level a caller has to disambiguate down to one of, by
-# hand, when a bucket holds several), `RepositoryLayout` represents the
-# *Repository* level: one vault (still 1:1, no change from today), or one
-# whole object-store bucket, carrying every sibling `<repo-id>` it found
-# as `catalog_ids` rather than requiring the caller to have already picked
-# one.
+# `RepoLayout` above. `api/session.py`/`api/repository.py` build on the
+# functions below (`iter_repository_layouts`, `key_probe_layout`,
+# `catalog_repo_layouts`); `RepoLayout`/`iter_layouts`/`detect_layout`
+# remain public SDK exports (`sdk/__init__.py`/`sdk/storage/__init__.py`)
+# for an external caller that wants the narrower, one-catalog-at-a-time
+# shape. Where `RepoLayout` represents one *catalog*-level location (one
+# vault, or one individual `<repo-id>` directory -- the level a caller has
+# to disambiguate down to one of, by hand, when a bucket holds several),
+# `RepositoryLayout` represents the *Repository* level: one vault (still
+# 1:1), or one whole object-store bucket, carrying every sibling
+# `<repo-id>` it found as `catalog_ids` rather than requiring the caller
+# to have already picked one.
 
 
 @dataclasses.dataclass(frozen=True)
 class RepositoryLayout:
-    """Where one Repository (a bucket, or a vault's own shared folder —
-    see this module's own docstring) lives within an ``ObjectStore``.
+    """Where one Repository (a bucket, or a vault's own shared folder)
+    lives within an ``ObjectStore``.
 
     ``repo_root``/``key_root`` are store-relative paths (``""`` means "the
     store's own root"), never absolute — same convention as

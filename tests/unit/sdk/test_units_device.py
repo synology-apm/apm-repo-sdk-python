@@ -13,6 +13,7 @@ import sqlite3
 import struct
 import zlib
 from collections.abc import AsyncIterator
+from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
@@ -47,8 +48,9 @@ from synology_apm_repo.sdk.identifiers import (
 )
 from synology_apm_repo.sdk.storage.layout import RepoKind, RepoLayout
 from synology_apm_repo.sdk.storage.local import LocalFsStore
-from synology_apm_repo.sdk.units.base import Node, UnitKind
+from synology_apm_repo.sdk.units.base import FileState, Node, UnitKind
 from synology_apm_repo.sdk.units.content.disk_fs import DiskFilesystem, DiskFilesystemUnavailableError
+from synology_apm_repo.sdk.units.content.disk_fs._base import _DirEntry
 from synology_apm_repo.sdk.units.content.pcps_disk import VirtualDiskContentSource
 from synology_apm_repo.sdk.units.device import DeviceProvider
 from synology_apm_repo.sdk.units.device_kind import _NodeKind
@@ -383,9 +385,9 @@ class TestTree:
 
     async def test_close_closes_the_cached_target_db_connection(self, repo: DedupRepo) -> None:
         # DeviceProvider.close() has no direct test anywhere in this
-        # file -- its own docstring explains why it's required, not
-        # merely tidiness (an un-daemonized aiosqlite worker thread
-        # would keep the interpreter alive forever).
+        # file -- it's required, not merely tidiness: an un-daemonized
+        # aiosqlite worker thread would keep the interpreter alive
+        # forever if never closed.
         async with await DeviceProvider.create(repo, _version()) as provider:
             device = (await provider.children(provider.root()))[0]
             await provider.children(device)  # populates _target_db via _object_nodes -> _target_db_source()
@@ -424,6 +426,10 @@ class TestTree:
             sibling = next(n for n in objects if n is not disk)
             assert sibling.name == f"{disk.name} (filesystem)"
             assert sibling.kind is UnitKind.DISK_FILESYSTEM
+            # disk_fs_containers_before_leaves(): the browsable
+            # "(filesystem)" sibling is a container (is_leaf=False) and
+            # must list ahead of its own disk-image leaf, not after it.
+            assert objects == [sibling, disk]
 
     async def test_device_and_object_refs_round_trip_through_str_and_parse(self, repo: DedupRepo) -> None:
         """Device/object/pcps refs must be built flatly via
@@ -534,8 +540,7 @@ class TestVmTargetDbMissingPropagatesRaw:
         ``copy_meta_file/<dir>`` itself genuinely exists (so the
         listing-time directory-presence check passes) — just without a
         ``target.db`` inside it. Real gaps found in practice remove the
-        whole directory at once (see ``copy_meta_dir_exists()``'s own
-        docstring); this narrower, only-one-file-missing case is
+        whole directory at once; this narrower, only-one-file-missing case is
         deliberately left uncaught rather than degraded."""
         store, layout = _write_repo_info_and_vault_key_db(tmp_path)
         _write_file_map(tmp_path / "db" / "file_map", [])
@@ -636,11 +641,10 @@ def _write_copy_target_version_and_file(
     path: Path, *, version_rows: list[tuple[int, str]], file_rows: list[tuple[int, int]]
 ) -> None:
     """One physical sqlite file holding *both* ``copy_target_version`` and
-    ``copy_target_file`` — this is the real on-disk shape (they share one
-    file, see ``storage/generations.py``'s ``PHYSICAL_NAME_ALIASES`` and
-    its own docstring for why), not two separate files. Writing them
-    separately would test a layout that doesn't actually occur and would
-    silently pass even if ``db("copy_target_file")`` were broken."""
+    ``copy_target_file`` — that's the real on-disk shape, not two separate
+    files. Writing them separately would test a layout that doesn't
+    actually occur and would silently pass even if
+    ``db("copy_target_file")`` were broken."""
     path.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(path)
     conn.execute("CREATE TABLE copy_target_version(version_id INTEGER PRIMARY KEY, version_uid TEXT)")
@@ -653,8 +657,8 @@ def _write_copy_target_version_and_file(
 
 class TestVmVsPcPsDispatch:
     """``_is_pcps`` is decided purely from ``Version.target_type`` — never
-    by probing which files exist (see ``units/device.py``'s own module
-    docstring's Trap for why)."""
+    by probing which files exist, since a PC/PS landing directory can look
+    identical to a normally-landed one."""
 
     async def test_ps_with_no_meta_row_at_all_is_pcps(self, tmp_path: Path) -> None:
         store, layout = _write_repo_info_and_vault_key_db(tmp_path)
@@ -668,11 +672,10 @@ class TestVmVsPcPsDispatch:
     async def test_pc_with_a_real_but_target_db_less_meta_dir_is_still_pcps(self, tmp_path: Path) -> None:
         """A PC/PS version whose meta directory genuinely landed
         (``copy_target_version_meta`` has a row, ``meta_filenames``
-        lists only ``snapshot_info.json`` — copy-meta-file-format.md
-        §1.1's documented PC/PS shape) must classify as PC/PS, not VM,
-        even though the directory itself exists (see ``units/device.py``'s
-        own module docstring Trap for why directory existence can't be
-        the signal)."""
+        lists only ``snapshot_info.json`` — FORMAT-SPEC.md:
+        copy_meta_file-layout's documented PC/PS shape) must classify as PC/PS, not VM,
+        even though the directory itself exists -- directory presence
+        alone can't distinguish VM from PC/PS."""
         store, layout = _write_repo_info_and_vault_key_db(tmp_path)
         _write_file_map(tmp_path / "db" / "file_map", [])
         meta_dir = tmp_path / "copy_meta_file" / "vuid-pcps"
@@ -795,11 +798,11 @@ class TestPcPsFallback:
             assert (await unit.open().read(0, 4096)) == _DISK_PLAINTEXT
 
     async def test_null_file_size_falls_back_from_listing_to_the_real_extent_on_open(self, tmp_path: Path) -> None:
-        """``file_meta.file_size`` genuinely NULL for every fragment of a
-        disk (a real on-disk possibility this module's own docstring
-        notes) must not crash or silently report a wrong size: the
-        listed ``Node.size`` degrades to ``None`` (nothing cheap to show
-        yet), and the *opened* unit's real size is still correctly
+        """``file_meta.file_size`` is genuinely ``int | None`` — NULL for
+        every fragment of a disk is a real on-disk possibility, not just a
+        theoretical case — and must not crash or silently report a wrong
+        size: the listed ``Node.size`` degrades to ``None`` (nothing cheap
+        to show yet), and the *opened* unit's real size is still correctly
         re-derived from the composition's own extent."""
         store, layout = _write_repo_info_and_vault_key_db(tmp_path)
         src_path = "PC-uid/ActiveBackup_2026-01-01/disk0.img"
@@ -829,8 +832,8 @@ class TestPcPsFallback:
         """The real gap found on a real sample: ``copy_target_file``
         registers a fid for this version, but ``file_meta``'s currently
         resolved generation has no row for it at all (an older, since
-        superseded generation did — see on-disk-format.md §1.5's
-        generation-selection rule). Must surface *something*, not a
+        superseded generation did — see FORMAT-SPEC.md: generation-selection's
+        rule). Must surface *something*, not a
         silent empty list."""
         store, layout = _write_repo_info_and_vault_key_db(tmp_path)
         _write_file_map(tmp_path / "db" / "file_map", [])
@@ -942,8 +945,9 @@ class TestPcPsFallback:
         self, tmp_path: Path
     ) -> None:
         """The listing itself stays cheap and succeeds — grouping only
-        needs file_meta's own path/file_size, no locate_file() at all
-        (see PcpsDiskTree._disk_nodes's own docstring for why, and
+        needs file_meta's own path/file_size, no locate_file() at all:
+        node construction is pure, with fragment resolution/opening
+        deferred entirely to ``open_disk`` (see
         test_units_device_pcps.py for the metadata-only real
         sample this cheapness matters for). Only opening the disk does
         the real per-fragment locate_file() work (PcpsDiskTree.open_disk); since
@@ -1014,6 +1018,96 @@ class TestPcPsFallback:
             assert await content.read(4096, 4096) == bytes(4096)  # the gap between the two fragments
             assert await content.read(8192, 4096) == _DISK_PLAINTEXT_B
 
+    async def test_disks_are_listed_by_disk_index_not_disk_uuid(self, tmp_path: Path) -> None:
+        """Regression test: two disks are grouped by ``(disk_uuid,
+        disk_index)`` (``_pcps_disk_key()``), and must be listed in
+        ``disk_index`` order — the disk_uuid alone has no relationship to
+        which disk a user would call "Disk 0" vs "Disk 1". Picks two UUIDs
+        whose alphabetical order is the reverse of their disk index, so a
+        regression back to sorting by ``disk_uuid`` would list "Disk 1"
+        before "Disk 0"."""
+        store, layout = _write_repo_info_and_vault_key_db(tmp_path)
+        path_disk0 = "PC-uid/ActiveBackup_2026-01-01/D(ZZZZ)S(0).img"
+        path_disk1 = "PC-uid/ActiveBackup_2026-01-01/D(AAAA)S(1).img"
+        _write_copy_target_version_and_file(
+            tmp_path / "db" / "copy_target_version",
+            version_rows=[(1, "vuid-pcps")],
+            file_rows=[(1, 100), (1, 101)],
+        )
+        _write_pcps_file_meta(
+            tmp_path / "db" / "file_meta",
+            [(100, path_disk0, 4096), (101, path_disk1, 8192)],
+        )
+
+        async with (
+            await DedupRepo.open(store, layout) as repo,
+            await DeviceProvider.create(repo, _pcps_version()) as provider,
+        ):
+            disks = await provider.children(provider.root())
+            assert [d.name for d in disks] == ["Disk 0", "Disk 1"]
+
+    async def test_disk_with_non_numeric_disk_index_sorts_after_numeric_disks(self, tmp_path: Path) -> None:
+        """Regression test: a real (non-singleton) disk whose ``S(...)``
+        capture isn't numeric must sort after every well-formed numeric
+        disk, not before "Disk 0" — its own ``int()`` ``ValueError``
+        fallback used to keep the numeric-disk bucket, placing it ahead
+        of every real disk via a ``-1`` placeholder instead of after them."""
+        store, layout = _write_repo_info_and_vault_key_db(tmp_path)
+        path_disk0 = "PC-uid/ActiveBackup_2026-01-01/D(AAAA)S(0).img"
+        path_disk1 = "PC-uid/ActiveBackup_2026-01-01/D(BBBB)S(1).img"
+        path_malformed = "PC-uid/ActiveBackup_2026-01-01/D(CCCC)S(x).img"
+        _write_copy_target_version_and_file(
+            tmp_path / "db" / "copy_target_version",
+            version_rows=[(1, "vuid-pcps")],
+            file_rows=[(1, 100), (1, 101), (1, 102)],
+        )
+        _write_pcps_file_meta(
+            tmp_path / "db" / "file_meta",
+            [(100, path_disk0, 4096), (101, path_disk1, 8192), (102, path_malformed, 2048)],
+        )
+
+        async with (
+            await DedupRepo.open(store, layout) as repo,
+            await DeviceProvider.create(repo, _pcps_version()) as provider,
+        ):
+            disks = await provider.children(provider.root())
+            assert [d.name for d in disks] == ["Disk 0", "Disk 1", "Disk x"]
+
+    async def test_disk_fs_siblings_are_listed_ahead_of_every_disk_image(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Regression test: each disk's "(filesystem)" sibling is a real
+        browsable container (``Node.is_leaf=False``) —
+        ``disk_fs_containers_before_leaves()`` must list every sibling
+        ahead of every disk-image leaf, not interleave
+        disk-image-then-its-own-sibling pair by pair, while keeping each
+        group's own disk-index order intact."""
+        monkeypatch.setattr(device_pcps_module, "disk_fs_available", lambda: True)
+        store, layout = _write_repo_info_and_vault_key_db(tmp_path)
+        path_disk0 = "PC-uid/ActiveBackup_2026-01-01/D(AAAA)S(0).img"
+        path_disk1 = "PC-uid/ActiveBackup_2026-01-01/D(BBBB)S(1).img"
+        _write_copy_target_version_and_file(
+            tmp_path / "db" / "copy_target_version",
+            version_rows=[(1, "vuid-pcps")],
+            file_rows=[(1, 100), (1, 101)],
+        )
+        _write_pcps_file_meta(
+            tmp_path / "db" / "file_meta",
+            [(100, path_disk0, 4096), (101, path_disk1, 8192)],
+        )
+
+        async with (
+            await DedupRepo.open(store, layout) as repo,
+            await DeviceProvider.create(repo, _pcps_version()) as provider,
+        ):
+            nodes = await provider.children(provider.root())
+            assert [(n.name, n.is_leaf) for n in nodes] == [
+                ("Disk 0 (filesystem)", False),
+                ("Disk 1 (filesystem)", False),
+                ("Disk 0", True),
+                ("Disk 1", True),
+            ]
+
     async def test_checkpoint_chained_fragments_sharing_one_nominal_offset_assemble_correctly(
         self, tmp_path: Path
     ) -> None:
@@ -1078,8 +1172,8 @@ class TestPcPsFallback:
         resolve in file_meta (so its disk grouping is known), but
         file_map has no row for it in the current generation — only
         discovered when the disk is actually opened (PcpsDiskTree.open_disk),
-        not at listing time (the listing node itself doesn't know yet;
-        see PcpsDiskTree._disk_nodes's own docstring). The disk's other fragment
+        not at listing time (node construction is pure and defers all
+        fragment resolution to open_disk). The disk's other fragment
         is healthy — opening still succeeds, with the gap recorded in the
         *opened* RestorableUnit's own attrs["diagnostic"], not as a
         separate sibling node."""
@@ -1153,8 +1247,8 @@ class TestPcPsFallback:
         """Different from the Compacted case above: status 4 (Corrupted)
         is FORMAT-SPEC.md's own "known-bad" value, so ``locate_file()``
         raises ``DataCorruptError`` instead of ``NotFoundError`` for it —
-        ``_open_one()``'s per-fragment catch only swallows ``NotFoundError``
-        (see its own comment), so this propagates through
+        ``_open_one()``'s per-fragment catch only swallows ``NotFoundError``,
+        so any other exception (like this one) still propagates through
         ``asyncio.gather()`` and fails the whole disk's assembly loudly,
         rather than silently becoming one more hole."""
         store, layout = _write_repo_info_and_vault_key_db(tmp_path)
@@ -1184,10 +1278,10 @@ class TestPcPsFallback:
                 await provider.unit(disk)
 
     async def test_fragments_are_opened_concurrently_not_one_at_a_time(self, tmp_path: Path) -> None:
-        """``PcpsDiskTree.open_disk()``'s own docstring: every fragment's
-        ``locate_file()``/``extent()`` is independent of every other
-        fragment's, so all of them run concurrently via
-        ``asyncio.gather()`` — proven directly by parking one fragment's
+        """Every fragment's ``locate_file()``/``extent()`` is independent of
+        every other fragment's (nothing reads what another fragment's call
+        produced), so all of them run concurrently via ``asyncio.gather()``
+        instead of one at a time — proven directly by parking one fragment's
         ``locate_file()`` call on an ``asyncio.Event`` and observing the
         *other* fragment's own ``locate_file()`` has already been called
         before that park is released. A strictly sequential ``for`` loop
@@ -1330,9 +1424,13 @@ async def test_object_nodes_raises_not_found_when_version_table_is_empty(tmp_pat
 
 
 class TestPagination:
-    """``children()``'s ``offset``/``limit`` push a real
-    ``ORDER BY file_path, object_id LIMIT ? OFFSET ?`` down to SQL (see
-    ``units/device.py``'s own comment)."""
+    """``children()``'s ``offset``/``limit`` semantics differ by node kind:
+    device-level listing pushes a real ``ORDER BY host_name, device_id
+    LIMIT ? OFFSET ?`` down to SQL, while object-level listing fetches
+    every row unpaginated and slices in Python — a dedup object can
+    contribute two nodes (itself plus a "(filesystem)" sibling), so a
+    row-count-based SQL ``LIMIT``/``OFFSET`` wouldn't line up with the
+    actual returned node count."""
 
     async def test_object_pagination_matches_full_list_slice_sorted_by_file_path(self, tmp_path: Path) -> None:
         # Deliberately inserted out of file_path order — the returned
@@ -1360,9 +1458,10 @@ class TestPagination:
             assert await provider.children(device, offset=100, limit=10) == []
 
     async def test_object_pagination_still_excludes_temp_postfix_rows(self, tmp_path: Path) -> None:
-        # temp_postfix filtering moved into the WHERE clause itself (see
-        # units/device.py's own comment) — a real SQL-level LIMIT/OFFSET
-        # must never let a filtered-out row eat into the requested window.
+        # temp_postfix filtering is in the WHERE clause itself, not a
+        # post-fetch filter, so a filtered-out row is excluded before the
+        # Python-side paginate() slice ever sees it -- it must never eat
+        # into the requested window.
         extra = [
             (2, 1, "real2.img", "VM-uid/real2", "", 1, 10),
             (3, 1, "interrupted.img", "VM-uid/interrupted", "some-postfix", 1, 10),
@@ -1491,9 +1590,9 @@ class TestDiskFsResolution:
         """A pasted canonical ref can land directly on an entry node in a
         *fresh* ``DeviceProvider`` instance, whose own ``DiskFsSibling``
         collaborator has an empty ``_filesystems`` cache — unlike a live
-        tree walk via ``DiskFsSibling.children()`` first, this method's
-        own docstring says it must resolve the filesystem itself rather
-        than assume it's already cached."""
+        tree walk via ``DiskFsSibling.children()`` first, ``open_entry``
+        must resolve the filesystem itself in that case rather than assume
+        it's already cached."""
         provider, fs_node = await self._provider_and_fs_node(repo, monkeypatch)
         try:
 
@@ -1518,5 +1617,54 @@ class TestDiskFsResolution:
 
             with pytest.raises(NotFoundError, match="no filesystem recognized"):
                 await provider._disk_fs.open_entry(entry_node)
+        finally:
+            await provider.close()
+
+    async def test_children_carries_the_file_state_into_node_attrs_and_the_opened_unit(
+        self, repo: DedupRepo, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A file this SDK believes is a cloud-sync placeholder
+        (disk_fs.py's ``_Format.content_unavailable``/
+        ``_apfs_is_dataless``) carries its ``FileState`` all the way from
+        ``DiskFilesystem.list_dir``'s own ``_DirEntry`` into
+        ``Node.attrs["file_state"]``, and from there (via
+        ``open_entry``'s own ``attrs=node.attrs``) into the resulting
+        ``RestorableUnit`` too — always ``FileState.NORMAL`` for a
+        partition/directory node, which has no placeholder concept of
+        its own. ``mtime`` rides the same path into ``Node.attrs["mtime"]``."""
+        provider, fs_node = await self._provider_and_fs_node(repo, monkeypatch)
+        try:
+            mtime = datetime(2024, 5, 6, 7, 8, 9, tzinfo=UTC)
+
+            class _FakeContent:
+                size = 10
+
+            class _FakeDiskFs:
+                def partitions(self) -> list[tuple[int, str]]:
+                    return [(0, "fake partition")]
+
+                async def list_dir(self, partition_addr: int, path: str) -> list[_DirEntry]:
+                    return [
+                        _DirEntry(name="cloud.txt", is_dir=False, size=10, file_state=FileState.CLOUD_ONLY, mtime=mtime)
+                    ]
+
+                async def open_file(self, partition_addr: int, path: str) -> _FakeContent:
+                    return _FakeContent()
+
+            async def _fake_open(cls: object, content: object) -> _FakeDiskFs:
+                return _FakeDiskFs()
+
+            monkeypatch.setattr(DiskFilesystem, "open", classmethod(_fake_open))
+
+            (partition_node,) = await provider._disk_fs.children(fs_node, offset=0)
+            assert partition_node.attrs["file_state"] is FileState.NORMAL
+            assert "mtime" not in partition_node.attrs
+
+            (file_node,) = await provider._disk_fs.children(partition_node, offset=0)
+            assert file_node.attrs["file_state"] is FileState.CLOUD_ONLY
+            assert file_node.attrs["mtime"] == mtime
+
+            unit = await provider._disk_fs.open_entry(file_node)
+            assert unit.attrs["file_state"] is FileState.CLOUD_ONLY
         finally:
             await provider.close()

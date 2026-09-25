@@ -60,7 +60,7 @@ def name_object_id_pairs(items: object) -> list[tuple[str, str]]:
     """Filters ``items`` down to the ``(name, object_id)`` pairs it
     actually holds, silently dropping anything that doesn't match —
     ``items`` is expected to be a JSON array of ``{"name": str,
-    "object_id": str}`` objects, the shape a object-name index's own
+    "object_id": str}`` objects, the shape an object-name index's own
     ``db_objects`` array uses (``object_name_index.py`` and
     ``services.py``'s own INDEX-object sniffing both need this
     identical filter). Returns ``[]`` outright when ``items`` isn't
@@ -93,13 +93,12 @@ class ObjectDb:
         classmethod factory rather than ``__init__``."""
         self = cls()
         # Deliberately NOT hopped to asyncio.to_thread, unlike this
-        # project's other peel() call sites: this module's own docstring
-        # -- "a tiny SQLite file *embedded* directly in the stream's
-        # dedup content" -- means ``data`` here is never a multi-MB
-        # payload, matching dedup/pool.py's own read_chunk() precedent
-        # ("one 4096-byte decode is far cheaper than a thread
-        # round-trip... deliberately does not hop"). Revisit only if a
-        # real embedded ObjectDB is ever observed to be large.
+        # project's other peel() call sites: never a multi-MB payload
+        # (a tiny embedded SQLite file, per the module docstring above),
+        # matching dedup/pool/_bucket_reader.py's own read_chunk()
+        # precedent ("one 4096-byte decode is far cheaper than a thread
+        # round-trip"). Revisit only if a real embedded ObjectDB is ever
+        # observed to be large.
         payload, _ = peel(data)
         self._source = await SqliteSource.from_bytes(payload)
         try:

@@ -42,8 +42,10 @@ ConnectionConfigId = NewType("ConnectionConfigId", int)
 primary key for a connection *and version_type* pair."""
 
 CatalogId = NewType("CatalogId", str)
-"""Repository Layer identifier for one ``api.Catalog`` (see ``api.repository``'s
-own module docstring) — distinct from every id above in that it's not a raw
+"""Repository Layer identifier for one ``api.Catalog`` — part of the
+``Session``/``Repository``/``Catalog`` split that CLI/TUI code imports
+directly, with everything below that split treated as an implementation
+detail — distinct from every id above in that it's not a raw
 on-disk column: a vault's own catalogs share one ``connection_config`` table
 (unique *within* that vault, so ``str(connection_config_id)`` alone
 identifies one), but each object-storage sibling's own ``connection_config``
@@ -54,8 +56,9 @@ construction, being a directory name)."""
 
 
 def resolve_catalog_id(repo_id: str | None, connection_config_id: ConnectionConfigId) -> CatalogId:
-    """The one shared place ``CatalogId``'s own formula (see its
-    docstring above) lives — used both by ``api.repository.Catalog.catalog_id``
+    """The one shared place holding the ``CatalogId`` fallback formula —
+    ``repo_id`` when set (object storage), else ``str(connection_config_id)``
+    (a vault) — used both by ``api.catalog.Catalog.catalog_id``
     and ``units.node_ref.canonical_ref_for``, which would otherwise each
     carry an identical, independently-drifting copy of this fallback."""
     return CatalogId(repo_id or str(connection_config_id))

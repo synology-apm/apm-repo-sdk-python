@@ -48,7 +48,8 @@ from synology_apm_repo.sdk.identifiers import (
 )
 from synology_apm_repo.sdk.storage.layout import RepoKind, RepoLayout
 from synology_apm_repo.sdk.storage.local import LocalFsStore
-from synology_apm_repo.sdk.units.base import Node, UnitKind
+from synology_apm_repo.sdk.units.base import Node, UnitKind, mtime_from_epoch, node_leaf_kind
+from synology_apm_repo.sdk.units.content.saas_site import build_values_json
 from synology_apm_repo.sdk.units.saas.provider import SaasWorkloadProvider
 from synology_apm_repo.sdk.units.saas.site import (
     SiteProvider,
@@ -57,6 +58,7 @@ from synology_apm_repo.sdk.units.saas.site import (
     _is_folder,
     _self_id_of,
 )
+from synology_apm_repo.sdk.units.saas.stream import SaasStreamCache
 
 _STREAM_ID = 15
 _CCID = 1
@@ -142,8 +144,15 @@ def _write_saas_version_db(path: Path) -> None:
 def _write_copy_target_version_db(
     path: Path, *, version_uid: str, object_db_id: str, db_objects: list[tuple[str, str]]
 ) -> None:
-    """See ``test_units_dispatch_saas.py``'s own
-    ``_write_copy_target_version_db`` docstring."""
+    """The connector's own index bookkeeping
+    (``synology_apm_repo.sdk.units.saas.object_name_index``) — every
+    ``SaasWorkloadProvider``/``TeamsChatProvider`` construction resolves
+    its service DB(s) *only* through this table, with no
+    scan-based fallback, so a fixture repository that wants a table found
+    must record it here rather than merely embedding the bytes
+    somewhere in ``saas_obj``. Plain, unencrypted JSON — these fixture
+    repositories never configure a vault_key, matching every other db this
+    file writes."""
     path.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(path)
     conn.execute("CREATE TABLE copy_target_version(version_uid TEXT PRIMARY KEY, version_spec TEXT)")
@@ -170,22 +179,24 @@ def _build_object_db(rows: list[tuple[str, int, int]]) -> bytes:
         return path.read_bytes()
 
 
-def _build_list_db(lists: list[tuple[str, str, str, int, str]]) -> bytes:
+def _build_list_db(lists: list[tuple[str, str, str, int, str, int]]) -> bytes:
     """``lists``: (list_id, list_title, meta_object_id, list_type,
-    root_folder_id) — ``list_type`` 1 means document library, 0 means a
-    plain list; ``root_folder_id`` is that list's own top-level anchor,
-    matched against a top-level item's own ``parent_folder_id`` — see
-    ``site.py``'s own ``_is_document_library``/
-    ``NamedGroupRecursiveTree``'s own docstring."""
+    root_folder_id, create_time) — ``list_type`` 1 means document library,
+    0 means a plain list; ``root_folder_id`` is that list's own top-level
+    anchor, matched against a top-level item's own ``parent_folder_id``
+    (a document library's top level is non-empty, unlike a plain list's
+    ``""``, so without this match its items would appear empty);
+    ``create_time`` is that list's own real creation epoch, read
+    regardless of category."""
     with tempfile.TemporaryDirectory() as td:
         path = Path(td) / "list.db"
         conn = sqlite3.connect(path)
         conn.execute("CREATE TABLE config_table(key TEXT, value TEXT)")
         conn.execute(
             "CREATE TABLE list_version_table(list_id TEXT PRIMARY KEY, list_title TEXT, "
-            "meta_object_id TEXT, list_type INTEGER, root_folder_id TEXT)"
+            "meta_object_id TEXT, list_type INTEGER, root_folder_id TEXT, create_time INTEGER)"
         )
-        conn.executemany("INSERT INTO list_version_table VALUES (?, ?, ?, ?, ?)", lists)
+        conn.executemany("INSERT INTO list_version_table VALUES (?, ?, ?, ?, ?, ?)", lists)
         conn.commit()
         conn.close()
         raw = path.read_bytes()
@@ -196,9 +207,9 @@ def _build_item_db(items: list[tuple[str, str, str, str, str, str, str | None, s
     """``items``: (item_id, list_id, file_id, parent_folder_id, title,
     item_type, meta_object_id, url_path, value1) — ``url_path`` is what a
     document-library folder's own display name actually comes from (its
-    ``title`` is empty — see ``site.py``'s own ``_display_name``
-    comment); ``value1`` is a document-library file's own cached real
-    byte size (see ``site.py``'s own ``_leaf_size`` comment)."""
+    ``title`` is empty); ``value1`` is a document-library file's own
+    cached real byte size, gated on a non-empty ``file_id`` since it
+    means something else entirely for a general list row."""
     with tempfile.TemporaryDirectory() as td:
         path = Path(td) / "item.db"
         conn = sqlite3.connect(path)
@@ -304,12 +315,14 @@ def _build_site_repo(
 
     list_db_bytes = _build_list_db(
         [
-            ("list-1", "Tasks", "meta_list_1", 0, ""),
+            ("list-1", "Tasks", "meta_list_1", 0, "", 1_700_000_000),
             # A real document library's own top level is *not* the empty
-            # string (az-test-2-encrypted's real "Documents" library) —
-            # "root-docs" here, matched by report.docx/Subfolder's own
-            # parent_folder_id below, not "".
-            ("list-2", "Docs", "meta_list_2", 1, "root-docs"),
+            # string — "root-docs" here, matched by report.docx/Subfolder's
+            # own parent_folder_id below, not "". Its own create_time (a real
+            # column on both categories) is distinct from Tasks' own, so
+            # a test can tell whether a given mtime actually came from
+            # this list's own row rather than a copy-paste coincidence.
+            ("list-2", "Docs", "meta_list_2", 1, "root-docs", 1_700_100_000),
         ]
     )
     item_db_bytes = _build_item_db(
@@ -318,15 +331,16 @@ def _build_site_repo(
             ("1", "list-1", "", "", "Task A", "0", "meta_item_1", "", ""),
             # a document library file (Docs) — file content via content_list.
             # Title is deliberately a *content* title, not the real file
-            # name — real SharePoint pages have exactly this shape (e.g.
-            # az-test-2-encrypted's real "Site Pages/Home", title="Home",
-            # real file "Home.aspx") — url_path must win regardless.
+            # name — a real SharePoint page's title (e.g. "Home") commonly
+            # differs from its underlying file name (e.g. "Home.aspx") —
+            # url_path must win regardless.
             ("2", "list-2", "file-abc", "root-docs", "Quarterly Report", "FILE", "meta_item_2", "/report.docx", "36"),
             # a document library folder (Docs) with a nested file — empty
             # title (a real folder row's own title is empty; its display
             # name comes from url_path instead) and item_type "1" (the
             # numeric FileSystemObjectType encoding, not the string
-            # "FOLDER" — both are real, see _is_folder's own comment).
+            # "FOLDER" — both are real, interchangeable encodings
+            # SharePoint uses.
             # value1 "null" (a real folder's own real value, never a
             # size) must not be misread as one.
             ("3", "list-2", "folder-xyz", "root-docs", "", "1", "meta_item_3", "/Subfolder", "null"),
@@ -415,8 +429,8 @@ async def provider(tmp_path: Path) -> AsyncIterator[SaasWorkloadProvider]:
     _build_site_repo(tmp_path)
     store = LocalFsStore(tmp_path)
     layout = RepoLayout(kind=RepoKind.VAULT, repo_root="")
-    async with await DedupRepo.open(store, layout) as repo:
-        p = await SiteProvider(repo, _version())
+    async with await DedupRepo.open(store, layout) as repo, SaasStreamCache(repo) as saas_streams:
+        p = await SiteProvider(repo, _version(), saas_streams)
         try:
             yield p
         finally:
@@ -449,6 +463,17 @@ class TestCategorization:
         assert list_names == {"Tasks"}
         assert doc_library_names == {"Docs"}
 
+    async def test_list_category_overrides_leaf_kind_to_category_group(self, provider: SaasWorkloadProvider) -> None:
+        """The "List" category's own children are individual List group
+        nodes, never leaves -- overriding its leaf_kind to CATEGORY_GROUP
+        (rather than inheriting SITE_ITEM) is what lets the browser give
+        it Name/Created columns instead of Document Library's Name/Size/
+        Modified. Document Library keeps the provider's default SITE_ITEM,
+        unaffected by this override."""
+        categories = {n.name: n for n in await provider.children(provider.root())}
+        assert node_leaf_kind(categories["List"]) is UnitKind.CATEGORY_GROUP
+        assert node_leaf_kind(categories["Document Library"]) is UnitKind.SITE_ITEM
+
     async def test_a_list_group_node_is_flagged_for_overview_a_doc_library_is_not(
         self, provider: SaasWorkloadProvider
     ) -> None:
@@ -465,6 +490,29 @@ class TestCategorization:
         assert tasks.attrs.get("site_list_overview") is True
         assert "site_list_overview" not in docs.attrs
 
+    async def test_both_a_list_and_a_doc_library_group_node_get_their_own_real_mtime(
+        self, provider: SaasWorkloadProvider
+    ) -> None:
+        # A document library's own top-level group node has no other
+        # real mtime source (its own children's individual mtimes don't
+        # apply to the library itself) -- its own create_time fills the
+        # same "Modified" column a List's "Created" column reuses.
+        [tasks] = [n for n in await _all_lists(provider) if n.name == "Tasks"]
+        [docs] = [n for n in await _all_lists(provider) if n.name == "Docs"]
+        assert tasks.attrs.get("mtime") == mtime_from_epoch(1_700_000_000)
+        assert docs.attrs.get("mtime") == mtime_from_epoch(1_700_100_000)
+
+    async def test_a_nested_document_library_folder_gets_no_list_level_mtime(
+        self, provider: SaasWorkloadProvider
+    ) -> None:
+        # Only the library's own top-level group node (key length 2)
+        # reuses the list's create_time -- a folder nested within it
+        # (key length 3+) is a different node with no such column of
+        # its own.
+        [docs] = [n for n in await _all_lists(provider) if n.name == "Docs"]
+        subfolder = next(n for n in await provider.children(docs) if n.name == "Subfolder")
+        assert "mtime" not in subfolder.attrs
+
 
 class TestTree:
     async def test_tasks_list_has_one_plain_row(self, provider: SaasWorkloadProvider) -> None:
@@ -474,21 +522,19 @@ class TestTree:
         assert items[0].name == "Task A"
         assert items[0].is_leaf is True
         assert items[0].kind is UnitKind.SITE_ITEM
-        # A plain list row's empty file_id gates _leaf_size off entirely
-        # (its own value1, if any, means something else — never a byte
-        # size — see _leaf_size's own comment).
+        # A plain list row's empty file_id gates _leaf_size off entirely --
+        # value1 means something else per row for a general list, never a
+        # byte size.
         assert items[0].size is None
 
     async def test_docs_list_has_a_file_and_a_folder_at_top_level(self, provider: SaasWorkloadProvider) -> None:
         """Also exercises three real fixes together: "Docs"' own top
         level is anchored at its non-empty ``root_folder_id``
-        ("root-docs"), not the empty string (without ``root_folder_id_of``,
-        this whole list would appear empty — see
-        ``NamedGroupRecursiveTree``'s own docstring); "report.docx"'s
+        ("root-docs"), not the empty string (without ``root_folder_id_of``
+        this whole list would appear empty); "report.docx"'s
         display name comes from its ``url_path``, not its own (deliberately
-        different) content ``title`` "Quarterly Report" (a real
-        document-library file's ``title`` is a content title, not its
-        real file name — see ``_display_name``'s own comment); and
+        different) content ``title`` "Quarterly Report" (a document-library
+        item's ``title`` is a content title, not its real file name); and
         "Subfolder"'s display name comes from its ``url_path`` fallback
         too, since a real folder row's own ``title`` is empty."""
         [docs] = [n for n in await _all_lists(provider) if n.name == "Docs"]
@@ -512,15 +558,92 @@ class TestTree:
         assert [n.name for n in nested] == ["nested.txt"]
         assert nested[0].size == len(b"nested file content")
 
+    async def test_docs_list_sorts_folders_first_then_files_by_display_name_not_title(self, tmp_path: Path) -> None:
+        """Two more document-library files under "root-docs", each with a
+        ``title`` that ranks in the *opposite* order from its real
+        ``url_path``-derived display name — proves sorting follows the
+        displayed name (``site.py``'s ``_NAME_ORDER_SQL``), not the raw
+        ``title`` column, on top of the existing folder-before-files
+        check ("Subfolder" still sorts before every file despite its own
+        name starting with a capital "S")."""
+        extra_items: list[tuple[str, str, str, str, str, str, str | None, str, str]] = [
+            ("6", "list-2", "file-f6", "root-docs", "Zzz Title", "FILE", "meta_item_2", "/aaa-file.docx", "1"),
+            ("7", "list-2", "file-f7", "root-docs", "Aaa Title", "FILE", "meta_item_2", "/zzz-file.docx", "1"),
+        ]
+        _build_site_repo(tmp_path, extra_items=extra_items)
+        store = LocalFsStore(tmp_path)
+        layout = RepoLayout(kind=RepoKind.VAULT, repo_root="")
+        async with await DedupRepo.open(store, layout) as repo, SaasStreamCache(repo) as saas_streams:
+            provider = await SiteProvider(repo, _version(), saas_streams)
+            try:
+                [docs] = [n for n in await _all_lists(provider) if n.name == "Docs"]
+                items = await provider.children(docs)
+                assert [n.name for n in items] == ["Subfolder", "aaa-file.docx", "report.docx", "zzz-file.docx"]
+            finally:
+                await provider.close()
+
+    async def test_docs_list_item_with_no_url_path_falls_back_to_title_for_sorting_too(self, tmp_path: Path) -> None:
+        """Regression test: a document-library item with ``file_id`` set
+        but an empty ``url_path`` -- ``_display_name`` falls back to
+        ``title`` for it (the ``if url_path:`` guard). ``_NAME_ORDER_SQL``
+        must fall back the same way, not key on the empty ``url_path``
+        directly -- SQLite sorts ``''`` before every non-empty string, so
+        a naive ``CASE`` (keying on ``file_id`` alone) would incorrectly
+        rank this item before "report.docx" regardless of its own title."""
+        extra_items: list[tuple[str, str, str, str, str, str, str | None, str, str]] = [
+            ("6", "list-2", "file-f6", "root-docs", "zzzzz-fallback-title", "FILE", "meta_item_2", "", "1"),
+        ]
+        _build_site_repo(tmp_path, extra_items=extra_items)
+        store = LocalFsStore(tmp_path)
+        layout = RepoLayout(kind=RepoKind.VAULT, repo_root="")
+        async with await DedupRepo.open(store, layout) as repo, SaasStreamCache(repo) as saas_streams:
+            provider = await SiteProvider(repo, _version(), saas_streams)
+            try:
+                [docs] = [n for n in await _all_lists(provider) if n.name == "Docs"]
+                items = await provider.children(docs)
+                assert [n.name for n in items] == ["Subfolder", "report.docx", "zzzzz-fallback-title"]
+            finally:
+                await provider.close()
+
+    async def test_docs_list_items_with_no_title_or_url_path_sort_by_file_id_not_item_id(self, tmp_path: Path) -> None:
+        """Regression test: a document-library item with ``file_id`` set
+        but neither a usable ``url_path`` nor a ``title`` falls back to
+        ``_self_id_of`` -- which prefers ``file_id`` over ``item_id`` --
+        for both its display name and its sort key. ``_NAME_ORDER_SQL``'s
+        own ``ELSE`` branch must match that preference, not sort by
+        ``item_id`` unconditionally: these two items' ``item_id``s ("6",
+        "9") sort in the *opposite* order from their real display
+        names/sort keys (``file_id``), so a naive ``ELSE item_id`` would
+        list them swapped."""
+        extra_items: list[tuple[str, str, str, str, str, str, str | None, str, str]] = [
+            ("6", "list-2", "zzz-file-id-for-item-6", "root-docs", "", "FILE", "meta_item_2", "", "1"),
+            ("9", "list-2", "aaa-file-id-for-item-9", "root-docs", "", "FILE", "meta_item_2", "", "1"),
+        ]
+        _build_site_repo(tmp_path, extra_items=extra_items)
+        store = LocalFsStore(tmp_path)
+        layout = RepoLayout(kind=RepoKind.VAULT, repo_root="")
+        async with await DedupRepo.open(store, layout) as repo, SaasStreamCache(repo) as saas_streams:
+            provider = await SiteProvider(repo, _version(), saas_streams)
+            try:
+                [docs] = [n for n in await _all_lists(provider) if n.name == "Docs"]
+                items = await provider.children(docs)
+                assert [n.name for n in items] == [
+                    "Subfolder",
+                    "report.docx",
+                    "aaa-file-id-for-item-9",
+                    "zzz-file-id-for-item-6",
+                ]
+            finally:
+                await provider.close()
+
     async def test_docs_list_top_level_issues_exactly_one_query(
         self, provider: SaasWorkloadProvider, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         """``children_of()`` for one folder within one list issues
         exactly one ``WHERE list_id = ? AND parent_folder_id = ?`` query,
-        backed by an index ``apply_index_hint()`` builds into this
-        table's own private per-version temp copy (real
-        ``item_version_table`` has none in the real schema — see
-        ``site.py``'s own comment)."""
+        backed by an index ``apply_index_hint()`` builds lazily into a
+        private per-version temp copy (real ``item_version_table`` has no
+        such index)."""
         from synology_apm_repo.sdk.storage.table import Table
 
         calls: list[tuple[str, Sequence[object]]] = []
@@ -545,7 +668,7 @@ class TestTree:
         await provider.children(docs)
         # "Docs" is list_id "list-2", a document library whose own
         # top-level root_folder_id is "root-docs" (not the plain-list
-        # empty-string default) -- see _build_list_db's own docstring.
+        # empty-string default).
         assert calls == [("list_id = ? AND parent_folder_id = ?", ("list-2", "root-docs"))]
 
     async def test_a_leaf_item_with_an_unparseable_value1_has_no_size(self, tmp_path: Path) -> None:
@@ -568,8 +691,8 @@ class TestTree:
         _build_site_repo(tmp_path, extra_items=[extra_item])
         store = LocalFsStore(tmp_path)
         layout = RepoLayout(kind=RepoKind.VAULT, repo_root="")
-        async with await DedupRepo.open(store, layout) as repo:
-            provider = await SiteProvider(repo, _version())
+        async with await DedupRepo.open(store, layout) as repo, SaasStreamCache(repo) as saas_streams:
+            provider = await SiteProvider(repo, _version(), saas_streams)
             try:
                 [docs] = [n for n in await _all_lists(provider) if n.name == "Docs"]
                 garbled = next(n for n in await provider.children(docs) if n.name == "garbled.docx")
@@ -610,8 +733,8 @@ class TestContent:
         _build_site_repo(tmp_path, extra_items=[extra_item])
         store = LocalFsStore(tmp_path)
         layout = RepoLayout(kind=RepoKind.VAULT, repo_root="")
-        async with await DedupRepo.open(store, layout) as repo:
-            provider = await SiteProvider(repo, _version())
+        async with await DedupRepo.open(store, layout) as repo, SaasStreamCache(repo) as saas_streams:
+            provider = await SiteProvider(repo, _version(), saas_streams)
             try:
                 [docs] = [n for n in await _all_lists(provider) if n.name == "Docs"]
                 no_meta = next(n for n in await provider.children(docs) if n.name == "no-meta.docx")
@@ -625,8 +748,8 @@ class TestContent:
         _build_site_repo(tmp_path, extra_items=[extra_item], extra_payloads=[("meta_item_5", b"not json at all")])
         store = LocalFsStore(tmp_path)
         layout = RepoLayout(kind=RepoKind.VAULT, repo_root="")
-        async with await DedupRepo.open(store, layout) as repo:
-            provider = await SiteProvider(repo, _version())
+        async with await DedupRepo.open(store, layout) as repo, SaasStreamCache(repo) as saas_streams:
+            provider = await SiteProvider(repo, _version(), saas_streams)
             try:
                 [docs] = [n for n in await _all_lists(provider) if n.name == "Docs"]
                 bad = next(n for n in await provider.children(docs) if n.name == "bad.docx")
@@ -648,8 +771,8 @@ class TestContent:
         _build_site_repo(tmp_path, extra_items=[extra_item], extra_payloads=[("meta_item_5", stale_meta)])
         store = LocalFsStore(tmp_path)
         layout = RepoLayout(kind=RepoKind.VAULT, repo_root="")
-        async with await DedupRepo.open(store, layout) as repo:
-            provider = await SiteProvider(repo, _version())
+        async with await DedupRepo.open(store, layout) as repo, SaasStreamCache(repo) as saas_streams:
+            provider = await SiteProvider(repo, _version(), saas_streams)
             try:
                 [docs] = [n for n in await _all_lists(provider) if n.name == "Docs"]
                 stale = next(n for n in await provider.children(docs) if n.name == "stale.docx")
@@ -671,7 +794,7 @@ class TestContent:
 
     async def test_unit_on_the_root_node_raises(self, provider: SaasWorkloadProvider) -> None:
         # The root node's own key is () (length 0) -- shorter than
-        # _CategorizedSiteTree.row_for()'s own 2-segment minimum
+        # CategorizedGroupTree.row_for()'s own 2-segment minimum
         # (category, list_id, ...), distinct from the already-tested
         # list-node/folder-node cases above (both length >= 2).
         with pytest.raises(ValueError, match="not a restorable unit"):
@@ -703,9 +826,9 @@ class TestDegradation:
 
         store = LocalFsStore(tmp_path)
         layout = RepoLayout(kind=RepoKind.VAULT, repo_root="")
-        async with await DedupRepo.open(store, layout) as repo:
+        async with await DedupRepo.open(store, layout) as repo, SaasStreamCache(repo) as saas_streams:
             with pytest.raises(UnsupportedDataFormatError):
-                await SiteProvider(repo, _version())
+                await SiteProvider(repo, _version(), saas_streams)
 
     async def test_children_of_a_list_with_no_indexed_items_returns_empty(self, provider: SaasWorkloadProvider) -> None:
         # a list_id with zero rows in item_version_table (index miss, not
@@ -717,9 +840,9 @@ class TestDegradation:
 class TestIsDocumentLibrary:
     """Direct unit tests for ``_is_document_library`` -- ``_build_list_db``
     (this file's own shared DB builder) always supplies a real
-    ``list_type`` value for every row, so the ``None`` case (a missing
-    column, or a genuinely unset value) its own comment describes was
-    never actually exercised anywhere in this file."""
+    ``list_type`` value for every row, so the ``None`` case -- treated as
+    "not a document library" rather than raising -- was never actually
+    exercised anywhere in this file."""
 
     def test_list_type_1_is_a_document_library(self) -> None:
         assert _is_document_library({"list_type": 1}) is True
@@ -736,9 +859,10 @@ class TestIsDocumentLibrary:
 
 class TestIsFolder:
     """Direct unit tests for ``_is_folder`` -- every real fixture in this
-    file only ever uses the numeric "1" encoding; the documented string
-    "FOLDER" encoding (its own comment: "FILE"/"FOLDER" or their numeric
-    equivalents) was never exercised."""
+    file only ever uses the numeric "1" encoding; ``item_type`` is
+    documented (FORMAT-SPEC.md: sharepoint-site) as "FILE"/"FOLDER" or
+    their numeric equivalents, but the string "FOLDER" encoding was
+    never exercised."""
 
     def test_numeric_folder_encoding(self) -> None:
         assert _is_folder({"item_type": "1"}) is True
@@ -775,3 +899,31 @@ class TestDisplayName:
         # ``return _self_id_of(row)`` fallback.
         row: dict[str, object | None] = {"file_id": "", "item_id": "i1", "url_path": "", "title": ""}
         assert _display_name(row) == _self_id_of(row) == "i1"
+
+    def test_falls_back_to_file_id_not_item_id_when_file_id_is_set(self) -> None:
+        # A document-library row (file_id set) with neither a usable
+        # url_path nor a title falls back to _self_id_of, which prefers
+        # file_id over item_id -- _NAME_ORDER_SQL's own ELSE branch must
+        # match this, not key on item_id unconditionally.
+        row: dict[str, object | None] = {"file_id": "f1", "item_id": "i1", "url_path": "", "title": ""}
+        assert _display_name(row) == _self_id_of(row) == "f1"
+
+
+class TestBuildValuesJson:
+    """Direct unit tests for
+    ``units.content.saas_site.build_values_json`` — every other exercise
+    of it in this file goes through a full ``SiteProvider`` end-to-end
+    (``TestUnit``'s own no-attachment-row test), which never covers an
+    empty ``values`` dict or a non-string value in isolation."""
+
+    def test_empty_values_serializes_to_an_empty_json_object(self) -> None:
+        assert build_values_json({}) == b"{}"
+
+    def test_non_string_values_round_trip_through_json(self) -> None:
+        data = build_values_json({"Count": 3, "Active": True, "Notes": None})
+        assert json.loads(data) == {"Count": 3, "Active": True, "Notes": None}
+
+    def test_result_is_utf8_encoded_bytes(self) -> None:
+        data = build_values_json({"Title": "café"})
+        assert isinstance(data, bytes)
+        assert json.loads(data.decode("utf-8")) == {"Title": "café"}

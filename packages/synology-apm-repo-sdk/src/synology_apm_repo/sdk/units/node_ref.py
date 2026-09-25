@@ -54,8 +54,9 @@ _T = TypeVar("_T")
 
 
 class RefKind(enum.Enum):
-    """Which of the three segment shapes a ``NodeRef`` is — see this module's
-    own docstring's table for what each shape looks like."""
+    """Which of the three segment shapes a ``NodeRef`` is: canonical
+    (``cat:``/``wl:``/``ver:`` prefixed), raw (``file_map`` fallback axis,
+    diagnostic-mode only), or human (display names, everything else)."""
 
     CANONICAL = "canonical"
     RAW = "raw"
@@ -119,10 +120,9 @@ class NodeRef:
     def canonical_ids(self) -> tuple[CatalogId, WorkloadId, VersionUid] | None:
         """``(catalog_id, workload_id, version_uid)`` if this is a
         canonical ref with a well-formed prefix, else ``None``.
-        ``catalog_id`` is a plain string, never parsed as an int here —
-        see ``identifiers.CatalogId``'s own docstring for why an object-
-        storage catalog's id (a repo-id string) can't be forced through
-        ``int()`` the way a vault's ``connection_config_id`` can."""
+        ``catalog_id`` is a plain string, never parsed as an int here — an
+        object-storage ``CatalogId`` is a repo-id string, not always an
+        integer the way a vault's ``connection_config_id`` is."""
         if self.kind is not RefKind.CANONICAL:
             return None
         try:
@@ -278,6 +278,35 @@ def disambiguate(names_and_ids: Sequence[tuple[str, str]], *, hints: Sequence[st
         else:
             result.append(candidate)
     return result
+
+
+def disambiguate_catalogs(catalogs: Sequence[_HasCatalogIdentity]) -> list[str]:
+    """Disambiguated display names for ``catalogs``, in the same order —
+    the ``catalog_pairs()`` + ``disambiguate()`` sequence the CLI's own
+    catalog-listing helpers and the browser's own catalog-tree selector
+    each built independently before this helper existed. Zipping the
+    result back against ``catalogs`` (or any other parallel sequence) is
+    left to the caller — consumers zip against different shapes (live
+    domain objects, index pairs)."""
+    return disambiguate(catalog_pairs(catalogs))
+
+
+def disambiguate_workloads(workloads: Sequence[Workload], *, use_type_hint: bool = True) -> list[str]:
+    """Same idea as ``disambiguate_catalogs``, for ``Workload``, folding in
+    ``workload_pairs()``'s own ``type_hint`` disambiguation hint by
+    default. ``use_type_hint=False`` skips it — for a caller whose own
+    ``workloads`` are already grouped by ``type_hint`` before reaching
+    here (the browser's own per-sub_type leaf list): every sibling there
+    already shares one ``type_hint``, so the hint could never actually
+    differentiate any of them, and showing it again in the display name
+    would just repeat what the grouping already conveys."""
+    pairs, hints = workload_pairs(workloads)
+    return disambiguate(pairs, hints=hints if use_type_hint else None)
+
+
+def disambiguate_versions(versions: Sequence[Version]) -> list[str]:
+    """Same idea as ``disambiguate_catalogs``, for ``Version``."""
+    return disambiguate(version_pairs(versions))
 
 
 def match_display_name(

@@ -27,6 +27,12 @@ replays bytes recorded once from a real sample, committed alongside it.
   are the current examples). Check what a test actually opens before assuming
   its file's directory settles the question.
 
+A `real shape` comment states structure only — which fields exist, how
+they nest, or a byte layout — never a literal value copied from a real
+sample. A literal the comment's own example needs (a name, an email, a
+domain) draws from this suite's already-established synthetic pool
+(`Alice`, `example.com`, `gwsdemo.example.com`, ...).
+
 ## The `sdk`/`cli`/`browser` split
 
 Both `tests/unit/` and `tests/integration/` are further split by which
@@ -96,7 +102,7 @@ recorded fixture. `record_target(name, allow_content=True)` is the opt-out
 for a test that genuinely needs real content bytes as a structural oracle
 (a hash/signature check that never asserts on the content's own meaning) —
 see `test_api.py`/`test_api_resolve.py`/`test_dedup_dedup_file.py` for real
-examples, each with its own comment justifying the read.
+examples, each explaining locally why that particular read is safe.
 
 `storage/recording.py`'s `RecordingStore`/`ReplayStore` — see
 `ARCHITECTURE.md`'s "Cross-cutting shared mechanisms" for what it is;
@@ -173,10 +179,10 @@ If a replay test can't prove real-data resolution without materializing an
 object's content (e.g. a `LazyArtifact`, whose `.size` is `None` until
 assembled), narrow it further still — assert on the node's own listed shape
 (kind, leaf-ness) instead of constructing a content unit at all, or push the
-content-assembly proof to a synthetic unit test with fake data. See
-`test_units_saas_mail.py`'s own docstring for the same pattern applied to a
-whole workload type: real dispatch/listing only, content-assembly proven
-synthetically instead.
+content-assembly proof to a synthetic unit test with fake data.
+`test_units_saas_mail.py` applies the same pattern at the whole-workload-type
+level: real dispatch/listing only, content-assembly proven synthetically
+instead.
 
 A fixture recording an AHLT-encrypted `target.db` (any `copy_meta_file/
 <vm>/target.db` under an encrypted vault) needs enough of its own
@@ -241,8 +247,8 @@ self-sufficient is worth some duplicated bytes across `tests/fixtures/`
 when two files touch the same real data. Multiple tests *within one
 file* can share one fixture two ways: if one test's own calls are
 already a superset of every sibling sharing the fixture, that single
-test is the documented recording recipe (its own docstring says which) —
-a narrower sibling simply exercises a slice of it, which `ReplayStore`
+test is the documented recording recipe, and a narrower sibling simply
+exercises a slice of it, which `ReplayStore`
 handles natively. Otherwise (each test covers a genuinely different
 scenario, none a superset of the others), record all of them together in
 one invocation — `record_target()`'s own session-wide sharing (above)
@@ -313,10 +319,9 @@ data (nothing recorded via `RecordingStore`/anonymized via
 `test_units_disk_fs_apfs.py`'s APFS tests replay real, byte-for-byte disk
 images (`tiny_*.raw.gz`/
 `tiny_*.raw.tar.gz`), parsed directly by `dissect.*` — nothing to do with
-`ObjectStore`/`RecordingStore`/`ReplayStore` above. Each of those two test
-modules' own docstring is the source of truth for its fixtures' build
-recipe and storage format (plain gzip vs. a sparse-tar `.raw.tar.gz`, by
-size) — this file doesn't duplicate that here.
+`ObjectStore`/`RecordingStore`/`ReplayStore` above. The build recipe and
+storage format for each (plain gzip vs. a sparse-tar `.raw.tar.gz`, by
+size) lives in that module's docstring, not duplicated here.
 
 ## Timezone-rendered assertions
 
@@ -354,12 +359,29 @@ Three preconditions are easy to assume and must be waited on instead:
   provider and rebuild the whole tree, so any `TreeNode` picked before them is
   gone afterwards — re-acquire, don't reuse.
 
-Budgets split by what is being waited for. A UI state transition (focus,
-cursor, a widget appearing, a rendered string changing) settles in a few turns
-and keeps a small budget. A wait on data genuinely being fetched and decoded
-through the SDK — a tree's root children, a folder's children, a versions
-table's rows — is waiting on real work and gets `timeout=3.0`; those are the
-waits that fail first when the machine is busy.
+Budgets split by whether reaching the condition requires an `await` into the
+SDK/Store/provider layer, not by how fast the underlying call sounds — a
+synchronous `push_screen`/`pop_screen` or widget-attribute change gets
+`tests/conftest.py`'s `ui_timeout` fixture; anything gated on a real dispatch
+(`Catalog`/`Repository` call, a `ChildrenRequested`/`RootRequested`/
+`WorkloadsLoaded` dispatch, `provider.unit()`, `ContentSource.read()`, ...)
+gets `sdk_timeout`, even when that dispatched work is itself cheap — a
+`KeyDialog` closing after a real (but practically instant)
+`Repository.set_key()`, or a hex-preview page turn after a tiny chunk decode,
+both need `sdk_timeout` for this reason.
+
+Neither budget is part of what the test asserts: `wait_until` returns the
+instant its condition is true, so both fixtures are pure poll-loop ceilings
+with zero cost on a healthy run, only mattering when something is genuinely
+stuck. The one exception is a wait whose condition is itself a transient
+window that closes again on its own (e.g. a loading indicator that
+disappears once the operation it was covering finishes) — there, unlike a
+condition that stays true once reached, a wider ceiling can make the poll
+check *after* the window has already closed, turning an occasional flake
+into a guaranteed miss. Such a wait keeps its own fixed, individually-reasoned
+timeout instead of `ui_timeout`/`sdk_timeout`, with a comment explaining why
+(`test_browser_pilot_hex_filter_refresh.py`'s two loading-indicator-vs-slow-operation
+tests are the current examples).
 
 Two cases legitimately keep a fixed `pause`: asserting that something *never*
 happens (there is no readiness signal for an absence), and sampling state at
@@ -371,19 +393,22 @@ A test that constructs a `UnitProvider` directly (`RawObjectProvider.create()`,
 `DeviceProvider.create()`, `FsProvider(...)`, `saas_provider_for()`, ...)
 rather than going through `Repository.provider()` (which tracks and closes
 its own) owns that provider's `SqliteSource`/`aiosqlite` connection and must
-close it — an unclosed one leaks a background thread, surfacing (sometimes
-on a *later*, unrelated test, since it depends on GC timing) as a
-`ResourceWarning: ... was deleted before being closed` that the default
-`make test` run doesn't even print. Every provider that needs this
-implements `ClosableUnitProvider` (see the SDK README's Design Conventions),
-so write `async with await XProvider.create(...) as provider:` — never a
-bare `provider = await XProvider.create(...)` — the same way every
-`DedupRepo.open()` call already goes through `async with`. This also
-covers a helper that builds one for its own caller to keep using (returns a
-still-open instance rather than closing it itself, mirroring
-`tests/unit/sdk/test_units_device.py`'s `_provider_and_fs_node`): the *caller* wraps its own
-use of the returned provider in `async with`/`try`-`finally`, never the
-helper.
+close it. Every provider that needs this implements `ClosableUnitProvider`
+(see the SDK README's Design Conventions), so write `async with await
+XProvider.create(...) as provider:` — never a bare `provider = await
+XProvider.create(...)` — the same way every `DedupRepo.open()` call already
+goes through `async with`. This also covers a helper that builds one for its
+own caller to keep using (returns a still-open instance rather than closing
+it itself, mirroring `tests/unit/sdk/test_units_device.py`'s
+`_provider_and_fs_node`): the *caller* wraps its own use of the returned
+provider in `async with`/`try`-`finally`, never the helper.
+
+A `monkeypatch.setattr(obj, "close", ...)`/`"aclose"` replacement that
+simulates a close failure (or otherwise never calls through to the real
+implementation) stops that real cleanup from ever running too — close the
+real resource directly in the test's own `finally` block, or have the
+replacement still delegate to the original close, rather than letting the
+patch itself be the reason nothing real ever gets released.
 
 ## Async tests
 

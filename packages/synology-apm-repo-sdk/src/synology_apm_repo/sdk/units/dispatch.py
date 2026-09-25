@@ -19,16 +19,14 @@ from .base import ClosableUnitProvider
 from .device import DeviceProvider
 from .fs import FsProvider
 from .saas.calendar import CalendarProvider
+from .saas.composite_provider import CompositeSaasProvider
 from .saas.contact import ContactProvider
 from .saas.drive import DriveProvider
 from .saas.mail import ArchiveMailProvider, MailProvider
-from .saas.provider import (
-    CompositeSaasProvider,
-    SharedSaasContext,
-    resolve_shared_saas_context,
-)
+from .saas.provider import SharedSaasContext, resolve_shared_saas_context
 from .saas.raw_object import RawObjectProvider
 from .saas.site import SiteProvider
+from .saas.stream import SaasStreamCache
 from .saas.teams_chat import TeamsChatProvider
 
 _DEVICE_TARGET_TYPES = frozenset({TargetType.VM, TargetType.PC, TargetType.PS})
@@ -36,23 +34,32 @@ _DEVICE_TARGET_TYPES = frozenset({TargetType.VM, TargetType.PC, TargetType.PS})
 #: ``target_type`` values ``provider_for`` alone can build a provider for —
 #: VM/PC/PS/FS only. SaaS dispatch needs the owning ``Workload`` (for
 #: ``sub_type``), so it lives in the separate ``saas_provider_for`` below;
-#: see ``SUPPORTED_SAAS_SUB_TYPES`` for that axis's equivalent.
+#: see ``SUPPORTED_SAAS_SUB_TYPES`` for that axis's equivalent. Membership
+#: here doesn't guarantee every individual version resolves — a specific
+#: PC/PS version can still have every disk fragment unresolvable at
+#: runtime (``device_pcps.PcpsDiskTree``'s own diagnostic-node path).
 SUPPORTED_TARGET_TYPES = _DEVICE_TARGET_TYPES | {TargetType.FS}
 
 
-#: Factories are ``(repo, version, *, shared=...) -> Awaitable[ClosableUnitProvider]``,
-#: not ``type``: six are factory functions over the shared
-#: ``SaasWorkloadProvider`` class, one is a classmethod. Every candidate
-#: is awaitable — building any SaaS provider opens the version's
-#: ``saas_obj`` and resolves its service DB via the connector's own
-#: object-name index (never a scan), both real I/O — unless ``shared`` is
-#: given, in which case that work was already done once by
-#: ``resolve_shared_saas_context`` (see ``saas_provider_for``). A plain
-#: ``Callable[[...], ...]`` alias can't express a keyword-only parameter,
-#: hence the ``Protocol``.
+#: Factories are ``(repo, version, saas_streams, *, shared=...) ->
+#: Awaitable[ClosableUnitProvider]``, not ``type``: six are factory
+#: functions over the shared ``SaasWorkloadProvider`` class, one is a
+#: classmethod. Every candidate is awaitable — building any SaaS provider
+#: opens the version's ``saas_obj`` (via ``saas_streams``, reused across
+#: every version of the same stream rather than opened fresh) and resolves
+#: its service DB via the connector's own object-name index (never a
+#: scan), both real I/O — unless ``shared`` is given, in which case that
+#: work was already done once by ``resolve_shared_saas_context`` (see
+#: ``saas_provider_for``). A plain ``Callable[[...], ...]`` alias can't
+#: express a keyword-only parameter, hence the ``Protocol``.
 class _ProviderFactory(Protocol):
     def __call__(
-        self, repo: DedupRepo, version: Version, *, shared: SharedSaasContext | None = None
+        self,
+        repo: DedupRepo,
+        version: Version,
+        saas_streams: SaasStreamCache,
+        *,
+        shared: SharedSaasContext | None = None,
     ) -> Awaitable[ClosableUnitProvider]: ...
 
 
@@ -72,9 +79,9 @@ _SAAS_SUB_TYPE_CANDIDATES: dict[str, tuple[tuple[str, _ProviderFactory], ...]] =
         ("mail", MailProvider),
         ("contact", ContactProvider),
         ("calendar", CalendarProvider),
-        # A real, separate mailbox coexisting with regular Mail in the
-        # same version (units/saas/mail.py's own module docstring) — a
-        # candidate like every other here, not special-cased: it either
+        # A real, separate M365-only mailbox coexisting with regular Mail
+        # in the same version — a candidate like every other here, not
+        # special-cased: it either
         # succeeds (a real archive_mail_db object-name index entry resolved) or
         # raises UnsupportedDataFormatError and is simply absent from the
         # sibling set, exactly like any other candidate that doesn't
@@ -119,7 +126,8 @@ def is_supported(workload: Workload) -> bool:
     ``Repository.workload_is_supported``) that want to report "not yet
     supported" without constructing a provider. Carries the same caveat
     those two constants do: ``True`` doesn't guarantee every individual
-    version actually resolves — see either constant's own docstring."""
+    version actually resolves — a specific version can still fail
+    construction or degrade to a raw fallback at runtime."""
     return workload.workload_type in SUPPORTED_TARGET_TYPES or workload.sub_type in SUPPORTED_SAAS_SUB_TYPES
 
 
@@ -151,6 +159,7 @@ async def saas_provider_for(
     repo: DedupRepo,
     workload: Workload,
     version: Version,
+    saas_streams: SaasStreamCache,
     *,
     object_db_id: str | None = None,
 ) -> ClosableUnitProvider:
@@ -168,6 +177,13 @@ async def saas_provider_for(
     independent workloads per app type (``"MAIL"``/``"CONTACT"``/
     ``"CALENDAR"``), so its candidate lists carry only one entry each.
 
+    ``saas_streams`` — the caller's shared ``SaasStreamCache`` (built
+    against this same ``repo``, never one built independently — see
+    ``api.repository._OpenCatalog``) — is threaded into every candidate
+    and the fallback alike, so a stream this call opens is reused by
+    every *other* version of the same stream a later call resolves too,
+    not just this call's own sibling candidates.
+
     ``object_db_id`` only reaches the fallback ``RawObjectProvider``
     construction — the application-layer candidates above resolve their
     own service DB internally.
@@ -184,12 +200,12 @@ async def saas_provider_for(
     only one candidate to share the read with.
     """
     candidates = _SAAS_SUB_TYPE_CANDIDATES.get(workload.sub_type or "", ())
-    shared = await resolve_shared_saas_context(repo, version) if len(candidates) > 1 else None
+    shared = await resolve_shared_saas_context(repo, version, saas_streams) if len(candidates) > 1 else None
     found: dict[str, ClosableUnitProvider] = {}
     try:
         for tag, factory in candidates:
             try:
-                found[tag] = await factory(repo, version, shared=shared)
+                found[tag] = await factory(repo, version, saas_streams, shared=shared)
             except UnsupportedDataFormatError:
                 continue
     except Exception:
@@ -205,12 +221,13 @@ async def saas_provider_for(
         return next(iter(found.values()))
     if len(found) > 1:
         return CompositeSaasProvider(repo, version, found)
-    return await RawObjectProvider.create(repo, version, object_db_id=object_db_id)
+    return await RawObjectProvider.create(repo, version, saas_streams, object_db_id=object_db_id)
 
 
 async def raw_fallback_provider_for(
     repo: DedupRepo,
     version: Version,
+    saas_streams: SaasStreamCache,
     *,
     object_db_id: str | None = None,
 ) -> RawObjectProvider:
@@ -223,6 +240,6 @@ async def raw_fallback_provider_for(
     visible at the type level.
 
     Async because ``RawObjectProvider.create`` is — it opens the version's
-    ``saas_obj`` and resolves its object-name index.
+    ``saas_obj`` (via ``saas_streams``) and resolves its object-name index.
     """
-    return await RawObjectProvider.create(repo, version, object_db_id=object_db_id)
+    return await RawObjectProvider.create(repo, version, saas_streams, object_db_id=object_db_id)

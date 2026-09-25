@@ -66,9 +66,11 @@ _MAX_VISITS = 200
 # recording.py) forward aclose() to whatever they wrap, so Session.close()
 # always reaches a real S3Store/AzureStore's own aclose() -- regardless of
 # whether trace= is passed (every smoke tool here always does) -- and
-# closes its aiohttp connector correctly. See storage/recording.py's own
-# _InstrumentedStore.aclose() docstring for the contract this relies on,
-# and git log for the investigation that found and fixed the gap.
+# closes its aiohttp connector correctly. Without that forwarding,
+# Session.close()'s isinstance(store, AsyncCloseable) check would find no
+# aclose() on the wrapper at all (@runtime_checkable only looks at method
+# presence), and the real connector would never be closed. See git log for
+# the investigation that found and fixed the gap.
 
 
 @dataclass
@@ -114,23 +116,20 @@ class RepoInfo:
     *narrower*, single-repository rescan of just one sibling (what ``cli/``'s
     subprocess does), the object-store layout's own key-verification
     probe reports "no repository found" instead of gracefully ignoring an
-    unneeded key, even for the sibling that doesn't actually need it
-    (empirically verified against ``sample-1``/``s3-sample-2-encrypted``'s
-    real bytes -- both siblings fail identically with the shared key,
-    both succeed identically without it). ``cli/`` only ever passes
-    ``--key`` when this is ``True``, sidestepping the whole ambiguity
-    rather than guessing which sibling the configured key really belongs
-    to.
+    unneeded key, even for the sibling that doesn't actually need it.
+    ``cli/`` only ever passes ``--key`` when this is ``True``,
+    sidestepping the whole ambiguity rather than guessing which sibling
+    the configured key really belongs to.
 
     This is a real, structural limitation for a *local* sample
-    specifically (``Session.open()`` builds a ``LocalFsStore`` rooted
+    specifically: ``Session.open()`` builds a ``LocalFsStore`` rooted
     exactly at whatever path it's given, so a narrowed local path
     structurally cannot see a sibling ``@ActiveProtectKey`` two levels
-    up -- confirmed empirically, `--key` still fails there even with
-    ``storage/layout.py``'s narrowed-root key-tree fix, which only helps
-    a *remote* narrowed rescan sharing the same, already-broad ``store``
-    instance). See the project's plan file for the proper fix (a
-    Repository/Catalog hierarchy rename) this sidesteps for now."""
+    up, even with ``storage/layout.py``'s narrowed-root key-tree fix
+    (which only helps a *remote* narrowed rescan sharing the same,
+    already-broad ``store`` instance). See the project's plan file for
+    the proper fix (a Repository/Catalog hierarchy rename) this
+    sidesteps for now."""
 
     @property
     def broad_repo_ref(self) -> str:
@@ -138,9 +137,10 @@ class RepoInfo:
         ``entry.path`` for every kind alike: a real filesystem directory
         for a ``LocalSample``, a store-relative prefix (possibly ``""``,
         meaning the whole bucket/container) for a ``ProfileSample``/
-        ``RemoteStorageSample``. See ``narrow_repo_ref`` and
-        ``_first_working_ref``'s own comment on which of the two a
-        ``--key`` reopen needs."""
+        ``RemoteStorageSample``. See ``narrow_repo_ref``; this is the ref
+        used whenever ``--key`` is passed, since ``object_store``'s layout
+        detector doesn't recognize a ``--key``-narrowed single-repository
+        rescan the way the vault layout does."""
         return self.entry.path
 
     @property
@@ -150,8 +150,12 @@ class RepoInfo:
         filesystem path (``entry.path`` joined with ``repo_root``) for a
         ``LocalSample``, or ``repo_root`` alone for a ``ProfileSample``/
         ``RemoteStorageSample`` (already store-root-relative regardless
-        of any narrower ``root=`` the discovery scan itself used -- see
-        ``Session.discover_remote``'s own docstring)."""
+        of any narrower ``root=`` the discovery scan itself used --
+        ``root=`` only narrows which store-relative sub-path
+        ``discover_remote`` scans, since an S3/Azure store is scoped to a
+        whole bucket/container with no "sub-root" constructor argument of
+        its own; it doesn't change what a found repository's own
+        ``repo_root`` is reported relative to)."""
         if isinstance(self.entry, LocalSample):
             return str(Path(self.entry.path) / self.repo_root) if self.repo_root else self.entry.path
         return self.repo_root
@@ -224,10 +228,10 @@ def prefer_adversarial_name(node: Node) -> bool:
     or an HTML/markup-special one (``<``, ``>``, ``[``, ``]``, ``&``).
 
     Real sample data's own adversarial names (emoji, HTML-escaped text,
-    path-traversal-looking segments) are exactly the class of name that
-    exposed a real Rich-markup-escaping bug in the CLI's ``ls``/``tree``/
-    ``doctor``/``verify`` commands by accident, via manual review -- this
-    seeks that class of name out on purpose instead."""
+    path-traversal-looking segments) are exactly the class of name most
+    likely to break Rich-markup escaping in the CLI's ``ls``/``tree``/
+    ``doctor``/``verify`` commands -- this seeks that class of name out on
+    purpose rather than leaving it to chance."""
     return any(not (" " <= ch <= "~") or ch in "<>[]&" for ch in node.name)
 
 
@@ -244,26 +248,21 @@ async def pick_workload_with_retry(
     "a sibling version might still work" reason its docstring gives: a
     single version's known data gap (a metadata-only fragment, an
     unsupported format, ...) must not doom the whole group when another
-    version might still work, the way the old, first-version-only
-    ``pick_workload`` this replaces did.
+    version might still work.
 
     Each entry carries the ``CatalogId`` of the specific ``Catalog`` its
-    ``workload``/``versions`` came from -- see ``resolve_catalog``'s own
-    docstring for why this must be resolved back to a live ``Catalog``
-    fresh, every time, rather than re-deriving "some catalog" from
-    ``ri.repo.catalogs()[0]`` (wrong the moment a repository holds more than
-    one ``Catalog``) or caching the ``Catalog`` object itself (stale the
-    moment any ``set_key()`` call touches the same repository later in the
-    same run).
+    ``workload``/``versions`` came from -- this must be resolved back to a
+    live ``Catalog`` fresh, every time, rather than re-deriving "some
+    catalog" from ``ri.repo.catalogs()[0]`` (wrong the moment a repository
+    holds more than one ``Catalog``) or caching the ``Catalog`` object
+    itself (stale the moment any ``set_key()`` call touches the same
+    repository later in the same run).
 
-    ``Repository.versions()`` (see its own docstring) already filters
-    each workload's version list down to what's confirmed openable for
-    its own ``workload_type`` (VM/FS's own ``meta`` fields, PC/PS's disk-
-    fragment resolution, GW/M365's ``saas_obj`` resolution) -- so this
-    doesn't re-filter by ``version.meta is not None`` on top of that,
-    which would silently exclude *every* GW/M365 version (SaaS versions
-    carry no ``VersionMeta`` at all) and second-guess PC/PS's own,
-    different resolution check.
+    ``Catalog.versions()`` itself never pre-filters by resolvability --
+    so this doesn't re-filter by ``version.meta is not None`` on top of
+    that, which would silently exclude *every* GW/M365 version (SaaS
+    versions carry no ``VersionMeta`` at all) and second-guess PC/PS's
+    own, different resolution check.
 
     Returns ``(result, any_truncated)``. ``result`` carries the winning
     candidate's already-fetched ``provider``/``leaf`` alongside it, so the
@@ -272,10 +271,9 @@ async def pick_workload_with_retry(
     like ``_first_working_ref``'s, invisible to the per-domain report the
     same way a rejected sibling already is there. ``any_truncated`` is
     ``True`` if ``find_leaf``'s own search bound cut short at least one
-    tried candidate (see its own docstring on what that means) --
-    reported even when ``result`` isn't ``None``, and worth surfacing to
-    the caller's report either way, distinct from every candidate's tree
-    genuinely, fully walked and found empty.
+    tried candidate, reported even when ``result`` isn't ``None``, and
+    worth surfacing to the caller's report either way, distinct from every
+    candidate's tree genuinely, fully walked and found empty.
 
     Closes every rejected candidate's own provider immediately (device/PC-
     PS's own ``target.db`` SqliteSource, most notably), same "whoever
@@ -370,9 +368,10 @@ async def find_leaf(
 @dataclass(frozen=True)
 class RepresentativeRef:
     """One real, representative ``(sample, workload type)`` pair's picked
-    leaf -- carries both the live objects (for ``browser/``'s
-    screen-driven navigation) and the built canonical ref string (for
-    ``cli/``'s subprocess argv); one bootstrap, two consumption shapes."""
+    leaf -- a plain data snapshot: the repository it came from is already
+    closed by the time any caller sees this, so ``cli/``/``browser/``
+    always reconnect fresh (via ``repo_path``/``ref`` below) rather than
+    reuse a live ``Repository``."""
 
     sample_name: str
     type_key: str
@@ -380,7 +379,6 @@ class RepresentativeRef:
     key (``sample_name`` alone collides across a sample's several
     workload types); use ``f"{sample_name}.{type_key}"`` for a unique
     step-name prefix."""
-    repo: Repository
     repo_path: str
     """A ``REPO``-argument value a fresh process can re-open this
     repository from -- ``RepoInfo.broad_repo_ref``/``.narrow_repo_ref``,
@@ -397,10 +395,10 @@ class RepresentativeRef:
     ``RepoInfo.repo_root`` (wrong for a fresh subprocess), so this
     rebuilds it with ``repo_path`` instead of reusing ``node.ref`` as-is."""
     key: str
-    """The key string bootstrap opened ``repo`` with (``""`` if none) --
-    ``cli/`` passes this as ``--key`` when non-empty, since the subprocess
-    has no access to the in-process ``Repository``'s already-verified
-    state."""
+    """The key string bootstrap opened this repository with (``""`` if
+    none) -- ``cli/`` passes this as ``--key`` when non-empty, since the
+    subprocess has no access to the in-process ``Repository``'s
+    already-verified state."""
     local: bool
     """``True`` only for a ``LocalSample``-derived ref. ``browser/``'s own
     bootstrap picks its ``main_ref``/``encrypted_ref`` from local refs
@@ -432,6 +430,17 @@ async def list_representative_refs(
     isn't readable (unkeyed/wrong-keyed) is skipped, same as ``sdk/``'s
     own bootstrap.
 
+    Processes one sample entry's repositories at a time -- discover,
+    resolve this entry's own leaf groups, then close every one of its
+    repositories via ``session.close_repo()`` before moving to the next --
+    same shape and rationale as ``sdk/__main__.py``'s own
+    ``_process_entry``: no repository's own caches or its workloads'
+    unpaginated ``Catalog.versions()`` result need to stay resident past
+    its own turn. Differs from that function only in what it keeps around
+    meanwhile: one picked leaf per group, discarding the rest immediately,
+    rather than every version list for later per-domain checks (see
+    ``_process_entry``'s own docstring).
+
     ``exclude_unreopenable_by_cli``, when set, also skips any
     ``RemoteStorageSample``-derived repository: the real CLI has no
     raw-credential flag, only ``--profile <name>`` for a saved profile, so
@@ -449,50 +458,58 @@ async def list_representative_refs(
     can't record them itself, and a bare ``print()`` alone would leave
     real, cli/browser-specific coverage gaps invisible in ``index.md``,
     visible only in whatever terminal happened to run the tool.
+    ``skip_reasons``' order reflects entry/repo processing order, not
+    skip kind -- nothing downstream branches on it, only its contents.
     """
     kinds = leaf_kinds if leaf_kinds is not None else frozenset(UnitKind)
-    repos = await discover_repos(session, entries)
+    refs: list[RepresentativeRef] = []
     skip_reasons: list[str] = []
 
-    grouped: dict[tuple[str, str], list[tuple[RepoInfo, CatalogId, Workload, list[Version]]]] = {}
-    for ri in repos:
-        if not ri.readable:
-            continue
-        if exclude_unreopenable_by_cli and isinstance(ri.entry, RemoteStorageSample):
-            reason = f"{ri.sample_name}: remote_storage sample, no --profile flag to reopen via cli subprocess"
-            print(f"[smoke] {reason} -- skipped")
-            skip_reasons.append(reason)
-            continue
-        if ri.repo.is_encrypted and not ri.sole_repo_for_entry:
-            # A shared-bucket, encrypted sibling: real, verified in this
-            # in-process session (its key already resolved via
-            # Session.discover/discover_remote), but structurally
-            # unaddressable by cli/browser's own fresh, per-repository re-open
-            # -- the sample's one configured key can't be safely applied
-            # at that narrower scope (see RepoInfo.sole_repo_for_entry),
-            # so a canonical ref built here would only fail to resolve
-            # there. sdk/ smoke still exercises this repository fully
-            # in-process; this is a cli/browser-specific gap, not a data
-            # gap.
-            reason = f"{ri.sample_name}: shared-bucket encrypted sibling, not addressable by cli/browser"
-            print(f"[smoke] {reason} -- skipped")
-            skip_reasons.append(reason)
-            continue
-        for catalog in await ri.repo.catalogs():
-            for workload in await catalog.workloads():
-                type_key = workload.type_hint
-                versions = await catalog.versions(workload)
-                grouped.setdefault((ri.sample_name, type_key), []).append((ri, catalog.catalog_id, workload, versions))
+    for entry in entries:
+        for ri in await discover_repos(session, [entry]):
+            if not ri.readable:
+                await session.close_repo(ri.repo)
+                continue
+            if exclude_unreopenable_by_cli and isinstance(ri.entry, RemoteStorageSample):
+                reason = f"{ri.sample_name}: remote_storage sample, no --profile flag to reopen via cli subprocess"
+                print(f"[smoke] {reason} -- skipped")
+                skip_reasons.append(reason)
+                await session.close_repo(ri.repo)
+                continue
+            if ri.repo.is_encrypted and not ri.sole_repo_for_entry:
+                # A shared-bucket, encrypted sibling: real, verified in this
+                # in-process session (its key already resolved via
+                # Session.discover/discover_remote), but structurally
+                # unaddressable by cli/browser's own fresh, per-repository re-open
+                # -- the sample's one configured key can't be safely applied
+                # at that narrower scope (see RepoInfo.sole_repo_for_entry),
+                # so a canonical ref built here would only fail to resolve
+                # there. sdk/ smoke still exercises this repository fully
+                # in-process; this is a cli/browser-specific gap, not a data
+                # gap.
+                reason = f"{ri.sample_name}: shared-bucket encrypted sibling, not addressable by cli/browser"
+                print(f"[smoke] {reason} -- skipped")
+                skip_reasons.append(reason)
+                await session.close_repo(ri.repo)
+                continue
 
-    refs: list[RepresentativeRef] = []
-    for (sample_name, type_key), entries_for_type in grouped.items():
-        ref = await _first_working_ref(sample_name, type_key, entries_for_type, kinds)
-        if ref is None:
-            reason = f"{sample_name}/{type_key}: no readable leaf found across any version"
-            print(f"[smoke] {reason} -- skipped")
-            skip_reasons.append(reason)
-            continue
-        refs.append(ref)
+            by_type: dict[str, list[tuple[RepoInfo, CatalogId, Workload, list[Version]]]] = {}
+            for catalog in await ri.repo.catalogs():
+                for workload in await catalog.workloads():
+                    type_key = workload.type_hint
+                    versions = await catalog.versions(workload)
+                    by_type.setdefault(type_key, []).append((ri, catalog.catalog_id, workload, versions))
+
+            for type_key, entries_for_type in by_type.items():
+                ref = await _first_working_ref(ri.sample_name, type_key, entries_for_type, kinds)
+                if ref is None:
+                    reason = f"{ri.sample_name}/{type_key}: no readable leaf found across any version"
+                    print(f"[smoke] {reason} -- skipped")
+                    skip_reasons.append(reason)
+                    continue
+                refs.append(ref)
+            await session.close_repo(ri.repo)
+
     return refs, skip_reasons
 
 
@@ -503,18 +520,19 @@ async def resolve_catalog(repo: Repository, catalog_id: CatalogId) -> Catalog:
     changed out from under this run, worth a loud failure rather than a
     silent skip.
 
-    Deliberately the real ``Repository.catalog_by_id()`` (see its own
-    docstring), not a fresh ``repo.catalogs()`` listing filtered down to
-    one match: that method already skips opening every sibling it can
-    rule out by ``repo_id`` alone, and — its own docstring's own words —
-    exists precisely for "re-fetching one already-known catalog after
-    ``set_key()``." ``Repository.set_key()`` closes and replaces every
-    already-opened ``DedupRepo`` (see its own docstring), which
+    Deliberately the real ``Repository.catalog_by_id()``, not a fresh
+    ``repo.catalogs()`` listing filtered down to one match: that method
+    already skips opening every sibling it can rule out by ``repo_id``
+    alone, and exists precisely for "re-fetching one already-known
+    catalog after ``set_key()``." ``Repository.set_key()`` closes and
+    replaces every already-opened ``DedupRepo`` -- documented to make a
+    stale ``Catalog`` a caller already holds fail cleanly on its next use
+    rather than silently keep serving the old key's data -- which
     silently turns a ``Catalog`` reference cached here from an earlier
     point in a run stale the moment ``catalog.py``'s own wrong-key/restore
     round trip (or any other ``set_key()`` call) runs against the same
     repository later in the same process -- a stale reference's own next use
-    doesn't raise cleanly the way that docstring promises; it surfaces
+    doesn't raise cleanly the way that's documented to happen; it surfaces
     several layers down as a raw ``aiosqlite`` "no active connection"
     error instead. Grouping helpers in this module key on ``CatalogId``
     rather than a ``Catalog`` object for exactly this reason."""
@@ -577,13 +595,12 @@ async def _first_working_ref(
                 await close_if_closable(provider)
                 continue
             await close_if_closable(provider)
-            # See RepoInfo.sole_repo_for_entry's own docstring: only the
-            # unambiguous, single-repository-per-entry case gets --key passed at
-            # all. When it is passed, the *broad* ref (not the narrowed
-            # one) is the one path empirically verified to accept --key
-            # for both vault and object_store layouts alike -- object_
-            # store's own layout detector doesn't recognize a --key-
-            # narrowed single-repository rescan the vault layout's does, but
+            # Only the unambiguous, single-repository-per-entry case gets
+            # --key passed at all. When it is passed, the *broad* ref (not
+            # the narrowed one) is the one path accepted by --key for both
+            # vault and object_store layouts alike -- object_store's own
+            # layout detector doesn't recognize a --key-narrowed
+            # single-repository rescan the vault layout's does, but
             # broad_repo_ref is only ever used here when sole_repo_for_
             # entry already rules out the ambiguity a broader ref would
             # otherwise risk.
@@ -594,7 +611,6 @@ async def _first_working_ref(
             return RepresentativeRef(
                 sample_name,
                 type_key,
-                ri.repo,
                 real_path,
                 workload,
                 version,

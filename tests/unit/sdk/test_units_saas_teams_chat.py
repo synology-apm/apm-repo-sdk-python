@@ -48,7 +48,7 @@ from synology_apm_repo.sdk.identifiers import (
 from synology_apm_repo.sdk.storage.layout import RepoKind, RepoLayout
 from synology_apm_repo.sdk.storage.local import LocalFsStore
 from synology_apm_repo.sdk.storage.table import Table
-from synology_apm_repo.sdk.units.base import Node, UnitKind
+from synology_apm_repo.sdk.units.base import Node, UnitKind, mtime_from_epoch
 from synology_apm_repo.sdk.units.content.saas_teams_chat import (
     _parse_json_object,
     _RenderedMessage,
@@ -59,14 +59,17 @@ from synology_apm_repo.sdk.units.saas import teams_chat as teams_chat_module
 from synology_apm_repo.sdk.units.saas.object_name_index import ObjectNameIndex
 from synology_apm_repo.sdk.units.saas.objectdb import ObjectDb
 from synology_apm_repo.sdk.units.saas.services import IndexEntry, ServiceKind, SniffResult
+from synology_apm_repo.sdk.units.saas.stream import SaasStreamCache
 from synology_apm_repo.sdk.units.saas.teams_chat import (
     TeamsChatProvider,
-    _channel_labels,
+    _channel_info,
     _chat_display_name_from_members,
     _chat_labels,
     _is_container,
+    _mtime_attr,
     _owning_account_email,
     _resolve_message_index,
+    _TeamsEntityFlatTree,
 )
 
 _STREAM_ID = 29
@@ -215,10 +218,10 @@ def _build_channel_list_db(channels: list[tuple[str, str]]) -> bytes:
 
 def _build_message_db(messages: list[tuple[str, str]], *, stickers: dict[str, dict[str, str]] | None = None) -> bytes:
     """``messages``: (sender display name, content_preview). Builds
-    ``author``/``metadata`` as real ``msg_info_table`` rows actually are
-    (both JSON, module docstring/``render_channel_html``'s own docstring)
-    — not plain strings — so tests exercise the real parsing path, not
-    just its fallback. ``stickers``, when given, also creates a real
+    ``author``/``metadata`` as real ``msg_info_table`` rows actually are:
+    both are themselves JSON strings, not plain strings, inside a real
+    row — so tests exercise the real parsing path, not just its
+    fallback. ``stickers``, when given, also creates a real
     ``sticker_info_table`` (``msg_id -> {url: base64_content}``) so a test
     can exercise ``_read_stickers``' own table-reading path end to end,
     not just ``render_channel_html``'s formatting of an already-built
@@ -455,12 +458,25 @@ async def channel_provider(tmp_path: Path) -> AsyncIterator[TeamsChatProvider]:
     )
     store = LocalFsStore(tmp_path)
     layout = RepoLayout(kind=RepoKind.VAULT, repo_root="")
-    async with await DedupRepo.open(store, layout) as repo:
-        provider = await TeamsChatProvider.create(repo, _version())
+    async with await DedupRepo.open(store, layout) as repo, SaasStreamCache(repo) as saas_streams:
+        provider = await TeamsChatProvider.create(repo, _version(), saas_streams)
         try:
             yield provider
         finally:
             await provider.close()
+
+
+async def _channels_of(provider: TeamsChatProvider) -> list[Node]:
+    """Every real channel across the Standard/Private/Shared synthetic
+    level ``children(root())`` inserts — every channel built by this
+    file's own fixtures defaults to Standard (none sets
+    ``channel_type``), so this is normally just that one category's own
+    children, but written generically over however many categories are
+    actually present."""
+    channels: list[Node] = []
+    for category in await provider.children(provider.root()):
+        channels.extend(await provider.children(category))
+    return channels
 
 
 def _row(**kwargs: object) -> dict[str, object]:
@@ -622,8 +638,7 @@ class TestRenderChannelHtml:
         assert "Empty" in page
 
     def test_real_sticker_img_is_rendered_as_a_real_embedded_image(self) -> None:
-        """Real shape (s3-sample-2-encrypted's own "many_stickers" Teams
-        channel): a sticker is an ordinary ``<img src="...">`` tag
+        """Real shape: a sticker is an ordinary ``<img src="...">`` tag
         inside a real ``"html"`` contentType
         body, matched against this message's own row in a separate
         ``sticker_info_table`` — never embedded in
@@ -676,8 +691,7 @@ class TestRenderChannelHtml:
         assert "plain" in page
 
     def test_deleted_message_shows_a_placeholder_not_a_blank_body(self) -> None:
-        # Real shape (apv-sample-1's "playground111" channel):
-        # is_deleted=1 rows have their real
+        # Real shape: is_deleted=1 rows have their real
         # metadata.body.content emptied to "" by the connector — reading
         # that literally would render an empty-looking message with no
         # indication anything was ever there.
@@ -747,30 +761,32 @@ class TestRenderChannelHtml:
         assert "<br>" in page
 
     def test_at_tag_renders_as_a_styled_mention_not_a_raw_id(self) -> None:
-        # Real shape: <at id="0">display name</at>, matching
-        # metadata.mentions[] in real apv-sample-1 data.
-        row = _row(metadata=json.dumps({"body": {"content": 'hi <at id="0">waichi kan</at>!', "contentType": "html"}}))
+        # id="0" is dropped, never rendered -- see saas_teams_chat.py's
+        # `at`-tag handling for why.
+        row = _row(
+            metadata=json.dumps({"body": {"content": 'hi <at id="0">Alice Example</at>!', "contentType": "html"}})
+        )
         page = render_channel_html([row], channel_name="General")
-        assert '<span class="mention">@waichi kan</span>' in page
+        assert '<span class="mention">@Alice Example</span>' in page
         assert 'id="0"' not in page
 
     def test_unresolved_inline_image_shows_its_alt_text_instead_of_vanishing(self) -> None:
-        # Real shape (apv-sample-1): an inline <img> whose src
-        # is a live, offline-unfetchable Microsoft Graph/giphy URL — the
-        # real alt text is still shown, rather than the whole reference
-        # silently disappearing with no trace.
+        # Real shape: an inline <img> whose src is a live,
+        # offline-unfetchable Microsoft Graph/giphy URL — the alt text is
+        # still shown, rather than the whole reference silently
+        # disappearing with no trace.
         row = _row(
             metadata=json.dumps(
                 {
                     "body": {
-                        "content": '<img alt="Meme 影像，123 456" src="https://graph.microsoft.com/v1.0/x">',
+                        "content": '<img alt="Team outing photo" src="https://graph.microsoft.com/v1.0/x">',
                         "contentType": "html",
                     }
                 }
             )
         )
         page = render_channel_html([row], channel_name="General")
-        assert "Meme 影像，123 456" in page
+        assert "Team outing photo" in page
         assert "graph.microsoft.com" not in page
 
     def test_link_with_safe_scheme_keeps_a_real_href(self) -> None:
@@ -824,26 +840,92 @@ class TestChannelTree:
     def test_root_is_named_channels(self, channel_provider: TeamsChatProvider) -> None:
         assert channel_provider.root().name == "Channels"
 
+    async def test_root_children_are_a_single_standard_channels_category(
+        self, channel_provider: TeamsChatProvider
+    ) -> None:
+        # Every real channel this file's fixtures build defaults to
+        # Standard (none sets channel_type) -- so only that one category
+        # ever appears, never an empty Private/Shared alongside it.
+        categories = await channel_provider.children(channel_provider.root())
+        assert [c.name for c in categories] == ["Standard Channels"]
+        assert all(not c.is_leaf for c in categories)
+
     async def test_children_are_named_from_channel_info_table(self, channel_provider: TeamsChatProvider) -> None:
-        names = {n.name for n in await channel_provider.children(channel_provider.root())}
+        names = {n.name for n in await _channels_of(channel_provider)}
         assert names == {"Alpha", "Beta"}
 
-    async def test_children_are_leaves_with_raw_object_kind(self, channel_provider: TeamsChatProvider) -> None:
-        for node in await channel_provider.children(channel_provider.root()):
+    async def test_children_are_leaves_with_teams_chat_message_kind(self, channel_provider: TeamsChatProvider) -> None:
+        # Lets the browser route these leaves through its own dedicated
+        # chat-transcript preview/columns purely off Node.kind, with no
+        # provider-specific attrs marker needed.
+        for node in await _channels_of(channel_provider):
             assert node.is_leaf
-            assert node.kind is UnitKind.RAW_OBJECT
+            assert node.kind is UnitKind.TEAMS_CHAT_MESSAGE
             assert node.attrs.get("degraded") is None
 
     async def test_pagination(self, channel_provider: TeamsChatProvider) -> None:
-        one = await channel_provider.children(channel_provider.root(), offset=0, limit=1)
+        [category] = await channel_provider.children(channel_provider.root())
+        one = await channel_provider.children(category, offset=0, limit=1)
         assert len(one) == 1
+
+    async def test_channels_are_listed_alphabetically_not_index_order(self, tmp_path: Path) -> None:
+        # Inserted in the *opposite* of alphabetical order -- the
+        # channel/chat index's own on-disk order isn't otherwise
+        # meaningful (within one category, this provider's own tree is
+        # one flat level, no dir-first concept applies).
+        _build_teams_repo(
+            tmp_path,
+            list_db_bytes=_build_channel_list_db([("chan-z", "Zeta"), ("chan-a", "Alpha")]),
+            list_db_name="teams_channel_db",
+            entries=[
+                ("chan-z", _build_message_db_compressed([("Zoe", "hi from zeta")])),
+                ("chan-a", _build_message_db_compressed([("Alice", "hi from alpha")])),
+            ],
+        )
+        store = LocalFsStore(tmp_path)
+        layout = RepoLayout(kind=RepoKind.VAULT, repo_root="")
+        async with await DedupRepo.open(store, layout) as repo, SaasStreamCache(repo) as saas_streams:
+            provider = await TeamsChatProvider.create(repo, _version(), saas_streams)
+            try:
+                names = [n.name for n in await _channels_of(provider)]
+                assert names == ["Alpha", "Zeta"]
+            finally:
+                await provider.close()
+
+    async def test_a_channel_missing_from_channel_info_table_still_lists_under_standard(self, tmp_path: Path) -> None:
+        """A channel the index itself names (``entries``) but
+        ``channel_info_table`` has no row for at all must still be
+        listed, defaulting to Standard -- the same fallback
+        ``_channel_info``'s own "no channel_type column" case gets,
+        just for a channel missing from the table entirely rather than
+        missing one column of an existing row."""
+        _build_teams_repo(
+            tmp_path,
+            list_db_bytes=_build_channel_list_db([("chan-a", "Alpha")]),  # "chan-b" has no row here
+            list_db_name="teams_channel_db",
+            entries=[
+                ("chan-a", _build_message_db_compressed([("Alice", "hi from alpha")])),
+                ("chan-b", _build_message_db_compressed([("Bob", "hi from beta")])),
+            ],
+        )
+        store = LocalFsStore(tmp_path)
+        layout = RepoLayout(kind=RepoKind.VAULT, repo_root="")
+        async with (
+            await DedupRepo.open(store, layout) as repo,
+            SaasStreamCache(repo) as saas_streams,
+            await TeamsChatProvider.create(repo, _version(), saas_streams) as provider,
+        ):
+            categories = await provider.children(provider.root())
+            assert [c.name for c in categories] == ["Standard Channels"]
+            names = {n.name for n in await provider.children(categories[0])}
+            assert names == {"Alpha", "chan-b"}  # chan-b falls back to its raw id -- no name row either
 
 
 class TestChannelUnit:
     async def test_unit_content_is_an_html_page_with_the_real_message(
         self, channel_provider: TeamsChatProvider
     ) -> None:
-        node = next(n for n in await channel_provider.children(channel_provider.root()) if n.name == "Alpha")
+        node = next(n for n in await _channels_of(channel_provider) if n.name == "Alpha")
         unit = await channel_provider.unit(node)
         page = (await unit.open().read()).decode("utf-8")
         assert page.startswith("<!doctype html>")
@@ -852,13 +934,13 @@ class TestChannelUnit:
         assert "Alpha" in page  # the channel name, in the page title/heading
 
     async def test_unit_name_has_html_suffix(self, channel_provider: TeamsChatProvider) -> None:
-        node = next(n for n in await channel_provider.children(channel_provider.root()) if n.name == "Alpha")
+        node = next(n for n in await _channels_of(channel_provider) if n.name == "Alpha")
         assert (await channel_provider.unit(node)).name == "Alpha.html"
 
     async def test_exported_content_is_a_well_formed_self_contained_html_file(
         self, channel_provider: TeamsChatProvider, tmp_path: Path
     ) -> None:
-        node = next(n for n in await channel_provider.children(channel_provider.root()) if n.name == "Beta")
+        node = next(n for n in await _channels_of(channel_provider) if n.name == "Beta")
         unit = await channel_provider.unit(node)
         dst = tmp_path / "export" / "beta.html"
         dst.parent.mkdir(parents=True, exist_ok=True)
@@ -901,17 +983,17 @@ class TestChannelUnit:
         )
         store = LocalFsStore(tmp_path)
         layout = RepoLayout(kind=RepoKind.VAULT, repo_root="")
-        async with await DedupRepo.open(store, layout) as repo:
-            provider = await TeamsChatProvider.create(repo, _version())
+        async with await DedupRepo.open(store, layout) as repo, SaasStreamCache(repo) as saas_streams:
+            provider = await TeamsChatProvider.create(repo, _version(), saas_streams)
             try:
-                [node] = await provider.children(provider.root())
+                [node] = await _channels_of(provider)
                 page = (await (await provider.unit(node)).open().read()).decode("utf-8")
                 assert '<img class="sticker" alt="[sticker]" src="data:image/jpeg;base64,BASE64DATA">' in page
             finally:
                 await provider.close()
 
     async def test_unit_on_a_node_with_no_object_id_raises(self, channel_provider: TeamsChatProvider) -> None:
-        real_node = next(n for n in await channel_provider.children(channel_provider.root()) if n.name == "Alpha")
+        real_node = next(n for n in await _channels_of(channel_provider) if n.name == "Alpha")
         phantom = Node(ref=real_node.ref, name="phantom", is_leaf=True, attrs={})
         with pytest.raises(ValueError, match="not a restorable unit"):
             await channel_provider.unit(phantom)
@@ -936,8 +1018,8 @@ class TestDegradedReason:
         )
         store = LocalFsStore(tmp_path)
         layout = RepoLayout(kind=RepoKind.VAULT, repo_root="")
-        async with await DedupRepo.open(store, layout) as repo:
-            provider = await TeamsChatProvider.create(repo, _version())
+        async with await DedupRepo.open(store, layout) as repo, SaasStreamCache(repo) as saas_streams:
+            provider = await TeamsChatProvider.create(repo, _version(), saas_streams)
             try:
                 provider._chat_schema_found = False
                 provider._labels = {}  # ensure this entity_id isn't already labeled
@@ -964,8 +1046,8 @@ class TestChatFallback:
         )
         store = LocalFsStore(tmp_path)
         layout = RepoLayout(kind=RepoKind.VAULT, repo_root="")
-        async with await DedupRepo.open(store, layout) as repo:
-            provider = await TeamsChatProvider.create(repo, _version())
+        async with await DedupRepo.open(store, layout) as repo, SaasStreamCache(repo) as saas_streams:
+            provider = await TeamsChatProvider.create(repo, _version(), saas_streams)
             try:
                 yield provider
             finally:
@@ -989,9 +1071,9 @@ class TestChatFallback:
     async def test_unit_on_a_chat_node_renders_the_real_message_html(self, tmp_path: Path) -> None:
         """Chat's ``.unit()`` renders through the same ``render_channel_html()``
         Channel's own does (``TestTree.test_unit_content_is_an_html_page_
-        with_the_real_message``) — this module's own docstring names
-        Chat's rendering as unconfirmed against real sample data; this is
-        the synthetic coverage for that path."""
+        with_the_real_message``) — Chat's rendering path is implemented
+        generically, unconfirmed against a real instance, so this is the
+        synthetic coverage for that path."""
         list_db = _build_chat_list_db([("chat-1", "Carol & Dave")], id_col="chat_id", label_col="topic")
         async with self._open(tmp_path, list_db) as provider:
             node = (await provider.children(provider.root()))[0]
@@ -1257,7 +1339,7 @@ class TestChatLabels:
 
     async def test_no_chat_info_table_at_all_returns_empty(self) -> None:
         container_bytes = _build_plain_sqlite_bytes(lambda conn: conn.execute("CREATE TABLE unrelated(x INTEGER)"))
-        assert await _chat_labels(container_bytes, None) == {}
+        assert await _chat_labels(container_bytes, None) == ({}, {})
 
     async def test_a_sqlite_error_while_reading_labels_returns_empty(self, monkeypatch: pytest.MonkeyPatch) -> None:
         def build(conn: sqlite3.Connection) -> None:
@@ -1273,7 +1355,7 @@ class TestChatLabels:
             yield {}  # pragma: no cover - unreachable, makes this a real async generator
 
         monkeypatch.setattr(Table, "select", raising_select)
-        assert await _chat_labels(container_bytes, None) == {}
+        assert await _chat_labels(container_bytes, None) == ({}, {})
 
     async def test_bot_label_for_an_unnamed_one_on_one_chat_with_no_derivable_member_name(self) -> None:
         def build(conn: sqlite3.Connection) -> None:
@@ -1288,7 +1370,8 @@ class TestChatLabels:
             conn.execute("INSERT INTO chat_members_table VALUES ('chat-1', '[]')")
 
         container_bytes = _build_plain_sqlite_bytes(build)
-        assert await _chat_labels(container_bytes, "me@example.com") == {"chat-1": "Bot"}
+        labels, _create_times = await _chat_labels(container_bytes, "me@example.com")
+        assert labels == {"chat-1": "Bot"}
 
     async def test_no_title_meeting_gets_the_literal_meeting_label(self) -> None:
         # _CHAT_TYPE_MEETING (2) with no topic set -- the chat_type == 2
@@ -1299,16 +1382,39 @@ class TestChatLabels:
             conn.execute("INSERT INTO chat_info_table VALUES ('chat-1', '', 2)")
 
         container_bytes = _build_plain_sqlite_bytes(build)
-        assert await _chat_labels(container_bytes, None) == {"chat-1": "(no title)"}
+        labels, _create_times = await _chat_labels(container_bytes, None)
+        assert labels == {"chat-1": "(no title)"}
+
+    async def test_create_time_is_read_when_the_column_is_present(self) -> None:
+        def build(conn: sqlite3.Connection) -> None:
+            conn.execute("CREATE TABLE chat_info_table(chat_id TEXT PRIMARY KEY, topic TEXT, create_time INTEGER)")
+            conn.execute("INSERT INTO chat_info_table VALUES ('chat-1', 'Some Topic', 1700000000)")
+
+        container_bytes = _build_plain_sqlite_bytes(build)
+        _labels, create_times = await _chat_labels(container_bytes, None)
+        assert create_times == {"chat-1": 1700000000}
+
+    async def test_create_time_is_absent_when_the_column_is_missing(self) -> None:
+        # chat_info_table's real schema is unconfirmed (module docstring)
+        # -- a connector version without this column must not crash.
+        def build(conn: sqlite3.Connection) -> None:
+            conn.execute("CREATE TABLE chat_info_table(chat_id TEXT PRIMARY KEY, topic TEXT)")
+            conn.execute("INSERT INTO chat_info_table VALUES ('chat-1', 'Some Topic')")
+
+        container_bytes = _build_plain_sqlite_bytes(build)
+        _labels, create_times = await _chat_labels(container_bytes, None)
+        assert create_times == {}
 
 
-class TestChannelLabels:
+class TestChannelInfo:
     """Direct unit tests for
-    ``synology_apm_repo.sdk.units.saas.teams_chat._channel_labels``."""
+    ``synology_apm_repo.sdk.units.saas.teams_chat._channel_info``."""
 
     async def test_channels_with_no_name_are_omitted(self) -> None:
         # ``if row.get("name")`` -- a falsy (empty/null) name must not
-        # produce an empty-string label.
+        # produce an empty-string label. No channel_type column at all --
+        # Table's own schema-drift tolerance backfills None for it
+        # (required=False), treated as Standard by _channel_info.
         def build(conn: sqlite3.Connection) -> None:
             conn.execute("CREATE TABLE channel_info_table(channel_id TEXT PRIMARY KEY, name TEXT)")
             conn.execute("INSERT INTO channel_info_table VALUES ('ch-1', 'General')")
@@ -1316,7 +1422,78 @@ class TestChannelLabels:
             conn.execute("INSERT INTO channel_info_table VALUES ('ch-3', NULL)")
 
         container_bytes = _build_plain_sqlite_bytes(build)
-        assert await _channel_labels(container_bytes) == {"ch-1": "General"}
+        labels, categories, create_times = await _channel_info(container_bytes)
+        assert labels == {"ch-1": "General"}
+        assert categories == {"ch-1": "standard", "ch-2": "standard", "ch-3": "standard"}
+        # No create_time column at all -- required=False backfills None,
+        # so no channel gets an entry rather than a bogus one.
+        assert create_times == {}
+
+    async def test_channel_type_drives_category(self) -> None:
+        def build(conn: sqlite3.Connection) -> None:
+            conn.execute("CREATE TABLE channel_info_table(channel_id TEXT PRIMARY KEY, name TEXT, channel_type TEXT)")
+            conn.execute("INSERT INTO channel_info_table VALUES ('ch-1', 'General', 'standard')")
+            conn.execute("INSERT INTO channel_info_table VALUES ('ch-2', 'private 2', 'private')")
+            conn.execute("INSERT INTO channel_info_table VALUES ('ch-3', 'shared 1', 'shared')")
+            # An unrecognized/malformed channel_type value degrades to
+            # Standard rather than raising or being dropped.
+            conn.execute("INSERT INTO channel_info_table VALUES ('ch-4', 'weird', 'unknown-type')")
+
+        container_bytes = _build_plain_sqlite_bytes(build)
+        _labels, categories, _create_times = await _channel_info(container_bytes)
+        assert categories == {"ch-1": "standard", "ch-2": "private", "ch-3": "shared", "ch-4": "standard"}
+
+    async def test_create_time_is_read_when_present(self) -> None:
+        def build(conn: sqlite3.Connection) -> None:
+            conn.execute("CREATE TABLE channel_info_table(channel_id TEXT PRIMARY KEY, name TEXT, create_time INTEGER)")
+            conn.execute("INSERT INTO channel_info_table VALUES ('ch-1', 'General', 1700000000)")
+            conn.execute("INSERT INTO channel_info_table VALUES ('ch-2', 'No Time', NULL)")
+
+        container_bytes = _build_plain_sqlite_bytes(build)
+        _labels, _categories, create_times = await _channel_info(container_bytes)
+        assert create_times == {"ch-1": 1700000000}
+
+
+class TestTeamsEntityFlatTree:
+    """Direct unit tests for ``_TeamsEntityFlatTree`` -- the ``TreeStrategy``
+    ``TeamsChatProvider`` builds its own channel/chat listing from (bare
+    for Chat, wrapped in ``CategorizedGroupTree`` for Channel's own
+    category split). Exercised here without a real repository, since
+    none of this class's own logic does any I/O."""
+
+    async def test_children_of_a_leafs_own_key_is_empty(self) -> None:
+        tree = _TeamsEntityFlatTree({"chat-1": "obj-1"}, {})
+        assert await tree.children_of(("chat-1",)) == []
+
+    def test_row_for_a_wrong_length_key_is_none(self) -> None:
+        tree = _TeamsEntityFlatTree({"chat-1": "obj-1"}, {})
+        assert tree.row_for(()) is None
+        assert tree.row_for(("chat-1", "extra")) is None
+
+    def test_row_for_an_entity_not_in_the_index_is_none(self) -> None:
+        tree = _TeamsEntityFlatTree({"chat-1": "obj-1"}, {})
+        assert tree.row_for(("nope",)) is None
+
+    def test_row_for_a_real_entity(self) -> None:
+        tree = _TeamsEntityFlatTree({"chat-1": "obj-1"}, {})
+        assert tree.row_for(("chat-1",)) == {"entity_id": "chat-1", "object_id": "obj-1"}
+
+
+class TestMtimeAttr:
+    """Direct unit tests for
+    ``synology_apm_repo.sdk.units.saas.teams_chat._mtime_attr``."""
+
+    def test_returns_mtime_when_present(self) -> None:
+        assert _mtime_attr({"ch-1": 1700000000}, "ch-1") == {"mtime": mtime_from_epoch(1700000000)}
+
+    def test_blank_when_entity_has_no_entry(self) -> None:
+        assert _mtime_attr({}, "ch-1") == {}
+
+    def test_blank_when_create_time_is_out_of_datetimes_representable_range(self) -> None:
+        # A corrupt-catalog value degrades this one entity's Created cell
+        # to blank rather than raising -- mtime_from_epoch returns None
+        # for an epoch outside datetime's own representable range.
+        assert _mtime_attr({"ch-1": 99999999999999999}, "ch-1") == {}
 
 
 class TestDegradation:
@@ -1324,19 +1501,20 @@ class TestDegradation:
         _build_empty_saas_repo(tmp_path)
         store = LocalFsStore(tmp_path)
         layout = RepoLayout(kind=RepoKind.VAULT, repo_root="")
-        async with await DedupRepo.open(store, layout) as repo:
+        async with await DedupRepo.open(store, layout) as repo, SaasStreamCache(repo) as saas_streams:
             with pytest.raises(UnsupportedDataFormatError):
-                await TeamsChatProvider.create(repo, _version())
+                await TeamsChatProvider.create(repo, _version(), saas_streams)
 
     async def test_no_index_found_closes_its_stream_instead_of_leaking_it(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         """Regression test: this is the *routine* degrade-to-RawObjectProvider
         path (no channel/chat index for this version, not corrupt data), hit
-        on every such version — create() must close self._stream on this
-        path rather than only on success, or every SaasStream/SqliteSource
-        it opened leaks (a leaked aiosqlite connection hangs interpreter
-        shutdown, per this module's own close() docstring)."""
+        on every such version — create() must call close() on this
+        path rather than only on success, or whatever it already opened
+        (e.g. ``self._db``) leaks -- an unclosed aiosqlite connection's
+        worker thread has no daemon flag, so it blocks interpreter
+        shutdown forever."""
         _build_empty_saas_repo(tmp_path)
         store = LocalFsStore(tmp_path)
         layout = RepoLayout(kind=RepoKind.VAULT, repo_root="")
@@ -1348,9 +1526,9 @@ class TestDegradation:
             await original_close(self)
 
         monkeypatch.setattr(TeamsChatProvider, "close", spy_close)
-        async with await DedupRepo.open(store, layout) as repo:
+        async with await DedupRepo.open(store, layout) as repo, SaasStreamCache(repo) as saas_streams:
             with pytest.raises(UnsupportedDataFormatError):
-                await TeamsChatProvider.create(repo, _version())
+                await TeamsChatProvider.create(repo, _version(), saas_streams)
             assert len(closed_instances) == 1
 
 

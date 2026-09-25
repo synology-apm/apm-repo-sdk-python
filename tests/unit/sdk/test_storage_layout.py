@@ -1,6 +1,6 @@
 """Unit tests for ``synology_apm_repo.sdk.storage.layout`` against
-synthetic directory trees replicating the shapes confirmed on real samples —
-no sample repositories required.
+synthetic directory trees shaped like real deployments — no sample
+repositories required.
 """
 
 from __future__ import annotations
@@ -52,8 +52,8 @@ async def test_single_vault_at_root(tmp_path: Path) -> None:
 
 async def test_vault_found_one_level_below_a_shared_folder_root(tmp_path: Path) -> None:
     # ``tmp_path`` plays the shared folder itself here — a connection made
-    # directly to it, matching ``RepositoryApi::createVault()``'s own fixed
-    # one-level placement.
+    # directly to it. A vault always sits exactly one level below the shared
+    # folder root, under ``@ActiveProtectVault``.
     _make_vault(tmp_path / "@ActiveProtectVault")
     store = LocalFsStore(tmp_path)
 
@@ -104,8 +104,8 @@ async def test_object_store_bucket_with_single_repo(tmp_path: Path) -> None:
 
 
 async def test_object_store_repo_info_may_be_suffixed(tmp_path: Path) -> None:
-    # Confirmed on samples/sample-1's "5fkUi8kPsAlP" repo: only
-    # repo_info.321 exists, no bare repo_info — db/ must be the marker.
+    # A real repo can have only a suffixed repo_info.<n>, no bare
+    # repo_info — db/ must be the marker instead.
     _make_object_store_repo(tmp_path / "@ActiveProtectData" / "abcdefghijkl", repo_info_suffixed=True)
     store = LocalFsStore(tmp_path)
 
@@ -221,8 +221,7 @@ async def test_iter_layouts_does_not_descend_into_a_found_vault(tmp_path: Path) 
 # The Repository-level counterpart to everything above: a bucket holding
 # several sibling repo-ids is one Repository (one RepositoryLayout, with
 # catalog_ids listing every sibling), not several separately-yielded
-# layouts requiring the caller to pick one -- see the project's own plan
-# file for the full Repository/Catalog rename this is Phase 2 of.
+# layouts requiring the caller to pick one.
 
 
 async def test_repository_layout_single_vault_at_root(tmp_path: Path) -> None:

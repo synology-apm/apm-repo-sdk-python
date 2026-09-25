@@ -110,8 +110,10 @@ async def resolve_generation(
     suppl_dir: str,
 ) -> str:
     """The correct ``db/<name>[.<N>]`` logical path for ``name`` on an
-    ``OBJECT_STORE`` layout (FORMAT-SPEC.md: generation-selection's two-branch rule —
-    this module's own docstring). ``db_dir``/``transactions_dir``/
+    ``OBJECT_STORE`` layout: the largest ``.<N>`` strictly less than the
+    latest *committed* transaction for most tables, or the largest ``.<N>``
+    with a matching ``suppl_transaction_ids`` marker for the 9 supplemental
+    tables (FORMAT-SPEC.md: generation-selection). ``db_dir``/``transactions_dir``/
     ``suppl_dir`` are already joined with ``layout.repo_root`` by the
     caller.
 

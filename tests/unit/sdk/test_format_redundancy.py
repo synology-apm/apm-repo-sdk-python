@@ -39,8 +39,9 @@ def _build_redundancy_blob(data: bytes, *, coverage: int) -> bytes:
 
 
 def test_worked_example_from_spec() -> None:
-    # on-disk-format.md §4.9's own worked example: a full bucket's SizeStore
-    # (chunkNum=8192 -> getChunkSizeLeng=15360) with bucket coverage 256:
+    # FORMAT-SPEC.md: SizeStore's tight-length formula for a full bucket's
+    # SizeStore (chunkNum=8192 -> 15360 bytes) run through FORMAT-SPEC.md:
+    # ChunkCrcStore's redundancy-size formula with bucket coverage 256:
     # 16 + 4*ceil(15360/256) + min(15360, 512) = 16 + 240 + 512 = 768.
     assert redundancy_size(15360, 256) == 768
 
@@ -68,7 +69,7 @@ def test_parity_capped_at_two_coverage() -> None:
 
 
 def test_composition_coverage_constant() -> None:
-    # composition record trailers use coverage=8192 (on-disk-format.md §15.2)
+    # composition record trailers use coverage=8192 (FORMAT-SPEC.md: RecordHead)
     assert redundancy_size(20 * 20, 8192) == 16 + 4 * 1 + min(400, 16384)
 
 

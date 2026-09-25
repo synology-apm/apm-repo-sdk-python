@@ -2,9 +2,9 @@
 VAULT and OBJECT_STORE layouts and a real ``vault_encryption_key``
 sqlite table, all written to real files.
 
-Per-chunk fingerprint verification is a separate concern, covered by
-``test_dedup_pool.py::TestVerifyFingerprint`` — see
-``Pool.read_chunk``'s own ``verify_fingerprint`` parameter."""
+Per-chunk fingerprint verification (``Pool.read_chunk``'s
+``verify_fingerprint`` parameter) is a separate concern, covered by
+``test_dedup_pool.py::TestVerifyFingerprint``."""
 
 from __future__ import annotations
 
@@ -93,9 +93,10 @@ class TestResolveVaultKeyFromVaultDb:
         """A half-written vault can have this file present (so the
         ``exists()`` check passes) but truncated/garbage -- reported as a
         recognized ``DataCorruptError`` rather than letting a raw
-        ``sqlite3``/``aiosqlite`` exception escape (see
-        ``Session._open_repository``'s own "skip, don't abort" handling
-        one layer up)."""
+        ``sqlite3``/``aiosqlite`` exception escape, since
+        ``Session._open_repository`` one layer up only knows how to skip
+        a vault whose key resolution fails with a recognized error, not
+        abort on an arbitrary one."""
         db_path = tmp_path / "db" / "vault_encryption_key"
         db_path.parent.mkdir(parents=True)
         db_path.write_bytes(b"not a real sqlite database")
@@ -151,7 +152,7 @@ class TestResolveVaultKeyFromKeyFile:
 
 # -- probe_encrypted() -- "is this repository encrypted at all", no key, no
 #    Pool touch — reads the repository's own encryption-key record directly
-#    (see the function's own docstring for why) --------------------------
+#    -------------------------------------------------------------------
 
 
 class TestProbeEncryptedVault:
@@ -169,8 +170,7 @@ class TestProbeEncryptedVault:
 
     async def test_uses_the_last_inserted_row_not_the_first(self, tmp_path: Path) -> None:
         # Real vaults never toggle Encryption<->NoEncryption after first
-        # init (see this module's own docstring), so this exact history
-        # couldn't occur for real — but it proves the query is really
+        # init, so this exact history couldn't occur for real — but it proves the query is really
         # "latest row" (ORDER BY rowid DESC), not "whichever row a plain
         # unordered SELECT happens to return first".
         _write_vault_encryption_key_db(
@@ -255,7 +255,8 @@ class TestProbeEncryptedObjectStore:
 
 
 # -- verify() -- GCM-unwrap layer alone, the whole answer to "is this
-#    key correct" (see keys.py's own module docstring for why) --------
+#    key correct" -- never confirmed by also decrypting a real
+#    chunk ---------------------------------------------------------
 
 
 class TestVerify:

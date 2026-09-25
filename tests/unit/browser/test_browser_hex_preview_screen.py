@@ -28,6 +28,10 @@ class _FakeApp(App[None]):
     def __init__(self, content: _FakeContentSource) -> None:
         super().__init__()
         self._content = content
+        # Read by NavigableScreen.on_mount/_render_breadcrumb (the jobs
+        # watch backing the breadcrumb's own tasks-hint) -- always empty
+        # here, since no test in this file exercises background jobs.
+        self.jobs: dict[object, object] = {}
 
     def compose(self) -> ComposeResult:
         return iter(())
@@ -50,10 +54,6 @@ async def test_offset_past_the_end_shows_the_empty_placeholder() -> None:
 
 
 async def test_action_page_forward_advances_by_the_window_size() -> None:
-    # No test in this file ever presses +/x, or checks the rendered
-    # #hex-dump text at all -- only _render_dump() called directly
-    # (test_offset_past_the_end_shows_the_empty_placeholder above) and
-    # action_go_back are covered.
     content = _FakeContentSource(bytes(range(256)) * 4)  # 1024 bytes, 2 real windows
     app = _FakeApp(content)
     async with app.run_test() as pilot:

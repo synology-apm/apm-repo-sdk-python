@@ -2,24 +2,21 @@
 mechanics — the screen auto-opened on top of ``BrowseScreen`` the
 instant the app mounts (``c`` reopens it later the same way): dialog
 mounting/tabs, the local backend's directory-tree fields, and the
-scan-and-submit flow shared by every backend. See
-``test_browser_pilot_remote_browser.py`` for S3/Azure/SMB field
-validation and remote bucket/container browsing, and
-``test_browser_profile_manager.py`` for profile save/load/delete —
-both duplicate this file's own ``_open_connect_dialog``/
-``_activate_backend`` helpers verbatim rather than importing them (see
-``tests/CLAUDE.md``'s "no test module ever imports from another").
-Mirrors ``test_browser_pilot_yg.py``'s own conventions (synchronous
-``def test_...()`` wrapping ``asyncio.run(...)``).
+scan-and-submit flow shared by every backend. S3/Azure/SMB field
+validation and remote bucket/container browsing live in
+``test_browser_pilot_remote_browser.py``, profile save/load/delete in
+``test_browser_profile_manager.py`` — both duplicate this file's own
+``_open_connect_dialog`` helper verbatim rather than importing it, since
+backend activation itself is shared through ``tests/unit/browser/
+conftest.py``'s ``activate_backend_and_settle`` fixture instead.
 
-The real connection test/repository scan runs *inside* this dialog (see its
-own module docstring for why) — every test below that needs a scan to
+The real connection test/repository scan runs *inside* this dialog, not
+``BrowseScreen`` — every test below that needs a scan to
 actually *succeed* (rather than just checking field-toggling/
 validation, which stays fully offline: constructing an
 ``S3Store``/``AzureStore``/``SmbStore`` does no real
 I/O) fakes ``Session.discover_remote`` to yield a fake ``Repository``
-instead of doing real network I/O — the same boundary
-``tests/unit/browser/test_browser_browse_screen_labels.py`` already fakes.
+instead of doing real network I/O.
 """
 
 from __future__ import annotations
@@ -38,6 +35,7 @@ import synology_apm_repo.sdk.api as api
 from synology_apm_repo.browser.app import ApmRepoBrowserApp
 from synology_apm_repo.browser.screens.browse_screen import BrowseScreen
 from synology_apm_repo.browser.screens.connect_dialog import ConnectDialog, ConnectResult
+from synology_apm_repo.browser.strings import CONNECT_CANCELLING_STATUS
 from synology_apm_repo.sdk.api import Catalog, Repository
 from synology_apm_repo.sdk.errors import ApmRepoError
 from synology_apm_repo.sdk.storage.azure import AzureStore
@@ -62,52 +60,6 @@ async def _open_connect_dialog() -> AsyncIterator[tuple[ApmRepoBrowserApp, Pilot
         await pilot.pause()
         assert isinstance(app.screen, ConnectDialog), app.screen
         yield app, pilot, app.screen
-
-
-def _activate_backend(dialog: ConnectDialog, backend: str) -> None:
-    """Drives the backend ``Tabs`` strip the same way
-    a real activation does — setting ``active`` posts the same
-    ``Tabs.TabActivated`` message ``ConnectDialog.on_tabs_tab_activated``
-    reacts to, so this is equivalent to a user pressing/arrowing onto the
-    given tab, not a backdoor into ``_switch_backend``."""
-    dialog.query_one("#connect-backend-tabs", Tabs).active = backend
-
-
-async def _activate_backend_and_settle(
-    dialog: ConnectDialog, backend: str, pilot: Pilot[None], wait_until: Any
-) -> None:
-    """``_activate_backend`` plus the wait its callers all need.
-
-    Setting ``Tabs.active`` only posts ``TabActivated``; the pane swap happens
-    when ``ConnectDialog`` handles it, which is a later event-loop turn. The
-    pane carrying the ``active`` class is that swap having happened — waiting
-    on it beats guessing a duration before touching this backend's widgets.
-    """
-    _activate_backend(dialog, backend)
-    await wait_until(
-        pilot,
-        lambda: dialog.query_one(f"#connect-{backend}-fields").has_class("active"),
-        timeout=0.6,
-        interval=0.02,
-        message=f"{backend} pane never became active",
-    )
-
-
-async def _wait_for_status_containing(dialog: ConnectDialog, pilot: Pilot[None], wait_until: Any, needle: str) -> str:
-    """Polls ``#connect-status`` until its rendered text contains
-    ``needle`` (case-insensitive), returning that final text — same
-    contract as ``_wait_for_detail_text`` in
-    ``test_browser_pilot_preview.py``, but for this dialog's own
-    status line."""
-    status = ""
-
-    def _matches() -> bool:
-        nonlocal status
-        status = str(dialog.query_one("#connect-status", Static).render())
-        return needle in status.lower()
-
-    await wait_until(pilot, _matches, timeout=1.5, interval=0.05)
-    return status
 
 
 def _fake_repository(repo_root: str) -> Repository:
@@ -156,8 +108,9 @@ class TestDialogMechanics:
         """ "Local" is the default backend (the common case, and the one
         that needs no credentials at all) — its directory tree/path fields
         start visible, S3/Azure/SMB's don't, and the submit button reads
-        "Open" (vs. "Connect" for the other backends — see
-        ``_switch_backend``'s own docstring)."""
+        "Open" (vs. "Connect" for the other backends — "Open" fits Local
+        better since, needing no credentials, there's nothing to
+        "connect" to, just a directory to read)."""
 
         async def scenario() -> tuple[bool, bool, bool, bool, str]:
             async with _open_connect_dialog() as (app, pilot, dialog):
@@ -175,7 +128,9 @@ class TestDialogMechanics:
         assert smb_active is False
         assert submit_label == "Open"
 
-    def test_connect_dialog_switching_backends_toggles_fields_and_submit_label(self, wait_until: Any) -> None:
+    def test_connect_dialog_switching_backends_toggles_fields_and_submit_label(
+        self, wait_until: Any, activate_backend_and_settle: Any
+    ) -> None:
         async def scenario() -> list[tuple[bool, bool, bool, bool, str]]:
             snapshots: list[tuple[bool, bool, bool, bool, str]] = []
             async with _open_connect_dialog() as (app, pilot, dialog):
@@ -189,16 +144,16 @@ class TestDialogMechanics:
                         str(dialog.query_one("#connect-submit", Button).label),
                     )
 
-                await _activate_backend_and_settle(dialog, "s3", pilot, wait_until)
+                await activate_backend_and_settle(dialog, "s3", pilot)
                 snapshots.append(snapshot())
 
-                await _activate_backend_and_settle(dialog, "azure", pilot, wait_until)
+                await activate_backend_and_settle(dialog, "azure", pilot)
                 snapshots.append(snapshot())
 
-                await _activate_backend_and_settle(dialog, "smb", pilot, wait_until)
+                await activate_backend_and_settle(dialog, "smb", pilot)
                 snapshots.append(snapshot())
 
-                await _activate_backend_and_settle(dialog, "local", pilot, wait_until)
+                await activate_backend_and_settle(dialog, "local", pilot)
                 snapshots.append(snapshot())
             return snapshots
 
@@ -208,7 +163,9 @@ class TestDialogMechanics:
         assert after_smb == (False, False, False, True, "Connect")
         assert after_local == (True, False, False, False, "Open")
 
-    def test_connect_dialog_arrow_keys_switch_backend_without_tab_key(self) -> None:
+    def test_connect_dialog_arrow_keys_switch_backend_without_tab_key(
+        self, focus_widget: Any, wait_until: Any, ui_timeout: float
+    ) -> None:
         """The whole point of the backend picker being one ``Tabs`` strip
         instead of separate ``Button``s: with focus on
         ``#connect-backend-tabs``, left/right alone must switch the active
@@ -218,19 +175,18 @@ class TestDialogMechanics:
             active_ids: list[str] = []
             async with _open_connect_dialog() as (app, pilot, dialog):
                 tabs = dialog.query_one("#connect-backend-tabs", Tabs)
-                tabs.focus()
-                await pilot.pause(0.05)
+                await focus_widget(pilot, tabs)
 
                 await pilot.press("right")
-                await pilot.pause(0.1)
+                await wait_until(pilot, lambda: tabs.active == "smb", timeout=ui_timeout, interval=0.05)
                 active_ids.append(tabs.active)
 
                 await pilot.press("right")
-                await pilot.pause(0.1)
+                await wait_until(pilot, lambda: tabs.active == "s3", timeout=ui_timeout, interval=0.05)
                 active_ids.append(tabs.active)
 
                 await pilot.press("left")
-                await pilot.pause(0.1)
+                await wait_until(pilot, lambda: tabs.active == "smb", timeout=ui_timeout, interval=0.05)
                 active_ids.append(tabs.active)
             return active_ids
 
@@ -239,7 +195,9 @@ class TestDialogMechanics:
         active_ids = asyncio.run(scenario())
         assert active_ids == ["smb", "s3", "smb"], active_ids
 
-    def test_connect_dialog_tab_key_moves_from_backend_tabs_into_active_fields(self) -> None:
+    def test_connect_dialog_tab_key_moves_from_backend_tabs_into_active_fields(
+        self, focus_widget: Any, wait_until: Any, ui_timeout: float
+    ) -> None:
         """Tab's job now is to move *between* the dialog's big components
         (backend picker -> active fields group), in one hop -- not to cycle
         within the backend picker itself, which the arrow-key test above
@@ -247,18 +205,17 @@ class TestDialogMechanics:
 
         async def scenario() -> bool:
             async with _open_connect_dialog() as (app, pilot, dialog):
-                dialog.query_one("#connect-backend-tabs", Tabs).focus()
-                await pilot.pause(0.05)
+                await focus_widget(pilot, dialog.query_one("#connect-backend-tabs", Tabs))
 
                 await pilot.press("tab")
-                await pilot.pause(0.1)
                 tree = dialog.query_one("#connect-local-tree", DirectoryTree)
+                await wait_until(pilot, lambda: dialog.focused is tree, timeout=ui_timeout, interval=0.05)
                 return dialog.focused is tree
 
         landed_on_tree = asyncio.run(scenario())
         assert landed_on_tree
 
-    def test_browse_screen_c_binding_pushes_connect_dialog(self) -> None:
+    def test_browse_screen_c_binding_pushes_connect_dialog(self, wait_until: Any, ui_timeout: float) -> None:
         """``c`` reopens ``ConnectDialog`` from ``BrowseScreen`` — checked here
         by first Esc-ing out of the dialog auto-opened on launch (landing on
         an empty ``BrowseScreen``, per ``app.py``'s own ``on_mount``), then
@@ -267,11 +224,13 @@ class TestDialogMechanics:
         async def scenario() -> bool:
             async with _open_connect_dialog() as (app, pilot, dialog):
                 await pilot.press("escape")
-                await pilot.pause(0.2)
+                await wait_until(pilot, lambda: isinstance(app.screen, BrowseScreen), timeout=ui_timeout, interval=0.05)
                 assert isinstance(app.screen, BrowseScreen), app.screen
                 app.screen.query_one("#col-catalogs", Tree).focus()
                 await pilot.press("c")
-                await pilot.pause(0.2)
+                await wait_until(
+                    pilot, lambda: isinstance(app.screen, ConnectDialog), timeout=ui_timeout, interval=0.05
+                )
                 return isinstance(app.screen, ConnectDialog)
 
         pushed = asyncio.run(scenario())
@@ -299,7 +258,7 @@ class TestDialogMechanics:
 
 
 class TestLocalBackend:
-    def test_connect_dialog_local_path_validation_errors(self, tmp_path: Path) -> None:
+    def test_connect_dialog_local_path_validation_errors(self, tmp_path: Path, wait_for_status_containing: Any) -> None:
         """Empty path and "not a directory" are both construction-time
         checks ``_build_local_store()`` raises before any real scan starts —
         the same "cheap check, no I/O, shown inline" contract
@@ -310,27 +269,26 @@ class TestLocalBackend:
             async with _open_connect_dialog() as (app, pilot, dialog):
                 dialog.query_one("#connect-local-path", Input).value = ""
                 dialog.query_one("#connect-submit", Button).press()
-                await pilot.pause(0.1)
-                empty_status = str(dialog.query_one("#connect-status", Static).render())
+                empty_status = await wait_for_status_containing(pilot, dialog, "directory path")
 
                 not_a_dir = tmp_path / "not-a-directory.txt"
                 not_a_dir.write_text("x")
                 dialog.query_one("#connect-local-path", Input).value = str(not_a_dir)
                 dialog.query_one("#connect-submit", Button).press()
-                await pilot.pause(0.1)
-                not_dir_status = str(dialog.query_one("#connect-status", Static).render())
+                not_dir_status = await wait_for_status_containing(pilot, dialog, "not a directory")
                 return empty_status, not_dir_status
 
         empty_status, not_dir_status = asyncio.run(scenario())
         assert "directory path" in empty_status.lower(), empty_status
         assert "not a directory" in not_dir_status.lower(), not_dir_status
 
-    def test_local_directory_tree_hides_files(self, tmp_path: Path, wait_until: Any) -> None:
+    def test_local_directory_tree_hides_files(self, tmp_path: Path, wait_until: Any, ui_timeout: float) -> None:
         """``DirsOnlyTree`` (the local backend's browser) must never show a
         plain file, only subdirectories — Textual's own ``DirectoryTree``
-        shows both by default; ``filter_paths()`` is the override this
-        project's own subclass uses to hide files entirely (see
-        ``connect_dialog.py``'s own docstring)."""
+        shows both by default; ``filter_paths()`` is ``DirectoryTree``'s
+        documented override point, called once per directory as its
+        contents load, and this project's own subclass uses it to hide
+        files entirely."""
         (tmp_path / "a-file.txt").write_text("x")
         (tmp_path / "a-subdir").mkdir()
 
@@ -338,14 +296,16 @@ class TestLocalBackend:
             async with _open_connect_dialog() as (app, pilot, dialog):
                 tree = app.screen.query_one("#connect-local-tree", DirectoryTree)
                 tree.path = str(tmp_path)
-                await wait_until(pilot, lambda: tree.root.children, timeout=2.0, interval=0.1)
+                await wait_until(pilot, lambda: tree.root.children, timeout=ui_timeout, interval=0.1)
                 return [str(child.label) for child in tree.root.children]
 
         labels = asyncio.run(scenario())
         assert any("a-subdir" in label for label in labels), labels
         assert not any("a-file" in label for label in labels), labels
 
-    def test_local_directory_tree_dotdot_entry_goes_up_a_level(self, tmp_path: Path, wait_until: Any) -> None:
+    def test_local_directory_tree_dotdot_entry_goes_up_a_level(
+        self, tmp_path: Path, wait_until: Any, move_cursor_to: Any, ui_timeout: float
+    ) -> None:
         """Going up is a ``".."`` entry inside the tree itself, matching the
         classic file-manager convention. Selecting it must re-root the whole
         tree at the parent (and sync the path Input), not merely land the
@@ -358,14 +318,13 @@ class TestLocalBackend:
                 assert len(app.screen.query("#connect-local-up")) == 0, "the old Up button must be gone"
                 tree = app.screen.query_one("#connect-local-tree", DirectoryTree)
                 tree.path = str(child)
-                await wait_until(pilot, lambda: tree.root.children, timeout=2.0, interval=0.1)
+                await wait_until(pilot, lambda: tree.root.children, timeout=ui_timeout, interval=0.1)
                 assert str(tree.root.children[0].label) == "..", [str(c.label) for c in tree.root.children]
 
                 tree.focus()
-                tree.move_cursor(tree.root.children[0])
-                await pilot.pause(0.05)
+                await move_cursor_to(pilot, tree, tree.root.children[0])
                 await pilot.press("enter")
-                await wait_until(pilot, lambda: str(tree.path) == str(tmp_path), timeout=2.0, interval=0.1)
+                await wait_until(pilot, lambda: str(tree.path) == str(tmp_path), timeout=ui_timeout, interval=0.1)
                 return str(tree.path), app.screen.query_one("#connect-local-path", Input).value
 
         tree_path, input_value = asyncio.run(scenario())
@@ -373,32 +332,30 @@ class TestLocalBackend:
         assert input_value == str(tmp_path)
 
     def test_local_directory_tree_backspace_jumps_to_parent_node_and_collapses_it(
-        self, tmp_path: Path, wait_until: Any
+        self, tmp_path: Path, wait_until: Any, move_cursor_to: Any, ui_timeout: float
     ) -> None:
         """Backspace is a *different* thing from the ".." entry: it moves
         within the currently-rooted tree (cursor to the current node's
         parent, collapsing it), it never changes what the tree is rooted
-        at — the shared behavior every tree in this app gets via
-        ``move_cursor_to_parent`` (see that function's own docstring)."""
+        at — the shared behavior every ``Tree`` in this app gets via
+        ``move_cursor_to_parent``."""
         (tmp_path / "parent" / "child").mkdir(parents=True)
 
         async def scenario() -> tuple[bool, bool, str, str]:
             async with _open_connect_dialog() as (app, pilot, dialog):
                 tree = app.screen.query_one("#connect-local-tree", DirectoryTree)
                 tree.path = str(tmp_path)
-                await wait_until(pilot, lambda: tree.root.children, timeout=2.0, interval=0.1)
+                await wait_until(pilot, lambda: tree.root.children, timeout=ui_timeout, interval=0.1)
                 parent_node = next(c for c in tree.root.children if str(c.label) == "parent")
-                tree.move_cursor(parent_node)
-                await pilot.pause(0.05)
+                await move_cursor_to(pilot, tree, parent_node)
                 await pilot.press("enter")
-                await wait_until(pilot, lambda: parent_node.children, timeout=2.0, interval=0.1)
+                await wait_until(pilot, lambda: parent_node.children, timeout=ui_timeout, interval=0.1)
                 child_node = parent_node.children[0]
-                tree.move_cursor(child_node)
-                await pilot.pause(0.1)
+                await move_cursor_to(pilot, tree, child_node)
                 path_before = str(tree.path)
 
                 await pilot.press("backspace")
-                await pilot.pause(0.2)
+                await wait_until(pilot, lambda: tree.cursor_node is parent_node, timeout=ui_timeout, interval=0.1)
                 landed_on_parent = tree.cursor_node is parent_node
                 return landed_on_parent, not parent_node.is_expanded, str(tree.path), path_before
 
@@ -407,7 +364,9 @@ class TestLocalBackend:
         assert collapsed
         assert path_after == path_before, 'Backspace must never re-root the tree — only ".." does that'
 
-    def test_local_directory_tree_typeahead_jumps_to_matching_sibling(self, tmp_path: Path, wait_until: Any) -> None:
+    def test_local_directory_tree_typeahead_jumps_to_matching_sibling(
+        self, tmp_path: Path, wait_until: Any, focus_widget: Any, ui_timeout: float
+    ) -> None:
         (tmp_path / "alpha").mkdir()
         (tmp_path / "beta").mkdir()
         (tmp_path / "gamma").mkdir()
@@ -416,16 +375,23 @@ class TestLocalBackend:
             async with _open_connect_dialog() as (app, pilot, dialog):
                 tree = app.screen.query_one("#connect-local-tree", DirectoryTree)
                 tree.path = str(tmp_path)
-                await wait_until(pilot, lambda: tree.root.children, timeout=2.0, interval=0.1)
-                tree.focus()
-                await pilot.pause(0.05)
+                await wait_until(pilot, lambda: tree.root.children, timeout=ui_timeout, interval=0.1)
+                await focus_widget(pilot, tree)
 
                 await pilot.press("b")
-                await pilot.pause(0.1)
+                await wait_until(
+                    pilot,
+                    lambda: tree.cursor_node is not None and str(tree.cursor_node.label) == "beta",
+                    timeout=ui_timeout,
+                    interval=0.1,
+                )
                 matched = str(tree.cursor_node.label) if tree.cursor_node is not None else None
 
                 before = tree.cursor_node
-                await pilot.press("z")  # no sibling starts with "z" — must not move
+                # no sibling starts with "z" — must not move; there is no
+                # readiness signal for an absence, so this keeps a fixed
+                # pause instead.
+                await pilot.press("z")
                 await pilot.pause(0.1)
                 unmatched_stayed = str(before.label) if tree.cursor_node is before and before is not None else None
                 return matched, unmatched_stayed
@@ -435,7 +401,7 @@ class TestLocalBackend:
         assert unmatched_stayed == "beta", "an unmatched keystroke must not move the cursor at all"
 
     def test_local_directory_tree_typeahead_resets_to_a_single_char_match(
-        self, tmp_path: Path, wait_until: Any
+        self, tmp_path: Path, wait_until: Any, focus_widget: Any, ui_timeout: float
     ) -> None:
         """ "b" then "g": the extended buffer "bg" matches no sibling, but
         "g" alone matches "gamma" — the buffer must reset to just "g"
@@ -449,24 +415,33 @@ class TestLocalBackend:
             async with _open_connect_dialog() as (app, pilot, dialog):
                 tree = app.screen.query_one("#connect-local-tree", DirectoryTree)
                 tree.path = str(tmp_path)
-                await wait_until(pilot, lambda: tree.root.children, timeout=2.0, interval=0.1)
-                tree.focus()
-                await pilot.pause(0.05)
+                await wait_until(pilot, lambda: tree.root.children, timeout=ui_timeout, interval=0.1)
+                await focus_widget(pilot, tree)
 
                 await pilot.press("b")
-                await pilot.pause(0.1)
+                await wait_until(
+                    pilot,
+                    lambda: tree.cursor_node is not None and str(tree.cursor_node.label) == "beta",
+                    timeout=ui_timeout,
+                    interval=0.1,
+                )
                 await pilot.press("g")
-                await pilot.pause(0.1)
+                await wait_until(
+                    pilot,
+                    lambda: tree.cursor_node is not None and str(tree.cursor_node.label) == "gamma",
+                    timeout=ui_timeout,
+                    interval=0.1,
+                )
                 return str(tree.cursor_node.label) if tree.cursor_node is not None else None
 
         assert asyncio.run(scenario()) == "gamma"
 
     def test_build_local_store_with_a_real_directory_returns_a_real_local_fs_store(self, tmp_path: Path) -> None:
-        """Every other "local" backend test in this file drives a scan via
-        ``open_browser_pilot``, which monkeypatches ``_build_local_store``
-        entirely (see that fixture's own docstring) — so the real method's
-        own success path, constructing an actual ``LocalFsStore``, is never
-        otherwise exercised at all."""
+        """Every other "local" backend test in this file either fails
+        validation before any store is built, or runs a real scan against
+        an empty ``tmp_path`` — none of them asserts that
+        ``_build_local_store()`` itself returns a real ``LocalFsStore``,
+        which is what this test checks directly."""
         from synology_apm_repo.sdk.storage import LocalFsStore
 
         async def scenario() -> tuple[object, str]:
@@ -480,9 +455,9 @@ class TestLocalBackend:
 
     def test_pressing_enter_in_the_local_path_field_submits(self, tmp_path: Path) -> None:
         """A real scan of an empty ``tmp_path`` can complete (finding
-        nothing) faster than polling could ever observe ``_scanning`` go
+        nothing) faster than polling could ever observe ``scanning`` go
         True and back — a spy on ``_submit`` itself, rather than watching
-        ``_scanning``, is the only race-free way to confirm Enter reached
+        ``scanning``, is the only race-free way to confirm Enter reached
         it."""
 
         async def scenario() -> bool:
@@ -536,6 +511,9 @@ class TestScanAndSubmit:
         expected_label: str,
         repo_root: str,
         wait_until: Any,
+        activate_backend_and_settle: Any,
+        ui_timeout: float,
+        sdk_timeout: float,
     ) -> None:
         """Valid fields build a real ``S3Store``/``AzureStore``, a
         (faked) successful scan finds one repository, and the dialog dismisses with
@@ -570,13 +548,19 @@ class TestScanAndSubmit:
                 # on launch, purely so this scenario gets its own dismiss
                 # callback to inspect.
                 app.push_screen(ConnectDialog(), on_dismiss)
-                await pilot.pause(0.2)
+                await wait_until(
+                    pilot,
+                    lambda: isinstance(app.screen, ConnectDialog) and app.screen is not _first_dialog,
+                    timeout=ui_timeout,
+                    interval=0.05,
+                    message="second ConnectDialog never became active",
+                )
                 dialog = app.screen
                 assert isinstance(dialog, ConnectDialog), dialog
-                await _activate_backend_and_settle(dialog, backend, pilot, wait_until)
+                await activate_backend_and_settle(dialog, backend, pilot)
                 set_fields(dialog)
                 dialog.query_one("#connect-submit", Button).press()
-                await wait_until(pilot, lambda: result is not None, timeout=1.5, interval=0.05)
+                await wait_until(pilot, lambda: result is not None, timeout=sdk_timeout, interval=0.05)
                 assert result is not None, "ConnectDialog never dismissed"
             return result
 
@@ -587,16 +571,17 @@ class TestScanAndSubmit:
         assert repos[0] is fake_repo
 
     def test_connecting_via_s3_backend_populates_browse_screen(
-        self, monkeypatch: pytest.MonkeyPatch, wait_until: Any
+        self, monkeypatch: pytest.MonkeyPatch, wait_until: Any, activate_backend_and_settle: Any, sdk_timeout: float
     ) -> None:
         """A successful ``ConnectDialog`` scan (here: S3, with
         ``Session.discover_remote`` faked to yield one repository, so this needs
         no live endpoint) must leave ``BrowseScreen`` — not ``ConnectDialog``
         — on screen, with that repository already rendered in ``#col-catalogs``
         and ``#open-status`` reporting it found. The discovery loop lives
-        entirely in ``ConnectDialog`` (see ``connect_dialog.py``'s own
-        module docstring for why), so this drives the real dialog UI rather
-        than calling a ``BrowseScreen`` method directly."""
+        entirely in ``ConnectDialog`` (``_scan`` itself drives
+        ``Session.discover_remote``, not something ``BrowseScreen`` ever
+        calls), so this drives the real dialog UI rather than calling a
+        ``BrowseScreen`` method directly."""
         fake_repo = _fake_repository("@ActiveProtectData/repo-1")
 
         async def fake_catalogs() -> list[Catalog]:
@@ -613,10 +598,24 @@ class TestScanAndSubmit:
 
         async def scenario() -> tuple[int, str]:
             async with _open_connect_dialog() as (app, pilot, dialog):
-                await _activate_backend_and_settle(dialog, "s3", pilot, wait_until)
+                await activate_backend_and_settle(dialog, "s3", pilot)
                 dialog.query_one("#connect-s3-bucket", Input).value = "test-bucket"
                 dialog.query_one("#connect-submit", Button).press()
-                await wait_until(pilot, lambda: isinstance(app.screen, BrowseScreen), timeout=3.0, interval=0.1)
+                # isinstance(app.screen, BrowseScreen) alone only proves the
+                # dialog has been dismissed -- the discovered repo still
+                # reaches #col-catalogs through its own async dispatch/render,
+                # which can land after the screen swap. Wait for that repo
+                # to actually be there before reading the tree, or an
+                # in-between read can catch it still empty.
+                await wait_until(
+                    pilot,
+                    lambda: (
+                        isinstance(app.screen, BrowseScreen)
+                        and app.screen.query_one("#col-catalogs", Tree).root.children
+                    ),
+                    timeout=sdk_timeout,
+                    interval=0.1,
+                )
                 assert isinstance(app.screen, BrowseScreen), app.screen
                 status = str(app.screen.query_one("#open-status", Static).render())
                 tree = app.screen.query_one("#col-catalogs", Tree)
@@ -627,7 +626,11 @@ class TestScanAndSubmit:
         assert "found" in status.lower(), status
 
     def test_connect_dialog_scan_apm_repo_error_shows_inline_and_stays_open(
-        self, monkeypatch: pytest.MonkeyPatch, wait_until: Any
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        wait_until: Any,
+        activate_backend_and_settle: Any,
+        wait_for_status_containing: Any,
     ) -> None:
         async def fake_discover_remote(
             self: object, store: object, key: str | None = None, *, progress: object = None, trace: object = None
@@ -639,20 +642,24 @@ class TestScanAndSubmit:
 
         async def scenario() -> tuple[bool, str, bool]:
             async with _open_connect_dialog() as (app, pilot, dialog):
-                await _activate_backend_and_settle(dialog, "s3", pilot, wait_until)
+                await activate_backend_and_settle(dialog, "s3", pilot)
                 dialog.query_one("#connect-s3-bucket", Input).value = "test-1"
                 submit = dialog.query_one("#connect-submit", Button)
                 submit.press()
-                status = await _wait_for_status_containing(dialog, pilot, wait_until, "error")
+                status = await wait_for_status_containing(pilot, dialog, "error")
                 return isinstance(app.screen, ConnectDialog), status, submit.disabled
 
         still_open, status, submit_disabled = asyncio.run(scenario())
         assert still_open
         assert "repo is locked" in status
-        assert submit_disabled is False  # _fail_scan re-enables it
+        assert submit_disabled is False  # the submit/cancel button is never disabled, even mid-scan
 
     def test_connect_dialog_scan_unexpected_exception_shows_inline_and_stays_open(
-        self, monkeypatch: pytest.MonkeyPatch, wait_until: Any
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        wait_until: Any,
+        activate_backend_and_settle: Any,
+        wait_for_status_containing: Any,
     ) -> None:
         class _FakeConnectionRefused(Exception):
             pass
@@ -667,10 +674,10 @@ class TestScanAndSubmit:
 
         async def scenario() -> tuple[bool, str]:
             async with _open_connect_dialog() as (app, pilot, dialog):
-                await _activate_backend_and_settle(dialog, "s3", pilot, wait_until)
+                await activate_backend_and_settle(dialog, "s3", pilot)
                 dialog.query_one("#connect-s3-bucket", Input).value = "test-1"
                 dialog.query_one("#connect-submit", Button).press()
-                status = await _wait_for_status_containing(dialog, pilot, wait_until, "error")
+                status = await wait_for_status_containing(pilot, dialog, "error")
                 return isinstance(app.screen, ConnectDialog), status
 
         still_open, status = asyncio.run(scenario())
@@ -678,7 +685,11 @@ class TestScanAndSubmit:
         assert "connection refused" in status
 
     def test_connect_dialog_scan_finding_nothing_shows_inline_error(
-        self, monkeypatch: pytest.MonkeyPatch, wait_until: Any
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        wait_until: Any,
+        activate_backend_and_settle: Any,
+        wait_for_status_containing: Any,
     ) -> None:
         async def fake_discover_remote(
             self: object, store: object, key: str | None = None, *, progress: object = None, trace: object = None
@@ -690,10 +701,10 @@ class TestScanAndSubmit:
 
         async def scenario() -> tuple[bool, str]:
             async with _open_connect_dialog() as (app, pilot, dialog):
-                await _activate_backend_and_settle(dialog, "s3", pilot, wait_until)
+                await activate_backend_and_settle(dialog, "s3", pilot)
                 dialog.query_one("#connect-s3-bucket", Input).value = "test-1"
                 dialog.query_one("#connect-submit", Button).press()
-                status = await _wait_for_status_containing(dialog, pilot, wait_until, "error")
+                status = await wait_for_status_containing(pilot, dialog, "error")
                 return isinstance(app.screen, ConnectDialog), status
 
         still_open, status = asyncio.run(scenario())
@@ -703,7 +714,9 @@ class TestScanAndSubmit:
     def test_submit_is_a_no_op_while_already_scanning(self) -> None:
         async def scenario() -> bool:
             async with _open_connect_dialog() as (app, pilot, dialog):
-                dialog._scanning = True
+                dialog._scan_worker = cast(
+                    Any, object()
+                )  # `scanning` is just `self._scan_worker is not None`, so any non-None value trips it
 
                 called = False
 
@@ -718,6 +731,173 @@ class TestScanAndSubmit:
                 return called
 
         assert asyncio.run(scenario()) is False
+
+
+class TestScanningDisablesFieldsAndRelabelsSubmit:
+    """Covers the field-lock/relabel/cancel behavior ``_submit``/``_end_scan``/
+    ``_cancel_scan`` add on top of the plain scan-and-dismiss flow already
+    covered by ``TestScanAndSubmit`` — each fakes ``Session.discover_remote``
+    to block on an ``asyncio.Event`` so the test can observe the dialog's
+    state *while* a scan is genuinely still in flight, not just before/after."""
+
+    def test_scan_disables_fields_and_relabels_submit_to_cancel(
+        self, monkeypatch: pytest.MonkeyPatch, wait_until: Any, activate_backend_and_settle: Any, sdk_timeout: float
+    ) -> None:
+        block = asyncio.Event()
+        fake_repo = _fake_repository("@ActiveProtectData/repo-1")
+
+        async def fake_discover_remote(
+            self: object, store: object, key: str | None = None, *, progress: object = None, trace: object = None
+        ) -> AsyncIterator[Repository]:
+            await block.wait()
+            yield fake_repo
+
+        monkeypatch.setattr(api.Session, "discover_remote", fake_discover_remote)
+
+        async def scenario() -> tuple[bool, bool, str, bool]:
+            async with _open_connect_dialog() as (app, pilot, dialog):
+                await activate_backend_and_settle(dialog, "s3", pilot)
+                dialog.query_one("#connect-s3-bucket", Input).value = "test-1"
+                submit = dialog.query_one("#connect-submit", Button)
+                submit.press()
+                await wait_until(pilot, lambda: dialog.scanning, timeout=sdk_timeout, interval=0.02)
+                tabs_disabled = dialog.query_one("#connect-backend-tabs").disabled
+                fields_disabled = dialog.query_one("#connect-s3-fields").disabled
+                label = str(submit.label)
+                submit_disabled = submit.disabled
+                block.set()
+                await wait_until(
+                    pilot, lambda: isinstance(app.screen, BrowseScreen), timeout=sdk_timeout, interval=0.02
+                )
+                return tabs_disabled, fields_disabled, label, submit_disabled
+
+        tabs_disabled, fields_disabled, label, submit_disabled = asyncio.run(scenario())
+        assert tabs_disabled
+        assert fields_disabled
+        assert label == "Cancel"
+        assert submit_disabled is False  # stays clickable -- it's what cancels the scan
+
+    def test_cancel_button_click_mid_scan_stops_worker_and_restores_editable_state(
+        self, monkeypatch: pytest.MonkeyPatch, wait_until: Any, activate_backend_and_settle: Any, sdk_timeout: float
+    ) -> None:
+        never = asyncio.Event()  # never set -- the scan is cancelled, not let to finish
+
+        async def fake_discover_remote(
+            self: object, store: object, key: str | None = None, *, progress: object = None, trace: object = None
+        ) -> AsyncIterator[Repository]:
+            await never.wait()
+            yield _fake_repository("@ActiveProtectData/unreachable")  # pragma: no cover - never reached
+
+        monkeypatch.setattr(api.Session, "discover_remote", fake_discover_remote)
+
+        async def scenario() -> tuple[bool, bool, str, bool, str, str]:
+            async with _open_connect_dialog() as (app, pilot, dialog):
+                await activate_backend_and_settle(dialog, "s3", pilot)
+                dialog.query_one("#connect-s3-bucket", Input).value = "test-1"
+                submit = dialog.query_one("#connect-submit", Button)
+                submit.press()
+                await wait_until(pilot, lambda: dialog.scanning, timeout=sdk_timeout, interval=0.02)
+                status = dialog.query_one("#connect-status", Static)
+                scanning_status = str(status.render())
+                submit.press()  # now the Cancel action, per on_button_pressed's own branch
+                await wait_until(pilot, lambda: not dialog.scanning, timeout=sdk_timeout, interval=0.02)
+                await pilot.pause()
+                return (
+                    isinstance(app.screen, ConnectDialog),
+                    dialog.query_one("#connect-s3-fields").disabled,
+                    str(submit.label),
+                    submit.disabled,
+                    scanning_status,
+                    str(status.render()),
+                )
+
+        still_open, fields_disabled, label, submit_disabled, scanning_status, final_status = asyncio.run(scenario())
+        assert still_open
+        assert fields_disabled is False
+        assert label == "Connect"
+        assert submit_disabled is False
+        assert "scanning" in scanning_status.lower()
+        # The real reported bug: the "scanning '...'..." text must not
+        # linger once the cancellation has actually completed -- see
+        # test_cancel_scan_writes_cancelling_status_immediately below for
+        # the transient "cancelling..." text this races past too quickly
+        # for a Pilot-driven test to reliably observe.
+        assert final_status == ""
+
+    def test_cancel_scan_writes_cancelling_status_immediately(self) -> None:
+        """``_cancel_scan`` writes ``CONNECT_CANCELLING_STATUS`` itself,
+        synchronously, before ``Worker.cancel()``'s own real cancellation
+        has any chance to land -- unlike the test above, this needs no
+        Pilot timing at all to prove it, since it calls ``_cancel_scan``
+        directly against a fake worker whose own ``cancel()`` does
+        nothing observable."""
+
+        class _FakeWorker:
+            def cancel(self) -> None:
+                pass
+
+        async def scenario() -> str:
+            async with _open_connect_dialog() as (app, pilot, dialog):
+                dialog._scan_worker = cast(Any, _FakeWorker())
+                dialog._cancel_scan()
+                return str(dialog.query_one("#connect-status", Static).render())
+
+        assert asyncio.run(scenario()) == CONNECT_CANCELLING_STATUS
+
+    def test_escape_mid_scan_cancels_the_worker_and_dismisses_the_dialog(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        wait_until: Any,
+        activate_backend_and_settle: Any,
+        ui_timeout: float,
+        sdk_timeout: float,
+    ) -> None:
+        """Escape (``action_cancel``) dismisses synchronously — unlike the
+        Cancel-button path above, this doesn't wait around for ``_scan``'s
+        own ``CancelledError`` cleanup to run before the screen is gone, so
+        this only asserts the dismiss itself, not the post-cancellation
+        field state (``_end_scan``'s ``NoMatches`` tolerance is what keeps
+        that later, asynchronous cleanup harmless once the screen already
+        popped)."""
+        never = asyncio.Event()
+
+        async def fake_discover_remote(
+            self: object, store: object, key: str | None = None, *, progress: object = None, trace: object = None
+        ) -> AsyncIterator[Repository]:
+            await never.wait()
+            yield _fake_repository("@ActiveProtectData/unreachable")  # pragma: no cover - never reached
+
+        monkeypatch.setattr(api.Session, "discover_remote", fake_discover_remote)
+
+        async def scenario() -> bool:
+            dismissed = False
+            result: ConnectResult | None = None
+
+            async def on_dismiss(r: ConnectResult | None) -> None:
+                nonlocal dismissed, result
+                dismissed = True
+                result = r
+
+            async with _open_connect_dialog() as (app, pilot, _first_dialog):
+                app.push_screen(ConnectDialog(), on_dismiss)
+                await wait_until(
+                    pilot,
+                    lambda: isinstance(app.screen, ConnectDialog) and app.screen is not _first_dialog,
+                    timeout=ui_timeout,
+                    interval=0.05,
+                    message="second ConnectDialog never became active",
+                )
+                dialog = app.screen
+                assert isinstance(dialog, ConnectDialog), dialog
+                await activate_backend_and_settle(dialog, "s3", pilot)
+                dialog.query_one("#connect-s3-bucket", Input).value = "test-1"
+                dialog.query_one("#connect-submit", Button).press()
+                await wait_until(pilot, lambda: dialog.scanning, timeout=sdk_timeout, interval=0.02)
+                await pilot.press("escape")
+                await wait_until(pilot, lambda: dismissed, timeout=sdk_timeout, interval=0.02)
+            return dismissed and result is None
+
+        assert asyncio.run(scenario())
 
 
 __all__: list[str] = []

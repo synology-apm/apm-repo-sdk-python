@@ -1,21 +1,22 @@
-"""``synology-apm-repo-cli doctor <repo>`` — one-page diagnosis: layout,
-key status, and every catalog/workload/version this repository has, entirely
-built on already-existing SDK calls. Available in both normal and
-``--verbose`` mode — normal mode shows only display names; ``--verbose``
-additionally shows internal ids, format metadata (see ``_CatalogReport``),
-and per-workload support status.
+"""``synology-apm-repo-cli doctor <repo>`` — one-page repository diagnosis
+built entirely on already-existing SDK calls. Available in both normal and
+``--verbose`` mode — normal mode shows only display names plus each
+workload's supported/unsupported status; ``--verbose`` additionally shows
+internal ids and format metadata (see ``_CatalogReport``).
 """
 
 from __future__ import annotations
 
+import asyncio
 from typing import NotRequired, TypedDict
 
 import typer
 from rich.console import Console
 
 from synology_apm_repo.cli.asyncio_support import typer_async
-from synology_apm_repo.cli.browse import opened_repo_or_profile
 from synology_apm_repo.cli.options import KeyOption, ProfileOption, RepoArgument
+from synology_apm_repo.cli.paging import render
+from synology_apm_repo.cli.repo_session import opened_repo_or_profile
 from synology_apm_repo.cli.state import CliState
 from synology_apm_repo.sdk.api import Catalog, Repository, Workload
 from synology_apm_repo.sdk.presentation.markup import safe
@@ -38,7 +39,7 @@ class _KeyReport(TypedDict):
 
 class _WorkloadReport(TypedDict):
     """``workload_id``/``workload_type``/``sub_type`` are ``--verbose``
-    only — see ``_workload_report``'s own body."""
+    only."""
 
     display_name: str
     subtitle: str | None
@@ -50,11 +51,10 @@ class _WorkloadReport(TypedDict):
 
 class _CatalogReport(TypedDict):
     """``catalog_id``/``namespaces``/``repo_uuid``/``repo_type`` are
-    ``--verbose`` only, and only ever set together — see
-    ``_catalog_report``'s own body. ``repo_uuid``/``repo_type`` are
-    genuinely this catalog's own (object storage: each repo-id has its
-    own ``repo_info`` marker) — the same value repeated for every sibling
-    of a vault, which shares one ``repo_info``."""
+    ``--verbose`` only, and only ever set together. ``repo_uuid``/
+    ``repo_type`` are genuinely this catalog's own (object storage: each
+    repo-id has its own ``repo_info`` marker) — the same value repeated
+    for every sibling of a vault, which shares one ``repo_info``."""
 
     display_name: str
     workload_count: int
@@ -79,9 +79,8 @@ class _DoctorReport(TypedDict):
 
 def _key_report(repo: Repository) -> _KeyReport:
     # repo.key_status/.is_encrypted/.key_verification are plain, no-I/O
-    # properties — Session.discover()/.open() already resolved them (see
-    # KeyStatus's own docstring: "the same four states the doctor command
-    # reports").
+    # properties — Session.discover()/.open() already resolved the key
+    # status up front when the repository was opened.
     report: _KeyReport = {"status": repo.key_status.value, "is_encrypted": repo.is_encrypted}
     verification = repo.key_verification
     if verification is not None:
@@ -121,12 +120,22 @@ async def _catalog_report(repo: Repository, catalog: Catalog, verbose: bool) -> 
 
 
 async def _build_report(repository: Repository, state: CliState) -> _DoctorReport:
+    catalogs = await repository.catalogs()
+    # Concurrent, not serial -- mirrors Repository.catalogs()'s own
+    # unbounded gather over this same "list of catalogs" collection
+    # (a repo's own backup-source count, never item-tree scale). For a
+    # vault (sibling catalogs sharing one serialized aiosqlite connection)
+    # this is safe but may show little wall-clock gain; for object storage
+    # (each catalog its own connection/store, genuinely non-blocking S3/
+    # Azure I/O) it can scale with catalog count. asyncio.gather preserves
+    # input order, so this list's shape is unchanged either way.
+    catalog_reports = await asyncio.gather(
+        *(_catalog_report(repository, catalog, state.verbose) for catalog in catalogs)
+    )
     report: _DoctorReport = {
         "layout": repository.layout.kind.value,
         "key": _key_report(repository),
-        "catalogs": [
-            await _catalog_report(repository, catalog, state.verbose) for catalog in await repository.catalogs()
-        ],
+        "catalogs": list(catalog_reports),
     }
     if state.verbose:
         report["repo_root"] = repository.layout.repo_root or "."
@@ -147,9 +156,9 @@ def _render_human(report: _DoctorReport, verbose: bool) -> None:
     cats = report["catalogs"]
     console.print(f"\n[bold]{len(cats)} backup source(s)[/bold]")
     for cat in cats:
-        # Every display_name/subtitle/namespace below is real repo content,
-        # not structure -- escaped at interpolation time (safe()) -- see
-        # its own docstring for why.
+        # Every display_name/subtitle/namespace below is real repo
+        # content, not structure -- escaped via safe() at interpolation
+        # time.
         console.print(
             f"  [cyan]{safe(cat['display_name'])}[/cyan] — {cat['workload_count']} workload(s), "
             f"{cat['version_count']} version(s)"
@@ -186,7 +195,4 @@ async def doctor(
     async with opened_repo_or_profile(repo, key, profile=profile, state=state) as repository:
         report = await _build_report(repository, state)
 
-    if state.json:
-        console.print_json(data=report)
-    else:
-        _render_human(report, state.verbose)
+    render(console, state, json=report, human=lambda: _render_human(report, state.verbose))

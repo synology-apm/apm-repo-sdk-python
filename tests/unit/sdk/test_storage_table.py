@@ -41,10 +41,9 @@ class TestConstruction:
             await Table.create(conn, "no_such_table", [Column("a")])
 
     async def test_index_hints_are_forwarded_to_apply_index_hint(self, conn: aiosqlite.Connection) -> None:
-        # Table.create's own docstring says each index_hints entry is
-        # "passed straight to apply_index_hint" -- prove it actually
-        # reaches there and creates a real index, not just that
-        # construction accepts the kwarg without raising.
+        # Each index_hints entry is passed straight to apply_index_hint --
+        # prove it actually reaches there and creates a real index, not
+        # just that construction accepts the kwarg without raising.
         await Table.create(conn, "t", [Column("a"), Column("b")], index_hints=[["a"], ["a", "b"]])
         cursor = await conn.execute("SELECT name FROM sqlite_master WHERE type = 'index' AND tbl_name = 't'")
         index_names = {row[0] for row in await cursor.fetchall()}
@@ -148,11 +147,11 @@ class TestAsInt:
         assert as_int(5) == 5
 
     def test_raises_for_a_non_int_value(self) -> None:
-        with pytest.raises(AssertionError):
+        with pytest.raises(DataCorruptError):
             as_int("5")
 
     def test_raises_for_none(self) -> None:
-        with pytest.raises(AssertionError):
+        with pytest.raises(DataCorruptError):
             as_int(None)
 
 
@@ -161,11 +160,11 @@ class TestAsStr:
         assert as_str("hello") == "hello"
 
     def test_raises_for_a_non_str_value(self) -> None:
-        with pytest.raises(AssertionError):
+        with pytest.raises(DataCorruptError):
             as_str(5)
 
     def test_raises_for_none(self) -> None:
-        with pytest.raises(AssertionError):
+        with pytest.raises(DataCorruptError):
             as_str(None)
 
 

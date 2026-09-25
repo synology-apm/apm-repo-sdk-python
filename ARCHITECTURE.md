@@ -130,8 +130,10 @@ import, the same simplification it applies to the kernel primitives below.
 ### Storage Layer — `storage/`, "how do I get these bytes"
 
 `ObjectStore` — four narrow `async def` methods (`read`/`size`/`exists`/
-`listdir`), nothing else; see `storage/base.py`'s own docstring for the exact
-signatures and per-backend async reality. Implementations: `LocalFsStore` (the
+`listdir`), nothing else; async is only genuinely non-blocking for the
+network backends (`S3Store`/`AzureStore`) — see "Async-native, by design"
+below for why `LocalFsStore`'s async is a thread-hop wrapper, not the real
+thing. Implementations: `LocalFsStore` (the
 common case), `S3Store`/`AzureStore`/`SmbStore` (built in — always installed,
 but their own third-party client libraries are imported lazily to keep import
 cost down for callers who never touch them). `SmbStore` follows
@@ -142,8 +144,10 @@ per-path** — every `read()` is a fresh, independent fetch (a plain
 open+pread+close for `LocalFsStore`/`SmbStore`, a fresh request for
 `S3Store`/`AzureStore`); the only state any of them shares across calls is a
 transport-level connection pool (`aiohttp`'s TCP/TLS reuse for S3/Azure,
-`SmbStore`'s own session pool — see its own module docstring for why SMB2's
-credit-window flow control makes that one specifically necessary).
+`SmbStore`'s pool of independent sessions — SMB2's per-connection credit-window
+flow control starts each connection with room for only one request in flight,
+so a pool of independent sessions is what lets several requests actually
+overlap without racing each other for that one connection's credit).
 `storage/sqlite.py`'s
 `open_sqlite()` and `storage/sqlite_source.py`'s `SqliteSource`/`peel()` are
 free functions built *on top of* `ObjectStore`, not Protocol methods, split
@@ -178,9 +182,10 @@ verify FULL's per-bucket decode) — DATA chunks grouped by
 get read in disk order instead of randomly re-visiting the same `.buk` file.
 A bounded, already-windowed multi-chunk read (an interactive `read()`
 spanning one extent) uses the same grouped-fetch strategy independently,
-without going through this module — see `dedup_file.py`'s own
-`_fill_data_extent()` docstring for why it stays independent rather than
-sharing this engine.
+without going through this module — `dedup_file.py`'s `_fill_data_extent()`
+stays independent because its range is always caller-bounded, never a
+whole-file sweep, so this module's windowed machinery would only add
+overhead there for no gain.
 `export_scheduler.py::export_to()` (used by `DedupFile.export_to()`/
 `ByteRangeView.export_to()`, `synology-apm-repo-cli export`, and the Content
 Layer's `VirtualDiskContentSource`) goes through it — on a real S3-backed
@@ -212,16 +217,13 @@ FULL does any per-chunk checking.
 Buckets are *discovered* by walking Catalog/Workload/Version
 serially, but *checked* concurrently once claimed, in batches bounded by a
 semaphore — each bucket its own isolated task, so one bucket's failure never
-aborts its batch siblings — since measuring against a real local-disk
-sample showed I/O-redundancy fixes alone plateau well before serial,
-one-bucket-at-a-time checking stops being the bottleneck. Whether raising
-the semaphore's own value further would help is a separate question from
-concurrent-vs-serial itself — measured twice since, against a local-disk
-sample (a small regression at double the shipped value) and against a
-real S3-compatible object-storage backend (no measurable difference at
-several times the shipped value); `_MAX_CONCURRENT_BUCKET_CHECKS`'s own
-docstring keeps only the resulting conclusion, not this investigation —
-see `git log` for the commit that measured it.
+aborts its batch siblings — since I/O-redundancy fixes alone plateau well
+before serial, one-bucket-at-a-time checking stops being the bottleneck.
+Raising the semaphore's own value further hasn't helped: a small regression
+at double the shipped value on a local-disk sample, no measurable
+difference at several times the shipped value against a real S3-compatible
+object-storage backend — see `git log` for the measurements behind
+`_MAX_CONCURRENT_BUCKET_CHECKS`'s current value.
 
 **Validation strength is tiered by context**, because `mapCrc` covers a
 chunk-map array that can be hundreds of MB — validating it on every open would
@@ -286,8 +288,7 @@ inferring it via `isinstance` against a concrete class.
 ### Unit Layer — `units/` (minus `content/`), the minimal restorable unit
 
 `UnitProvider` is one workload version's browsable tree (`root`/`children`/
-`unit` — `root()` is sync, the other two are async). See `units/base.py`'s own
-docstring for the exact signatures.
+`unit` — `root()` is sync, the other two are async).
 
 Device (VM/PC/PS), FS, and SaaS (Mail/Drive/Contact/Calendar/Site/Teams/raw)
 providers all implement this same shape. **Degradation, not failure, is the
@@ -332,14 +333,21 @@ every fragment's real `locate_file()`/composition I/O is deferred to
 `SaasWorkloadProvider` + `SaasWorkloadConfig` (`units/saas/provider.py`) is the
 shared base for Mail/Drive/Contact/Calendar/Site — four of those five modules
 are just a `SaasWorkloadConfig` constant plus an `assemble()` function, not a
-duplicated provider class; `site.py` additionally carries one small
-`_CategorizedSiteTree` helper class of its own for grouping site content by
-category. `TeamsChatProvider` is deliberately *not* folded into
+duplicated provider class; `site.py` and `calendar.py` additionally each build
+a `tree_strategy.CategorizedGroupTree` on top of their own inner tree —
+one shared wrapper class, not a per-module helper, splitting a tree's own top
+level into named categories (Document Library/List for Site, My/Other
+Calendars for Calendar). `TeamsChatProvider` is deliberately *not* folded into
 that base — its service-DB location mechanism (the object-name index names an
 *index object*, itself read once to find the further, per-channel message-DB
 object ids — one more level of indirection, not a scan) is genuinely different
 from "look up one fixed table name," and forcing it into the shared shape
-would make the shared shape worse for everyone else. Every application-layer
+would make the shared shape worse for everyone else. It still builds its own
+channel listing as a `TreeStrategy` (a flat, in-memory tree over the
+already-resolved channel/chat index, no I/O of its own) and wraps that same
+`CategorizedGroupTree` around it for Channel's own Standard/Private/Shared
+split — reusing the identical category mechanism Site/Calendar use, just
+without the surrounding `SaasWorkloadProvider` scaffolding. Every application-layer
 provider, `RawObjectProvider` included, resolves its content exclusively
 through the connector's own object-name index
 (`units/saas/object_name_index.py::resolve_object_name_index`); a version whose
@@ -355,9 +363,11 @@ its own, with `api/__init__.py` re-exporting every public name from all
 three so a caller never needs to know that split exists. This is the
 entry point CLI and
 TUI code is built on — neither talks to the Unit/Content/Catalog/Dedup/
-Storage layers directly, except for three named exceptions; see
-`api/__init__.py`'s own module docstring for the current list of three,
-which is the one place that enumeration is kept.
+Storage layers directly, except for a few narrow, explicitly-named
+exceptions (each scoped to one call site) that `api/__init__.py`
+enumerates rather than this document duplicating — the list changes as
+call sites are added or removed, and a second copy here would just be
+one more place for it to drift out of sync.
 
 **`Repository` is one opened bucket or vault — never one connection
 within it.** This distinction matters because the two backends' physical
@@ -367,7 +377,7 @@ once), while an object-storage bucket's several sibling `<repo-id>`
 directories are each an independent physical dedup pool of their own
 (FORMAT-SPEC.md: no cross-repo-id dedup) — `Repository` opens one
 `DedupRepo` for a vault, or one per sibling repo-id for object
-storage, lazily (`catalogs()`'s own docstring), and hides that difference
+storage, lazily, and hides that difference
 entirely: `Repository.catalogs() -> list[Catalog]` is the one, uniform
 way to enumerate what's inside, for either backend. `Catalog` (one
 `connection_config` row for a vault, one repo-id's worth of data for
@@ -401,7 +411,7 @@ are genuinely unencrypted plaintext, key or no key, and opening a
 *was* given but doesn't match, though, still makes that `DedupRepo`'s
 own open raise `KeyMismatchError` — `catalogs()` surfaces that immediately
 rather than quietly excluding the catalog, the same as any other open
-failure (see its own docstring). `Catalog.workloads()`/`versions()`, by
+failure. `Catalog.workloads()`/`versions()`, by
 contrast, raise `KeyRequiredError`/
 `KeyMismatchError` before any catalog I/O once a repository is *confirmed* encrypted
 (`is_encrypted is True`) and not yet key-verified — without this, a
@@ -426,8 +436,8 @@ to run.
 arguments, TUI breadcrumbs, and error messages, with a `human` display
 form (`#Test-Workload-02/CORP-PC-001/...`) and a `canonical` form
 (`#cat:1/wl:2/ver:<uid>/...`) that both parse back to the same `Node`.
-The `cat:` segment is a `CatalogId` (a plain string, `identifiers.py`'s
-own docstring) — a vault's `str(connection_config_id)` (already unique
+The `cat:` segment is a `CatalogId` (a plain string) — a vault's
+`str(connection_config_id)` (already unique
 within it), or an object-storage catalog's own repo-id string (needed
 since each sibling's own `connection_config` table independently starts
 at 1, so a bare `connection_config_id` can't tell two siblings apart).
@@ -460,9 +470,8 @@ The whole SDK, CLI, and TUI are async-native end to end:
   `BucketReader.read_chunk`, decodes inline instead, since one 4096-byte
   decode is cheaper than a thread hop. **It never parallelizes CPU-bound work,
   no matter how many OS threads dispatch it** — decompress/decrypt/hash all
-  serialize under CPython's GIL regardless, confirmed against real
-  profiling (see git log for `concurrency.py`), not just assumed from the
-  GIL's reputation.
+  serialize under CPython's GIL regardless (see `git log` for
+  `concurrency.py`'s profiling history).
 - **Real multi-core parallelism, where this CPU-bound work is heavy enough
   to be worth it, comes from a `concurrent.futures.ProcessPoolExecutor`
   instead** — verify FULL's per-bucket decode sweep
@@ -504,8 +513,7 @@ The whole SDK, CLI, and TUI are async-native end to end:
   `plan_chunks_windowed` windows and get opened/decoded twice — measured
   ~12% of buckets on a real 32GB VM fixture. The duplication comes from
   genuinely separate references, not a splittable run, so no windowing
-  change removes it. See `dedup/export_scheduler.py`'s own module
-  docstring for the full disclosure.
+  change removes it.
 - **`S3Store`/`AzureStore`** are the one place async is *actually* non-blocking
   (network I/O via `aioboto3`/`azure.storage.blob.aio`, both on `aiohttp`) —
   genuinely different from the local-file/SMB cases above.
@@ -524,9 +532,11 @@ The whole SDK, CLI, and TUI are async-native end to end:
   also needs an upper bound on how many stay open *concurrently* — a
   guarantee they eventually close isn't enough on its own, since "eventually"
   can mean "after a single run has already opened hundreds of them at once."
-  `units.saas.stream.SaasStreamCache` is this project's example — see its
-  own class docstring for the concrete shape and why it isn't built on
-  `AsyncKeyedCache`.
+  `units.saas.stream.SaasStreamCache` is this project's example: an
+  LRU-bounded cache that closes an evicted stream immediately rather than
+  leaving it to a future close pass. Hand-rolled instead of built on
+  `AsyncKeyedCache`, which has no hook for that kind of eager close on
+  eviction.
 - **Cancellation is native `asyncio.CancelledError`/`Task.cancel()`**, not a
   `threading.Event` parameter threaded through every long-running call.
 - **`Table.__init__` cannot be `async def`**, so schema introspection
@@ -617,16 +627,20 @@ below), not a separate placeholder-substitution mechanism of its own.
   ...) are `NewType`s, specifically so mypy catches a mixed-up ID at the type
   level instead of it silently reading the wrong row at runtime. `target.db`'s
   own on-prem-minted `version_uuid` is a related but distinct namespace worth
-  knowing about too — `VersionUid`'s own docstring flags it as a hazard not
-  to confuse it with, but it isn't itself modeled as a `NewType` (nothing
-  else in the SDK references it).
+  knowing about too — easy to confuse with `VersionUid` (the server-minted
+  Copy-version UUID) despite the similar name, but it isn't itself modeled
+  as a `NewType` (nothing else in the SDK references it).
 - **`presentation/`** — anything that must render identically in the CLI and
   TUI (progress/ETA formatting, byte-size formatting) lives here, in the SDK,
   once — not duplicated per frontend. "CLI and TUI disagree" is a bug by
   definition for anything in this module. (`NodeRef`'s human-form rendering
   and `disambiguate()` are the same kind of shared-once mechanism but live in
   `units/node_ref.py` instead, since they're address logic, not display
-  formatting.)
+  formatting; `dedup/verify_report.py`'s `group_findings()`/`sort_key()` are
+  the same idea again for grouping/ordering a `Repository.verify()` result,
+  but live in `dedup/` instead, since `presentation/` is a true leaf with
+  zero internal imports of its own and this logic needs `Finding`, which
+  lives one layer up.)
 - **`ApmRepoError.safe_message`** (`errors.py`) — the message alone, with the
   `ref=`/`spec=` tags `str(exc)` appends stripped, so the same exception can
   render two ways: full detail, or that detail stripped down. Only the CLI's

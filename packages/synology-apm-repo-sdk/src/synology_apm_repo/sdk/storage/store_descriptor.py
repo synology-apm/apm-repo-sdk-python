@@ -6,10 +6,12 @@ event loop and can't cross a process boundary at all.
 
 ``describe_store()`` is the one place this module reaches into another
 ``storage/`` class's private fields (``_bucket``/``_client_kwargs``/...) —
-an accepted exception to those classes' own encapsulation, the same shape
-``dedup/chunk_walk.py``'s own module docstring already carves out for
-``DedupFile._extents()``: every field read here is read *only* to describe
-how to rebuild an equivalent store, never touched for any other purpose,
+an accepted, deliberately narrow exception to those classes' own
+encapsulation, the same way ``dedup/chunk_walk.py`` is the one module
+allowed to reach into ``DedupFile._extents()`` for its own narrow,
+single purpose rather than that field becoming generally public: every
+field read here is read *only* to describe how to rebuild an equivalent
+store, never touched for any other purpose,
 and the reason a free function does this instead of each store class
 exposing a public ``describe()`` method is that ``ObjectStore`` itself
 stays a narrow four-method Protocol (``read``/``size``/``exists``/
@@ -75,9 +77,8 @@ def describe_store(store: ObjectStore) -> StoreDescriptor | None:
 
     - A ``TracingStore``/``RecordingStore`` wrapper (``storage/recording.py``)
       or any other/unrecognized ``ObjectStore`` implementation — this
-      module only knows the four real backends by name, deliberately (see
-      this module's own docstring for why that's a Protocol/encapsulation
-      choice, not an oversight).
+      module only knows the four real backends by name, deliberately, not
+      an oversight.
     - An ``S3Store``/``AzureStore`` built from an already-live, injected
       ``client=`` (tests, or a caller-supplied pre-entered client) — there
       is no picklable recipe for a client that already exists.
@@ -85,7 +86,7 @@ def describe_store(store: ObjectStore) -> StoreDescriptor | None:
     if isinstance(store, LocalFsStore):
         return LocalFsStoreDescriptor(root=str(store.root))
     if isinstance(store, S3Store):
-        if not store._owns_client:  # noqa: SLF001 - see this module's own docstring
+        if not store._owns_client:  # noqa: SLF001 - read only to build a picklable rebuild recipe
             return None
         return S3StoreDescriptor(bucket=store._bucket, client_kwargs=dict(store._client_kwargs))  # noqa: SLF001
     if isinstance(store, AzureStore):
@@ -110,8 +111,8 @@ def rebuild_store(descriptor: StoreDescriptor) -> ObjectStore:
     """The worker-process-side counterpart to ``describe_store()`` — every
     real backend's constructor is synchronous and does no I/O (confirmed
     for all four: ``LocalFsStore.__init__``'s ``os.open``/``Path.is_dir()``,
-    ``S3Store``/``SmbStore``'s own docstrings state their construction does
-    no I/O, and ``AzureStore``'s ``BlobServiceClient(...)`` call is plain
+    ``S3Store``/``SmbStore``'s constructors likewise do no I/O, and
+    ``AzureStore``'s ``BlobServiceClient(...)`` call is plain
     client-object configuration), so this is always safe to call from a
     ``ProcessPoolExecutor``'s synchronous ``initializer=``, not just from
     inside a worker's own event loop.

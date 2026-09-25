@@ -80,7 +80,7 @@ async def test_replayed_ps_sample_2_pc_and_ps_are_both_healthy_and_listable(
         pc_provider = await catalog.provider(pc_version)
         assert pc_provider.root().attrs["_kind"] == _NodeKind.PCPS_ROOT
         # Filtered to DISK_IMAGE: a dedup disk also gets an additive
-        # "(filesystem)" sibling node (units/content/disk_fs.py, DISK_FILESYSTEM
+        # "(filesystem)" sibling node (units/content/disk_fs/, DISK_FILESYSTEM
         # kind) whenever pytsk3 is installed -- this test is about
         # disk-grouping fidelity, not that sibling.
         pc_children = await pc_provider.children(pc_provider.root())

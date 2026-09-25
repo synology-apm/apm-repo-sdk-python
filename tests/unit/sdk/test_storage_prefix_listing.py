@@ -1,8 +1,8 @@
 """Unit tests for ``synology_apm_repo.sdk.storage.prefix_listing`` — the
 shared listing/probing shapes ``S3Store``/``AzureStore`` both build their
-own ``listdir``/``exists`` on top of. See ``test_storage_s3.py``'s/
-``test_storage_azure.py``'s own ``exists()`` tests for end-to-end coverage
-through a real backend; these are the pure-function pieces in isolation.
+own ``listdir``/``exists`` on top of, tested here as pure functions in
+isolation (``test_storage_s3.py``/``test_storage_azure.py`` cover
+``exists()`` end-to-end through a real backend).
 """
 
 from __future__ import annotations

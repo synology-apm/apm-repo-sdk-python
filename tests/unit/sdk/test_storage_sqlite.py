@@ -55,8 +55,7 @@ async def test_zero_length_wal_sidecar_still_takes_fast_path(tmp_path: Path) -> 
 
 async def test_nonzero_shm_alone_does_not_trigger_slow_path(tmp_path: Path) -> None:
     # per spec, only -wal's size gates the decision — a non-zero -shm alone
-    # (the actual, universal shape observed across every real sample) must
-    # not force materialization.
+    # must not force materialization.
     _make_plain_db(tmp_path)
     (tmp_path / "test.db-shm").write_bytes(b"\x00" * 32768)
     store = LocalFsStore(tmp_path)
@@ -130,8 +129,8 @@ async def test_transform_forces_slow_path_even_with_no_wal(tmp_path: Path) -> No
 async def test_transform_applied_independently_to_main_file_and_wal(tmp_path: Path) -> None:
     # Same WAL-building recipe as test_nonzero_wal_takes_slow_path_and_sees_wal_committed_data,
     # plus wrapping the main file and its sidecars independently -- each
-    # file decides its own wrapping on its own, per FORMAT-SPEC.md §6.1's
-    # per-file detection rule.
+    # file decides its own wrapping on its own, per FORMAT-SPEC.md:
+    # copy_meta_file-layout's per-file detection rule.
     db_path = tmp_path / "test.db"
     writer = sqlite3.connect(str(db_path))
     writer.execute("PRAGMA journal_mode=WAL")
@@ -245,9 +244,10 @@ async def test_connection_opened_in_worker_thread_can_be_closed_from_main_thread
     # on a background thread running its own event loop, close on this
     # — the main — thread's loop) without needing Textual at all.
     #
-    # See open_sqlite()'s own docstring for why this is safe (aiosqlite's
-    # per-connection thread pinning). Asserts that the open-here /
-    # close-there sequence completes without ProgrammingError.
+    # Safe because aiosqlite always routes a connection's statements --
+    # close() included -- through the one thread that opened it, no
+    # matter which thread's loop issues the call. Asserts that the
+    # open-here / close-there sequence completes without ProgrammingError.
     _make_plain_db(tmp_path)
     store = LocalFsStore(tmp_path)
 
@@ -285,8 +285,6 @@ async def test_non_local_store_always_materializes_even_without_wal(tmp_path: Pa
     try:
         assert materialized is not None
         cursor = await conn.execute("SELECT v FROM t")
-        # aiosqlite types fetchall() as Iterable[Row]; with the default
-        # (None) row_factory these really are plain tuples at runtime.
         rows: list[Any] = list(await cursor.fetchall())
         assert rows == [(1,)]
     finally:
@@ -305,12 +303,13 @@ async def _index_names(conn: aiosqlite.Connection, table: str) -> set[str]:
 
 class TestApplyIndexHint:
     """``apply_index_hint()`` is a pure declaration of intent, not a
-    command guaranteed to succeed — see its own docstring. These tests
-    exercise both halves of that contract: real index creation against a
-    writable connection, and a silent no-op against a genuinely
-    read-only one (the shape ``storage/sqlite.py``'s own fast path
-    opens directly against a real repository file — never to be
-    mutated)."""
+    command guaranteed to succeed: a genuinely read-only connection makes
+    ``CREATE INDEX`` raise ``OperationalError: attempt to write a readonly
+    database``, which it catches and treats as the hint quietly doing
+    nothing. These tests exercise both halves of that contract: real index
+    creation against a writable connection, and a silent no-op against a
+    read-only one (the shape ``storage/sqlite.py``'s own fast path opens
+    directly against a real repository file — never to be mutated)."""
 
     async def test_creates_an_index_when_none_covers_the_columns(self, tmp_path: Path) -> None:
         conn = await aiosqlite.connect(tmp_path / "t.db")

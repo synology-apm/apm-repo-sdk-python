@@ -1,27 +1,18 @@
-"""Chunk pool: resolves a ``ChunkAddress`` to plaintext bytes.
-
-The only place chunk decrypt+decompress happens. Three collaborating
-classes: ``BucketReader`` (one ``.buk`` file's header/SizeStore/
-locators plus the actual per-chunk read), ``Pool`` (repository-wide
-entry point — resolves ``(streamID, bucketID)`` to the right ``.buk``
-path and caches both ``BucketReader``\\ s and decoded plaintext chunks),
-and ``BucketReaderCache`` (the private, unbounded cache shape a bulk
-sweep needs instead of ``Pool``'s own bounded one). See each class's own
-docstring for its actual contract.
+"""``BucketReader``: one ``.buk`` file's header, SizeStore entries,
+per-chunk locators, and the decrypt+decompress read path itself. Only
+ever calls ``ObjectStore.read`` — never mmaps directly, never assumes
+anything about the backend.
 """
 
 from __future__ import annotations
 
 import array
 import asyncio
-import dataclasses
-import hashlib
-from collections.abc import Mapping, Sequence
+from collections.abc import Sequence
 
-from ..asynccache import AsyncKeyedCache
-from ..errors import ChunkCompactedError, DataCorruptError, FormatError, KeyRequiredError, NotFoundError
-from ..format.addressing import ChunkAddress, pool_layer_path, split_layer_leaf
-from ..format.bucket import (
+from ...errors import ChunkCompactedError, DataCorruptError, FormatError, KeyRequiredError, NotFoundError
+from ...format.addressing import ChunkAddress
+from ...format.bucket import (
     COMPRESS_TYPE_BY_VALUE,
     COMPRESS_TYPE_COMPACTED_VALUE,
     BucketFileHeader,
@@ -35,16 +26,13 @@ from ..format.bucket import (
     parse_size_store,
     raw_chunk_arrays,
 )
-from ..format.compression import CompressType, decompress, decompress_many
-from ..format.const import CHUNK_CRC_SIZE, COMPRESS_RESERVED_LENG, REDUNDANCY_COVERAGE_BUCKET
-from ..format.crypto import decrypt_chunk
-from ..format.headers import HEADER_LEN, verify_crc32
-from ..format.redundancy import redundancy_size, repair_via_trailer
-from ..identifiers import BucketId, ChunkIdx, StreamId
-from ..storage.base import ObjectStore, join_path
-from ..storage.dircache import DirCache
-from ..storage.seqid import resolve_seq_path
-from .fingerprint import AllocationTableCache, fingerprints
+from ...format.compression import CompressType, decompress, decompress_many
+from ...format.const import CHUNK_CRC_SIZE, COMPRESS_RESERVED_LENG, REDUNDANCY_COVERAGE_BUCKET
+from ...format.crypto import decrypt_chunk
+from ...format.headers import HEADER_LEN, verify_crc32
+from ...format.redundancy import redundancy_size, repair_via_trailer
+from ...identifiers import ChunkIdx
+from ...storage.base import ObjectStore
 
 _SPEC = "FORMAT-SPEC.md: sidecar-files/chunk-pool-encryption"
 
@@ -107,18 +95,12 @@ async def _attempt_size_store_repair(
 
 
 class BucketReader:
-    """One ``.buk`` file: header, SizeStore entries, per-chunk locators, and
-    the decrypt+decompress read path itself. Only ever calls
-    ``ObjectStore.read`` — never mmaps directly, never assumes
-    anything about the backend.
-
-    ``entries``/``locators`` (lazy ``Sequence``\\ s) are for *external*,
+    """``entries``/``locators`` (lazy ``Sequence``\\ s) are for *external*,
     sparse-access callers that only ever touch a handful of a bucket's
-    chunks (``verify.py``'s spot-checks, the ``dump`` CLI command). This
+    chunks (``verify_checks.py``'s spot-checks, the ``dump`` CLI command). This
     class's *own* per-chunk reads (``read_chunk``, ``read_chunks``)
-    go straight to the raw ``array.array`` values
-    ``raw_chunk_arrays`` returns
-    instead, skipping per-chunk ``SizeStoreEntry``/``ChunkLocator``
+    go straight to the raw ``array.array`` values ``raw_chunk_arrays``
+    returns instead, skipping per-chunk ``SizeStoreEntry``/``ChunkLocator``
     construction entirely — a bucket-major export touches nearly every
     chunk in nearly every bucket it opens, dense enough that even lazy
     construction adds up.
@@ -173,10 +155,9 @@ class BucketReader:
         # per-chunk verify_ciphertext_crc pass does; this cumulative array
         # makes each chunk's own lookup O(1) instead.
         self._chunk_crc_positions: array.array[int] | None = None
-        # read_chunks()/_decode_run()'s own raw-array fast path — see this
-        # class's own docstring for why they bypass entries/locators
-        # entirely instead of also using (even lazy) SizeStoreEntry/
-        # ChunkLocator construction.
+        # read_chunks()/_decode_run()'s own raw-array fast path — they
+        # bypass entries/locators entirely instead of also using (even
+        # lazy) SizeStoreEntry/ChunkLocator construction.
         self._raw_compress_types, self._raw_offsets, self._raw_lengths = raw_chunk_arrays(
             header, entries, self.locators
         )
@@ -206,8 +187,8 @@ class BucketReader:
         check_bucket_structure`` is what actually reports it.
 
         ``verify_ciphertext_crc`` becomes this reader's own
-        ``read_chunk``/``read_chunks`` default (see their own docstrings) —
-        it does not itself trigger reading the ChunkCrcStore trailer here.
+        ``read_chunk``/``read_chunks`` default — it does not itself
+        trigger reading the ChunkCrcStore trailer here.
         """
         head = await store.read(path, 0, COMPRESS_RESERVED_LENG)
         header = parse_bucket_header(head)
@@ -265,8 +246,7 @@ class BucketReader:
                 self._chunk_crc_values = parse_chunk_crc_store(
                     trailer_raw, length // CHUNK_CRC_SIZE, verify_crc=self.header.crc_of_chunk_crc
                 )
-            # One O(chunk_num) pass, not per-chunk-per-call — see this
-            # field's own comment in __init__.
+            # One O(chunk_num) pass, not per-chunk-per-call.
             self._chunk_crc_positions = chunk_crc_store_positions(self.entries)
         return self._chunk_crc_values
 
@@ -335,7 +315,7 @@ class BucketReader:
 
         ``addr`` supplies the IV for decryption — pass the chunk's *own* ``ChunkAddress``.
 
-        Reads straight off the raw arrays (see this class's own docstring)
+        Reads straight off the raw arrays
         rather than ``entries``/``locators`` — no reason for even a single
         cold-path ``SizeStoreEntry``/``ChunkLocator`` construction once the
         raw arrays already exist from ``__init__``.
@@ -386,7 +366,7 @@ class BucketReader:
     async def read_raw_chunk(self, chunk_idx: ChunkIdx) -> bytes:
         """Fetch chunk ``chunk_idx``'s stored bytes exactly as written —
         compressed and/or encrypted per ``mode``, no decrypt/decompress
-        applied. For ``verify.py``'s ChunkCrcStore spot-check
+        applied. For ``verify_checks.py``'s ChunkCrcStore spot-check
         (FORMAT-SPEC.md: ChunkCrcStore), which checks the *ciphertext*
         CRC32 directly and has no need for the plaintext ``read_chunk``
         produces.
@@ -477,8 +457,10 @@ class BucketReader:
                 unless it is; a caller that doesn't know ahead of time may
                 still pass a real one.
             semaphore: The shared concurrency pool for this whole export
-                (default ``None``: serial) — see ``exec_chunks``'s own
-                docstring for the cross-bucket/in-bucket accounting. A
+                (default ``None``: serial) — the same ``asyncio.Semaphore``
+                ``exec_chunks()``'s cross-bucket dispatch loop also draws
+                from, so total concurrently in-flight reads across both
+                levels never exceed one shared bound. A
                 caller passing a non-``None`` semaphore has already
                 acquired one permit on this call's behalf; this method's
                 first merged run spends that permit directly, and only a
@@ -515,7 +497,7 @@ class BucketReader:
             # runs.
             await self.ensure_chunk_crc_store()
 
-        # Off the raw arrays (see this class's own docstring), not
+        # Off the raw arrays, not
         # entries/locators: no SizeStoreEntry/ChunkLocator is constructed
         # anywhere in this method or in _fits_in_run()/_read_run()/
         # _decode_run() below, not even lazily — ``located``/``run`` carry the
@@ -552,8 +534,7 @@ class BucketReader:
                     await self._read_run(run, result, verify_ciphertext_crc=should_verify)
 
             async with asyncio.TaskGroup() as tg:
-                # runs[0] spends the permit the caller already acquired —
-                # see this method's own docstring's ``semaphore`` contract.
+                # runs[0] spends the permit the caller already acquired.
                 # Concurrent runs write disjoint keys into ``result`` (each
                 # run's own chunk_idx set never overlaps another's, by
                 # construction), so no lock is needed around it.
@@ -566,8 +547,9 @@ class BucketReader:
     def _fits_in_run(prev_end: int, offset: int) -> bool:
         """Whether the next locator range (starting at ``offset``) is
         close enough to a run's own last entry (ending at ``prev_end``)
-        to merge — gap-only, no size cap (see ``_GAP_TOLERANCE``'s own
-        docstring for why). The next range's own length plays no part in
+        to merge — gap-only, no size cap: a bucket's own chunk-index space
+        already bounds how large a merged run can get. The next range's
+        own length plays no part in
         this decision, only where it starts. Shared by ``read_chunks``
         and ``read_raw_chunks`` — each passes its own run shape's
         offset+length in, rather than this method assuming one."""
@@ -626,7 +608,7 @@ class BucketReader:
         # slice — every per-chunk slice below becomes a zero-copy view into
         # this one buffer instead of an independent copy. Unlike
         # BucketReaderCache, which caches whole BucketReaders but not
-        # decoded chunk plaintext (see its own docstring), nothing here
+        # decoded chunk plaintext across calls, nothing here
         # holds one of these views past this one merged run's own decode:
         # ``result`` only lives until
         # _exec_one_bucket_group's run-assembly loop copies each chunk
@@ -645,23 +627,21 @@ class BucketReader:
         verify_ciphertext_crc: bool = False,
     ) -> None:
         """Decrypt each chunk in ``run`` individually (own IV per chunk,
-        so this loop can't be collapsed — see this class's own
-        ``read_chunks`` docstring), then hand the whole run's
+        so this loop can't be collapsed), then hand the whole run's
         ciphertext-removed bytes to ``decompress_many`` in one batched
         call instead of decompressing chunk by chunk.
 
         Takes each chunk's ``compress_type``/``offset``/``length`` straight
-        from ``run`` (see ``read_chunks``'s own comment) — no
-        ``SizeStoreEntry``/``ChunkLocator`` lookup anywhere in this
-        method. ``addr`` is only actually dereferenced inside the
-        ``is_vault_encrypted`` branch below — see ``read_chunks``'s
-        own docstring for why a caller may have skipped constructing a
-        real one when it already knows that branch never runs.
+        from ``run``, already resolved by ``read_chunks()`` when it built
+        these tuples. ``addr`` is only actually dereferenced inside the
+        ``is_vault_encrypted`` branch below — a caller that already knows
+        this bucket isn't vault-encrypted may pass ``None`` for it.
 
         ``verify_ciphertext_crc``, when set, checks each chunk's raw slice
         against ``self._chunk_crc_values`` (already resolved by
-        ``read_chunks`` before this ever runs — see that method's own
-        docstring) before decrypting it."""
+        ``read_chunks`` before this ever runs — this method can't await
+        that resolution itself, running on a worker thread via
+        ``asyncio.to_thread``) before decrypting it."""
         chunk_idxs: list[int] = []
         items: list[tuple[CompressType, bytes | memoryview]] = []
         for chunk_idx, addr, offset, length, compress_type in run:
@@ -683,302 +663,3 @@ class BucketReader:
             chunk_idxs.append(chunk_idx)
             items.append((compress_type, raw))
         result.update(zip(chunk_idxs, decompress_many(items), strict=True))
-
-
-# Not frozen: a stateful cache object, not a value model — buckets is
-# grown in place as new BucketReaders are opened.
-@dataclasses.dataclass
-class BucketReaderCache:
-    """A private, unbounded ``BucketReader`` cache for one bulk sweep
-    through many buckets — export's bucket-major path and ``verify``'s
-    Bucket-and-key stage each build one instead of going through
-    ``Pool``'s own bounded ``_buckets``, so a sweep touching every bucket
-    once doesn't evict genuinely-hot interactive entries from that shared
-    cache. Reads/writes never cross over with ``Pool``'s own cache — the
-    two stay fully independent.
-
-    Grow-only, no eviction — bounded by however many distinct buckets one
-    sweep actually touches. Built on ``AsyncKeyedCache`` like every other
-    cache in this SDK, with ``fetch`` supplied *per call* (typically
-    ``Pool.open_bucket_uncached``) since this class is constructed at
-    layers with no ``Pool`` reference of their own.
-
-    One instance is shared across every fragment of a
-    ``VirtualDiskContentSource`` export, so a bucket one fragment opens
-    stays open for the next; a standalone ``export_to`` call or a
-    ``verify`` run instead each get their own separate instance.
-
-    Note:
-        Deliberately does not also cache decoded chunk plaintext across
-        calls — same-call repeats are already deduplicated by
-        ``exec_chunks`` itself, and unconditionally remembering every
-        decoded chunk would cost memory roughly equal to the whole
-        export's unique DATA content for little cross-call reuse against
-        real VM-image exports. Chunk decode stays scoped to one
-        bucket-group call, which is also what lets ``decompress_many``
-        hand back zero-copy ``memoryview`` values instead of an
-        independent ``bytes`` copy per chunk.
-    """
-
-    buckets: AsyncKeyedCache[tuple[StreamId, BucketId], BucketReader] = dataclasses.field(
-        default_factory=AsyncKeyedCache
-    )
-
-
-class Pool:
-    """Repository-wide chunk pool entry point.
-
-    Resolves any ``ChunkAddress`` to its 4096-byte plaintext, with
-    two-level LRU caching: ``BucketReader``\\ s (header + locators, cheap,
-    kept many) and decoded plaintext chunks (more expensive, kept fewer).
-    Both are ``AsyncKeyedCache`` instances — session-wide, shared across
-    every interactive caller —
-    which already gives concurrency-safety (an internal lock, held only
-    around bookkeeping, never around the I/O of opening a bucket or
-    reading/decrypting/decompressing a chunk) and in-flight fetch
-    de-duplication (two concurrent callers missing the same key pay for
-    one fetch, not two) for free; see that module's own docstring for the
-    exact contract.
-    """
-
-    def __init__(
-        self,
-        store: ObjectStore,
-        pool_root: str,
-        dir_cache: DirCache,
-        *,
-        vault_key: bytes | None = None,
-        bucket_cache_size: int = 16,
-        chunk_cache_size: int = 4096,
-        verify_fingerprint: bool = False,
-        verify_ciphertext_crc: bool = False,
-    ) -> None:
-        self._store = store
-        self._pool_root = pool_root
-        self._dir_cache = dir_cache
-        self._vault_key = vault_key
-        # See read_chunk()'s own docstring — this is the session-wide
-        # default; a per-call ``verify_fingerprint=`` argument overrides it.
-        self._verify_fingerprint = verify_fingerprint
-        # Threaded into every BucketReader this Pool opens (open_bucket_uncached)
-        # as that reader's own default — see BucketReader.open()'s docstring.
-        # Unlike verify_fingerprint, there's no separate Pool-level
-        # verify_fingerprints()-style method for this: ChunkCrcStore lives
-        # inside the bucket file BucketReader already owns, not a separate
-        # sidecar Pool has to locate.
-        self._verify_ciphertext_crc = verify_ciphertext_crc
-        self._buckets: AsyncKeyedCache[tuple[StreamId, BucketId], BucketReader] = AsyncKeyedCache(
-            self.open_bucket_uncached_by_key, maxsize=bucket_cache_size
-        )
-        self._chunks: AsyncKeyedCache[tuple[StreamId, BucketId, ChunkIdx], bytes] = AsyncKeyedCache(
-            maxsize=chunk_cache_size
-        )
-        # Shared by every fingerprint lookup this Pool ever does (below,
-        # and via verify_fingerprints()) — up to GROUP_BUCKET_NUM buckets
-        # sharing one .inf group only ever pay for its own header
-        # validation/allocation-table read once, not once per bucket. See
-        # AllocationTableCache's own docstring.
-        self._allocation_cache = AllocationTableCache()
-
-    def release_caches(self) -> None:
-        """Drop everything this pool holds in memory: decoded chunks, open
-        bucket readers, and allocation tables.
-
-        Closing a repository does not, on its own, free any of this — the
-        caches live on the ``Pool``, which a caller can still be holding a
-        reference to. Anything walking several repositories in one process
-        (a smoke run, a TUI session browsing one after another) would
-        otherwise keep every pool it ever opened fully populated. The
-        ``DirCache`` is deliberately untouched: it belongs to the store,
-        not to this pool.
-        """
-        self._buckets.invalidate()
-        self._chunks.invalidate()
-        self._allocation_cache.clear()
-
-    @property
-    def store(self) -> ObjectStore:
-        """Needed by ``dedup.pool_descriptor.PoolDescriptor.from_pool`` to
-        describe an equivalent ``Pool`` for a multiprocess worker to
-        rebuild — the same reason ``dedup.repository.DedupRepo`` already
-        exposes its own ``store``."""
-        return self._store
-
-    @property
-    def pool_root(self) -> str:
-        return self._pool_root
-
-    @property
-    def vault_key(self) -> bytes | None:
-        return self._vault_key
-
-    @property
-    def verify_fingerprint(self) -> bool:
-        """This ``Pool``'s own session-wide default — needed alongside
-        ``store``/``pool_root``/``vault_key`` by
-        ``dedup.pool_descriptor.PoolDescriptor.from_pool`` so a
-        multiprocess worker's own rebuilt ``Pool`` mirrors this one's
-        actual configuration instead of silently resetting it."""
-        return self._verify_fingerprint
-
-    @property
-    def verify_ciphertext_crc(self) -> bool:
-        return self._verify_ciphertext_crc
-
-    async def bucket_path(self, stream_id: StreamId, bucket_id: BucketId) -> str:
-        """Resolve ``(stream_id, bucket_id)`` to its physical ``.buk`` path
-        (including any ``.<seqId>`` generation suffix), relative to the
-        repository root."""
-        layer_path = pool_layer_path(stream_id, bucket_id)
-        dir_part, leaf = split_layer_leaf(layer_path)
-        logical_name = f"{leaf}.buk"
-        full_dir = join_path(self._pool_root, dir_part)
-        return await resolve_seq_path(self._dir_cache, full_dir, logical_name)
-
-    async def bucket(self, stream_id: StreamId, bucket_id: BucketId) -> BucketReader:
-        """Return the (cached) ``BucketReader`` for ``(stream_id,
-        bucket_id)``, opening and caching it on first access."""
-        return await self._buckets.resolve((stream_id, bucket_id))
-
-    async def open_bucket_uncached(self, stream_id: StreamId, bucket_id: BucketId) -> BucketReader:
-        """Open ``(stream_id, bucket_id)`` fresh, **without** touching
-        ``_buckets`` at all — no lookup, no insert, no eviction.
-
-        Exists for callers that need their own private, separately-scoped
-        ``BucketReader`` cache instead of this shared one (a bulk sweep like
-        ``export_scheduler.export_to``'s bucket-major path, or ``verify``'s
-        Bucket-and-key stage — see ``BucketReaderCache``'s own
-        docstring). ``_buckets`` itself is bound to call this for its
-        own miss path (see ``Pool.__init__``); the two never diverge in
-        how a bucket actually gets opened, only in whether the result is
-        remembered in the shared cache afterward.
-        """
-        path = await self.bucket_path(stream_id, bucket_id)
-        return await BucketReader.open(
-            self._store, path, vault_key=self._vault_key, verify_ciphertext_crc=self._verify_ciphertext_crc
-        )
-
-    async def open_bucket_uncached_by_key(self, key: tuple[StreamId, BucketId]) -> BucketReader:
-        """``open_bucket_uncached``, taking its ``(stream_id, bucket_id)``
-        as one tuple — the single-arg shape ``AsyncKeyedCache.resolve``'s
-        ``fetch`` callback needs, so every caller building a
-        ``BucketReader`` cache keyed this way (this class's own
-        ``_buckets``, ``chunk_walk.py``'s bucket-major export, ``verify``'s
-        Bucket stage) can pass this bound method directly instead of each
-        writing its own ``lambda key: pool.open_bucket_uncached(*key)``."""
-        return await self.open_bucket_uncached(*key)
-
-    async def read_chunk(
-        self,
-        addr: ChunkAddress,
-        *,
-        cache: bool = True,
-        verify_fingerprint: bool | None = None,
-        verify_ciphertext_crc: bool | None = None,
-    ) -> bytes:
-        """Resolve ``addr`` — using *its own* embedded ``stream_id``/
-        ``bucket_id``,
-        not any caller-assumed values — to 4096 bytes of plaintext. Not
-        used by the bucket-major export scheduler
-        (``chunk_walk.py``'s ``_exec_one_bucket_group``), which calls
-        ``BucketReader.read_chunks`` directly, bypassing this class
-        entirely.
-
-        ``cache=False`` bypasses the plaintext chunk cache entirely — for
-        a one-off integrity check of a single chunk per bucket, which has
-        nothing to gain from caching it and would only evict genuinely-hot
-        interactive data for no benefit.
-
-        ``verify_fingerprint`` (``None``: defer to whatever this
-        ``Pool`` was constructed with; an explicit ``True``/``False``
-        overrides it for this one call) compares this chunk's plaintext
-        SHA-256 against its stored ``.fgp`` fingerprint and raises
-        ``DataCorruptError`` on a mismatch —
-        a general data-integrity check independent of encryption, off by
-        default since it costs one extra ``.inf``/``.fgp`` read per
-        chunk. A plaintext-cache hit is checked too, not skipped, since
-        the point is verifying the bytes about to be handed back.
-
-        ``verify_ciphertext_crc`` — forwarded to
-        ``BucketReader.read_chunk`` as-is (``None`` defers to whatever
-        that reader was opened with); see its own docstring. Checked
-        before decrypting, so it still requires a vault key for an
-        encrypted bucket to get as far as returning plaintext — a caller
-        that wants the ChunkCrcStore check in isolation, independent of
-        whether a key is even available, wants
-        ``BucketReader.verify_chunk_ciphertext_crc`` instead.
-        """
-        key = (addr.stream_id, addr.bucket_id, addr.chunk_idx)
-
-        async def fetch_chunk(_key: tuple[StreamId, BucketId, ChunkIdx]) -> bytes:
-            reader = await self.bucket(addr.stream_id, addr.bucket_id)
-            return await reader.read_chunk(addr.chunk_idx, addr, verify_ciphertext_crc=verify_ciphertext_crc)
-
-        plain = await self._chunks.resolve(key, fetch_chunk) if cache else await fetch_chunk(key)
-        await self.verify_fingerprints(
-            addr.stream_id, addr.bucket_id, {int(addr.chunk_idx): plain}, verify_fingerprint=verify_fingerprint
-        )
-        return plain
-
-    async def verify_fingerprints(
-        self,
-        stream_id: StreamId,
-        bucket_id: BucketId,
-        chunks: Mapping[int, bytes | memoryview],
-        *,
-        verify_fingerprint: bool | None = None,
-    ) -> None:
-        """Check every entry in ``chunks`` (already-decoded plaintext, keyed
-        by its own ``chunk_idx`` within ``(stream_id, bucket_id)``) against
-        its stored ``.fgp`` digest — the same policy/lookup ``read_chunk``
-        applies to its own single chunk, factored out here so
-        ``BucketReader.read_chunks``'s multi-chunk batch result (fetched
-        by ``dedup_file.py``'s ``_fill_data_extent`` and
-        ``chunk_walk.py``'s ``_exec_one_bucket_group``, both of which call
-        ``read_chunks`` directly and so bypass ``read_chunk`` entirely) can
-        honor it too, instead of silently skipping verification whenever a
-        read/export spans more than one distinct chunk.
-
-        ``verify_fingerprint`` — same meaning as ``read_chunk``'s own
-        parameter: ``None`` defers to this ``Pool``'s session-wide default.
-
-        Raises:
-            DataCorruptError: Any chunk's plaintext SHA-256 doesn't match its
-                stored fingerprint.
-        """
-        should_verify = self._verify_fingerprint if verify_fingerprint is None else verify_fingerprint
-        if not should_verify:
-            return
-        # One batched fingerprints() call resolves the .inf header/
-        # allocation-table entry shared by every chunk in this bucket
-        # exactly once, instead of once per chunk (see fingerprints()'s
-        # own docstring) -- real for a multi-chunk read/export with
-        # verify_fingerprint enabled. self._allocation_cache additionally
-        # shares that resolution across separate calls/buckets in the same
-        # .inf group (see AllocationTableCache's own docstring).
-        chunk_indices = [ChunkIdx(raw_chunk_idx) for raw_chunk_idx in chunks]
-        expected_by_chunk = await self.fingerprints_for(stream_id, bucket_id, chunk_indices)
-        for raw_chunk_idx, plain in chunks.items():
-            chunk_idx = ChunkIdx(raw_chunk_idx)
-            if hashlib.sha256(plain).digest() != expected_by_chunk[chunk_idx]:
-                addr = ChunkAddress(stream_id, bucket_id, chunk_idx)
-                raise DataCorruptError(f"chunk fingerprint mismatch at {addr}", ref=self._pool_root, spec=_SPEC)
-
-    async def fingerprints_for(
-        self, stream_id: StreamId, bucket_id: BucketId, chunk_indices: Sequence[ChunkIdx]
-    ) -> dict[ChunkIdx, bytes]:
-        """Batched ``dedup.fingerprint.fingerprints()``, using this Pool's
-        own ``AllocationTableCache`` — ``verify_fingerprints``'s own
-        lookup half (resolves the stored digests only, no plaintext
-        comparison of its own), factored out so its own ``.inf``/``.fgp``
-        resolution shares this ``Pool``'s cache the same way every other
-        lookup here does."""
-        return await fingerprints(
-            self._store,
-            self._dir_cache,
-            self._pool_root,
-            stream_id,
-            bucket_id,
-            chunk_indices,
-            cache=self._allocation_cache,
-        )

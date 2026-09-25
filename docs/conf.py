@@ -60,6 +60,14 @@ nitpick_ignore = [
     # asyncio.Semaphore path instead, so intersphinx can't resolve the
     # fully-qualified name autodoc emits.
     ("py:class", "asyncio.locks.Semaphore"),
+    # Same shape as the asyncio.Semaphore case above, one level down:
+    # TreeStrategy's own __module__ is tree_strategy's private _base leaf
+    # (which gets no apidoc page of its own -- see units/content/disk_fs/
+    # for the same "no page for a leading-underscore submodule"
+    # convention), but it's re-exported at the public
+    # units.saas.tree_strategy path CategorizedGroupTree.__init__'s own
+    # `inner: TreeStrategy` parameter is documented under.
+    ("py:class", "synology_apm_repo.sdk.units.saas.tree_strategy._base.TreeStrategy"),
 ]
 
 html_theme = "furo"
@@ -77,6 +85,7 @@ exclude_patterns = [
     "api/synology_apm_repo.sdk.rst",
     "api/synology_apm_repo.sdk.api.rst",
     "api/synology_apm_repo.sdk.storage.rst",
+    "api/synology_apm_repo.sdk.units.saas.tree_strategy.rst",
     # These __init__.py files hold only a module docstring (no imports, no
     # functions/classes) — the docstring itself is real, but its content is
     # already covered at more length by ARCHITECTURE.md's own per-layer

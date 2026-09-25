@@ -1,16 +1,14 @@
 """Unit tests for ``synology_apm_repo.sdk.units.content.pcps_disk`` —
 synthetic composition + Pool data written to real files, no sample
-repositories required (mirrors ``tests/unit/sdk/test_dedup_export_scheduler.py``'s
-own synthetic-fixture conventions, duplicated rather than imported —
-this file's own established house style).
+repositories required.
 
 Two independent fragments, each its own composition (disk-absolute
 addressing — every ``DedupFile`` here is opened with ``size=_DISK_SIZE``,
 the *whole disk's* capacity, exactly like a real PC/PS fragment's own
 ``file_meta.file_size``), sharing one ``Pool``:
 
-- fragment A: covers ``[0, 8192)`` — two 4096-byte chunks of ``0xAA``.
-- fragment B: covers ``[16384, 24576)`` — two 4096-byte chunks of ``0xBB``.
+- fragment A: covers ``[0, 8192)`` — a 4096-byte chunk of ``0xAA``, then one of ``0xAB``.
+- fragment B: covers ``[16384, 24576)`` — a 4096-byte chunk of ``0xBB``, then one of ``0xBC``.
 - ``[8192, 16384)`` and ``[24576, 32768)`` are real gaps — no fragment's
   own composition covers them at all, unlike a composition's own
   ``ZERO``/``HOLE`` extents (which stay *inside* one composition).
@@ -170,8 +168,7 @@ def two_fragment_disk(tmp_path: Path) -> VirtualDiskContentSource:
     return VirtualDiskContentSource(size=_DISK_SIZE, fragments=[frag_b, frag_a])
 
 
-# Overlap fixture -- a real, observed condition (see VirtualDiskContentSource's
-# own docstring): fragment "early" declares [4096, 12288) all ZERO (its own
+# Overlap fixture -- a real, observed condition: fragment "early" declares [4096, 12288) all ZERO (its own
 # capture stopped at an unaligned true boundary and padded the rest of its
 # last chunk); fragment "late" starts at 4096 too but has real, non-zero
 # MAPPING data across the whole overlap -- the later fragment's real data
@@ -211,8 +208,7 @@ class TestOverlappingFragments:
     """Real PC/PS fragments can genuinely overlap — the
     later-starting fragment's real data must win over an earlier
     fragment's own boundary-padding ``ZERO`` declaration in whatever
-    range they share. See ``VirtualDiskContentSource``'s own docstring
-    for the full story and the precedence rule this locks in."""
+    range they share."""
 
     async def test_the_non_overlapping_prefix_reads_the_early_fragment(
         self, overlapping_fragment_disk: VirtualDiskContentSource
@@ -414,10 +410,10 @@ class TestExportTo:
     ) -> None:
         """Added after a real PC/PS disk export was found running well
         under 10 MiB/s with no way to opt into the same read
-        parallelism a VM disk_image export already has (see this
-        class's own docstring) -- pins down that the knob actually
-        reaches each fragment's own ``export_to()`` call, not just that
-        the whole-disk export still produces correct bytes."""
+        parallelism a VM disk_image export already has -- pins down that
+        the knob actually reaches each fragment's own ``export_to()``
+        call, not just that the whole-disk export still produces correct
+        bytes."""
         from synology_apm_repo.sdk.dedup.dedup_file import ByteRangeView
 
         received: list[int | None] = []
@@ -437,8 +433,8 @@ class TestExportTo:
         self, two_fragment_disk: VirtualDiskContentSource, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         """Same forwarding contract as ``max_concurrent_reads`` above,
-        for the independent bucket-open prefetch knob (this module's own
-        docstring, ``chunk_walk._prefetch_bucket_opens``)."""
+        for the independent bucket-open prefetch knob
+        (``chunk_walk._prefetch_bucket_opens``)."""
         from synology_apm_repo.sdk.dedup.dedup_file import ByteRangeView
 
         received: list[int | None] = []

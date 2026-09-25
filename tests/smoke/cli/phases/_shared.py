@@ -22,8 +22,7 @@ def key_args(ref: RepresentativeRef) -> list[str]:
 def profile_args(ref: RepresentativeRef) -> list[str]:
     """``--profile <name>`` for a ``ProfileSample``-derived ref, ``[]``
     otherwise -- needed alongside ``ref.repo_path``'s store-relative form
-    to reopen a profile-based remote sample from a fresh subprocess (see
-    ``RepresentativeRef.profile``'s own docstring)."""
+    to reopen a profile-based remote sample from a fresh subprocess."""
     return ["--profile", ref.profile] if ref.profile else []
 
 

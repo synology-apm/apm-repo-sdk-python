@@ -15,45 +15,77 @@ from __future__ import annotations
 
 import asyncio
 import sys
-from collections.abc import AsyncIterator
-from contextlib import asynccontextmanager
+from collections.abc import AsyncIterator, Callable
+from contextlib import AbstractAsyncContextManager, asynccontextmanager
 from pathlib import Path
 from typing import Any
 
 import pytest
 from textual.pilot import Pilot
-from textual.widgets import Button, Input, ProgressBar
+from textual.widgets import Button, Input, ProgressBar, Static
 
 from synology_apm_repo.browser.app import ApmRepoBrowserApp
+from synology_apm_repo.browser.core.app.model import Job, JobStatus
+from synology_apm_repo.browser.core.app.msg import CancelJobRequested
+from synology_apm_repo.browser.core.keys import JobId
 from synology_apm_repo.browser.screens.export_screen import ExportScreen
-from synology_apm_repo.browser.strings import EXPORT_NO_DESTINATION_WARNING, EXPORT_NOTHING_RUNNING_WARNING
+from synology_apm_repo.browser.screens.help_screen import HelpScreen
+from synology_apm_repo.browser.strings import (
+    EXPORT_NO_DESTINATION_WARNING,
+    EXPORT_NOTHING_RUNNING_WARNING,
+    EXPORT_RUNNING_STATUS_TEXT,
+)
 from synology_apm_repo.sdk.api import ExportResult
 from synology_apm_repo.sdk.errors import ApmRepoError
 from synology_apm_repo.sdk.units.base import RestorableUnit
 from synology_apm_repo.sdk.units.node_ref import NodeRef
 
-
-@asynccontextmanager
-async def _open_export_screen(
-    unit: RestorableUnit,
-) -> AsyncIterator[tuple[ApmRepoBrowserApp, Pilot[None], ExportScreen]]:
-    """Mounts a fresh app, pushes ``ExportScreen`` for ``unit``, and
-    yields ``(app, pilot, export_screen)`` once it's on screen — the
-    boilerplate every scenario() closure below starts with."""
-    app = ApmRepoBrowserApp()
-    async with app.run_test(size=(140, 45)) as pilot:
-        await pilot.pause()
-        app.push_screen(ExportScreen(unit))
-        await pilot.pause(0.2)
-        assert isinstance(app.screen, ExportScreen), app.screen
-        yield app, pilot, app.screen
+_OpenExportScreen = Callable[..., AbstractAsyncContextManager[tuple[ApmRepoBrowserApp, Pilot[None], ExportScreen]]]
 
 
-def test_export_dialog_suggests_a_windows_sanitized_filename_on_windows(monkeypatch: pytest.MonkeyPatch) -> None:
+@pytest.fixture
+def open_export_screen(wait_until: Any, ui_timeout: float) -> _OpenExportScreen:
+    """``async with open_export_screen(unit) as (app, pilot, export_screen):``
+    mounts a fresh app (or a caller-supplied ``app=`` for a non-default
+    constructor arg like ``default_sparse``), pushes ``ExportScreen`` for
+    ``unit``, and waits for it to actually become the active screen rather
+    than a fixed pause — the boilerplate every scenario() closure below
+    starts with."""
+
+    @asynccontextmanager
+    async def _open(
+        unit: RestorableUnit, *, app: ApmRepoBrowserApp | None = None
+    ) -> AsyncIterator[tuple[ApmRepoBrowserApp, Pilot[None], ExportScreen]]:
+        app = app if app is not None else ApmRepoBrowserApp()
+        async with app.run_test(size=(140, 45)) as pilot:
+            await pilot.pause()
+            app.push_screen(ExportScreen(unit))
+            # isinstance(app.screen, ExportScreen) alone only proves the
+            # screen has been pushed, not that its compose() has actually
+            # mounted anything yet -- every caller below immediately
+            # queries a widget by id, which can race an unmounted screen
+            # (NoMatches) on a slow/busy runner. #export-dst is always
+            # present once compose() runs, so wait for that too.
+            await wait_until(
+                pilot,
+                lambda: isinstance(app.screen, ExportScreen) and bool(app.screen.query("#export-dst")),
+                timeout=ui_timeout,
+                interval=0.02,
+                message="ExportScreen never became the active, fully composed screen",
+            )
+            assert isinstance(app.screen, ExportScreen), app.screen
+            yield app, pilot, app.screen
+
+    return _open
+
+
+def test_export_dialog_suggests_a_windows_sanitized_filename_on_windows(
+    monkeypatch: pytest.MonkeyPatch, open_export_screen: _OpenExportScreen
+) -> None:
     """The suggested destination is sanitized for Windows-invalid
     characters only when the dialog is actually built while running on
-    Windows -- see _windows_safe_filename's own docstring for why this
-    is gated rather than applied unconditionally."""
+    Windows: it's just a freely-editable default, so a POSIX run has no
+    reason to touch an already-valid name."""
     monkeypatch.setattr(sys, "platform", "win32")
 
     async def scenario() -> str:
@@ -63,14 +95,14 @@ def test_export_dialog_suggests_a_windows_sanitized_filename_on_windows(monkeypa
             is_leaf=True,
             size=0,
         )
-        async with _open_export_screen(unit) as (app, pilot, export_screen):
+        async with open_export_screen(unit) as (app, pilot, export_screen):
             return export_screen.query_one("#export-dst", Input).value
 
     assert asyncio.run(scenario()) == "./Report_ _Q1_Q2_ _draft_.pdf"
 
 
 def test_export_dialog_does_not_sanitize_the_suggested_filename_off_windows(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, open_export_screen: _OpenExportScreen
 ) -> None:
     """The same Windows-invalid name is left untouched when not actually
     running on Windows -- a valid POSIX filename must not be needlessly
@@ -79,7 +111,7 @@ def test_export_dialog_does_not_sanitize_the_suggested_filename_off_windows(
 
     async def scenario() -> str:
         unit = RestorableUnit(ref=NodeRef("repo", ("item",)), name="weird:name.txt", is_leaf=True, size=0)
-        async with _open_export_screen(unit) as (app, pilot, export_screen):
+        async with open_export_screen(unit) as (app, pilot, export_screen):
             return export_screen.query_one("#export-dst", Input).value
 
     assert asyncio.run(scenario()) == "./weird:name.txt"
@@ -122,7 +154,9 @@ class _BlockingContentSource:
         raise AssertionError("unreachable — this export can only end by being cancelled")
 
 
-def test_export_dialog_ux_details(tmp_path: Path, wait_until: Any) -> None:
+def test_export_dialog_ux_details(
+    tmp_path: Path, wait_until: Any, sdk_timeout: float, open_export_screen: _OpenExportScreen
+) -> None:
     """Four direct user-reported UX asks against the export dialog
     (button alignment, progress-bar animation, the Enter-key shortcut,
     button relabeling — see the assertions below for each), all verified
@@ -145,7 +179,7 @@ def test_export_dialog_ux_details(tmp_path: Path, wait_until: Any) -> None:
             # genuinely satisfies the async ContentSource protocol.
             content=content,
         )
-        async with _open_export_screen(unit) as (app, pilot, export_screen):
+        async with open_export_screen(unit) as (app, pilot, export_screen):
             box = export_screen.query_one("Vertical")
             button_before = export_screen.query_one("#export-start", Button)
             input_widget = export_screen.query_one("#export-dst", Input)
@@ -169,7 +203,7 @@ def test_export_dialog_ux_details(tmp_path: Path, wait_until: Any) -> None:
             await wait_until(
                 pilot,
                 lambda: str(export_screen.query_one("#export-start", Button).label) == "Cancel",
-                timeout=0.8,
+                timeout=sdk_timeout,
                 interval=0.02,
                 message="the start button never flipped to Cancel",
             )
@@ -186,7 +220,11 @@ def test_export_dialog_ux_details(tmp_path: Path, wait_until: Any) -> None:
                 return "cancel" in text and "cancelling" not in text
 
             await wait_until(
-                pilot, _settled_on_cancelled, timeout=1.0, interval=0.02, message="export never reported cancelled"
+                pilot,
+                _settled_on_cancelled,
+                timeout=sdk_timeout,
+                interval=0.02,
+                message="export never reported cancelled",
             )
             status = str(export_screen.query_one("#export-status").render())
             label_after = str(export_screen.query_one("#export-start", Button).label)
@@ -231,10 +269,12 @@ def test_export_dialog_ux_details(tmp_path: Path, wait_until: Any) -> None:
     assert label_after == "Export", "the button must relabel back to Export once the export finishes/cancels"
 
 
-def test_export_screen_uses_the_apps_default_sparse_setting(wait_until: Any) -> None:
-    """``ExportScreen`` has no per-export sparse ``Checkbox`` (see
-    ``app.py``'s own ``main()`` docstring) — every export uses whatever
-    ``ApmRepoBrowserApp.default_sparse`` was set to at launch. Checked
+def test_export_screen_uses_the_apps_default_sparse_setting(
+    wait_until: Any, sdk_timeout: float, open_export_screen: _OpenExportScreen
+) -> None:
+    """``ExportScreen`` has no per-export sparse ``Checkbox`` -- it always
+    defers to whatever ``ApmRepoBrowserApp.default_sparse`` was set to at
+    launch. Checked
     both ways (``True``, the default, and ``False``) so a future
     regression that silently hardcodes one value would still be caught."""
 
@@ -244,13 +284,7 @@ def test_export_screen_uses_the_apps_default_sparse_setting(wait_until: Any) -> 
             ref=NodeRef("repo", ("item",)), name="item.bin", is_leaf=True, size=content.size, content=content
         )
         app = ApmRepoBrowserApp(default_sparse=default_sparse)
-        async with app.run_test(size=(140, 45)) as pilot:
-            await pilot.pause()
-            app.push_screen(ExportScreen(unit))
-            await pilot.pause(0.2)
-            assert isinstance(app.screen, ExportScreen), app.screen
-            export_screen = app.screen
-
+        async with open_export_screen(unit, app=app) as (app, pilot, export_screen):
             assert len(export_screen.query("#export-sparse")) == 0, "no per-export sparse Checkbox"
 
             dst_input = export_screen.query_one("#export-dst", Input)
@@ -260,7 +294,7 @@ def test_export_screen_uses_the_apps_default_sparse_setting(wait_until: Any) -> 
             await wait_until(
                 pilot,
                 lambda: content.received_sparse is not None,
-                timeout=0.8,
+                timeout=sdk_timeout,
                 interval=0.02,
                 message="export_to was never called",
             )
@@ -270,11 +304,14 @@ def test_export_screen_uses_the_apps_default_sparse_setting(wait_until: Any) -> 
             # scenario returns — otherwise ``run_test()``'s own teardown
             # cancels the still-running job itself (on_unmount()'s own
             # cleanup loop), which races the App's own widget teardown
-            # and can raise NoMatches from inside finish_job(); every
-            # other test using _BlockingContentSource resolves its job
-            # the same way before returning, for the same reason.
+            # and can raise NoMatches from a widget query during
+            # export-finish handling; every other test using
+            # _BlockingContentSource resolves its job the same way
+            # before returning, for the same reason.
             export_screen.query_one("#export-start", Button).press()
-            await wait_until(pilot, lambda: not app.jobs, timeout=1.0, interval=0.02, message="job never finished")
+            await wait_until(
+                pilot, lambda: not app.jobs, timeout=sdk_timeout, interval=0.02, message="job never finished"
+            )
 
             return received_sparse
 
@@ -283,10 +320,11 @@ def test_export_screen_uses_the_apps_default_sparse_setting(wait_until: Any) -> 
 
 
 class _RecordingArtifactSource:
-    """Declares ``supports_concurrent_export = False`` — matches an
-    assembled-artifact ``ContentSource`` (mail/calendar/...), the case
-    ``test_export_screen_hides_max_concurrent_reads_for_a_source_with_no_bucket_concept``
-    exists to check."""
+    """Declares ``supports_concurrent_export = False`` — a fast-completing,
+    non-blocking ``ContentSource`` standing in for an assembled-artifact
+    source (mail/calendar/...), used wherever a test needs a second unit
+    that finishes immediately rather than blocking like
+    ``_BlockingContentSource``."""
 
     size = 4096
     supports_concurrent_export = False
@@ -344,28 +382,51 @@ class _ErroringContentSource:
         raise ApmRepoError("simulated export failure")
 
 
-def test_export_screen_renders_rate_and_eta_once_progress_ticks_arrive(tmp_path: Path) -> None:
+class _UnexpectedlyFailingContentSource:
+    """Stands in for a content source wrapping a third-party dependency
+    (e.g. a dissect.* filesystem parser) that leaks something that isn't
+    an ``ApmRepoError`` at all — same broad-catch scenario
+    ``unit_screen.py``'s own ``_load_children`` guards against, proven
+    here for ``_run_export``'s own widened catch."""
+
+    size = 1000
+    supports_concurrent_export = False
+
+    async def read(self, offset: int = 0, length: int | None = None) -> bytes:
+        raise AssertionError("not used in this test")
+
+    def stream(self, block: int = 0) -> AsyncIterator[tuple[int, bytes]]:
+        raise AssertionError("not used in this test")
+
+    async def export_to(self, dst: Path, *, sparse: bool = True, progress: object = None, **kwargs: object) -> object:
+        raise RuntimeError("simulated unexpected dependency failure")
+
+
+def test_export_screen_renders_rate_and_eta_once_progress_ticks_arrive(
+    tmp_path: Path, wait_until: Any, sdk_timeout: float, open_export_screen: _OpenExportScreen
+) -> None:
     async def scenario() -> str:
         content = _ProgressingContentSource()
         unit = RestorableUnit(
             ref=NodeRef("repo", ("item",)), name="item.bin", is_leaf=True, size=content.size, content=content
         )
-        async with _open_export_screen(unit) as (app, pilot, export_screen):
+        async with open_export_screen(unit) as (app, pilot, export_screen):
             dst = tmp_path / "export_target.bin"
             export_screen.query_one("#export-dst", Input).value = str(dst)
             export_screen.query_one("#export-start", Button).press()
 
-            rate_text = ""
-            for _ in range(80):
-                await pilot.pause(0.02)
-                rate_text = str(export_screen.query_one("#export-rate").render())
-                if "ETA" in rate_text:
-                    break
+            await wait_until(
+                pilot,
+                lambda: "ETA" in str(export_screen.query_one("#export-rate").render()),
+                timeout=sdk_timeout,
+                interval=0.02,
+                message="rate/ETA text never appeared",
+            )
+            rate_text = str(export_screen.query_one("#export-rate").render())
 
-            for _ in range(50):
-                await pilot.pause(0.02)
-                if not app.jobs:
-                    break
+            await wait_until(
+                pilot, lambda: not app.jobs, timeout=sdk_timeout, interval=0.02, message="job never finished"
+            )
 
             return rate_text
 
@@ -375,23 +436,27 @@ def test_export_screen_renders_rate_and_eta_once_progress_ticks_arrive(tmp_path:
     assert "/s" in rate_text, rate_text  # a rate segment was rendered too
 
 
-def test_export_screen_export_failure_shows_the_error_and_resets_the_button(tmp_path: Path) -> None:
+def test_export_screen_export_failure_shows_the_error_and_resets_the_button(
+    tmp_path: Path, wait_until: Any, sdk_timeout: float, open_export_screen: _OpenExportScreen
+) -> None:
     async def scenario() -> tuple[str, str]:
         content = _ErroringContentSource()
         unit = RestorableUnit(
             ref=NodeRef("repo", ("item",)), name="item.bin", is_leaf=True, size=content.size, content=content
         )
-        async with _open_export_screen(unit) as (app, pilot, export_screen):
+        async with open_export_screen(unit) as (app, pilot, export_screen):
             dst = tmp_path / "export_target.bin"
             export_screen.query_one("#export-dst", Input).value = str(dst)
             export_screen.query_one("#export-start", Button).press()
 
-            status = ""
-            for _ in range(50):
-                await pilot.pause(0.02)
-                status = str(export_screen.query_one("#export-status").render())
-                if status:
-                    break
+            await wait_until(
+                pilot,
+                lambda: bool(str(export_screen.query_one("#export-status").render())),
+                timeout=sdk_timeout,
+                interval=0.02,
+                message="export status was never rendered",
+            )
+            status = str(export_screen.query_one("#export-status").render())
 
             return status, str(export_screen.query_one("#export-start", Button).label)
 
@@ -401,7 +466,44 @@ def test_export_screen_export_failure_shows_the_error_and_resets_the_button(tmp_
     assert label == "Export"  # _finish() flips the button back regardless of outcome
 
 
-def test_export_screen_calling_start_twice_only_creates_one_job(tmp_path: Path) -> None:
+def test_export_screen_unexpected_non_apm_repo_error_shows_a_clean_error_too(
+    tmp_path: Path, wait_until: Any, sdk_timeout: float, open_export_screen: _OpenExportScreen
+) -> None:
+    """The broad ``except Exception`` in ``_run_export`` must show the
+    same clean error message and button reset for a raw,
+    non-``ApmRepoError`` failure, not let it crash the worker as an
+    unhandled ``WorkerFailed``."""
+
+    async def scenario() -> tuple[str, str]:
+        content = _UnexpectedlyFailingContentSource()
+        unit = RestorableUnit(
+            ref=NodeRef("repo", ("item",)), name="item.bin", is_leaf=True, size=content.size, content=content
+        )
+        async with open_export_screen(unit) as (app, pilot, export_screen):
+            dst = tmp_path / "export_target.bin"
+            export_screen.query_one("#export-dst", Input).value = str(dst)
+            export_screen.query_one("#export-start", Button).press()
+
+            await wait_until(
+                pilot,
+                lambda: bool(str(export_screen.query_one("#export-status").render())),
+                timeout=sdk_timeout,
+                interval=0.02,
+                message="export status was never rendered",
+            )
+            status = str(export_screen.query_one("#export-status").render())
+
+            return status, str(export_screen.query_one("#export-start", Button).label)
+
+    status, label = asyncio.run(scenario())
+    assert "error" in status.lower(), status
+    assert "simulated unexpected dependency failure" in status, status
+    assert label == "Export"  # _finish() flips the button back regardless of outcome
+
+
+def test_export_screen_calling_start_twice_only_creates_one_job(
+    tmp_path: Path, wait_until: Any, sdk_timeout: float, open_export_screen: _OpenExportScreen
+) -> None:
     """``on_button_pressed`` already prevents this via the button
     relabeling to "Cancel", but ``_start()``'s own internal guard is the
     thing actually responsible — exercised directly here."""
@@ -411,7 +513,7 @@ def test_export_screen_calling_start_twice_only_creates_one_job(tmp_path: Path) 
         unit = RestorableUnit(
             ref=NodeRef("repo", ("item",)), name="item.bin", is_leaf=True, size=content.size, content=content
         )
-        async with _open_export_screen(unit) as (app, pilot, export_screen):
+        async with open_export_screen(unit) as (app, pilot, export_screen):
             export_screen.query_one("#export-dst", Input).value = str(tmp_path / "out.bin")
 
             export_screen._start()
@@ -420,41 +522,50 @@ def test_export_screen_calling_start_twice_only_creates_one_job(tmp_path: Path) 
             job_count = len(app.jobs)
 
             export_screen.query_one("#export-start", Button).press()  # cancel, so teardown doesn't race it
-            for _ in range(50):
-                await pilot.pause(0.02)
-                if not app.jobs:
-                    break
+            await wait_until(
+                pilot, lambda: not app.jobs, timeout=sdk_timeout, interval=0.02, message="job never finished"
+            )
             return job_count
 
     assert asyncio.run(scenario()) == 1
 
 
-def test_export_screen_empty_destination_warns_and_does_not_start() -> None:
+def test_export_screen_empty_destination_warns_and_does_not_start(open_export_screen: _OpenExportScreen) -> None:
+    """The warning now fires via ``app.notify()``, not ``screen.notify()``
+    — ``StartExport``'s own validation moved into ``core/app/update.py``
+    (pure, testable there directly), returning a ``Notify`` command
+    ``AppEffects.perform`` carries out on the App itself. ``Widget.notify``
+    (which ``Screen`` inherits) is documented as delegating straight to
+    ``self.app.notify()`` regardless, so this is an internal plumbing
+    change only — not a user-visible one."""
+
     async def scenario() -> tuple[list[str], bool]:
         content = _RecordingArtifactSource()
         unit = RestorableUnit(
             ref=NodeRef("repo", ("item",)), name="item.bin", is_leaf=True, size=content.size, content=content
         )
-        async with _open_export_screen(unit) as (app, pilot, export_screen):
+        async with open_export_screen(unit) as (app, pilot, export_screen):
             warnings: list[str] = []
-            export_screen.notify = lambda message, **kwargs: warnings.append(message)  # type: ignore[method-assign]
+            app.notify = lambda message, **kwargs: warnings.append(message)  # type: ignore[method-assign]
             export_screen.query_one("#export-dst", Input).value = ""
             export_screen.query_one("#export-start", Button).press()
             await pilot.pause()
-            return warnings, export_screen._job is None
+            return warnings, export_screen._job_id is None
 
     warnings, no_job = asyncio.run(scenario())
     assert warnings == [EXPORT_NO_DESTINATION_WARNING]
     assert no_job
 
 
-def test_export_screen_background_action(tmp_path: Path) -> None:
+def test_export_screen_background_action(
+    tmp_path: Path, wait_until: Any, sdk_timeout: float, open_export_screen: _OpenExportScreen
+) -> None:
     async def scenario() -> tuple[list[str], list[str], bool]:
         content = _BlockingContentSource()
         unit = RestorableUnit(
             ref=NodeRef("repo", ("item",)), name="item.bin", is_leaf=True, size=content.size, content=content
         )
-        async with _open_export_screen(unit) as (app, pilot, export_screen):
+        async with open_export_screen(unit) as (app, pilot, export_screen):
             warnings: list[str] = []
             export_screen.notify = lambda message, **kwargs: warnings.append(message)  # type: ignore[method-assign]
             export_screen.action_background()  # nothing running yet
@@ -469,15 +580,19 @@ def test_export_screen_background_action(tmp_path: Path) -> None:
             await pilot.pause()
             screens_after = [type(s).__name__ for s in app.screen_stack]
 
-            # Cancel the still-running backgrounded job before the scenario
-            # returns — see test_export_screen_uses_the_apps_default_sparse_setting's
-            # own comment for why.
-            job = next(iter(app.jobs.values()))
-            job.cancel()
-            for _ in range(50):
-                await pilot.pause(0.02)
-                if not app.jobs:
-                    break
+            # Cancel the still-running backgrounded job before the
+            # scenario returns -- otherwise run_test()'s own teardown
+            # cancels it itself, racing the App's own widget teardown and
+            # occasionally raising NoMatches during export-finish
+            # handling. Dispatched through the store, not job.cancel() --
+            # Job is a frozen value with nothing to call -- matching how
+            # WorklistScreen's own action_cancel_selected and
+            # ExportScreen._cancel_job both request it now.
+            job_id = next(iter(app.jobs))
+            app.store.dispatch(CancelJobRequested(job_id=job_id))
+            await wait_until(
+                pilot, lambda: not app.jobs, timeout=sdk_timeout, interval=0.02, message="job never finished"
+            )
 
             return idle_warnings, warnings, "ExportScreen" not in screens_after
 
@@ -487,13 +602,15 @@ def test_export_screen_background_action(tmp_path: Path) -> None:
     assert popped
 
 
-def test_export_screen_escape_pops_when_idle_and_cancels_when_running(tmp_path: Path) -> None:
+def test_export_screen_escape_pops_when_idle_and_cancels_when_running(
+    tmp_path: Path, wait_until: Any, ui_timeout: float, sdk_timeout: float, open_export_screen: _OpenExportScreen
+) -> None:
     async def scenario() -> tuple[bool, bool]:
         content = _BlockingContentSource()
         unit = RestorableUnit(
             ref=NodeRef("repo", ("item",)), name="item.bin", is_leaf=True, size=content.size, content=content
         )
-        async with _open_export_screen(unit) as (app, pilot, export_screen):
+        async with open_export_screen(unit) as (app, pilot, export_screen):
             # Idle: Esc pops the screen (action_cancel_or_back's else branch).
             await pilot.press("escape")
             await pilot.pause()
@@ -501,23 +618,30 @@ def test_export_screen_escape_pops_when_idle_and_cancels_when_running(tmp_path: 
 
             # Running: Esc cancels instead of popping.
             app.push_screen(ExportScreen(unit))
-            await pilot.pause(0.2)
+            await wait_until(
+                pilot,
+                lambda: isinstance(app.screen, ExportScreen),
+                timeout=ui_timeout,
+                interval=0.02,
+                message="ExportScreen never became the active screen",
+            )
             assert isinstance(app.screen, ExportScreen), app.screen
             export_screen = app.screen
             export_screen.query_one("#export-dst", Input).value = str(tmp_path / "out2.bin")
             export_screen.query_one("#export-start", Button).press()
             await pilot.pause()
             await pilot.press("escape")
-            status = ""
-            for _ in range(50):
-                await pilot.pause(0.02)
-                status = str(export_screen.query_one("#export-status").render())
-                if "cancel" in status.lower():
-                    break
-            for _ in range(50):
-                await pilot.pause(0.02)
-                if not app.jobs:
-                    break
+            await wait_until(
+                pilot,
+                lambda: "cancel" in str(export_screen.query_one("#export-status").render()).lower(),
+                timeout=sdk_timeout,
+                interval=0.02,
+                message="export never reported cancelled",
+            )
+            status = str(export_screen.query_one("#export-status").render())
+            await wait_until(
+                pilot, lambda: not app.jobs, timeout=sdk_timeout, interval=0.02, message="job never finished"
+            )
 
             return popped_while_idle, "cancel" in status.lower()
 
@@ -526,31 +650,284 @@ def test_export_screen_escape_pops_when_idle_and_cancels_when_running(tmp_path: 
     assert cancelled_while_running
 
 
-def test_export_screen_touch_ui_skips_once_detached_or_on_stale_widgets(tmp_path: Path) -> None:
-    async def scenario() -> tuple[bool, bool]:
-        content = _RecordingArtifactSource()
+def test_export_screen_cancelling_a_queued_export_shows_cancelled_not_cancelling(
+    tmp_path: Path, wait_until: Any, ui_timeout: float, sdk_timeout: float, open_export_screen: _OpenExportScreen
+) -> None:
+    """``_cancel_job`` dispatches ``CancelJobRequested`` then
+    unconditionally used to write "cancelling..." afterward -- but for a
+    still-``QUEUED`` job (this one, blocked behind unit_a's own running
+    export), that dispatch removes the job and renders its real terminal
+    status *synchronously*, before ``_cancel_job``'s own next line would
+    otherwise clobber it back to a stuck, wrong "cancelling..." with
+    nothing left to ever correct it."""
+
+    async def scenario() -> str:
+        content_a = _BlockingContentSource()
+        unit_a = RestorableUnit(
+            ref=NodeRef("repo", ("a",)), name="a.bin", is_leaf=True, size=content_a.size, content=content_a
+        )
+        content_b = _RecordingArtifactSource()
+        unit_b = RestorableUnit(
+            ref=NodeRef("repo", ("b",)), name="b.bin", is_leaf=True, size=content_b.size, content=content_b
+        )
+        async with open_export_screen(unit_a) as (app, pilot, export_screen_a):
+            export_screen_a.query_one("#export-dst", Input).value = str(tmp_path / "a_out.bin")
+            export_screen_a.query_one("#export-start", Button).press()
+            await pilot.pause()
+
+            app.push_screen(ExportScreen(unit_b))
+            await wait_until(
+                pilot,
+                lambda: isinstance(app.screen, ExportScreen),
+                timeout=ui_timeout,
+                interval=0.02,
+                message="ExportScreen never became the active screen",
+            )
+            assert isinstance(app.screen, ExportScreen), app.screen
+            export_screen_b = app.screen
+            export_screen_b.query_one("#export-dst", Input).value = str(tmp_path / "b_out.bin")
+            export_screen_b.query_one("#export-start", Button).press()
+            await pilot.pause()
+            queued_status = str(export_screen_b.query_one("#export-status").render())
+
+            export_screen_b.query_one("#export-start", Button).press()  # cancel the queued job
+            await wait_until(
+                pilot,
+                lambda: bool(str(export_screen_b.query_one("#export-status").render())),
+                timeout=sdk_timeout,
+                interval=0.02,
+                message="cancelled status was never rendered",
+            )
+            status = str(export_screen_b.query_one("#export-status").render())
+
+            # Cleanup: cancel unit_a's still-running export too, so
+            # run_test()'s own teardown doesn't race it.
+            app.store.dispatch(CancelJobRequested(job_id=next(iter(app.jobs))))
+            await wait_until(
+                pilot, lambda: not app.jobs, timeout=sdk_timeout, interval=0.02, message="job never finished"
+            )
+
+            assert "queued" in queued_status.lower(), queued_status
+            return status
+
+    status = asyncio.run(scenario())
+    assert "cancelled" in status.lower(), status
+    assert "cancelling" not in status.lower(), status
+
+
+def test_export_screen_clears_stale_rate_text_when_the_next_job_is_queued(
+    open_export_screen: _OpenExportScreen,
+) -> None:
+    """``_render_progress`` (the only place that ever writes
+    ``#export-rate``) must still run for a ``QUEUED`` job -- its own
+    ``rate_text``/``eta_text``/``elapsed_text`` are all ``""``, which is
+    exactly what clears a previous, already-finished export's leftover
+    rate/ETA/elapsed line from the same screen instance. Skipping that
+    call for QUEUED (rendering only the "queued" status text instead)
+    would leave the stale line showing right next to it."""
+
+    async def scenario() -> str:
+        unit = RestorableUnit(ref=NodeRef("repo", ("item",)), name="item.bin", is_leaf=True, size=100)
+        async with open_export_screen(unit) as (app, pilot, export_screen):
+            # Simulates what a finished, rate-reporting export would have
+            # left behind -- _render_job's FinishedJob branch never
+            # touches #export-rate itself, matching the real behavior.
+            export_screen.query_one("#export-rate", Static).update("187 MiB/s · ETA 00:08 · elapsed 00:42")
+
+            queued_job = Job(id=JobId(1), label="export item.bin", group="job-1", status=JobStatus.QUEUED)
+            export_screen._render_job(queued_job)
+            await pilot.pause()
+
+            return str(export_screen.query_one("#export-rate").render())
+
+    assert asyncio.run(scenario()) == ""
+
+
+def test_export_screen_status_text_flips_from_queued_to_exporting_on_promotion(
+    open_export_screen: _OpenExportScreen,
+) -> None:
+    """A ``QUEUED`` job promoted to ``RUNNING`` reaches this screen only
+    via the store's own subscription re-firing ``_render_job`` (this
+    screen never calls ``_start()`` again for that transition) --
+    ``_render_job`` itself must be what rewrites ``#export-status`` on
+    every render, not a one-time write ``_start()`` makes when the job
+    is first minted, or the stale "queued..." text would never clear
+    once the export is actually running underneath it."""
+
+    async def scenario() -> tuple[str, str]:
+        unit = RestorableUnit(ref=NodeRef("repo", ("item",)), name="item.bin", is_leaf=True, size=100)
+        async with open_export_screen(unit) as (app, pilot, export_screen):
+            queued_job = Job(id=JobId(1), label="export item.bin", group="job-1", status=JobStatus.QUEUED)
+            export_screen._render_job(queued_job)
+            queued_text = str(export_screen.query_one("#export-status").render())
+
+            running_job = Job(id=JobId(1), label="export item.bin", group="job-1", status=JobStatus.RUNNING)
+            export_screen._render_job(running_job)
+            await pilot.pause()
+            running_text = str(export_screen.query_one("#export-status").render())
+
+            return queued_text, running_text
+
+    queued_text, running_text = asyncio.run(scenario())
+    assert "queued" in queued_text.lower(), queued_text
+    assert "exporting" in running_text.lower(), running_text
+    assert "queued" not in running_text.lower(), running_text
+
+
+def test_export_screen_progress_bar_treats_a_genuinely_zero_total_as_complete(
+    open_export_screen: _OpenExportScreen,
+) -> None:
+    """``job.total`` (not ``job.total or None``) is passed straight
+    through to ``ProgressBar.update`` -- a genuinely known total of 0
+    (an empty unit) must render as complete, the same special case
+    ``Job.percent`` already carves out, not fall back to an
+    indeterminate spinner because ``0`` is falsy."""
+
+    async def scenario() -> tuple[float | None, float | None]:
+        unit = RestorableUnit(ref=NodeRef("repo", ("item",)), name="empty.bin", is_leaf=True, size=0)
+        async with open_export_screen(unit) as (app, pilot, export_screen):
+            job = Job(id=JobId(1), label="export empty.bin", group="job-1", done=0, total=0)
+            export_screen._render_job(job)
+            await pilot.pause()
+            bar = export_screen.query_one("#export-progress", ProgressBar)
+            return bar.total, bar.percentage
+
+    total, percentage = asyncio.run(scenario())
+    assert total == 0
+    assert percentage == 1.0
+
+
+def test_export_screen_common_bindings_are_reachable_while_running(
+    tmp_path: Path, wait_until: Any, sdk_timeout: float, open_export_screen: _OpenExportScreen
+) -> None:
+    """``ExportScreen`` keeps ``COMMON_BINDINGS`` (``q``/``d``/``?``) in
+    its own ``BINDINGS``, but that alone doesn't make them work on a
+    ``ModalScreen``: Textual's own action dispatch runs the method on
+    whichever node the key's own ``Binding`` was found on, never
+    bubbling further once the modal chain is truncated here -- so
+    ``action_toggle_verbose``/``action_show_help`` must exist directly
+    on this class too, delegating to the App's real implementation."""
+
+    async def scenario() -> tuple[bool, str]:
+        content = _BlockingContentSource()
         unit = RestorableUnit(
             ref=NodeRef("repo", ("item",)), name="item.bin", is_leaf=True, size=content.size, content=content
         )
-        async with _open_export_screen(unit) as (app, pilot, export_screen):
-            calls = 0
+        async with open_export_screen(unit) as (app, pilot, export_screen):
+            export_screen.query_one("#export-dst", Input).value = str(tmp_path / "out.bin")
+            export_screen.query_one("#export-start", Button).press()
+            await pilot.pause()  # _start() moves focus off the Input once running
 
-            def bump() -> None:
-                nonlocal calls
-                calls += 1
+            await pilot.press("d")
+            await pilot.pause()
+            verbose = app.verbose
 
-            # A stale widget id raises NoMatches — caught, flips _detached.
-            def _query_stale_widget() -> None:
-                export_screen.query_one("#does-not-exist", Input)
+            await pilot.press("question_mark")
+            await pilot.pause()
+            screen_name = type(app.screen).__name__
 
-            export_screen._touch_ui(_query_stale_widget)
-            became_detached = export_screen._detached
+            # Cleanup: cancel the still-running job so run_test()'s own
+            # teardown doesn't race it -- same reasoning every other
+            # _BlockingContentSource scenario in this file gives.
+            app.store.dispatch(CancelJobRequested(job_id=next(iter(app.jobs))))
+            await wait_until(
+                pilot, lambda: not app.jobs, timeout=sdk_timeout, interval=0.02, message="job never finished"
+            )
 
-            # Once _detached, the fast path skips fn() entirely.
-            export_screen._touch_ui(bump)
+            return verbose, screen_name
 
-            return became_detached, calls == 0
+    verbose, screen_name = asyncio.run(scenario())
+    assert verbose is True
+    assert screen_name == HelpScreen.__name__
 
-    became_detached, never_called = asyncio.run(scenario())
-    assert became_detached
-    assert never_called
+
+def test_export_screen_background_action_wording_for_a_queued_job(
+    tmp_path: Path, wait_until: Any, ui_timeout: float, sdk_timeout: float, open_export_screen: _OpenExportScreen
+) -> None:
+    """``action_background`` on a still-``QUEUED`` job (behind unit_a's
+    own running export) must not claim it's "continuing export in the
+    background" -- it hasn't started yet. Popping the screen is still
+    correct either way (the job already lives in the store regardless of
+    whether this screen stays open); only the notify wording must match
+    reality."""
+
+    async def scenario() -> str:
+        content_a = _BlockingContentSource()
+        unit_a = RestorableUnit(
+            ref=NodeRef("repo", ("a",)), name="a.bin", is_leaf=True, size=content_a.size, content=content_a
+        )
+        content_b = _RecordingArtifactSource()
+        unit_b = RestorableUnit(
+            ref=NodeRef("repo", ("b",)), name="b.bin", is_leaf=True, size=content_b.size, content=content_b
+        )
+        async with open_export_screen(unit_a) as (app, pilot, export_screen_a):
+            export_screen_a.query_one("#export-dst", Input).value = str(tmp_path / "a_out.bin")
+            export_screen_a.query_one("#export-start", Button).press()
+            await pilot.pause()
+
+            app.push_screen(ExportScreen(unit_b))
+            await wait_until(
+                pilot,
+                lambda: isinstance(app.screen, ExportScreen),
+                timeout=ui_timeout,
+                interval=0.02,
+                message="ExportScreen never became the active screen",
+            )
+            assert isinstance(app.screen, ExportScreen), app.screen
+            export_screen_b = app.screen
+            export_screen_b.query_one("#export-dst", Input).value = str(tmp_path / "b_out.bin")
+            export_screen_b.query_one("#export-start", Button).press()
+            await pilot.pause()
+
+            warnings: list[str] = []
+            export_screen_b.notify = lambda message, **kwargs: warnings.append(message)  # type: ignore[method-assign]
+            export_screen_b.action_background()
+            await pilot.pause()
+
+            # Cleanup: cancel unit_a's still-running export.
+            app.store.dispatch(CancelJobRequested(job_id=next(iter(app.jobs))))
+            await wait_until(
+                pilot, lambda: not app.jobs, timeout=sdk_timeout, interval=0.02, message="job never finished"
+            )
+
+            (message,) = warnings
+            return message
+
+    message = asyncio.run(scenario())
+    assert "continuing export in the background" not in message, message
+    assert "queued" in message.lower(), message
+
+
+def test_export_screen_does_not_rewrite_status_text_on_repeated_running_renders(
+    open_export_screen: _OpenExportScreen,
+) -> None:
+    """``#export-status`` must be rewritten only on an actual QUEUED<->
+    RUNNING transition, not on every render -- ``_render_job`` is the
+    store subscription callback and fires on every ``ExportProgressed``
+    tick (up to 10/s) for the whole duration of a running export, and
+    ``Static.update()`` always repaints regardless of whether the text
+    changed, which this app's own ``progress_hint.py`` already documents
+    as the dominant cost of driving it."""
+
+    async def scenario() -> list[object]:
+        unit = RestorableUnit(ref=NodeRef("repo", ("item",)), name="item.bin", is_leaf=True, size=100)
+        async with open_export_screen(unit) as (app, pilot, export_screen):
+            status = export_screen.query_one("#export-status", Static)
+            calls: list[object] = []
+            original_update = status.update
+
+            def _counting_update(content: object = "", **kwargs: object) -> None:
+                calls.append(content)
+                original_update(content, **kwargs)  # type: ignore[arg-type]
+
+            status.update = _counting_update  # type: ignore[method-assign]
+
+            running = Job(id=JobId(1), label="export item.bin", group="job-1", status=JobStatus.RUNNING, done=1)
+            export_screen._render_job(running)
+            running_tick = Job(id=JobId(1), label="export item.bin", group="job-1", status=JobStatus.RUNNING, done=2)
+            export_screen._render_job(running_tick)
+            await pilot.pause()
+            return calls
+
+    calls = asyncio.run(scenario())
+    assert calls == [EXPORT_RUNNING_STATUS_TEXT]  # written once, not once per render

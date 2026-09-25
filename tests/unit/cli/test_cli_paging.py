@@ -1,7 +1,7 @@
 """Unit tests for ``synology_apm_repo.cli.paging``. ``paged()``'s
 subprocess-invoking branch is deliberately never exercised here — a real
 ``less`` process reading real stdin isn't something a unit test should
-shell out to — see each test's own docstring for what it checks instead.
+shell out to.
 """
 
 from __future__ import annotations
@@ -12,7 +12,8 @@ from io import StringIO
 import pytest
 from rich.console import Console
 
-from synology_apm_repo.cli.paging import _SubprocessPager, paged, pager_argv
+from synology_apm_repo.cli.paging import _SubprocessPager, paged, pager_argv, render
+from synology_apm_repo.cli.state import CliState
 
 
 class TestPagerArgv:
@@ -60,6 +61,53 @@ class TestPaged:
         with paged(console):
             console.print("paged content")
         assert shown and "paged content" in shown[0]
+
+
+class TestRender:
+    """``render()`` is the shared ``--json``-or-human dispatch every
+    command's own final output goes through — ``paged()`` itself is
+    already fully covered above, so these only check ``render()``'s own
+    dispatch logic (which branch runs, and whether ``paged()`` gets
+    entered), not paging mechanics a second time."""
+
+    def test_json_mode_prints_the_json_payload_and_never_calls_human(self) -> None:
+        buffer = StringIO()
+        console = Console(file=buffer)
+        calls: list[None] = []
+        render(console, CliState(json=True), json={"a": 1}, human=lambda: calls.append(None))
+        assert calls == []
+        assert '"a": 1' in buffer.getvalue()
+
+    def test_human_mode_calls_human_and_never_prints_json(self) -> None:
+        buffer = StringIO()
+        console = Console(file=buffer)
+        render(console, CliState(json=False), json={"a": 1}, human=lambda: console.print("human output"))
+        assert "human output" in buffer.getvalue()
+        assert '"a"' not in buffer.getvalue()
+
+    def test_page_false_never_enters_a_pager_even_on_a_real_terminal(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        shown: list[str] = []
+        monkeypatch.setattr(_SubprocessPager, "show", lambda self, content: shown.append(content))
+        console = Console(file=StringIO(), force_terminal=True)
+        render(console, CliState(json=False), json=None, human=lambda: console.print("x"), page=False)
+        assert shown == []  # printed directly, not handed to a pager
+
+    def test_page_true_routes_human_output_through_paged(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        shown: list[str] = []
+        monkeypatch.setattr(_SubprocessPager, "show", lambda self, content: shown.append(content))
+        console = Console(file=StringIO(), force_terminal=True)
+        render(console, CliState(json=False), json=None, human=lambda: console.print("paged output"), page=True)
+        assert shown and "paged output" in shown[0]
+
+    def test_page_true_is_ignored_under_json(self) -> None:
+        # --json output is never paged, regardless of page=True -- the
+        # json branch returns before paging is even considered.
+        buffer = StringIO()
+        console = Console(file=buffer, force_terminal=True)
+        calls: list[None] = []
+        render(console, CliState(json=True), json=[1, 2, 3], human=lambda: calls.append(None), page=True)
+        assert calls == []
+        assert "[" in buffer.getvalue()
 
 
 class TestSubprocessPager:

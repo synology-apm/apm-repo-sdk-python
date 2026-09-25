@@ -73,13 +73,17 @@ _CONTACT_COLUMNS = [
     Column("last_name"),
     Column("meta_object_id"),
     Column("parent_folder_id", required=False),  # M365 only
+    Column("primary_email", required=False),
 ]
 
 
 def _display_name(row: _Row) -> str:
+    """A contact's full name, or ``""`` when neither ``first_name`` nor
+    ``last_name`` is set — never the raw ``contact_id`` (for GWS, a
+    People API resource name like ``people/c1074766279142650414``,
+    meaningless to a user)."""
     parts = [str(row["first_name"] or ""), str(row["last_name"] or "")]
-    name = " ".join(p for p in parts if p)
-    return name or str(row["contact_id"])
+    return " ".join(p for p in parts if p)
 
 
 async def _m365_contact_folder_names(provider: SaasWorkloadProvider) -> dict[str, str] | None:
@@ -120,7 +124,11 @@ async def _gws_contact_groups(provider: SaasWorkloadProvider) -> dict[str, list[
 
 
 def _contact_extra_attrs(provider: SaasWorkloadProvider, row: _Row) -> dict[str, object]:
-    return extras_attr(provider, "gws_contact_groups", row["contact_id"], "groups")
+    attrs = extras_attr(provider, "gws_contact_groups", row["contact_id"], "groups")
+    email = row.get("primary_email")
+    if email:
+        attrs["email"] = email
+    return attrs
 
 
 async def _build_tree(provider: SaasWorkloadProvider) -> SyntheticGroupedTree:
@@ -137,8 +145,8 @@ async def _build_tree(provider: SaasWorkloadProvider) -> SyntheticGroupedTree:
         columns=_CONTACT_COLUMNS,
         id_column="contact_id",
         # GWS Contact groups are a genuine M:N relationship (a contact
-        # can belong to more than one — see this module's own docstring),
-        # so there is no single-parent column to filter by: group_column=
+        # can belong to more than one), so there is no single-parent
+        # column to filter by: group_column=
         # None means every contact sits in the one synthetic
         # _ALL_CONTACTS_GROUP, queried without any WHERE at all.
         group_column="parent_folder_id" if is_m365 else None,
@@ -146,8 +154,8 @@ async def _build_tree(provider: SaasWorkloadProvider) -> SyntheticGroupedTree:
         root_name=_ALL_CONTACTS_GROUP,
         # M365's own Portal contact list is itself ``ORDER BY first_name``
         # (FORMAT-SPEC.md: m365-contact) — last_name/rowid are the tiebreakers
-        # (both required, always present; see tree_strategy.py's own
-        # _resolve_order_by()).
+        # (both required, always present; tree_strategy/_base.py's
+        # _resolve_order_by() supplies rowid as the final tiebreaker).
         order_by=["first_name", "last_name"],
         group_display_name=group_display_name_resolver(folder_names),
     )
@@ -163,7 +171,12 @@ async def _assemble(provider: SaasWorkloadProvider, row: _Row, key: _Key) -> Res
         meta_bytes = await read_object(provider.object_db(_CONTACT_TABLE), provider.dedup_file, meta_object_id)
         return build_contact_csv(meta_bytes) if is_m365 else meta_bytes
 
-    name = _display_name(row)
+    # The exported file's own name, unlike the browsed/displayed Full
+    # Name, still needs *some* non-empty text — falls back to
+    # ``contact_id`` here only, not in ``_display_name`` itself, so an
+    # unnamed contact's Full Name column stays genuinely blank while its
+    # exported file still gets a real name.
+    name = _display_name(row) or str(row["contact_id"])
     suffix = "csv" if is_m365 else "json"
     return RestorableUnit(
         ref=provider.ref_for(key),
@@ -174,8 +187,10 @@ async def _assemble(provider: SaasWorkloadProvider, row: _Row, key: _Key) -> Res
     )
 
 
-#: ``SaasWorkloadConfig`` behind ``ContactProvider`` — see this module's
-#: own docstring for the M365/GWS split.
+#: ``SaasWorkloadConfig`` behind ``ContactProvider`` — M365 contacts have
+#: a real, single-parent folder hierarchy (``parent_folder_id``); GWS
+#: contacts instead belong to zero or more groups, an M:N relationship
+#: with no folder column at all.
 CONTACT_CONFIG = SaasWorkloadConfig(
     root_name=_ALL_CONTACTS_GROUP,
     leaf_kind=UnitKind.CONTACT,
@@ -193,7 +208,9 @@ CONTACT_CONFIG = SaasWorkloadConfig(
 )
 
 
-#: Constructor-style factory over ``CONTACT_CONFIG`` — see
-#: ``make_saas_provider``'s own docstring for what "constructor-style
-#: factory" and ``shared`` mean.
+#: Constructor-style factory over ``CONTACT_CONFIG`` — callable exactly
+#: like a constructor (``await ContactProvider(repo, version, saas_streams)``), with
+#: an optional ``shared`` context passed straight through to
+#: ``SaasWorkloadProvider.create`` for M365's multi-candidate
+#: ``USER_EXCHANGE``/``GROUP_EXCHANGE`` dispatch.
 ContactProvider = make_saas_provider(CONTACT_CONFIG, name="ContactProvider")

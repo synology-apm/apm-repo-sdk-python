@@ -1,7 +1,7 @@
 """Regression test for ``synology-apm-repo-cli --trace`` — replayed from a committed
 fixture recorded against real bytes, with **no external dependency**:
-same ``patch_profile_store`` fixture (``tests/conftest.py``) every
-sibling in this directory uses.
+same ``patch_profile_store`` fixture (``tests/integration/cli/conftest.py``)
+every sibling in this directory uses.
 
 Fixture: ``cli_trace_apv1_vault.json.gz``, this file's own dedicated
 recording against ``apv-sample-1/@ActiveProtectVault`` — every test here
@@ -18,7 +18,7 @@ from types import ModuleType
 import pytest
 from typer.testing import CliRunner
 
-import synology_apm_repo.cli.browse as browse_mod
+import synology_apm_repo.cli.repo_session as repo_session_mod
 from synology_apm_repo.cli.main import app
 
 runner = CliRunner()
@@ -26,7 +26,7 @@ runner = CliRunner()
 
 @pytest.fixture(autouse=True)
 def _replay(patch_profile_store: Callable[[str, ModuleType], None]) -> None:
-    patch_profile_store("cli_trace_apv1_vault.json.gz", browse_mod)
+    patch_profile_store("cli_trace_apv1_vault.json.gz", repo_session_mod)
 
 
 def test_trace_json_lines_on_stderr_describe_real_object_store_calls_replayed() -> None:

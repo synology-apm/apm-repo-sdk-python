@@ -7,6 +7,7 @@ bare catalog/workload REF or a REF naming a single leaf directly."""
 
 from __future__ import annotations
 
+import asyncio
 import json
 from typing import Any, cast
 
@@ -38,17 +39,18 @@ from synology_apm_repo.sdk.identifiers import (
     WorkloadUid,
 )
 from synology_apm_repo.sdk.storage.layout import RepoKind, RepoLayout
-from synology_apm_repo.sdk.units.base import Node
+from synology_apm_repo.sdk.units.base import FileState, Node, UnitKind, diagnostic_node
 from synology_apm_repo.sdk.units.node_ref import NodeRef
+from synology_apm_repo.sdk.units.saas.stream import SaasStreamCache
 
 runner = CliRunner()
 
 
-def _make_connection(ccid: int = 1) -> Connection:
+def _make_connection(ccid: int = 1, *, display_name: str = "Source") -> Connection:
     return Connection(
         connection_config_id=ConnectionConfigId(ccid),
         connection_id=ConnectionId("cc"),
-        display_name="Source",
+        display_name=display_name,
         namespaces=(),
         workload_count=1,
         version_count=1,
@@ -104,8 +106,13 @@ class _FakeCatalog(Catalog):
         workloads: list[Workload] | None = None,
         versions: list[Version] | None = None,
     ) -> None:
+        dedup_repo = cast(DedupRepo, _FakeDedupRepo())
         super().__init__(
-            cast(DedupRepo, _FakeDedupRepo()), connection, track=lambda p: p, require_key_verified=lambda: None
+            dedup_repo,
+            connection,
+            saas_streams=SaasStreamCache(dedup_repo),
+            track=lambda p: p,
+            require_key_verified=lambda: None,
         )
         self._fake_workloads = workloads or []
         self._fake_versions = versions or []
@@ -159,10 +166,7 @@ async def test_workload_entries_disambiguates_colliding_display_names_by_sub_typ
     rows can share one real display name (a GWS/M365 account name/email
     reused across its MAIL/CALENDAR/CONTACT/DRIVE personas), so
     ``workload_pairs``'s own ``type_hint`` (``sub_type`` here) resolves the
-    collision instead of falling back straight to a hash suffix — this is
-    the one production code path (`disambiguate(pairs, hints=hints)` in
-    ``_workload_entries``) that only ``tests/integration/cli/
-    test_cli_tree.py``'s real-fixture replay exercised before this."""
+    collision instead of falling back straight to a hash suffix."""
     workloads = [
         _make_workload(1, display_name="Alice", sub_type="MAIL"),
         _make_workload(2, display_name="Alice", sub_type="CALENDAR"),
@@ -173,6 +177,54 @@ async def test_workload_entries_disambiguates_colliding_display_names_by_sub_typ
     entries = await _workload_entries(catalog, with_versions=False)
     names = {e.name for e in entries}
     assert names == {"Alice · MAIL", "Alice · CALENDAR", "Alice · CONTACT", "Alice · DRIVE"}
+
+
+class _EventGatedVersionsCatalog(Catalog):
+    """A real ``Catalog`` whose ``versions()`` only resolves once every
+    sibling workload's own call has started -- proves
+    ``_workload_entries``' per-workload ``_version_entries`` calls run
+    concurrently, not one at a time (a serial ``for`` loop would deadlock
+    here instead, the same way ``test_cli_doctor_report.py``'s
+    ``_EventGatedCatalog`` proves it for ``doctor``'s own gather)."""
+
+    def __init__(
+        self, connection: Connection, *, workloads: list[Workload], started: list[str], release: asyncio.Event
+    ) -> None:
+        dedup_repo = cast(DedupRepo, _FakeDedupRepo())
+        super().__init__(
+            dedup_repo,
+            connection,
+            saas_streams=SaasStreamCache(dedup_repo),
+            track=lambda p: p,
+            require_key_verified=lambda: None,
+        )
+        self._fake_workloads = workloads
+        self._started = started
+        self._release = release
+
+    async def workloads(self) -> list[Workload]:
+        return self._fake_workloads
+
+    async def versions(self, workload: Workload, *, include_deleted: bool = False) -> list[Version]:
+        self._started.append(workload.display_name)
+        if len(self._started) >= len(self._fake_workloads):
+            self._release.set()
+        else:
+            await self._release.wait()
+        return []
+
+
+async def test_workload_entries_awaits_version_entries_concurrently_not_serially() -> None:
+    started: list[str] = []
+    workloads = [_make_workload(1, display_name="wl-a"), _make_workload(2, display_name="wl-b")]
+    catalog = _EventGatedVersionsCatalog(
+        _make_connection(), workloads=workloads, started=started, release=asyncio.Event()
+    )
+    entries = await _workload_entries(catalog, with_versions=True)
+    assert set(started) == {"wl-a", "wl-b"}
+    # Order matches named_workloads()'s own order regardless of which
+    # sibling's versions() actually resolved first.
+    assert [e.name for e in entries] == ["wl-a", "wl-b"]
 
 
 # -- _catalog_tree ----------------------------------------------------------
@@ -211,10 +263,11 @@ async def test_catalog_tree_at_catalog_level_depth_two_lists_workloads_with_vers
 
 
 async def test_catalog_tree_rejects_a_frame_level_it_does_not_handle() -> None:
-    # "root"/"node" frames are handled by tree()'s own dispatch before
-    # _catalog_tree is ever called (see its own docstring) -- this pins
-    # down the defensive assertion for that invariant, not a real
-    # reachable-in-production path.
+    # "root"/"node" frames are handled by _result_for_frame()'s own
+    # match statement (its "root"/"node" cases return directly) before
+    # falling through to its catch-all case, which is the only one that
+    # calls _catalog_tree -- this pins down the defensive assertion for
+    # that invariant, not a real reachable-in-production path.
     with pytest.raises(AssertionError, match="unexpected frame.level"):
         await _catalog_tree(Frame(level="root"), depth=0)
 
@@ -274,6 +327,52 @@ async def test_root_catalog_entries_depth_one_lists_workloads_without_versions()
     assert entries[0].children[0].children == []  # depth 1 at root: workloads, no versions yet
 
 
+class _EventGatedWorkloadsCatalog(Catalog):
+    """A real ``Catalog`` whose ``workloads()`` only resolves once every
+    sibling catalog's own call has started -- proves
+    ``_root_catalog_entries``' per-catalog ``_workload_entries`` calls run
+    concurrently (same technique as
+    ``_EventGatedVersionsCatalog`` above, one level up)."""
+
+    def __init__(self, connection: Connection, *, started: list[str], total: int, release: asyncio.Event) -> None:
+        dedup_repo = cast(DedupRepo, _FakeDedupRepo())
+        super().__init__(
+            dedup_repo,
+            connection,
+            saas_streams=SaasStreamCache(dedup_repo),
+            track=lambda p: p,
+            require_key_verified=lambda: None,
+        )
+        self._started = started
+        self._total = total
+        self._release = release
+
+    async def workloads(self) -> list[Workload]:
+        self._started.append(self.connection.display_name)
+        if len(self._started) >= self._total:
+            self._release.set()
+        else:
+            await self._release.wait()
+        return []
+
+
+async def test_root_catalog_entries_awaits_workload_entries_concurrently_not_serially() -> None:
+    started: list[str] = []
+    release = asyncio.Event()
+    catalogs = [
+        _EventGatedWorkloadsCatalog(
+            _make_connection(1, display_name="cat-a"), started=started, total=2, release=release
+        ),
+        _EventGatedWorkloadsCatalog(
+            _make_connection(2, display_name="cat-b"), started=started, total=2, release=release
+        ),
+    ]
+    repo = _FakeRepo(catalogs=cast(list[Catalog], catalogs))
+    entries = await _root_catalog_entries(cast(Any, repo), depth=1)
+    assert set(started) == {"cat-a", "cat-b"}
+    assert [e.name for e in entries] == ["cat-a", "cat-b"]
+
+
 # -- tree command: leaf-ref branch (frame.level == "node", is_leaf) ------
 
 
@@ -292,6 +391,57 @@ def test_tree_command_on_a_single_leaf_ref_prints_just_that_item(monkeypatch: py
     assert "item.bin" in result.output
     # A leaf entry has no children — nothing recursed into via _node_entry.
     assert result.output.count("\n") == 1
+
+
+def test_tree_command_on_a_single_leaf_ref_shows_the_cloud_file_icon(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Regression test: this branch (``frame.node.is_leaf`` — a REF naming
+    one leaf directly, no ``_node_entry`` recursion at all) builds its own
+    ``TreeEntry`` by hand rather than going through ``_node_entry``, so it
+    must read ``Node.attrs["file_state"]`` itself too, the same way
+    ``_node_entry`` already does — this is the one path that missed it."""
+    leaf = Node(
+        ref=NodeRef("repo", ("item",)),
+        name="item.bin",
+        is_leaf=True,
+        size=42,
+        attrs={"file_state": FileState.CLOUD_ONLY},
+    )
+    frame = Frame(level="node", node=leaf, provider=None)
+
+    async def fake_walk_ref(repo: object, node_ref: object, *, object_db_id: object = None) -> Frame:
+        return frame
+
+    monkeypatch.setattr(tree_module, "opened_repo", lambda *a, **k: _FakeRepoCtx(object()))
+    monkeypatch.setattr(tree_module, "walk_ref", fake_walk_ref)
+
+    result = runner.invoke(app, ["tree", "/some/path#item"])
+    assert result.exit_code == 0, result.output
+    assert "item.bin ☁" in result.output
+
+    json_result = runner.invoke(app, ["--json", "tree", "/some/path#item"])
+    assert json_result.exit_code == 0, json_result.output
+    assert json.loads(json_result.output)["file_state"] == "cloud_only"
+
+
+def test_tree_command_on_a_single_leaf_ref_shows_the_diagnostic_marker(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Same regression-branch reasoning as the cloud-icon test above, for
+    ``diagnostic_node()``'s own placeholder attrs."""
+    leaf = diagnostic_node(NodeRef("repo", ("item",)), "(no filesystem recognized on this disk)", {"diagnostic": "x"})
+    frame = Frame(level="node", node=leaf, provider=None)
+
+    async def fake_walk_ref(repo: object, node_ref: object, *, object_db_id: object = None) -> Frame:
+        return frame
+
+    monkeypatch.setattr(tree_module, "opened_repo", lambda *a, **k: _FakeRepoCtx(object()))
+    monkeypatch.setattr(tree_module, "walk_ref", fake_walk_ref)
+
+    result = runner.invoke(app, ["tree", "/some/path#item"])
+    assert result.exit_code == 0, result.output
+    assert "(no filesystem recognized on this disk) ⚠" in result.output
+
+    json_result = runner.invoke(app, ["--json", "tree", "/some/path#item"])
+    assert json_result.exit_code == 0, json_result.output
+    assert json.loads(json_result.output)["diagnostic"] is True
 
 
 # -- tree command: bare-root rendering (no synthetic "/" wrapper) -----------
@@ -371,6 +521,98 @@ def test_tree_command_on_a_version_ref_at_provider_root_peels_the_synthetic_head
     assert result.exit_code == 0, result.output
     assert "disk0.img" in result.output
     assert "Devices" not in result.output
+
+
+# -- tree command: cloud-sync/EFS hint (Node.attrs["file_state"]) -----------
+
+
+def test_tree_command_shows_the_cloud_file_icon_in_human_and_json_output(monkeypatch: pytest.MonkeyPatch) -> None:
+    root_node = Node(ref=NodeRef("repo", ("ver",)), name="root", is_leaf=False)
+    normal_child = Node(ref=NodeRef("repo", ("ver", "normal.txt")), name="normal.txt", is_leaf=True, size=1)
+    cloud_child = Node(
+        ref=NodeRef("repo", ("ver", "cloud.txt")),
+        name="cloud.txt",
+        is_leaf=True,
+        size=1,
+        attrs={"file_state": FileState.CLOUD_ONLY},
+    )
+    provider = _FakeRootProvider(root_node, [normal_child, cloud_child])
+    frame = Frame(level="node", node=root_node, provider=cast(Any, provider))
+
+    async def fake_walk_ref(repo: object, node_ref: object, *, object_db_id: object = None) -> Frame:
+        return frame
+
+    monkeypatch.setattr(tree_module, "opened_repo", lambda *a, **k: _FakeRepoCtx(object()))
+    monkeypatch.setattr(tree_module, "walk_ref", fake_walk_ref)
+
+    result = runner.invoke(app, ["tree", "/some/path#ver"])
+    assert result.exit_code == 0, result.output
+    assert "normal.txt\n" in result.output  # no hint suffix on this line
+    assert "cloud.txt ☁" in result.output
+
+    json_result = runner.invoke(app, ["--json", "tree", "/some/path#ver"])
+    assert json_result.exit_code == 0, json_result.output
+    data = json.loads(json_result.output)
+    # frame.node is the provider's own root (test_tree_command_on_a_version_ref_at_provider_root_peels_the_synthetic_heading's
+    # own scenario, above) -- its children print as a bare list, not wrapped in a single root entry.
+    entries_by_name = {e["name"]: e for e in data}
+    assert "file_state" not in entries_by_name["normal.txt"]
+    assert entries_by_name["cloud.txt"]["file_state"] == "cloud_only"
+
+
+def test_tree_command_shows_the_diagnostic_marker_in_human_and_json_output(monkeypatch: pytest.MonkeyPatch) -> None:
+    root_node = Node(ref=NodeRef("repo", ("ver",)), name="root", is_leaf=False)
+    normal_child = Node(ref=NodeRef("repo", ("ver", "normal.txt")), name="normal.txt", is_leaf=True, size=1)
+    diagnostic_child = diagnostic_node(
+        NodeRef("repo", ("ver", "(missing)")), "(1 registered object(s) not found in current data)", {"diagnostic": "x"}
+    )
+    provider = _FakeRootProvider(root_node, [normal_child, diagnostic_child])
+    frame = Frame(level="node", node=root_node, provider=cast(Any, provider))
+
+    async def fake_walk_ref(repo: object, node_ref: object, *, object_db_id: object = None) -> Frame:
+        return frame
+
+    monkeypatch.setattr(tree_module, "opened_repo", lambda *a, **k: _FakeRepoCtx(object()))
+    monkeypatch.setattr(tree_module, "walk_ref", fake_walk_ref)
+
+    result = runner.invoke(app, ["tree", "/some/path#ver"])
+    assert result.exit_code == 0, result.output
+    assert "normal.txt\n" in result.output  # no diagnostic marker on this line
+    assert "(1 registered object(s) not found in current data) ⚠" in result.output
+
+    json_result = runner.invoke(app, ["--json", "tree", "/some/path#ver"])
+    assert json_result.exit_code == 0, json_result.output
+    data = json.loads(json_result.output)
+    entries_by_name = {e["name"]: e for e in data}
+    assert "diagnostic" not in entries_by_name["normal.txt"]
+    assert entries_by_name["(1 registered object(s) not found in current data)"]["diagnostic"] is True
+
+
+# -- tree command: unit-kind parity with `ls --json` ------------------------
+
+
+def test_tree_command_json_reports_kind_matching_ls(monkeypatch: pytest.MonkeyPatch) -> None:
+    """``tree --json``'s per-node ``kind`` field must match ``ls --json``'s
+    for the same node -- both derive it from the shared
+    ``units.base.node_kind_label``."""
+    root_node = Node(ref=NodeRef("repo", ("ver",)), name="root", is_leaf=False)
+    mail = Node(ref=NodeRef("repo", ("ver", "msg")), name="msg", is_leaf=True, kind=UnitKind.MAIL)
+    folder = Node(ref=NodeRef("repo", ("ver", "sub")), name="sub", is_leaf=False)
+    provider = _FakeRootProvider(root_node, [mail, folder])
+    frame = Frame(level="node", node=root_node, provider=cast(Any, provider))
+
+    async def fake_walk_ref(repo: object, node_ref: object, *, object_db_id: object = None) -> Frame:
+        return frame
+
+    monkeypatch.setattr(tree_module, "opened_repo", lambda *a, **k: _FakeRepoCtx(object()))
+    monkeypatch.setattr(tree_module, "walk_ref", fake_walk_ref)
+
+    json_result = runner.invoke(app, ["--json", "tree", "/some/path#ver", "--depth", "0"])
+    assert json_result.exit_code == 0, json_result.output
+    data = json.loads(json_result.output)
+    entries_by_name = {e["name"]: e for e in data}
+    assert entries_by_name["msg"]["kind"] == "mail"
+    assert entries_by_name["sub"]["kind"] == "folder"
 
 
 __all__: list[str] = []

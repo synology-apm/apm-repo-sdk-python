@@ -44,7 +44,7 @@ from synology_apm_repo.sdk.dedup.keys import KeyMaterial
 from synology_apm_repo.sdk.dedup.repository import DedupRepo
 from synology_apm_repo.sdk.storage.base import ObjectStore
 from synology_apm_repo.sdk.storage.layout import detect_layout
-from synology_apm_repo.sdk.units.base import UnitKind
+from synology_apm_repo.sdk.units.base import UnitKind, node_modified_time
 from synology_apm_repo.sdk.units.content.disk_fs import DiskFilesystem
 from synology_apm_repo.sdk.units.device import DeviceProvider
 
@@ -134,9 +134,14 @@ async def test_replayed_vm_disk_filesystem_sibling_lists_real_ntfs_and_fat32(
             windows_dir = next(e for e in entries if e.name == "Windows")
             assert windows_dir.is_leaf is False
             assert windows_dir.kind is UnitKind.DISK_FILESYSTEM
+            # A real, non-degraded mtime for a directory node, reaching all
+            # the way out to the public Node.attrs["mtime"] the TUI's
+            # "Modified" column reads.
+            assert node_modified_time(windows_dir) is not None
 
             windows_entries = await provider.children(windows_dir)
             win_ini = next(e for e in windows_entries if e.name == "win.ini")
+            assert node_modified_time(win_ini) is not None
             content = (await provider.unit(win_ini)).open()
             data = await content.read(0, content.size)
             assert data == (
@@ -228,13 +233,17 @@ async def test_replayed_ntfs_iterdir_reads_the_file_name_index_attribute_not_a_f
             )
 
             assert len(entries) == 4445
-            by_name = {name: (is_dir, size) for name, is_dir, size in entries}
-            assert by_name["drivers"] == (True, None)
-            assert by_name["config"] == (True, None)
-            assert by_name["notepad.exe"] == (False, 211968)
-            assert by_name["calc.exe"] == (False, 27648)
-            assert by_name["win32k.sys"] == (False, 596992)
-            assert by_name["kernel32.dll"] == (False, 770144)
+            by_name = {e.name: e for e in entries}
+            assert (by_name["drivers"].is_dir, by_name["drivers"].size) == (True, None)
+            assert (by_name["config"].is_dir, by_name["config"].size) == (True, None)
+            assert (by_name["notepad.exe"].is_dir, by_name["notepad.exe"].size) == (False, 211968)
+            assert (by_name["calc.exe"].is_dir, by_name["calc.exe"].size) == (False, 27648)
+            assert (by_name["win32k.sys"].is_dir, by_name["win32k.sys"].size) == (False, 596992)
+            assert (by_name["kernel32.dll"].is_dir, by_name["kernel32.dll"].size) == (False, 770144)
+            # A real mtime for both a file and a directory, off real
+            # recorded $FILE_NAME index-entry bytes (not a hand-built fake).
+            assert by_name["kernel32.dll"].mtime is not None
+            assert by_name["drivers"].mtime is not None
 
 
 async def test_replayed_vm_disk_filesystem_sibling_lists_real_ext4_boot_partition(
@@ -274,21 +283,27 @@ async def test_replayed_vm_disk_filesystem_sibling_lists_real_ext4_boot_partitio
             assert any(name.startswith("vmlinuz-") for name in names)
             assert any(name.startswith("initramfs-") for name in names)
             assert "grub2" in names
+            vmlinuz = next(e for e in entries if e.name.startswith("vmlinuz-"))
+            # A real, non-degraded mtime for a real ext4 file entry -- its
+            # inode struct is already fetched for .size, so .mtime reuses
+            # the same cached read rather than needing a new one.
+            assert node_modified_time(vmlinuz) is not None
+            grub2_dir = next(e for e in entries if e.name == "grub2")
+            # A real mtime for a directory entry too -- unlike a file's
+            # size/mtime, a directory's own .filetype is pre-seeded from
+            # the dirent's own inline type hint, so this is the one case
+            # that needs a real disk read of its inode.
+            assert node_modified_time(grub2_dir) is not None
 
             # Only the top-level subvolume listing is checked here -- proof
             # that a real, dedup-reconstructed Btrfs partition (chunked,
             # decrypted) parses and enumerates subvolumes correctly through
             # the *whole* repository pipeline, which the Docker-built fixture
-            # below never exercises (it opens a plain raw file directly).
-            # Deeper subvolume-crossing content coverage (entering a
-            # subvolume, reading a real file from two different ones) used
-            # to live here against this same real Fedora VM disk, but now
-            # lives in tests/unit/sdk/test_units_disk_fs.py's own
-            # tiny_btrfs_subvols.raw.tar.gz -- a real, Docker-built
-            # multi-subvolume Btrfs image this project owns outright, rather
-            # than only reachable through this one real sample. Trimmed here
-            # accordingly, which is also why this fixture was re-recorded
-            # smaller (see this module's own docstring).
+            # in tests/unit/sdk/test_units_disk_fs.py never exercises (it
+            # opens a plain raw file directly). Deeper subvolume-crossing
+            # content coverage (entering a subvolume, reading a real file
+            # from two different ones) lives there instead, against that
+            # file's own tiny_btrfs_subvols.raw.tar.gz.
             btrfs_partition = next(p for p in partitions if "Btrfs" in p.name)
             top_level_entries = await provider.children(btrfs_partition)
             top_level_names = {e.name for e in top_level_entries}

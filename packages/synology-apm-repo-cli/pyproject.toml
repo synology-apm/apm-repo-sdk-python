@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "synology-apm-repo-cli"
-version = "0.1.1"
+version = "0.2.0"
 description = "Command-line browser/exporter for Synology APM/APV/Object-Storage dedup repositories, built on synology-apm-repo-sdk"
 readme = "README.md"
 license = "Apache-2.0"
@@ -24,7 +24,7 @@ classifiers = [
     "Topic :: System :: Systems Administration",
 ]
 dependencies = [
-    "synology-apm-repo-sdk==0.1.1",
+    "synology-apm-repo-sdk==0.2.0",
     "typer>=0.12,<0.28",
     "rich>=13.0",
 ]

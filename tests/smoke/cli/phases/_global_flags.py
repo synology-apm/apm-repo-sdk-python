@@ -25,7 +25,7 @@ def run(ctx: SmokeContext) -> None:
     args = common_args(ref)
 
     # --verbose: a field only present with --verbose, in both human and
-    # --json output for doctor (83404f6's json/human-parity fix).
+    # --json output for doctor.
     plain = ctx.run("global_flags", "global_flags.verbose.doctor_json_plain", "--json", "doctor", repo_path, *args)
     verbose = ctx.run(
         "global_flags", "global_flags.verbose.doctor_json_verbose", "--verbose", "--json", "doctor", repo_path, *args
@@ -49,9 +49,9 @@ def run(ctx: SmokeContext) -> None:
     # --progress: NDJSON, stderr-only -- but only under --json too;
     # --progress always alone still renders a human progress bar
     # (progress_render.py's build_progress_meter gates NDJSON on
-    # state.json, not state.progress). verify --level full is real,
-    # cancellable, scales with data size -- exactly the kind of operation
-    # worth checking the stream's shape against, per 52fe645.
+    # state.json, not state.progress). verify --level full is real and
+    # scales with data size -- exactly the kind of operation worth
+    # checking the stream's shape against.
     progress_result = ctx.run(
         "global_flags",
         f"global_flags.progress.{ref.sample_name}.{ref.type_key}",

@@ -4,10 +4,11 @@ Export writes land at bucket-major, non-monotonic offsets
 (``export_scheduler.py``), so the destination is created at its full
 logical size before any of them run and every write is positional.
 
-On POSIX that is one ``ftruncate``. On Windows it is three Win32 calls,
-because the CRT's own file-extending ``truncate`` writes the zeros for
-real rather than recording a size — a cost proportional to the export's
-whole logical size, paid before the first byte of real data.
+On POSIX that is one ``ftruncate``. On Windows it is up to three Win32
+calls (two when not marking the file sparse), because the CRT's own
+file-extending ``truncate`` writes the zeros for real rather than
+recording a size — a cost proportional to the export's whole logical
+size, paid before the first byte of real data.
 """
 
 from __future__ import annotations

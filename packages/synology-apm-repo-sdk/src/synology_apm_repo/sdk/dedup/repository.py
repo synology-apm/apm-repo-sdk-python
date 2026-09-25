@@ -40,7 +40,7 @@ from .composition_reader import CompositionReader
 from .dedup_file import DedupFile
 from .keys import KeyMaterial
 from .keys import probe_encrypted as _probe_encrypted
-from .pool import Pool
+from .pool import DEFAULT_BUCKET_CACHE_SIZE, DEFAULT_CHUNK_CACHE_SIZE, Pool
 
 POOL_ROOT = "@data/Pool"
 COMPOSITION_ROOT = "@data/Composition"
@@ -105,10 +105,10 @@ class FileLocation:
 
 
 class DedupRepo:
-    """One opened repository: cheap metadata (``RepoInfo``, key material)
-    plus the machinery — ``Pool``, ``CompositionReader`` construction, a
-    small cache of read-only ``db/<name>`` sqlite connections — that
-    ``open_file``/``open_composition`` need to hand back a ``DedupFile``.
+    """Rounds out the module-level ``Pool``/``CompositionReader`` machinery
+    with a small cache of read-only ``db/<name>`` sqlite connections —
+    together, what ``open_file``/``open_composition`` need to hand back a
+    ``DedupFile``.
     """
 
     def __init__(
@@ -119,8 +119,8 @@ class DedupRepo:
         dir_cache: DirCache,
         *,
         vault_key: bytes | None = None,
-        bucket_cache_size: int = 16,
-        chunk_cache_size: int = 4096,
+        bucket_cache_size: int = DEFAULT_BUCKET_CACHE_SIZE,
+        chunk_cache_size: int = DEFAULT_CHUNK_CACHE_SIZE,
         verify_fingerprint: bool = False,
     ) -> None:
         self._store = store
@@ -157,8 +157,10 @@ class DedupRepo:
         # probe_encrypted()'s cache, and _get_file_meta_table()'s —
         # single-value AsyncKeyedCache instances (a constant ``None`` key)
         # rather than a hand-rolled bool/lock pair each: both results are
-        # legitimately ``None`` ("checked, found nothing" — see each
-        # method's own docstring for what that covers), which
+        # legitimately ``None`` ("checked, found nothing" — the
+        # encryption-key record is entirely absent for probe_encrypted, or
+        # this repository shape has no usable file_meta table for
+        # _get_file_meta_table), which
         # AsyncKeyedCache's own presence check (``key in self._store``, not
         # ``... is not None``) caches correctly rather than re-probing
         # forever. A repository opened read-only never rewrites its own
@@ -227,8 +229,8 @@ class DedupRepo:
         layout: RepoLayout,
         keys: KeyMaterial | None = None,
         *,
-        bucket_cache_size: int = 16,
-        chunk_cache_size: int = 4096,
+        bucket_cache_size: int = DEFAULT_BUCKET_CACHE_SIZE,
+        chunk_cache_size: int = DEFAULT_CHUNK_CACHE_SIZE,
         verify_fingerprint: bool = False,
     ) -> Self:
         """Open ``layout``. Cheap by construction — reads only
@@ -243,9 +245,8 @@ class DedupRepo:
         silently decrypt every chunk into garbage later (AES-CTR has no
         integrity check of its own). ``verify_fingerprint=True`` makes
         per-chunk ``.fgp`` verification this session's default for every
-        read through ``pool`` instead of the off-by-default cost —
-        see ``Pool.read_chunk``'s
-        own docstring — or pass it per-call there instead.
+        read through ``pool`` instead of it being off by default — or
+        pass it per-call there instead.
         """
         dir_cache = DirCache(store)
         info_path = await _resolve_versioned(store, dir_cache, layout, layout.repo_root, REPO_INFO_NAME)
@@ -484,9 +485,9 @@ class DedupRepo:
         say) can already have opened a real, connected ``SqliteSource``
         that nothing else references; skipping straight to ``.values()``
         would abandon exactly that connection's aiosqlite background
-        thread forever. See ``AsyncKeyedCache.settle_all()``'s own
-        docstring, and ``api.repository.Repository.close()``'s identical
-        reasoning for its own dedup-catalog cache one layer up.
+        thread forever — the same reasoning
+        ``api.repository.Repository.close()`` applies to its own
+        dedup-catalog cache one layer up.
 
         Every source gets a close attempt regardless of whether an
         earlier one raised or hung -- same "attempt all, then report"

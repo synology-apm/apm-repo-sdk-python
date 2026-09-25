@@ -29,7 +29,7 @@ from ..base import Node, RestorableUnit, UnitKind, not_restorable, paginate
 from ..node_ref import NodeRef, canonical_ref_for
 from .object_name_index import ObjectNameIndex, resolve_object_name_index
 from .objectdb import ObjectDb, parse_object_db_id
-from .stream import SaasStream
+from .stream import SaasStreamCache
 
 
 class RawObjectProvider:
@@ -52,16 +52,18 @@ class RawObjectProvider:
         never construct this class directly."""
         self._repo = repo
         self._version = version
-        # Kept open for this provider's lifetime (DeviceProvider's
-        # target.db convention) — the version's saas_obj isn't
-        # otherwise reachable without one.
-        self._stream = SaasStream(repo, version.connection_config_id, version.saas_stream_uuid)
 
     @classmethod
-    async def create(cls, repo: DedupRepo, version: Version, *, object_db_id: str | None = None) -> Self:
+    async def create(
+        cls, repo: DedupRepo, version: Version, saas_streams: SaasStreamCache, *, object_db_id: str | None = None
+    ) -> Self:
+        """``saas_streams`` is borrowed, not owned — the version's
+        ``saas_obj`` is opened via the caller's shared ``SaasStreamCache``
+        rather than a private ``SaasStream`` this provider would otherwise
+        need to close itself."""
         self = cls(repo, version)
         try:
-            self._dedup_file = await self._stream.open_saas_obj(version)
+            self._dedup_file = await saas_streams.open_saas_obj(version)
 
             self._manual_db = None
             if object_db_id is not None:
@@ -77,8 +79,9 @@ class RawObjectProvider:
                     )
                 self._manual_db = await ObjectDb.load(self._dedup_file, offset, length)
 
-            # The sole location-resolution mechanism — same call every
-            # application-layer provider makes (this module's own docstring).
+            # The sole location-resolution mechanism — the same
+            # resolve_object_name_index call every application-layer
+            # provider (mail/drive/contact/calendar/site) makes.
             # None whenever this version simply has no index at all (an old connector predating this bookkeeping) — this
             # provider then has nothing to show unless ``object_db_id`` was
             # given, which is exactly as honest as every other provider's
@@ -90,10 +93,10 @@ class RawObjectProvider:
                 self._indexed_db = await ObjectDb.load(self._dedup_file, index.offset, index.length)
         except Exception:
             # A bad --object-db-id, a corrupt manual/indexed ObjectDb, or
-            # any other failure here must not leak self._stream (or
-            # whichever of _manual_db/_indexed_db already got opened) —
-            # this is the guaranteed-to-succeed fallback provider, reachable
-            # directly from CLI/TUI diagnostic tooling.
+            # any other failure here must not leak whichever of
+            # _manual_db/_indexed_db already got opened -- this is the
+            # guaranteed-to-succeed fallback provider, reachable directly
+            # from CLI/TUI diagnostic tooling.
             await self.close()
             raise
         return self
@@ -104,8 +107,12 @@ class RawObjectProvider:
     # -- UnitProvider -------------------------------------------------
 
     async def close(self) -> None:
-        """Release the sqlite connection(s) this provider opened — see
-        ``DeviceProvider.close``'s own docstring for why this matters.
+        """Release the sqlite connection(s) this provider owns — an
+        unclosed ``aiosqlite`` connection owns a non-daemon background
+        thread that keeps the interpreter alive forever, so this
+        matters beyond tidiness. The version's own stream is borrowed
+        from the caller's ``SaasStreamCache``, not owned here, so there's
+        nothing of its own to release.
         Tolerates ``_indexed_db``/``_manual_db`` never having been
         assigned (``create()`` failing before either was set), so it's
         safe to call from ``create()``'s own failure path."""
@@ -117,7 +124,6 @@ class RawObjectProvider:
         if manual_db is not None:
             await manual_db.close()
             self._manual_db = None
-        await self._stream.close()
 
     async def __aenter__(self) -> Self:
         return self
@@ -144,7 +150,8 @@ class RawObjectProvider:
         if self._indexed_db is not None and self._object_name_index is not None:
             return await self._named_nodes(self._indexed_db, self._object_name_index, offset, limit)
         # No manual override, no object-name index for this version — nothing
-        # to show (this module's own docstring: never a scan fallback).
+        # to show: there is no scan fallback, only a resolved index or a
+        # manually supplied object_db_id can produce a listing.
         return []
 
     def _raw_object_node(self, name: str, offset: int, length: int) -> Node:

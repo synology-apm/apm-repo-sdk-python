@@ -2,8 +2,9 @@
 ``describe_store()``/``rebuild_store()``'s own round-trip contract per
 backend, and the "can't reconstruct" cases that must come back ``None``
 rather than raise. No real network access anywhere here: every real
-backend's own constructor does no I/O (see each store's own docstring,
-and ``rebuild_store()``'s), so a plain, un-entered
+backend's constructor is synchronous and does no I/O — it only stores
+configuration (or, for ``AzureStore``, builds a plain client object) and
+defers any real connection to first use — so a plain, un-entered
 ``S3Store``/``AzureStore``/``SmbStore`` (no injected ``client=``) is safe
 to construct and describe entirely offline.
 """
@@ -59,9 +60,9 @@ def test_local_fs_store_round_trips(tmp_path: str) -> None:
 
 
 def test_s3_store_round_trips_when_it_owns_its_own_client() -> None:
-    # No client= override -- S3Store's own constructor does no I/O (its
-    # own docstring: "Session construction is pure configuration, no
-    # I/O"), so this is safe entirely offline.
+    # No client= override -- S3Store's constructor only stores
+    # client_kwargs and builds the real client lazily on first use, so
+    # this is safe entirely offline.
     store = S3Store("my-bucket", endpoint_url="https://example.invalid:9000", aws_access_key_id="ak")
     descriptor = describe_store(store)
     assert descriptor == S3StoreDescriptor(

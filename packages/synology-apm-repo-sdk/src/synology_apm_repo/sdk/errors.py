@@ -103,6 +103,21 @@ class NotFoundError(ApmRepoError):
     repository — as opposed to existing but being unreadable."""
 
 
+class ContentUnavailableError(ApmRepoError):
+    """This node's metadata was found, but its real content is not
+    available to read — either because the guest OS itself only held a
+    placeholder for it at backup time (e.g. a cloud-sync client's
+    local-storage-optimization eviction, such as iCloud Drive or Windows
+    OneDrive Files-On-Demand), never actual data, or because the real
+    on-disk bytes exist but this SDK has no key material to make sense
+    of them (e.g. an NTFS EFS-encrypted file). Distinct from
+    ``DataCorruptError``: nothing here asserts the on-disk bytes are
+    damaged, only that this SDK could not obtain real content for them.
+    Deliberately not a ``NotFoundError`` subclass: callers that catch
+    ``NotFoundError`` to treat an optional item as absent-and-skippable
+    must not silently swallow this instead."""
+
+
 class PermissionDeniedError(ApmRepoError):
     """The referenced path / node exists but the OS or backend denied the
     access needed to read or list it (permission bits, ACL, or an

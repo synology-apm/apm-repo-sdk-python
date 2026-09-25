@@ -2,8 +2,8 @@
 synthetic bytes only (see
 ``tests/integration/sdk/test_storage_generations.py`` for the
 cross-check against real ``repo_transaction.<N>`` files, where the
-filename's own ``<N>`` is confirmed to differ from the embedded
-``transaction_id`` — exactly the trap this module exists to close off)."""
+filename's own ``<N>`` differs from the embedded ``transaction_id`` —
+exactly the trap this module exists to close off)."""
 
 from __future__ import annotations
 

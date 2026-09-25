@@ -25,16 +25,18 @@ from __future__ import annotations
 
 import contextlib
 import dataclasses
-from collections.abc import AsyncIterator
+import functools
+from collections.abc import AsyncIterator, Awaitable, Callable
 from pathlib import Path
+from typing import Protocol, TypeVar
 
 import typer
 from rich.console import Console
 
 from synology_apm_repo.cli.asyncio_support import typer_async
-from synology_apm_repo.cli.errors import fail, friendly_message, unwrap
+from synology_apm_repo.cli.errors import fail, fail_from_apm_error, unwrap
 from synology_apm_repo.cli.options import ProfileOption
-from synology_apm_repo.cli.paging import paged
+from synology_apm_repo.cli.paging import render
 from synology_apm_repo.cli.profile_store import resolve_profile_store
 from synology_apm_repo.cli.state import CliState
 from synology_apm_repo.cli.strings import (
@@ -68,6 +70,19 @@ _DEFAULT_RECORD_LIMIT = 10
 _DEFAULT_ENTRY_LIMIT = 50
 
 
+class _HasPath(Protocol):
+    """Structural minimum ``_run_dump``'s own ``dataclasses.replace(result,
+    path=path)`` call needs — every real result type (``BucketInspection``,
+    ``CompositionWalk``, ``ChunkMapInspection``) is a frozen dataclass with
+    its own ``path: str`` field."""
+
+    @property
+    def path(self) -> str: ...
+
+
+_ResultT = TypeVar("_ResultT", bound=_HasPath)
+
+
 def _badge(ok: bool, fail_word: str = "FAIL") -> str:
     """``"[green]OK[/green]"``/``"[red]<fail_word>[/red]"`` — the pass/fail
     rich-markup rendering shared by every check result this command family
@@ -76,9 +91,9 @@ def _badge(ok: bool, fail_word: str = "FAIL") -> str:
 
 
 @contextlib.asynccontextmanager
-async def _resolved_store(path: str, profile: str | None, *, verbose: bool) -> AsyncIterator[tuple[ObjectStore, str]]:
+async def _resolved_store(path: str, profile: str | None, *, state: CliState) -> AsyncIterator[tuple[ObjectStore, str]]:
     """Resolve ``path``/``profile`` into an ``(ObjectStore, rel)`` pair,
-    mirroring ``browse.py``'s ``opened_repo`` — but store-level, not
+    mirroring ``repo_session.py``'s ``opened_repo`` — but store-level, not
     repository-level, since this command family never opens a ``Session``: an
     ``ApmRepoError`` raised while resolving the store itself (a missing
     local directory, an unknown profile name) gets the same clean
@@ -96,19 +111,48 @@ async def _resolved_store(path: str, profile: str | None, *, verbose: bool) -> A
             rel = path
         yield store, rel
     except ApmRepoError as exc:
-        fail(friendly_message(exc, verbose=verbose), cause=exc)
+        fail_from_apm_error(exc, state)
     finally:
         if store is not None:
             await aclose_if_possible(store)
 
 
-def _render_json(result: BucketInspection | ChunkMapInspection) -> None:
-    """``console.print_json(data=dataclasses.asdict(result))`` — shared by
-    ``bucket()``'s and ``chunkmap()``'s ``--json`` output, both plain
-    ``asdict()`` dumps of their own result dataclass.
-    ``composition()``'s own ``_render_composition_json`` stays separate:
-    it builds a custom dict, not a plain ``asdict()``."""
-    console.print_json(data=dataclasses.asdict(result))
+async def _run_dump(
+    path: str,
+    profile: str | None,
+    state: CliState,
+    *,
+    fetch: Callable[[ObjectStore, str], Awaitable[_ResultT]],
+    build_json: Callable[[_ResultT], object],
+    render_human: Callable[[_ResultT], None],
+) -> None:
+    """The shape ``bucket``/``composition``/``chunkmap`` each repeat:
+    resolve the store, run one ``sdk.diagnostics`` call via ``fetch``
+    (which owns its own ``unwrap()`` and any command-specific exception
+    translation), stamp the result with the original ``path`` argument
+    (not the store-relative ``rel`` ``_resolved_store`` actually read
+    from), then dispatch through ``paging.render()`` — ``build_json``
+    returns the payload rather than printing it directly, which is what
+    lets this share ``render()`` with every other command despite
+    ``composition()``'s own ``--json`` shape being a hand-built dict, not
+    a plain ``dataclasses.asdict()``: ``render()``'s own ``json`` parameter
+    already accepts any payload, so the two shapes need no special-casing
+    here."""
+    async with _resolved_store(path, profile, state=state) as (store, rel):
+        result = await fetch(store, rel)
+    # mypy can't confirm dataclasses.replace() keeps _ResultT's concrete
+    # type through the _HasPath protocol bound.
+    result = dataclasses.replace(result, path=path)  # type: ignore[type-var]
+    render(console, state, json=build_json(result), human=lambda: render_human(result), page=True)
+
+
+def _build_json(result: BucketInspection | ChunkMapInspection) -> object:
+    """``dataclasses.asdict(result)`` — shared by ``bucket()``'s and
+    ``chunkmap()``'s ``--json`` output, both plain ``asdict()`` dumps of
+    their own result dataclass. ``composition()``'s own
+    ``_build_composition_json`` stays separate: it builds a custom dict,
+    not a plain ``asdict()``."""
+    return dataclasses.asdict(result)
 
 
 def _render_bucket_human(result: BucketInspection) -> None:
@@ -140,28 +184,22 @@ async def bucket(
     """Dump a .buk file's header, SizeStore summary, and the
     expected_bucket_size self-check."""
     state: CliState = ctx.obj
-    async with _resolved_store(path, profile, verbose=state.verbose) as (store, rel):
+
+    async def _fetch(store: ObjectStore, rel: str) -> BucketInspection:
         try:
-            result = await unwrap(inspect_bucket(store, rel, chunk=chunk), verbose=state.verbose)
+            return await unwrap(inspect_bucket(store, rel, chunk=chunk), verbose=state.verbose)
         except IndexError as exc:
             fail(str(exc))
-    result = dataclasses.replace(result, path=path)
 
-    if state.json:
-        _render_json(result)
-    else:
-        with paged(console):
-            _render_bucket_human(result)
+    await _run_dump(path, profile, state, fetch=_fetch, build_json=_build_json, render_human=_render_bucket_human)
 
 
-def _render_composition_json(result: CompositionWalk) -> None:
-    console.print_json(
-        data={
-            "path": result.path,
-            "header": {"major": result.header[0], "minor": result.header[1]} if result.header is not None else None,
-            "records": [dataclasses.asdict(r) for r in result.records],
-        }
-    )
+def _build_composition_json(result: CompositionWalk) -> object:
+    return {
+        "path": result.path,
+        "header": {"major": result.header[0], "minor": result.header[1]} if result.header is not None else None,
+        "records": [dataclasses.asdict(r) for r in result.records],
+    }
 
 
 def _render_composition_human(result: CompositionWalk, *, limit: int) -> None:
@@ -200,17 +238,20 @@ async def composition(
     starting at --offset (default: right after the header, or byte 0 for
     a non-subID=0 file)."""
     state: CliState = ctx.obj
-    async with _resolved_store(path, profile, verbose=state.verbose) as (store, rel):
-        result = await unwrap(
+
+    async def _fetch(store: ObjectStore, rel: str) -> CompositionWalk:
+        return await unwrap(
             walk_composition(store, rel, offset=offset, limit=limit, verify_map=verify_map), verbose=state.verbose
         )
-    result = dataclasses.replace(result, path=path)
 
-    if state.json:
-        _render_composition_json(result)
-    else:
-        with paged(console):
-            _render_composition_human(result, limit=limit)
+    await _run_dump(
+        path,
+        profile,
+        state,
+        fetch=_fetch,
+        build_json=_build_composition_json,
+        render_human=functools.partial(_render_composition_human, limit=limit),
+    )
 
 
 def _render_chunkmap_human(result: ChunkMapInspection) -> None:
@@ -251,15 +292,11 @@ async def chunkmap(
     flag, map number and repeat count, plus (with --verify) the
     chunk-map CRC check result."""
     state: CliState = ctx.obj
-    async with _resolved_store(path, profile, verbose=state.verbose) as (store, rel):
-        result = await unwrap(inspect_chunk_map(store, rel, offset, limit=limit, verify=verify), verbose=state.verbose)
-    result = dataclasses.replace(result, path=path)
 
-    if state.json:
-        _render_json(result)
-    else:
-        with paged(console):
-            _render_chunkmap_human(result)
+    async def _fetch(store: ObjectStore, rel: str) -> ChunkMapInspection:
+        return await unwrap(inspect_chunk_map(store, rel, offset, limit=limit, verify=verify), verbose=state.verbose)
+
+    await _run_dump(path, profile, state, fetch=_fetch, build_json=_build_json, render_human=_render_chunkmap_human)
 
 
 app.command("bucket")(bucket)

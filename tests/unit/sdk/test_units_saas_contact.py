@@ -1,11 +1,12 @@
 """Unit tests for ``synology_apm_repo.sdk.units.saas.contact`` — a
 full synthetic repository root (same building blocks as
-``test_units_saas_calendar.py``). **No integration/real-sample test exists**
-for this module (see its own module docstring): no SaaS stream in
-apv-sample-1 contains any Contact data, so this module is implemented
-against the sibling docs' spec only, same posture as
-``units/device.py``'s unverified PC/PS path — these synthetic tests are
-the only verification this module has."""
+``test_units_saas_calendar.py``). A real-sample regression test also
+exists (``tests/integration/sdk/test_units_saas_contact.py``), but only
+proves dispatch and the top-level bucket's existence against real
+GWS/M365 Contact workloads — no SaaS stream in apv-sample-1 has real
+per-contact content recorded, so listing, grouping, and CSV/JSON-content
+correctness (same posture as ``units/device.py``'s unverified PC/PS path)
+are proven only here."""
 
 from __future__ import annotations
 
@@ -52,6 +53,7 @@ from synology_apm_repo.sdk.units.base import UnitKind
 from synology_apm_repo.sdk.units.content.saas_contact import build_contact_csv
 from synology_apm_repo.sdk.units.saas.contact import ContactProvider
 from synology_apm_repo.sdk.units.saas.provider import SaasWorkloadProvider
+from synology_apm_repo.sdk.units.saas.stream import SaasStreamCache
 
 _STREAM_ID = 14
 _CCID = 1
@@ -135,8 +137,14 @@ def _write_saas_version_db(path: Path, target_type: str) -> None:
 def _write_copy_target_version_db(
     path: Path, *, version_uid: str, object_db_id: str, db_objects: list[tuple[str, str]]
 ) -> None:
-    """See test_units_dispatch_saas.py's own
-    ``_write_copy_target_version_db`` docstring."""
+    """The connector's own index bookkeeping
+    (``synology_apm_repo.sdk.units.saas.object_name_index``) — every
+    ``SaasWorkloadProvider``/``TeamsChatProvider`` construction resolves
+    its service DB(s) *only* through this table, with no scan-based
+    fallback, so a fixture repository that wants a table found must
+    record it here rather than merely embedding the bytes somewhere in
+    ``saas_obj``. Plain, unencrypted JSON — these fixture repositories
+    never configure a vault_key, matching every other db this file writes."""
     path.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(path)
     conn.execute("CREATE TABLE copy_target_version(version_uid TEXT PRIMARY KEY, version_spec TEXT)")
@@ -163,17 +171,26 @@ def _build_object_db(rows: list[tuple[str, int, int]]) -> bytes:
         return path.read_bytes()
 
 
-def _build_m365_contact_db(contacts: list[tuple[str, str, str, str, str]]) -> bytes:
-    """``contacts``: (contact_id, first_name, last_name, parent_folder_id, meta_object_id)."""
+def _build_m365_contact_db(
+    contacts: list[tuple[str, str, str, str, str]], *, emails: dict[str, str] | None = None
+) -> bytes:
+    """``contacts``: (contact_id, first_name, last_name, parent_folder_id, meta_object_id).
+    ``emails`` (contact_id -> primary_email), when given, populates the
+    real ``primary_email`` column -- every existing call site omits it,
+    leaving that column empty (falsy) exactly as it was before this
+    column existed."""
     with tempfile.TemporaryDirectory() as td:
         path = Path(td) / "contact.db"
         conn = sqlite3.connect(path)
         conn.execute("CREATE TABLE config_table(key TEXT, value TEXT)")
         conn.execute(
             "CREATE TABLE contact_table(contact_id TEXT PRIMARY KEY, first_name TEXT, last_name TEXT, "
-            "parent_folder_id TEXT, meta_object_id TEXT)"
+            "parent_folder_id TEXT, meta_object_id TEXT, primary_email TEXT)"
         )
-        conn.executemany("INSERT INTO contact_table VALUES (?, ?, ?, ?, ?)", contacts)
+        conn.executemany(
+            "INSERT INTO contact_table VALUES (?, ?, ?, ?, ?, ?)",
+            [(*row, (emails or {}).get(row[0], "")) for row in contacts],
+        )
         conn.commit()
         conn.close()
         raw = path.read_bytes()
@@ -185,10 +202,9 @@ def _build_gws_contact_db(
 ) -> bytes:
     """``contacts``: (contact_id, first_name, last_name, meta_object_id) — no folder column.
     ``group_memberships`` (contact_id, group_id), when given, also
-    populates ``contact_group_table`` inside this same object — see
-    ``contact.py``'s own module comment on why that membership half
-    lives here rather than in the separate ``group_table`` definitions
-    object (``_build_group_db``)."""
+    populates ``contact_group_table`` inside this same object — membership
+    rows live alongside ``contact_table`` here, while group definitions
+    live in the separate ``contact_group_db`` object (``_build_group_db``)."""
     with tempfile.TemporaryDirectory() as td:
         path = Path(td) / "contact.db"
         conn = sqlite3.connect(path)
@@ -223,7 +239,7 @@ def _build_group_db(groups: list[tuple[str, str]]) -> bytes:
 
 def _build_contact_folder_db(folders: list[tuple[str, str]]) -> bytes:
     """``contact_folder_table``: (folder_id, folder_name) -- M365's own
-    folder *definitions*, see ``contact.py``'s own
+    folder *definitions*, consumed by ``contact.py``'s
     ``_m365_contact_folder_names``."""
     with tempfile.TemporaryDirectory() as td:
         path = Path(td) / "contact_folder.db"
@@ -344,6 +360,7 @@ def _build_contact_repo(
     is_m365: bool = True,
     include_folder_names: bool = False,
     include_groups: bool = False,
+    emails: dict[str, str] | None = None,
 ) -> None:
     _write_repo_info(tmp_path / "repo_info")
     _write_vault_encryption_key_db(tmp_path / "db" / "vault_encryption_key")
@@ -354,7 +371,9 @@ def _build_contact_repo(
     _write_saas_version_db(stream_db_dir / "saas_version", "M365" if is_m365 else "GW")
 
     if is_m365:
-        contact_db_bytes = _build_m365_contact_db([("contact-1", "Ada", "Lovelace", "folder-1", "meta_1")])
+        contact_db_bytes = _build_m365_contact_db(
+            [("contact-1", "Ada", "Lovelace", "folder-1", "meta_1")], emails=emails
+        )
     else:
         group_memberships = (("contact-1", "group-1"),) if include_groups else ()
         contact_db_bytes = _build_gws_contact_db(
@@ -448,8 +467,8 @@ class TestM365Tree:
         _build_contact_repo(tmp_path, is_m365=True)
         store = LocalFsStore(tmp_path)
         layout = RepoLayout(kind=RepoKind.VAULT, repo_root="")
-        async with await DedupRepo.open(store, layout) as repo:
-            p = await ContactProvider(repo, _version("M365"))
+        async with await DedupRepo.open(store, layout) as repo, SaasStreamCache(repo) as saas_streams:
+            p = await ContactProvider(repo, _version("M365"), saas_streams)
             try:
                 yield p
             finally:
@@ -466,6 +485,19 @@ class TestM365Tree:
         assert len(contacts) == 1
         assert contacts[0].name == "Ada Lovelace"
         assert contacts[0].kind is UnitKind.CONTACT
+
+    async def test_contact_with_a_real_email_exposes_it_as_an_attr(self, tmp_path: Path) -> None:
+        _build_contact_repo(tmp_path, is_m365=True, emails={"contact-1": "ada@example.com"})
+        store = LocalFsStore(tmp_path)
+        layout = RepoLayout(kind=RepoKind.VAULT, repo_root="")
+        async with (
+            await DedupRepo.open(store, layout) as repo,
+            SaasStreamCache(repo) as saas_streams,
+            await ContactProvider(repo, _version("M365"), saas_streams) as provider,
+        ):
+            [folder] = await provider.children(provider.root())
+            [contact] = await provider.children(folder)
+            assert contact.attrs.get("email") == "ada@example.com"
 
     async def test_unit_builds_a_csv_with_bom(self, provider: SaasWorkloadProvider) -> None:
         [folder] = await provider.children(provider.root())
@@ -509,8 +541,8 @@ class TestM365Tree:
         _build_contact_repo(tmp_path, is_m365=True, include_folder_names=True)
         store = LocalFsStore(tmp_path)
         layout = RepoLayout(kind=RepoKind.VAULT, repo_root="")
-        async with await DedupRepo.open(store, layout) as repo:
-            provider = await ContactProvider(repo, _version("M365"))
+        async with await DedupRepo.open(store, layout) as repo, SaasStreamCache(repo) as saas_streams:
+            provider = await ContactProvider(repo, _version("M365"), saas_streams)
             try:
                 folders = await provider.children(provider.root())
                 assert len(folders) == 1
@@ -525,8 +557,8 @@ class TestGwsTree:
         _build_contact_repo(tmp_path, is_m365=False)
         store = LocalFsStore(tmp_path)
         layout = RepoLayout(kind=RepoKind.VAULT, repo_root="")
-        async with await DedupRepo.open(store, layout) as repo:
-            p = await ContactProvider(repo, _version("GW"))
+        async with await DedupRepo.open(store, layout) as repo, SaasStreamCache(repo) as saas_streams:
+            p = await ContactProvider(repo, _version("GW"), saas_streams)
             try:
                 yield p
             finally:
@@ -547,8 +579,9 @@ class TestGwsTree:
         self, provider: SaasWorkloadProvider, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         """GWS has no ``parent_folder_id`` column at all (``group_column
-        =None`` — see ``tree_strategy.py``'s own docstring) — the single
-        synthetic group's own members are still exactly one ``ORDER BY
+        =None``, since GWS Contact's groups are M:N, not a single column)
+        — the single synthetic group's own members are still exactly one
+        ``ORDER BY
         ... LIMIT ? OFFSET ?`` query with no ``WHERE`` at all, not a
         full-table scan building an in-memory index."""
         calls = _install_call_counting_select(monkeypatch)
@@ -565,8 +598,8 @@ class TestGwsTree:
         _build_contact_repo(tmp_path, is_m365=False, include_groups=True)
         store = LocalFsStore(tmp_path)
         layout = RepoLayout(kind=RepoKind.VAULT, repo_root="")
-        async with await DedupRepo.open(store, layout) as repo:
-            provider = await ContactProvider(repo, _version("GW"))
+        async with await DedupRepo.open(store, layout) as repo, SaasStreamCache(repo) as saas_streams:
+            provider = await ContactProvider(repo, _version("GW"), saas_streams)
             try:
                 [group] = await provider.children(provider.root())
                 [contact] = await provider.children(group)
@@ -658,11 +691,14 @@ class TestBuildContactCsv:
 
 
 class TestDisplayName:
-    def test_falls_back_to_the_raw_contact_id_when_both_names_are_blank(self) -> None:
+    def test_is_blank_when_both_names_are_blank(self) -> None:
+        # Never falls back to the raw contact_id -- for GWS that's an
+        # opaque People API resource name, not something a user would
+        # want to see.
         from synology_apm_repo.sdk.units.saas.contact import _display_name
 
         row: dict[str, object | None] = {"first_name": "", "last_name": None, "contact_id": "contact-123"}
-        assert _display_name(row) == "contact-123"
+        assert _display_name(row) == ""
 
 
 class TestDegradation:
@@ -682,6 +718,6 @@ class TestDegradation:
 
         store = LocalFsStore(tmp_path)
         layout = RepoLayout(kind=RepoKind.VAULT, repo_root="")
-        async with await DedupRepo.open(store, layout) as repo:
+        async with await DedupRepo.open(store, layout) as repo, SaasStreamCache(repo) as saas_streams:
             with pytest.raises(UnsupportedDataFormatError):
-                await ContactProvider(repo, _version("M365"))
+                await ContactProvider(repo, _version("M365"), saas_streams)

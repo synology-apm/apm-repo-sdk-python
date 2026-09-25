@@ -1,10 +1,9 @@
 """Unit tests for ``synology_apm_repo.sdk.presentation.markup.safe``
 against the CLI's own ``Console.print()`` entry point — proves the actual
-failure mode ``safe()`` fixes (mirrors
-``tests/unit/browser/test_browser_markup.py`` in spirit; the CLI and TUI
-hit the identical root cause, the bracketed ``[ref=...]``/``[spec=...]``
-exception-message suffix, through two different Rich entry points —
-``Console.print()`` here, ``Static.update()`` there)."""
+failure mode ``safe()`` fixes. The CLI and TUI hit the identical root
+cause, the bracketed ``[ref=...]``/``[spec=...]`` exception-message
+suffix, through two different Rich entry points — ``Console.print()``
+here, ``Static.update()`` there."""
 
 from __future__ import annotations
 
@@ -16,8 +15,8 @@ from rich.errors import MarkupError
 from synology_apm_repo.sdk.errors import KeyRequiredError
 from synology_apm_repo.sdk.presentation.markup import safe
 
-# See test_browser_markup.py's own comment on this same constant for
-# where this real shape comes from.
+# A real shape (dedup/pool.py's KeyRequiredError): the ref contains "/",
+# which Rich's markup grammar cannot parse as a tag parameter.
 _REAL_SHAPE_MESSAGE = (
     "'@ActiveProtectVault/@data/Pool/45/0.buk.99' is encrypted but no vault key was provided "
     "[ref=@ActiveProtectVault/@data/Pool/45/0.buk.99]"
@@ -37,8 +36,10 @@ def test_unescaped_exception_text_breaks_console_print() -> None:
         console.print(f"[red]error:[/red] {exc}")
     except MarkupError:
         return  # the crash this module exists to prevent
-    # Didn't crash — must have silently dropped the ref suffix instead
-    # (rich/markup.py's own docstring documents this exact failure mode).
+    # Didn't crash — must have silently dropped the ref suffix instead:
+    # unlike a TUI widget, which crashes outright on an unresolvable tag,
+    # Rich's Console.print() sometimes swallows a bracketed suffix as an
+    # unclosed style span instead of raising.
     assert str(exc) not in buf.getvalue()
 
 
@@ -59,6 +60,21 @@ def test_safe_handles_the_exact_real_sample_shape() -> None:
     console = Console(file=buf, width=200)
     console.print(f"[red]error:[/red] {safe(_REAL_SHAPE_MESSAGE)}")  # must not raise
     assert _REAL_SHAPE_MESSAGE in buf.getvalue()
+
+
+def test_safe_preserves_a_literal_backslash_right_before_an_unclosed_bracket() -> None:
+    """A literal backslash immediately before a ``[`` that never closes
+    must come back through ``Console.print()`` unchanged, not with an
+    extra backslash inserted -- unlike a tag-shaped match (whose existing
+    backslash run gets doubled), both Rich's and Textual's fallback for an
+    unclosed/non-tag bracket only ever strips exactly one backslash from
+    the run, so adding exactly one (not doubling) is what round-trips
+    correctly here."""
+    original = "a Windows-style path fragment \\[not-a-real-tag"
+    buf = io.StringIO()
+    console = Console(file=buf, width=200)
+    console.print(safe(original))
+    assert original in buf.getvalue()
 
 
 def test_safe_is_a_plain_str_transform() -> None:

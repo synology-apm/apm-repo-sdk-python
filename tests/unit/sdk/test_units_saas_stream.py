@@ -5,6 +5,7 @@ end-to-end cross-check against ``apv-sample-1``)."""
 
 from __future__ import annotations
 
+import asyncio
 import dataclasses
 import json
 import os
@@ -314,14 +315,11 @@ class TestDbPathResolution:
             assert await stream.stream_version_for(_version()) == 1
 
     async def test_falls_back_to_suffix_when_bare_file_is_empty(self, tmp_path: Path) -> None:
-        """A bare file that merely *exists* but is empty (0 bytes) — the
-        real shape observed against a real sample (an empty placeholder
-        left behind by some earlier rotation) — must not be mistaken for
-        a live file; falls back to the largest suffixed generation, the
-        same as when the bare file is absent entirely. Before the fix,
-        this resolved to the empty bare file, which then raised
-        ``DataCorruptError`` (an empty file has zero SQLite tables) instead of
-        reading the real content next to it."""
+        """A bare file that merely *exists* but is empty (0 bytes) — an
+        empty placeholder left behind by some earlier rotation — must not
+        be mistaken for a live file; resolution falls back to the largest
+        suffixed generation instead, the same as when the bare file is
+        absent entirely."""
         _build_saas_repo(tmp_path)
         stream_db_dir = tmp_path / "saas" / str(_CCID) / _STREAM_UUID / "db"
         bare = stream_db_dir / "saas_snapshot"
@@ -447,13 +445,13 @@ def _build_saas_repo_multi_gen(
     """Like ``_build_saas_repo`` but ``version_info`` records
     ``stream_version=1`` for ``_version()``'s default row (the
     "requested" generation) while ``file_map`` only has rows for
-    ``live_stream_versions`` — the real shape ``cleanupSaasFile()``
-    produces once older generations are GC'd (workload-format/
-    saas-obj.md §11.4.6). Every live generation shares one physical
-    composition/bucket (same stream_id/session_id) — these tests only
-    need to prove *which* generation resolution picks, not that content
-    differs across generations. ``non_complete_stream_versions`` gives
-    those entries ``status=1`` (Written) instead of ``2`` (Complete)."""
+    ``live_stream_versions`` — the real shape left behind once older
+    generations are server-side GC'd (FORMAT-SPEC.md: saas-addressing). Every live
+    generation shares one physical composition/bucket (same
+    stream_id/session_id) — these tests only need to prove *which*
+    generation resolution picks, not that content differs across
+    generations. ``non_complete_stream_versions`` gives those entries
+    ``status=1`` (Written) instead of ``2`` (Complete)."""
     _write_repo_info(tmp_path / "repo_info")
     _write_vault_encryption_key_db(tmp_path / "db" / "vault_encryption_key")
     _write_file_map(
@@ -567,9 +565,9 @@ class TestForwardResolution:
 
     async def test_does_not_cross_latest_complete_version(self, tmp_path: Path) -> None:
         """A live file_map row exists at stream_version=5, but
-        latest_complete_version=2 (simulated crash garbage, per
-        SaasDbWrapper::Rollback()'s own semantics) — must not be used as
-        a substitute."""
+        latest_complete_version=2 (simulating crash garbage left behind
+        by an incomplete write that was later rolled back) — must not be
+        used as a substitute."""
         _build_saas_repo_multi_gen(tmp_path, live_stream_versions=[5], latest_complete_version=2)
         store = LocalFsStore(tmp_path)
         layout = RepoLayout(kind=RepoKind.VAULT, repo_root="")
@@ -680,26 +678,26 @@ class TestResourceManagement:
     async def test_close_is_idempotent_and_releases_connections(self, repo: DedupRepo) -> None:
         stream = SaasStream(repo, _CCID, _STREAM_UUID)
         await stream.stream_version_for(_version())  # opens both the snapshot and version connections
-        assert stream._snapshot_source is not None
-        assert stream._version_source is not None
+        assert stream._db_source_cache.get("saas_snapshot") is not None
+        assert stream._db_source_cache.get("saas_version") is not None
         await stream.close()
-        assert stream._snapshot_source is None
-        assert stream._version_source is None
+        assert stream._db_source_cache.get("saas_snapshot") is None
+        assert stream._db_source_cache.get("saas_version") is None
         await stream.close()  # idempotent
 
     async def test_context_manager_closes_on_exit(self, repo: DedupRepo) -> None:
         async with SaasStream(repo, _CCID, _STREAM_UUID) as stream:
             await stream.stream_version_for(_version())
-        assert stream._snapshot_source is None
+        assert stream._db_source_cache.get("saas_snapshot") is None
 
 
 class TestBoundedEviction:
     """SaasStreamCache's own bounded LRU — eviction must actually close
     the evicted stream's connections, not just drop the reference (the
-    fd/thread-exhaustion regression this bound exists to prevent; see
-    ``SaasStreamCache``'s own docstring). Faked ``SaasStream`` construction:
-    proving the cache mechanics needs no real repository/sqlite I/O at
-    all."""
+    fd/thread-exhaustion regression this bound exists to prevent). Faked
+    ``SaasStream``
+    construction: proving the cache mechanics needs no real
+    repository/sqlite I/O at all."""
 
     @staticmethod
     def _install_fake_stream(monkeypatch: pytest.MonkeyPatch) -> list[tuple[int, str]]:
@@ -763,8 +761,8 @@ class TestBoundedEviction:
     async def test_eviction_close_failure_does_not_propagate(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """A stream that raises while being closed on eviction must not
         break the caller getting its own, newly-built stream back --
-        cleaning up a resource we're already done with is best-effort
-        (see this class's own docstring / _stream_for's comment)."""
+        closing a stream we're already done with is best-effort and must
+        never abort an otherwise-successful run."""
 
         class _RaisingCloseStream:
             def __init__(self, repo: object, ccid: ConnectionConfigId, stream_uuid: StreamUuid) -> None:
@@ -786,3 +784,182 @@ class TestBoundedEviction:
         # to the caller as if live -- rejected up front instead.
         with pytest.raises(ValueError, match="maxsize"):
             SaasStreamCache(repo=None, maxsize=0)  # type: ignore[arg-type]
+
+
+class TestStreamReuseAcrossVersions:
+    """Two catalog Versions sharing one ``(connection_config_id,
+    saas_stream_uuid)`` pair must resolve through one shared ``SaasStream``
+    instance, not a fresh one per version."""
+
+    async def test_two_versions_of_the_same_stream_share_one_saas_stream_instance(self, repo: DedupRepo) -> None:
+        cache = SaasStreamCache(repo)
+        try:
+            await cache.open_saas_obj(_version())
+            first = cache._streams[(int(_CCID), str(_STREAM_UUID))]
+            other_version = dataclasses.replace(_version(), version_uid=VersionUid("some-other-vuid"))
+            await cache.open_saas_obj(other_version)
+            second = cache._streams[(int(_CCID), str(_STREAM_UUID))]
+            assert first is second
+        finally:
+            await cache.close()
+
+
+class TestConcurrentConnectionResolution:
+    """Concurrent callers resolving the same not-yet-opened connection on
+    one ``SaasStream`` must genuinely de-duplicate (via ``AsyncKeyedCache``'s
+    own in-flight sharing), not double-open."""
+
+    async def test_concurrent_snapshot_connection_calls_resolve_to_one_connection(self, repo: DedupRepo) -> None:
+        async with SaasStream(repo, _CCID, _STREAM_UUID) as stream:
+            first, second = await asyncio.gather(stream._snapshot_connection(), stream._snapshot_connection())
+            assert first is second
+
+
+class TestEvictionDefersForAnInUseStream:
+    """``SaasStreamCache.open_saas_obj`` marks its stream in-use for the
+    call's duration, so a concurrent call for a different key can't
+    evict-and-close it out from under the first caller."""
+
+    async def test_a_stream_still_mid_open_is_not_evicted_by_a_different_keys_call(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        closed: list[tuple[int, str]] = []
+        entered = asyncio.Event()
+        release = asyncio.Event()
+
+        class _FakeStream:
+            def __init__(self, repo: object, ccid: ConnectionConfigId, stream_uuid: StreamUuid) -> None:
+                self._key = (int(ccid), str(stream_uuid))
+
+            async def open_saas_obj(self, version: Version) -> object:
+                if self._key == (1, "a"):
+                    entered.set()
+                    await release.wait()
+                return object()
+
+            async def close(self) -> None:
+                closed.append(self._key)
+
+        monkeypatch.setattr("synology_apm_repo.sdk.units.saas.stream.SaasStream", _FakeStream)
+        cache = SaasStreamCache(repo=None, maxsize=1)  # type: ignore[arg-type]
+        version_a = dataclasses.replace(
+            _version(), connection_config_id=ConnectionConfigId(1), saas_stream_uuid=StreamUuid("a")
+        )
+        version_b = dataclasses.replace(
+            _version(), connection_config_id=ConnectionConfigId(2), saas_stream_uuid=StreamUuid("b")
+        )
+
+        task = asyncio.create_task(cache.open_saas_obj(version_a))
+        try:
+            await entered.wait()
+            # Cache is at capacity (1) and (1, "a") is still mid-open --
+            # a concurrent call for a different key must not evict it.
+            await cache.open_saas_obj(version_b)
+            assert closed == []
+            assert (1, "a") in cache._streams
+        finally:
+            release.set()
+            await task
+
+    async def test_a_just_inserted_key_is_protected_even_while_its_own_eviction_is_still_closing(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Regression test: ``_in_use`` must be set *before* ``_stream_for``
+        ever runs, not after it returns -- ``_stream_for`` itself can
+        ``await`` (closing a *different*, evicted sibling) between
+        inserting this call's own new key and handing the stream back, and
+        a concurrent call for yet another key racing through its own
+        eviction loop during that window would otherwise see this call's
+        own just-inserted key as not-yet-in-use and evict it."""
+        closed: list[tuple[int, str]] = []
+        c_close_started = asyncio.Event()
+        release_c_close = asyncio.Event()
+
+        class _FakeStream:
+            def __init__(self, repo: object, ccid: ConnectionConfigId, stream_uuid: StreamUuid) -> None:
+                self._key = (int(ccid), str(stream_uuid))
+
+            async def open_saas_obj(self, version: Version) -> object:
+                return object()
+
+            async def close(self) -> None:
+                if self._key == (3, "c"):
+                    c_close_started.set()
+                    await release_c_close.wait()
+                closed.append(self._key)
+
+        monkeypatch.setattr("synology_apm_repo.sdk.units.saas.stream.SaasStream", _FakeStream)
+        cache = SaasStreamCache(repo=None, maxsize=1)  # type: ignore[arg-type]
+        # Seed the cache with (3, "c") as the sole, already-resident entry.
+        await cache._stream_for((3, "c"))
+
+        version_a = dataclasses.replace(
+            _version(), connection_config_id=ConnectionConfigId(1), saas_stream_uuid=StreamUuid("a")
+        )
+        version_b = dataclasses.replace(
+            _version(), connection_config_id=ConnectionConfigId(2), saas_stream_uuid=StreamUuid("b")
+        )
+
+        # Task A: opens A -- cache is at capacity (1), so this evicts
+        # (3, "c"), whose own close() blocks, holding task A inside
+        # _stream_for's own eviction-await with (1, "a") already inserted
+        # into self._streams but not yet returned to open_saas_obj.
+        task_a = asyncio.create_task(cache.open_saas_obj(version_a))
+        try:
+            await c_close_started.wait()
+            assert (1, "a") in cache._streams  # inserted before the blocking close
+
+            # Task B: opens a different key concurrently, while task A is
+            # still stuck inside its own eviction-await above. (1, "a")
+            # must already be protected by _in_use at this point, or this
+            # eviction loop would treat it as a free victim.
+            await cache.open_saas_obj(version_b)
+            assert (1, "a") in cache._streams  # never evicted out from under task A
+            assert (3, "c") not in closed  # task A's own close() hasn't finished yet
+        finally:
+            release_c_close.set()
+            await task_a
+        assert closed == [(3, "c")]
+
+
+class TestCloseRacingAnInFlightOpen:
+    """``SaasStreamCache.close()`` clears ``_in_use`` unconditionally --
+    it's tearing down the whole cache, not just evicting one entry -- so a
+    concurrent, still in-flight ``open_saas_obj()`` call must tolerate its
+    own key already being gone by the time its ``finally`` block runs."""
+
+    async def test_close_running_concurrently_does_not_mask_the_callers_own_result(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """``open_saas_obj()``'s own ``finally`` block must tolerate its
+        key already being gone when a concurrent ``close()`` clears
+        ``_in_use`` first — not raise ``KeyError`` there and silently
+        replace this call's real return value with an unrelated
+        exception."""
+        entered = asyncio.Event()
+        release = asyncio.Event()
+        completed: list[str] = []
+
+        class _FakeStream:
+            def __init__(self, repo: object, ccid: ConnectionConfigId, stream_uuid: StreamUuid) -> None:
+                pass
+
+            async def open_saas_obj(self, version: Version) -> object:
+                entered.set()
+                await release.wait()
+                completed.append("real result")
+                return object()
+
+            async def close(self) -> None:
+                pass
+
+        monkeypatch.setattr("synology_apm_repo.sdk.units.saas.stream.SaasStream", _FakeStream)
+        cache = SaasStreamCache(repo=None, maxsize=1)  # type: ignore[arg-type]
+
+        task = asyncio.create_task(cache.open_saas_obj(_version()))
+        await entered.wait()
+        await cache.close()  # races the in-flight call above, clearing _in_use
+        release.set()
+
+        await task  # must not raise KeyError -- would mask this real completion
+        assert completed == ["real result"]

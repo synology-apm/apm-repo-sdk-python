@@ -65,9 +65,9 @@ def _pread(fd: int, length: int, offset: int) -> bytes:
 
 _FIXTURES = Path(__file__).parent.parent.parent / "fixtures"
 
-#: Every not-hand-built format's ``.raw.tar.gz`` fixture — see this
-#: file's own module docstring for why FAT12 (hand-built, not a real
-#: image) isn't part of this contract.
+#: Every not-hand-built format's ``.raw.tar.gz`` fixture — FAT12 isn't
+#: part of this contract since it's hand-built byte-exact rather than a
+#: real filesystem image, a different construction entirely.
 _TAR_GZ_FIXTURES = [
     "tiny_ext4.raw.tar.gz",
     "tiny_xfs.raw.tar.gz",
@@ -134,12 +134,12 @@ async def _all_names(fs: DiskFilesystem, partition_addr: int, path: str, *, dept
     this test can check every name it can cheaply reach, not just root's
     own immediate children."""
     entries = await fs.list_dir(partition_addr, path)
-    names = [name for name, _is_dir, _size in entries]
+    names = [e.name for e in entries]
     if depth <= 0:
         return names
-    for name, is_dir, _size in entries:
-        if is_dir:
-            child_path = f"{path.rstrip('/')}/{name}"
+    for entry in entries:
+        if entry.is_dir:
+            child_path = f"{path.rstrip('/')}/{entry.name}"
             names.extend(await _all_names(fs, partition_addr, child_path, depth=depth - 1))
     return names
 
@@ -147,7 +147,7 @@ async def _all_names(fs: DiskFilesystem, partition_addr: int, path: str, *, dept
 async def test_root_listing_has_no_self_referential_or_bookkeeping_entry(disk_fs: DiskFilesystem) -> None:
     for partition_addr, _label in disk_fs.partitions():
         entries = await disk_fs.list_dir(partition_addr, "/")
-        names = {name for name, _is_dir, _size in entries}
+        names = {e.name for e in entries}
         assert "." not in names, f"partition {partition_addr}: root listed itself ('.') as a child"
         assert ".." not in names, f"partition {partition_addr}: root listed its own parent ('..') as a child"
 

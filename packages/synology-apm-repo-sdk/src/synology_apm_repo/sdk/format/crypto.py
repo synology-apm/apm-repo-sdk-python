@@ -14,9 +14,9 @@ Three independent AES schemes, never confused with each other:
   (``vaultKey``) but with AES-256-CTR and an IV stored in its own header,
   not derived (aHlT).
 - ``db/copy_target_version.version_spec``: AES-256-CTR, same DEK
-  (``vaultKey``) again, but its own derived-not-stored IV — see
-  ``version_spec_iv``'s own docstring for the derivation
-  (version-spec-encryption).
+  (``vaultKey``) again, but its own derived-not-stored IV, taken from the
+  first 16 ASCII bytes of ``hex(MD5(version_uid))`` rather than the raw
+  MD5 digest (version-spec-encryption).
 
 Nothing here decides *whether* something is encrypted — that is always a
 mode-bit or magic-byte check made by the caller; this
@@ -145,7 +145,7 @@ def unwrap_vault_key(user_key_id: str, user_key: bytes, wrapped: bytes) -> bytes
     A successful unwrap already proves the ``(userKeyID, userKey)`` pair
     is correct for this repository's real data too, not merely for this
     stored record in isolation — the DEK it unwraps never changes after
-    first initialization (see ``dedup/keys.py``'s own module docstring).
+    first initialization.
 
     Raises:
         KeyMismatchError: The GCM tag check fails — proof the

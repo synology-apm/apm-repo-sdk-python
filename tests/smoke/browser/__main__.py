@@ -59,7 +59,10 @@ _MAIN_SESSION_PHASES = {
     "help_screen": _help_screen,
 }
 #: Domains that drive their own, separate ``App.run_test()`` session
-#: instead of sharing the main one -- see this module's own docstring.
+#: instead of sharing the main one -- each connects to a different sample
+#: (key_dialog's own encrypted one, remote_connect's per-sample profile/
+#: remote_storage target), and a fresh connect in the shared main session
+#: would disturb its own already-connected state.
 _OWN_SESSION_PHASES = {"key_dialog", "remote_connect"}
 
 
@@ -96,18 +99,17 @@ async def _run(args: argparse.Namespace) -> int:
                 ctx.skip(domain, f"{domain}.no_samples_configured", reason)
         else:
             # Recorded here, not inside list_representative_refs() itself
-            # (this SmokeContext doesn't exist yet at that point) -- see
-            # that function's own docstring for why a bare print() alone
-            # would leave a real browser-specific coverage gap invisible
-            # in index.md.
+            # (this SmokeContext doesn't exist yet at that point) -- a bare
+            # print() alone would leave a real browser-specific coverage
+            # gap invisible in index.md, visible only in whatever terminal
+            # happened to run the tool.
             for i, reason in enumerate(bootstrap_skips):
                 ctx.skip("navigate", f"navigate.bootstrap_skip[{i}]", reason)
 
             # main_ref/encrypted_ref are picked from local refs only:
             # every domain but remote_connect drives ConnectDialog via
             # connect_local(), which takes a filesystem path -- a
-            # profile/remote_storage ref has no such path (see
-            # RepresentativeRef.local's own docstring). remote_connect
+            # profile/remote_storage ref has no such path. remote_connect
             # covers profile/remote_storage samples on its own, below.
             local_refs = [r for r in refs if r.local]
 
@@ -116,12 +118,11 @@ async def _run(args: argparse.Namespace) -> int:
             # (unchanged); avoiding a real M365/GW leaf specifically is
             # because UnitScreen.refresh_for_verbose_mode() re-loads the
             # whole tree -- discarding cursor position -- only for that
-            # version kind (see its own docstring), which would silently
-            # break every later phase's "cursor stays on the leaf
-            # navigate landed on" assumption the moment
-            # diagnostics_and_verbose (or hex_preview's own on-demand
-            # toggle) flips verbose mode. Falls back to a SaaS ref
-            # only when the configured samples have nothing else.
+            # version kind, which would silently break every later phase's
+            # "cursor stays on the leaf navigate landed on" assumption the
+            # moment diagnostics_and_verbose (or hex_preview's own
+            # on-demand toggle) flips verbose mode. Falls back to a SaaS
+            # ref only when the configured samples have nothing else.
             unencrypted = [r for r in local_refs if not r.key]
             ctx.data["main_ref"] = (
                 next((r for r in unencrypted if r.version.target_type not in (TargetType.M365, TargetType.GW)), None)
@@ -157,9 +158,10 @@ async def _run(args: argparse.Namespace) -> int:
                     )
                 for entry in remote_entries:
                     # One fresh session per remote sample, not one shared
-                    # loop -- see _remote_connect.py's own module
-                    # docstring for why a second connect in the same
-                    # session can't be used to add to the first's tree.
+                    # loop -- BrowseScreen._reset_for_new_scan clears
+                    # _repos/the tree on every new scan, so connecting a
+                    # second source in the same session replaces the
+                    # first's tree instead of adding to it.
                     print(f"[smoke] running phase: remote_connect ({entry.name})")
                     remote_app = ApmRepoBrowserApp()
                     async with remote_app.run_test() as remote_pilot:
@@ -193,9 +195,10 @@ def main(argv: list[str] | None = None) -> int:
     args = _parse_args(argv)
     # Must happen before any ApmRepoBrowserApp.run_test() session: Textual
     # redirects sys.stderr to its own capture stream for the session's
-    # duration, and preload_resource_tracker() needs the real one -- see
-    # its own docstring. The real CLI/TUI entry point (browser/app.py's
-    # main()) does this before its own .run() for the same reason.
+    # duration, whose fileno() returns a sentinel rather than a real, open
+    # descriptor that preload_resource_tracker() needs. The real CLI/TUI
+    # entry point (browser/app.py's main()) does this before its own
+    # .run() for the same reason.
     preload_resource_tracker()
     return asyncio.run(_run(args))
 

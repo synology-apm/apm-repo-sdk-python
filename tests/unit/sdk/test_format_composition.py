@@ -67,7 +67,7 @@ class TestCompositionHeader:
             parse_composition_header(bytes(data))
 
     def test_unsupported_major_raises(self) -> None:
-        data = _build_composition_header(major=0)  # CompMajor::Basic, obsolete
+        data = _build_composition_header(major=0)  # major=0 is an obsolete, no-longer-supported composition format
         with pytest.raises(UnsupportedVersionError):
             parse_composition_header(data)
 
@@ -78,8 +78,10 @@ class TestCompositionHeader:
 
 
 class TestRecordHead:
-    def test_matches_real_sample_values(self) -> None:
-        # exact field values from apv-sample-1's Composition/132/0.com/c0.8.
+    def test_decodes_a_realistic_non_default_record(self) -> None:
+        # every field set to a distinct, non-default value at once, so a
+        # decoder bug that only shows up with a real combination (not all
+        # zeros/defaults) can't hide.
         data = _build_record_head()
         record = parse_record_head(data)
 
@@ -124,9 +126,9 @@ class TestRecordHead:
 
 
 class TestRecordTotalLength:
-    def test_matches_real_sample_next_record_offset(self) -> None:
-        # apv-sample-1: headOff=64, mapNum=37, attrLeng=60 -> next
-        # record's "Mu" magic sits at exactly 64 + 1592 = 1656.
+    def test_computes_a_realistic_next_record_offset(self) -> None:
+        # headOff=64, mapNum=37, attrLeng=60 -> next record's "Mu" magic
+        # sits at exactly 64 + 1592 = 1656.
         assert record_total_length(map_num=37, attr_leng=60) == 1592
 
     def test_zero_map_num_and_attr(self) -> None:

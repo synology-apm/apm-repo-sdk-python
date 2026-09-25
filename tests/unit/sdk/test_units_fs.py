@@ -1,7 +1,5 @@
 """Unit tests for ``synology_apm_repo.sdk.units.fs`` — synthetic
-repository roots written to real files, no sample repositories required
-(see ``tests/integration/sdk/test_units_fs.py`` for the real-FS-version
-resolution cross-check)."""
+repository roots written to real files, no sample repositories required."""
 
 from __future__ import annotations
 
@@ -40,6 +38,7 @@ from synology_apm_repo.sdk.identifiers import (
 )
 from synology_apm_repo.sdk.storage.layout import RepoKind, RepoLayout
 from synology_apm_repo.sdk.storage.local import LocalFsStore
+from synology_apm_repo.sdk.units.base import node_modified_time
 from synology_apm_repo.sdk.units.fs import FsProvider
 
 _STREAM_ID = 8
@@ -381,9 +380,9 @@ class TestErrorHandling:
 
 
 class TestPagination:
-    """``children()``'s ``offset``/``limit`` push a real
-    ``ORDER BY basename, rowid LIMIT ? OFFSET ?`` down to SQL (see
-    ``units/fs.py``'s own comment)."""
+    """``children()``'s ``offset``/``limit`` push a real ``ORDER BY
+    (CASE WHEN file_type = 2 THEN 0 ELSE 1 END), basename, rowid LIMIT ?
+    OFFSET ?`` down to SQL — containers before leaves, then by basename."""
 
     async def test_pagination_matches_full_list_slice_sorted_by_basename(self, tmp_path: Path) -> None:
         _write_repo_info(tmp_path / "repo_info")
@@ -411,6 +410,32 @@ class TestPagination:
             page = await provider.children(dir1, offset=2, limit=2)
             assert [f.name for f in page] == [f.name for f in full[2:4]]
 
+    async def test_directories_sort_before_files_regardless_of_name(self, tmp_path: Path) -> None:
+        _write_repo_info(tmp_path / "repo_info")
+        _write_vault_encryption_key_db(tmp_path / "db" / "vault_encryption_key")
+        dedup_img_path = f"{_SNAPSHOT_UUID}/{_VERSION_ID}/dedup.img"
+        _write_file_map(tmp_path / "db" / "file_map", [(dedup_img_path, _STREAM_ID, 3, 64, 2, 2)])
+        _write_target_db_with_version_id(tmp_path / "copy_meta_file" / "FS_uid1" / "target.db", _VERSION_ID)
+
+        # "zzz_dir" would sort after "aaa.txt" by name alone — asserting
+        # it still comes first proves the container-vs-leaf rank, not
+        # just the name tiebreaker, is being applied.
+        entry_rows = [
+            ("dir1", "/", 0, 0, 2, "", ""),
+            ("aaa.txt", "/dir1", 10, 1700000000, 1, "0", "[]"),
+            ("zzz_dir", "/dir1", 0, 0, 2, "", ""),
+        ]
+        version_db_dir = tmp_path / "copy_meta_file" / "FS_uid1" / "ActiveBackup_2026-01-01_120000_vuuid"
+        zst_bytes = _write_entry_table(version_db_dir / "_source.db", entry_rows)
+        (version_db_dir / "version.db.zst").write_bytes(zst_bytes)
+
+        store = LocalFsStore(tmp_path)
+        layout = RepoLayout(kind=RepoKind.VAULT, repo_root="")
+        async with await DedupRepo.open(store, layout) as repo, FsProvider(repo, _version()) as provider:
+            dir1 = (await provider.children(provider.root()))[0]
+            children = await provider.children(dir1)
+            assert [c.name for c in children] == ["zzz_dir", "aaa.txt"]
+
     async def test_pagination_offset_past_end_returns_empty(self, repo: DedupRepo) -> None:
         async with FsProvider(repo, _version()) as provider:
             dir1 = (await provider.children(provider.root()))[0]
@@ -420,3 +445,26 @@ class TestPagination:
         async with FsProvider(repo, _version()) as provider:
             dir1 = (await provider.children(provider.root()))[0]
             assert len(await provider.children(dir1, offset=0, limit=None)) == 2
+
+
+class TestMtime:
+    async def test_an_out_of_range_file_mtime_degrades_to_no_mtime_attr_without_failing_the_listing(
+        self, tmp_path: Path
+    ) -> None:
+        """``file_mtime`` is a raw, unvalidated ``entry_table`` integer --
+        an out-of-``datetime``-range value (corrupt data, not a real
+        filesystem fact) must degrade only that one row's own Modified
+        cell to blank, not raise out of ``children()`` and fail every
+        other file in the same directory's listing too."""
+        _build_fs_repo(tmp_path, extra_entry_rows=(("corrupt.txt", "/dir1", 10, 99999999999999, 1, "8192", "[]"),))
+        store = LocalFsStore(tmp_path)
+        layout = RepoLayout(kind=RepoKind.VAULT, repo_root="")
+        async with await DedupRepo.open(store, layout) as repo, FsProvider(repo, _version()) as provider:
+            dir1 = (await provider.children(provider.root()))[0]
+            children = await provider.children(dir1)
+            by_name = {c.name: c for c in children}
+            assert node_modified_time(by_name["corrupt.txt"]) is None
+            # The other, real rows are unaffected -- the whole listing
+            # didn't fail just because one row's mtime was corrupt.
+            assert node_modified_time(by_name["fileA.txt"]) is not None
+            assert node_modified_time(by_name["fileB.txt"]) is not None

@@ -50,8 +50,8 @@ async def _bootstrap() -> tuple[int, list[RepresentativeRef], list[str]]:
         return 0, [], []
     async with Session() as session:
         # exclude_unreopenable_by_cli=True: a RemoteStorageSample-derived
-        # ref has no --profile to reopen it with (see that function's own
-        # docstring) -- sdk/ and browser/ still cover it fully.
+        # ref has no --profile to reopen it with, and the real CLI has no
+        # raw-credential flag either -- sdk/ and browser/ still cover it fully.
         refs, skip_reasons = await list_representative_refs(session, entries, exclude_unreopenable_by_cli=True)
     return len(entries), refs, skip_reasons
 
@@ -70,10 +70,10 @@ def _run(args: argparse.Namespace) -> int:
                 ctx.skip(domain, f"{domain}.no_samples_configured", reason)
         else:
             # Recorded here, not inside list_representative_refs() itself
-            # (this SmokeContext doesn't exist yet at that point) -- see
-            # that function's own docstring for why a bare print() alone
-            # would leave a real cli-specific coverage gap invisible in
-            # index.md.
+            # (this SmokeContext doesn't exist yet at that point) -- a bare
+            # print() alone would leave a real cli-specific coverage gap
+            # invisible in index.md, visible only in whatever terminal
+            # happened to run the tool.
             for i, reason in enumerate(bootstrap_skips):
                 ctx.skip("commands", f"commands.bootstrap_skip[{i}]", reason)
             ctx.data["refs"] = refs

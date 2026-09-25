@@ -1,8 +1,9 @@
 """Checks (and optionally rewrites) pinned GitHub Actions in .github/workflows/*.yml.
 
-Two passes: `_discover_pins` parses every `uses:` step's pin, and
-`_evaluate` then checks each well-formed pin against its upstream tags —
-see each function's own docstring for the detail.
+Two passes: `_discover_pins` parses every `uses:` step's pin into an
+`ActionPin`, or an error when it's unpinned or missing its `# vX.Y.Z` tag
+comment; `_evaluate` then flags a discrepancy only when a pin's resolved
+upstream commit SHA differs from what's currently pinned.
 
 Exit code 0 = clean; non-zero = errors printed to stderr.
 
@@ -81,8 +82,8 @@ def _discover_pins() -> tuple[list[ActionPin], list[str]]:
     comment), plus every step that fails to parse as one, as an error
     string. A `./`-prefixed value (a local reusable workflow ref) is
     skipped entirely; a pin that isn't shaped `owner/repo@<40-hex-sha>`,
-    or is missing the tag comment, is itself a "GitHub Actions Security
-    Conventions" violation and becomes an error rather than an `ActionPin`."""
+    or is missing the tag comment, violates this repository's pinning
+    convention and becomes an error rather than an `ActionPin`."""
     pins: list[ActionPin] = []
     errors: list[str] = []
 
@@ -199,17 +200,10 @@ def _evaluate(
     sha_cache: dict[tuple[str, str], str | None],
 ) -> Discrepancy | str | None:
     """Return a Discrepancy if `pin` is outdated, None if clean, or an error message
-    if upstream couldn't be resolved at all.
-
-    Finds the highest version tag upstream (via `git ls-remote --tags`,
-    comparing parsed `(major, minor, patch)` regardless of how many
-    components a tag itself specifies — a pin on `v7` is compared against
-    `v8.3.2` too, see `_best_tag`) and resolves its commit SHA (preferring
-    the dereferenced `<tag>^{}` line for an annotated tag, see
-    `_resolve_tag_sha`). A discrepancy is reported only when that resolved
-    SHA differs from the pinned SHA — a floating tag and an exact tag that
-    currently point at the identical commit are not treated as outdated
-    just because their labels differ."""
+    if upstream couldn't be resolved at all. A discrepancy is reported only
+    when the resolved SHA differs from the pinned SHA — a floating tag and
+    an exact tag that currently point at the identical commit are not
+    treated as outdated just because their labels differ."""
     if pin.owner_repo not in tags_cache:
         tags_cache[pin.owner_repo] = _list_tags(pin.owner_repo)
     best_tag = _best_tag(pin.tag, tags_cache[pin.owner_repo])

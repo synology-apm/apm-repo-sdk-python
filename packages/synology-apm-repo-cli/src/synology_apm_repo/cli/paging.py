@@ -1,10 +1,15 @@
 """Pipes a command's human-mode console output through a pager when
 stdout is a real terminal — never for ``--json`` output (machine-consumable)
 or a non-tty stdout (piped/redirected — there's nothing to page). Used by
-``tree``/``dump``, the two command families whose output genuinely scales
-unbounded (see each module's own docstring); ``ls``/``doctor``/``key``/
-``verify`` stay one-shot prints, deliberately — their output is normally
-short.
+``ls``/``tree``/``dump``/``verify``, whose output can scale unbounded;
+``doctor``/``key`` stay one-shot prints, deliberately — their output is
+bounded by catalog/workload/version *counts*, or a fixed handful of
+lines, never by raw item-tree content the way the other four commands'
+output can be.
+
+``render()`` is the shared ``--json``-or-human dispatch every command uses
+for its own final output — paging (when the command asks for it) is one
+part of that dispatch, not a separate step each command wires up itself.
 """
 
 from __future__ import annotations
@@ -13,10 +18,12 @@ import contextlib
 import os
 import shlex
 import subprocess
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 
 from rich.console import Console
 from rich.pager import Pager
+
+from synology_apm_repo.cli.state import CliState
 
 _DEFAULT_PAGER = "less -FIRX"
 """``-F``: don't page at all if the content already fits on one screen —
@@ -67,3 +74,22 @@ def paged(console: Console) -> Iterator[None]:
         return
     with console.pager(pager=_SubprocessPager(argv), styles=True):
         yield
+
+
+def render(console: Console, state: CliState, *, json: object, human: Callable[[], None], page: bool = False) -> None:
+    """``--json``-or-human output dispatch, shared by every command's own
+    final render step: ``console.print_json(data=json)`` under ``--json``,
+    else call ``human()`` — wrapped in ``paged(console)`` first when
+    ``page`` is true. A caller with its own JSON-building quirks (e.g.
+    ``dump.py``'s ``composition``, whose ``--json`` shape isn't a plain
+    ``dataclasses.asdict()``) still calls this the same way — ``json`` is
+    whatever payload the caller already built, this function only picks
+    which of the two ways to print it."""
+    if state.json:
+        console.print_json(data=json)
+        return
+    if page:
+        with paged(console):
+            human()
+    else:
+        human()

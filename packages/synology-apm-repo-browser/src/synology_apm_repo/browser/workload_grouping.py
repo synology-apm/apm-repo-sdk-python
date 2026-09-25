@@ -64,8 +64,7 @@ def _saas_group_key(workload: Workload) -> str:
     real domain (``workload.domain``); which one depends on
     ``workload.workload_type``, never ``sub_type`` (both fields are
     already ``workload_type``-specific — a GW workload's own
-    ``tenant_id`` is always ``None``, and vice versa, see
-    ``catalog/workload.py``'s own docstrings on both properties)."""
+    ``tenant_id`` is always ``None``, and vice versa)."""
     key = workload.tenant_id if workload.workload_type == "M365" else workload.domain
     return key or _UNKNOWN_TENANT_LABEL
 

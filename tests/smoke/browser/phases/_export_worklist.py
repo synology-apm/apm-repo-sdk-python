@@ -48,9 +48,9 @@ async def run(ctx: SmokeContext, app: Any, pilot: Any) -> None:
 
             # A real, tiny leaf can finish before this coroutine even gets
             # scheduled -- background only when there's still a live job to
-            # background (real ExportScreen._job, white-box, allowed for
+            # background (real ExportScreen._job_id, white-box, allowed for
             # tests -- pyproject.toml's per-file-ignores).
-            if isinstance(app.screen, ExportScreen) and app.screen._job is not None:
+            if isinstance(app.screen, ExportScreen) and app.screen._job_id is not None:
                 await pilot.press("b")
                 await wait_until(
                     pilot, lambda: isinstance(app.screen, UnitScreen), message="never returned after backgrounding"

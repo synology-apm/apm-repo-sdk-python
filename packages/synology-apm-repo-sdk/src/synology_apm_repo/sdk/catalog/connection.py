@@ -63,8 +63,8 @@ async def connections(repo: DedupRepo) -> list[Connection]:
     version_counts_by_connection = await _version_counts_by_connection(repo, connection_config_ids)
     all_workload_ids = [wid for ids in workload_ids_by_connection.values() for wid in ids]
     namespace_by_workload = await _namespace_by_workload(repo, all_workload_ids)
-    # Repository-wide, not per-connection (see the function's own docstring) —
-    # fetched once here rather than once per row below.
+    # Repository-wide, not per-connection — fetched once here rather than
+    # once per row below.
     display_name_candidates = await _connection_display_name_candidates(repo)
 
     result = []
@@ -148,7 +148,7 @@ async def _namespace_by_workload(repo: DedupRepo, workload_ids: list[WorkloadId]
     # workloads()/workload_by_id() (which read every column; this reads
     # only workload_id/workload_spec off the same rows) via
     # catalog/workload_config.py, so the two required-column lists can
-    # never silently drift apart -- see that module's own docstring.
+    # never silently drift apart.
     table = await Table.create(await repo.db("workload_config"), "workload_config", _WORKLOAD_COLUMNS)
     result: dict[WorkloadId, str] = {}
     async for row in table.select(f"workload_id IN ({placeholders})", workload_ids):
@@ -161,9 +161,8 @@ async def _namespace_by_workload(repo: DedupRepo, workload_ids: list[WorkloadId]
 async def _connection_display_name_candidates(repo: DedupRepo) -> list[str]:
     """The full link-name candidate list ``_connection_display_name``
     prefix-matches against — independent of any specific
-    ``connection_id`` (see that function's own docstring), so
-    ``connections`` fetches this once per call rather than once per
-    connection."""
+    ``connection_id``, so ``connections`` fetches this once per call
+    rather than once per connection."""
     if repo.layout.kind is RepoKind.VAULT:
         try:
             conn = await repo.db("vault_link_key")

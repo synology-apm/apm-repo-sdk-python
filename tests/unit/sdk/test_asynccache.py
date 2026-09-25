@@ -50,7 +50,7 @@ class TestBasicResolve:
         assert fetcher.calls == [1, 2]
 
     async def test_a_fetch_that_resolves_to_none_is_still_a_real_cache_hit(self) -> None:
-        # resolve()'s own comment: ``key in self._store``, not
+        # resolve() checks ``key in self._store``, not
         # ``self._store.get(key) is not None`` -- a fetch legitimately
         # resolving to None (a "checked, found nothing" outcome some
         # callers cache on purpose) must still count as a hit, not
@@ -67,6 +67,52 @@ class TestBasicResolve:
         assert calls == [1]  # fetched only once
         assert 1 in cache
         assert cache[1] is None
+
+
+class TestPut:
+    """``put()`` — a direct, synchronous insert for a caller that already
+    has a value in hand (no fetch involved), as opposed to ``resolve()``'s
+    await-a-fetch-on-miss shape."""
+
+    async def test_put_inserts_without_fetching(self) -> None:
+        fetcher = _CountingFetcher()
+        cache: AsyncKeyedCache[int, str] = AsyncKeyedCache(fetcher)
+        cache.put(1, "value-1")
+        assert cache[1] == "value-1"
+        assert fetcher.calls == []
+
+    async def test_resolve_after_put_is_a_cache_hit(self) -> None:
+        fetcher = _CountingFetcher()
+        cache: AsyncKeyedCache[int, str] = AsyncKeyedCache(fetcher)
+        cache.put(1, "value-1")
+        assert await cache.resolve(1) == "value-1"
+        assert fetcher.calls == []  # never fetched -- put() already settled it
+
+    async def test_put_overwrites_an_existing_key(self) -> None:
+        cache: AsyncKeyedCache[int, str] = AsyncKeyedCache(_CountingFetcher())
+        cache.put(1, "first")
+        cache.put(1, "second")
+        assert cache[1] == "second"
+
+    async def test_put_respects_maxsize_eviction(self) -> None:
+        cache: AsyncKeyedCache[int, str] = AsyncKeyedCache(_CountingFetcher(), maxsize=2)
+        cache.put(1, "value-1")
+        cache.put(2, "value-2")
+        cache.put(3, "value-3")  # evicts 1 (LRU), cache stays at 2
+        assert len(cache) == 2
+        assert 1 not in cache
+        assert 2 in cache
+        assert 3 in cache
+
+    async def test_put_refreshes_recency_the_same_way_resolve_does(self) -> None:
+        cache: AsyncKeyedCache[int, str] = AsyncKeyedCache(_CountingFetcher(), maxsize=2)
+        cache.put(1, "value-1")
+        cache.put(2, "value-2")
+        cache.put(1, "value-1-again")  # touches 1 again -> 2 is now the LRU one
+        cache.put(3, "value-3")  # evicts 2, not 1
+        assert 1 in cache
+        assert 2 not in cache
+        assert 3 in cache
 
 
 class TestMappingInterface:
@@ -374,8 +420,10 @@ class TestKnownKeys:
 
     async def test_in_flight_keys_are_known_before_they_settle(self) -> None:
         """The one gap ``.keys()`` (the ``Mapping`` interface, settled
-        entries only) has that this exists to close -- see
-        ``Repository.close()``'s own use of this for the race it fixes."""
+        entries only) has that this closes: a fetch already in flight when
+        a caller like ``Repository.close()`` wants to settle everything
+        outstanding must still be found, not missed because it hasn't
+        landed in the ``Mapping`` view yet."""
         started = asyncio.Event()
         release = asyncio.Event()
 

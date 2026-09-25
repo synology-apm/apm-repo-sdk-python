@@ -3,7 +3,10 @@
 sending the export to the background -- always offered, no size
 threshold -- so a long-running export never locks the user into one
 screen. Output goes to ``<dst>.part`` first, renamed to ``<dst>`` only on
-success — see the CLI's ``export`` command's own docstring for why.
+success: a truncated-but-plausible-looking output file is a
+safety-level problem for a restore tool, not just a UX nicety, so a
+failure or cancel leaves the ``.part`` file rather than one named
+``<dst>`` that looks complete but isn't.
 
 No sparse toggle here: every export uses ``app.default_sparse`` (set
 once at launch via ``synology-apm-repo-browser --no-sparse-export``, see ``app.py``'s
@@ -11,58 +14,53 @@ once at launch via ``synology-apm-repo-browser --no-sparse-export``, see ``app.p
 "sparse is what you want" is a launch-time preference, not something
 worth asking on every export.
 
-The export always runs as an ``app.BackgroundJob`` owned by the *app*
-(``app.run_worker(...)``, never ``@work`` on ``self``), from the moment
-Export is pressed, not only once backgrounded: a Textual worker whose
-node is a ``Screen`` is cancelled automatically the instant that screen
-unmounts, so tying it to ``self`` would make pressing ``b`` (or navigating
-away) silently kill the export.
-
-**``self.app``/``self.app_state`` are live parent-chain lookups, not
-cached**, and raise ``NoActiveAppError`` once this screen is actually
-removed (not merely suspended). ``_start`` therefore captures the live app
-reference exactly once, while the screen is still guaranteed mounted, and
-threads it through every closure below instead of touching ``self.app``
-again; ``_touch_ui`` guards ordinary widget access the same way — see its
-own docstring for why ``self._detached`` alone isn't enough.
+The export itself runs entirely above this screen: ``_start`` dispatches
+``StartExport`` into ``app.store``, which mints the job and returns a
+``RunExport`` command that ``runtime/app_effects.py`` carries out via
+``app.run_worker(..., group=<job's own group>)`` -- unless another export
+or a running verify-FULL check already has the slot, in which case the
+job starts life ``QUEUED`` and promotes to ``RUNNING`` once that slot
+frees. Either way, the worker's node is the *App*, never this screen,
+so pressing ``b`` (or navigating away) never kills it. This screen only
+ever *subscribes* to its own job's
+state (``_my_job``/``_render_job``) and dispatches ``CancelJobRequested``
+to cancel it -- it holds no live ``Worker`` reference and posts no
+``Message`` of its own; the store is the one shared place both this
+screen and ``WorklistScreen`` read/drive the same job through.
 """
 
 from __future__ import annotations
 
-import asyncio
-import functools
-import os
 import re
 import sys
-from collections.abc import Callable
-from pathlib import Path
 from typing import cast
 
 from textual.app import ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical
-from textual.css.query import NoMatches
 from textual.screen import ModalScreen
 from textual.widgets import Button, Input, ProgressBar, Static
 
-from synology_apm_repo.browser.app import ApmRepoBrowserApp, BackgroundJob
+from synology_apm_repo.browser.app import ApmRepoBrowserApp
+from synology_apm_repo.browser.core.app.model import AppModel, FinishedJob, Job, JobStatus
+from synology_apm_repo.browser.core.app.msg import CancelJobRequested, StartExport
+from synology_apm_repo.browser.core.app.select import ExportButtonSpec, export_button_spec
+from synology_apm_repo.browser.core.keys import JobId
 from synology_apm_repo.browser.keymap import COMMON_BINDINGS
-from synology_apm_repo.browser.screens._shared import modal_box_css
+from synology_apm_repo.browser.runtime.store import Subscription
+from synology_apm_repo.browser.screens._shared import delegate_common_action, modal_box_css
 from synology_apm_repo.browser.strings import (
     EXPORT_BACKGROUNDED_TITLE,
-    EXPORT_CANCEL_LABEL,
     EXPORT_DST_LABEL,
     EXPORT_DST_PLACEHOLDER,
-    EXPORT_NO_DESTINATION_WARNING,
     EXPORT_NOTHING_RUNNING_WARNING,
+    EXPORT_QUEUED_MESSAGE,
+    EXPORT_RUNNING_STATUS_TEXT,
     EXPORT_START_LABEL,
     EXPORT_STATUS_BAR,
 )
-from synology_apm_repo.sdk.api import ExportResult
-from synology_apm_repo.sdk.errors import ApmRepoError
-from synology_apm_repo.sdk.presentation.format import format_bytes, format_duration, format_rate
+from synology_apm_repo.sdk.presentation.format import format_bytes
 from synology_apm_repo.sdk.presentation.markup import safe
-from synology_apm_repo.sdk.presentation.progress import Progress, ProgressMeter, reading_progress_callback
 from synology_apm_repo.sdk.units.base import RestorableUnit
 
 _WINDOWS_FORBIDDEN_CHARS = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
@@ -92,9 +90,16 @@ def _windows_safe_filename(name: str) -> str:
 
 
 class ExportScreen(ModalScreen[None]):
-    """See module docstring. ``ModalScreen`` truncates the App-level
-    binding chain at itself, same as ``KeyDialog`` — only the bindings
-    declared here are reachable while this dialog is open."""
+    """``ModalScreen`` truncates the App-level binding chain at itself,
+    same as ``KeyDialog`` — only the bindings
+    declared here are reachable while this dialog is open. Keeping
+    ``COMMON_BINDINGS`` in ``BINDINGS`` isn't enough on its own to make
+    ``q``/``d``/``?`` work, though: Textual's own action dispatch runs
+    the method on whichever node's own ``BINDINGS`` the key was actually
+    found on, never bubbling further once the chain is truncated here —
+    see ``action_quit_app``/``action_toggle_verbose``/``action_show_help``
+    below, each an explicit delegate to the App's own real
+    implementation (same fix/rationale as ``WorklistScreen``'s own)."""
 
     DEFAULT_CSS = (
         modal_box_css("ExportScreen", width=76, guard_child_horizontal=True)
@@ -120,7 +125,7 @@ class ExportScreen(ModalScreen[None]):
         called), so an unhidden bar in a freshly-opened dialog would spin
         for work that hasn't started and read as "export already
         running". ``_start()`` adds the ``active`` class the moment a job is
-        actually created. */
+        actually accepted. */
         display: none;
     }
 
@@ -143,8 +148,19 @@ class ExportScreen(ModalScreen[None]):
     def __init__(self, unit: RestorableUnit) -> None:
         super().__init__()
         self._unit = unit
-        self._job: BackgroundJob | None = None
-        self._detached = False
+        self._job_id: JobId | None = None
+        self._subscription: Subscription | None = None
+        #: The status last written to #export-status by _render_job's
+        #: own QUEUED/RUNNING branch, so a same-status re-render (every
+        #: ExportProgressed tick while RUNNING, up to 10/s) can skip the
+        #: write -- Static.update() unconditionally calls
+        #: self.refresh(layout=True) regardless of whether the text
+        #: actually changed, and a real repaint is this app's own
+        #: documented dominant cost (see widgets/progress_hint.py's
+        #: _FRAME_INTERVAL comment). Reset to None once a job leaves
+        #: (FinishedJob), so the next fresh start always writes at least
+        #: once regardless of what the previous job's last status was.
+        self._last_rendered_status: JobStatus | None = None
 
     def compose(self) -> ComposeResult:
         with Vertical():
@@ -160,19 +176,86 @@ class ExportScreen(ModalScreen[None]):
             )
             with Horizontal(id="export-actions"):
                 yield Button(EXPORT_START_LABEL, id="export-start", variant="primary")
-            # show_eta=False: ETA is rendered from our own ProgressMeter below
-            # (the same rate/ETA adapter export_to()'s CLI counterpart uses),
+            # show_eta=False: ETA is rendered from Job.rate_text/eta_text/
+            # elapsed_text below (the same rate/ETA adapter export_to()'s
+            # CLI counterpart uses, computed in runtime/app_effects.py),
             # not ProgressBar's own built-in ETA math.
             yield ProgressBar(id="export-progress", show_eta=False)
             yield Static("", id="export-rate")
             yield Static("", id="export-status")
             yield Static(EXPORT_STATUS_BAR, id="status-bar")
 
+    def on_mount(self) -> None:
+        app = cast(ApmRepoBrowserApp, self.app)
+        self._subscription = app.store.subscribe(self._my_job, self._render_job, init=False)
+
     def on_unmount(self) -> None:
-        # The export worker (app-owned, not screen-owned — see module
-        # docstring) keeps running after this; it only stops touching this
-        # screen's widgets from here on.
-        self._detached = True
+        if self._subscription is not None:
+            self._subscription.unsubscribe()
+
+    def _my_job(self, model: AppModel) -> Job | FinishedJob | None:
+        """This screen's own job, wherever it currently is -- still
+        running (``AppModel.jobs``) or just finished (``AppModel.recent``,
+        kept around precisely so a still-open screen like this one can
+        read its own job's terminal ``outcome`` after the fact). ``None``
+        before any export has been started yet, and again once one
+        finishes and ``_render_job`` resets ``self._job_id``."""
+        if self._job_id is None:
+            return None
+        job = model.jobs.get(self._job_id)
+        if job is not None:
+            return job
+        return next((finished for finished in model.recent if finished.id == self._job_id), None)
+
+    def _render_job(self, job: Job | FinishedJob | None) -> None:
+        """The single choke point every path -- a freshly-started job, a
+        queued one getting promoted, an ongoing one's own progress tick,
+        or one that just finished (cancelled, errored, or successful) --
+        routes through, so the button/progress-bar/status-line state
+        never drifts from what the job's own current status actually is."""
+        if isinstance(job, Job):
+            # Called for QUEUED too, not just RUNNING/CANCELLING: a
+            # QUEUED job's own rate_text/eta_text/elapsed_text are all
+            # still "" already, which is exactly what clears
+            # #export-rate's leftover text from a previous export that
+            # finished on this same screen instance -- this is the only
+            # place that ever writes to it.
+            self._render_progress(job)
+            # Only written on an actual QUEUED<->RUNNING transition, not
+            # on every render -- this fires on every ExportProgressed
+            # tick while RUNNING (up to 10/s), and Static.update() always
+            # repaints regardless of whether the text changed, so writing
+            # the same "exporting..." on every one of those ticks would
+            # be pure repaint churn. A QUEUED job promoted to RUNNING
+            # (this screen never calls _start() again for that
+            # transition, only the store's own subscription re-firing
+            # this method) still needs exactly one write to flip the text
+            # over from "queued..." to "exporting...", which comparing
+            # against ``_last_rendered_status`` catches. CANCELLING is
+            # left alone here on purpose either way: _cancel_job is the
+            # one place that writes "cancelling...", immediately after
+            # this same dispatch-triggered render already ran.
+            if job.status is not self._last_rendered_status:
+                if job.status is JobStatus.QUEUED:
+                    self.query_one("#export-status", Static).update(EXPORT_QUEUED_MESSAGE)
+                elif job.status is JobStatus.RUNNING:
+                    self.query_one("#export-status", Static).update(EXPORT_RUNNING_STATUS_TEXT)
+                self._last_rendered_status = job.status
+        elif isinstance(job, FinishedJob):
+            self.query_one("#export-status", Static).update(job.outcome.status_text)
+            self._job_id = None  # allow re-exporting from this same screen instance
+            self._last_rendered_status = None
+        # None: nothing running and nothing finished to show yet -- the
+        # dialog's own freshly-composed empty state already covers this.
+        self._render_button(export_button_spec(job))
+
+    def _render_button(self, spec: ExportButtonSpec) -> None:
+        self.query_one("#export-progress", ProgressBar).set_class(spec.progress_active, "active")
+        button = self.query_one("#export-start", Button)
+        button.label = spec.label
+        # ExportButtonSpec.variant is plain str (core/ stays Textual-free) --
+        # a real ButtonVariant literal at every construction site above.
+        button.variant = spec.variant
 
     def on_button_pressed(self, event: Button.Pressed) -> None:
         # Same button, two lives: [Export] while idle, [Cancel] while an
@@ -181,7 +264,7 @@ class ExportScreen(ModalScreen[None]):
         # branch below exactly (``_cancel_job`` is the one place that logic
         # lives).
         if event.button.id == "export-start":
-            if self._job is None:
+            if self._job_id is None:
                 self._start()
             else:
                 self._cancel_job()
@@ -192,40 +275,29 @@ class ExportScreen(ModalScreen[None]):
         if event.input.id == "export-dst":
             self._start()
 
-    def _read_export_inputs(self) -> Path | None:
-        """Validates the destination path, ``notify()``-ing and returning
-        ``None`` on a problem. Pure read + validation — no widget
-        mutation, no job creation, so ``_start`` can bail out before
-        touching either."""
-        dst = self.query_one("#export-dst", Input).value
-        if not dst:
-            self.notify(EXPORT_NO_DESTINATION_WARNING, severity="warning")
-            return None
-        return Path(dst)
-
     def _start(self) -> None:
-        if self._job is not None:
+        if self._job_id is not None:
             return
-        # Captured once, here, while this screen is still guaranteed
-        # mounted — see the module docstring's live-``self.app`` note.
-        # Every closure from here on takes ``app`` as an explicit parameter
-        # rather than touching ``self.app`` again. Cast, not
-        # ``NavigableScreen.app_state`` (this is a ModalScreen, not a
-        # NavigableScreen — see the class docstring):
-        # ``self.app`` is typed as the generic ``App[None]``, but
-        # ``start_job``/``update_job``/``finish_job`` (all called on ``app``
-        # below) are specific to ApmRepoBrowserApp.
         app = cast(ApmRepoBrowserApp, self.app)
-        dst = self._read_export_inputs()
-        if dst is None:
+        dst_text = self.query_one("#export-dst", Input).value
+        # StartExport's own update() handler validates dst_text itself
+        # (empty -> a Notify the store's effect interpreter turns into a
+        # real app.notify() -- see core/app/update.py) rather than this
+        # screen re-validating before dispatching; the *new* key(s) in
+        # `model.jobs` after the dispatch (there is at most one --
+        # StartExport's own case adds exactly one job on acceptance, none
+        # on rejection) tell "accepted" from "rejected" without update()
+        # needing its own reply channel back to one specific caller, and
+        # without this screen needing to know or predict how `update()`
+        # itself mints a job's own id.
+        jobs_before = set(app.store.model.jobs)
+        app.store.dispatch(StartExport(unit=self._unit, dst_text=dst_text, sparse=app.default_sparse))
+        new_job_ids = set(app.store.model.jobs) - jobs_before
+        if not new_job_ids:
             return
-        sparse = app.default_sparse
-        self._job = app.start_job(f"export {self._unit.name}")
-        self.query_one("#export-status", Static).update("exporting...")
-        self.query_one("#export-progress", ProgressBar).add_class("active")
-        button = self.query_one("#export-start", Button)
-        button.label = EXPORT_CANCEL_LABEL
-        button.variant = "warning"
+        (job_id,) = new_job_ids
+        job = app.store.model.jobs[job_id]
+        self._job_id = job_id
         # Move focus off the destination Input once exporting starts —
         # otherwise every single-letter binding on this screen (``b``
         # background included) gets swallowed as ordinary typed text by
@@ -234,152 +306,72 @@ class ExportScreen(ModalScreen[None]):
         # before they'd ever bubble up to a binding lookup). Escape/Enter
         # aren't affected either way since Input doesn't claim those.
         self.set_focus(None)
-        # ``functools.partial``, not a lambda: Textual's ``Worker._run_async``
-        # decides whether it may run the work at all by asking
-        # ``inspect.iscoroutinefunction(self._work)`` or
-        # ``iscoroutinefunction(self._work.func)`` — a lambda *returning* a
-        # coroutine satisfies neither and raises WorkerError("Request to
-        # run a non-async function as an async worker"). A partial over
-        # the ``async def`` itself exposes it as ``.func``, so the check
-        # passes.
-        self._job = app.attach_worker(
-            self._job.id,
-            app.run_worker(
-                functools.partial(self._run_export, app, self._job, dst, sparse),
-                name=f"export-{self._job.id}",
-            ),
-        )
+        # The subscription registered in on_mount only re-renders on the
+        # *next* dispatch's own notify pass -- which already happened,
+        # synchronously, inside the dispatch() call above, using the
+        # `self._job_id` value from *before* this method set it. One
+        # explicit catch-up render for this job's own just-minted state
+        # (0 done, no rate/eta/elapsed text yet -- or, if the one job slot
+        # was already occupied, QUEUED instead of RUNNING) closes that
+        # gap -- this is also the one place that writes the "exporting..."/
+        # "queued..." status text, so it stays correct for either case
+        # without a separate write here that a later QUEUED->RUNNING
+        # promotion (a subsequent render, not this method running again)
+        # would have no way to redo.
+        self._render_job(job)
 
-    async def _run_export(
-        self,
-        app: ApmRepoBrowserApp,
-        job: BackgroundJob,
-        dst: Path,
-        sparse: bool,
-    ) -> None:
-        content = self._unit.open()
-        part_path = dst.with_name(dst.name + ".part")
-
-        # ``meter`` is referenced by ``on_meter_update`` below before it's
-        # assigned on the following line — ordinary Python closure
-        # late-binding, not a bug: the name only needs to exist by the
-        # time the callback actually *runs*, and ProgressMeter.__init__
-        # never invokes its callback synchronously.
-        async def on_meter_update(p: Progress) -> None:
-            # ``update_job``/``finish_job`` (here and below) go through the
-            # ``app`` reference captured in ``_start``, never ``_touch_ui``:
-            # they need the App itself, not a screen widget, so
-            # ``_touch_ui``'s NoMatches staleness guard doesn't apply to them.
-            app.update_job(job.id, p.done, p.total)
-            self._touch_ui(lambda: self._render_progress(meter, p))
-
-        # Rate/ETA are computed here via ProgressMeter; on_progress below
-        # wraps it with presentation.progress.reading_progress_callback(),
-        # the same adapter the CLI's export command uses, so the two
-        # surfaces can never disagree about what "187 MiB/s" or "ETA 00:08"
-        # means.
-        meter = ProgressMeter(callback=on_meter_update)
-        on_progress = reading_progress_callback(meter)
-
-        try:
-            # ``mkdir``/``os.replace`` stay plain blocking calls even though
-            # this runs on the event loop, not a worker thread: both are
-            # single filesystem *metadata* operations, not the
-            # bulk data path the SDK offloads with ``asyncio.to_thread``, and
-            # wrapping the rename in particular would add a cancellation
-            # point between "export finished" and "output is at its final
-            # name" for no benefit.
-            dst.parent.mkdir(parents=True, exist_ok=True)
-            # No concurrency kwargs to pass here — export_to()'s own real
-            # parallelism (a multiprocess dispatch, unconditional whenever
-            # the repository's store supports it) isn't a caller-facing
-            # knob; see export_scheduler.py's own module docstring.
-            result = cast(
-                ExportResult,
-                await content.export_to(part_path, sparse=sparse, progress=on_progress),
+    def _render_progress(self, job: Job) -> None:
+        # job.total, not `job.total or None`: ProgressBar's own
+        # percentage math already treats a genuinely known total of 0
+        # (an empty unit) as 100% complete, not indeterminate -- `or
+        # None` would collapse that known-zero back into "unknown",
+        # rendering an indeterminate spinner for an export that's
+        # actually already done. Matches Job.percent's own total==0
+        # special case (model.py) for the same reason.
+        self.query_one("#export-progress", ProgressBar).update(total=job.total, progress=job.done)
+        parts = [
+            part
+            for part in (
+                job.rate_text,
+                f"ETA {job.eta_text}" if job.eta_text else "",
+                f"elapsed {job.elapsed_text}" if job.elapsed_text else "",
             )
-            os.replace(part_path, dst)
-        except asyncio.CancelledError:
-            # The SDK's own try/finally has already closed the partial
-            # destination file on the way out, so <dst>.part is left on
-            # disk.
-            message = f"{self._unit.name}: cancelled (partial file kept as {part_path.name})"
-            app.finish_job(job.id, message, severity="warning")
-            self._touch_ui(lambda: self._finish("[yellow]cancelled[/yellow] (partial file kept as .part)"))
-            self._job = None  # allow re-exporting from this same screen instance
-            # Re-raised, never swallowed: swallowing it would leave this
-            # worker reported as SUCCESS and could suppress a cancellation
-            # that came from the event loop itself (app shutdown), which
-            # asyncio requires to propagate.
-            raise
-        except ApmRepoError as exc:
-            # ``str(exc)`` must be captured now, not referenced from inside a
-            # lambda that runs later: ``except ... as exc`` implicitly
-            # unbinds ``exc`` the moment this block exits (a well-known
-            # Python gotcha, to avoid leaking traceback references), so a
-            # deferred closure over the bare name would raise NameError.
-            detail = str(exc)
-            message = f"{self._unit.name}: export failed — {detail}"
-            app.finish_job(job.id, message, severity="error")
-            self._touch_ui(lambda: self._finish(f"[red]error:[/red] {safe(detail)}"))
-            self._job = None
-            return
-
-        message = f"{self._unit.name}: exported {format_bytes(result.bytes_written)} to {dst}"
-        app.finish_job(job.id, message, severity="information")
-        self._touch_ui(
-            lambda: self._finish(
-                f"[green]done[/green] — {format_bytes(result.bytes_written)} written, "
-                f"{format_bytes(result.holes)} holes, {format_bytes(result.zeros)} zero-fill"
-            ),
-        )
-        self._job = None
-
-    def _render_progress(self, meter: ProgressMeter, p: Progress) -> None:
-        self.query_one("#export-progress", ProgressBar).update(total=p.total or None, progress=p.done)
-        rate = meter.rate
-        parts = []
-        if rate > 0:
-            parts.append(format_rate(rate, p.unit))
-        eta = meter.eta
-        if eta is not None:
-            parts.append(f"ETA {format_duration(eta.total_seconds())}")
-        parts.append(f"elapsed {format_duration(meter.elapsed.total_seconds())}")
+            if part
+        ]
         self.query_one("#export-rate", Static).update(" · ".join(parts))
 
-    def _touch_ui(self, fn: Callable[[], None]) -> None:
-        # No thread hop needed (the export worker runs on the App's own
-        # event loop), but the screen can go stale between event-loop turns
-        # before ``on_unmount()`` flips ``self._detached`` — so ``NoMatches`` (not
-        # ``_detached`` alone) is the actual authority on whether the screen
-        # is still touchable; ``_detached`` stays as a fast-path skip.
-        if self._detached:
-            return
-        try:
-            fn()
-        except NoMatches:
-            self._detached = True
+    # -- COMMON_BINDINGS delegates -- see the class docstring for why
+    # the Binding alone (inherited into this screen's own BINDINGS) isn't
+    # enough on a modal; each of these must exist here too.
+    def action_quit_app(self) -> None:
+        delegate_common_action(self, "quit_app")
 
-    def _finish(self, message: str) -> None:
-        # The single choke point every completion path (cancelled,
-        # errored, or successful — see the three call sites in
-        # _run_export) routes through, so the button flipping back to
-        # "Export" happens exactly once, regardless of which of those
-        # three ways this export ended.
-        self.query_one("#export-status", Static).update(message)
-        button = self.query_one("#export-start", Button)
-        button.label = EXPORT_START_LABEL
-        button.variant = "primary"
+    def action_toggle_verbose(self) -> None:
+        delegate_common_action(self, "toggle_verbose")
+
+    def action_show_help(self) -> None:
+        delegate_common_action(self, "show_help")
 
     def action_background(self) -> None:
-        if self._job is None:
+        if self._job_id is None:
             self.notify(EXPORT_NOTHING_RUNNING_WARNING, severity="warning")
             return
-        self.notify(f"{self._unit.name}: continuing export in the background", title=EXPORT_BACKGROUNDED_TITLE)
+        # A QUEUED job (self._job_id is set the same way for either
+        # status -- see _start()) hasn't actually started yet, so
+        # "continuing export in the background" would be inaccurate;
+        # either way the job already lives in AppModel.jobs/
+        # queued_requests regardless of whether this screen stays open,
+        # so popping is correct either way -- only the wording differs.
+        app = cast(ApmRepoBrowserApp, self.app)
+        job = app.store.model.jobs.get(self._job_id)
+        if job is not None and job.status is JobStatus.QUEUED:
+            self.notify(f"{self._unit.name}: {EXPORT_QUEUED_MESSAGE}", title=EXPORT_BACKGROUNDED_TITLE)
+        else:
+            self.notify(f"{self._unit.name}: continuing export in the background", title=EXPORT_BACKGROUNDED_TITLE)
         self.app.pop_screen()
 
     def action_cancel_or_back(self) -> None:
-        if self._job is not None:
+        if self._job_id is not None:
             self._cancel_job()
         else:
             self.app.pop_screen()
@@ -387,12 +379,18 @@ class ExportScreen(ModalScreen[None]):
     def _cancel_job(self) -> None:
         # Shared by the button and ``Esc`` — one place that requests
         # cancellation and sets the "cancelling..." status text, so the
-        # two triggers can never drift apart. Cancellation semantics: see
-        # BackgroundJob.cancel().
-        assert self._job is not None
-        self._job.cancel()
-        # Cast for the same reason _start()'s own comment gives:
-        # mark_job_cancelling is ApmRepoBrowserApp-specific, not on the
-        # generic App[None] self.app is typed as.
-        cast(ApmRepoBrowserApp, self.app).mark_job_cancelling(self._job.id)
-        self.query_one("#export-status", Static).update("cancelling...")
+        # two triggers can never drift apart.
+        assert self._job_id is not None
+        cast(ApmRepoBrowserApp, self.app).store.dispatch(CancelJobRequested(job_id=self._job_id))
+        # dispatch() above runs synchronously to completion, including
+        # this screen's own subscription callback -- for a QUEUED job,
+        # CancelJobRequested removes it immediately (never routed through
+        # CANCELLING, see update.py's own branch) and _render_job's
+        # FinishedJob path already reset self._job_id to None and wrote
+        # the real "cancelled (was queued...)" status text. Only a job
+        # still RUNNING/CANCELLING after that (self._job_id still set)
+        # gets the generic "cancelling..." text here -- otherwise this
+        # would unconditionally clobber the correct terminal text with a
+        # wrong one nothing would ever correct afterward.
+        if self._job_id is not None:
+            self.query_one("#export-status", Static).update("cancelling...")

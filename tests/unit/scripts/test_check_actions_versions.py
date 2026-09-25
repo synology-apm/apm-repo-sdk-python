@@ -1,14 +1,13 @@
 """Tests for scripts/check_actions_versions.py.
 
-``scripts/`` isn't an installed package (same as
-``test_anonymize_catalog_metadata.py``'s own loading convention), so the module
-under test is loaded by path via ``importlib`` through the ``check_actions_versions``
-fixture. No test here hits the network: ``_run_git_ls_remote`` (the single seam both
-tag-resolution and tag-listing funnel through) is monkeypatched with a fake that
-answers from an in-memory fixture instead. Unlike `test_check_version_consistency.py`,
-there is no "regression guard against the real repository files" test — that pattern only
-works offline, and this checker's real-repository pass needs live network access to
-github.com.
+``scripts/`` isn't an installed package, so the module under test is loaded
+by path via ``importlib`` through the ``check_actions_versions`` fixture. No
+test here hits the network: ``_run_git_ls_remote`` (the single seam both
+tag-resolution and tag-listing funnel through) is monkeypatched with a fake
+that answers from an in-memory fixture instead. This checker's own
+real-repository pass needs live network access to github.com, so unlike a
+purely local checker, there's no offline "regression guard against the real
+repository files" test here.
 """
 
 from __future__ import annotations

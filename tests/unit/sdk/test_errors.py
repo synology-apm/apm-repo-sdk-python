@@ -31,13 +31,13 @@ def test_none_of_the_hierarchy_shadows_builtin_keyerror() -> None:
 
 
 def test_message_includes_ref_and_spec() -> None:
-    exc = errors.NotFoundError("no such file", ref="db/file_map", spec="on-disk-format.md §1.2")
+    exc = errors.NotFoundError("no such file", ref="db/file_map", spec="FORMAT-SPEC.md §1.2")
     text = str(exc)
     assert "no such file" in text
     assert "db/file_map" in text
-    assert "on-disk-format.md §1.2" in text
+    assert "FORMAT-SPEC.md §1.2" in text
     assert exc.ref == "db/file_map"
-    assert exc.spec == "on-disk-format.md §1.2"
+    assert exc.spec == "FORMAT-SPEC.md §1.2"
 
 
 def test_message_without_ref_or_spec_is_just_the_message() -> None:
@@ -59,6 +59,17 @@ def test_profile_config_corrupt_is_a_data_corrupt() -> None:
     assert isinstance(exc, errors.DataCorruptError)
     assert isinstance(exc, errors.FormatError)
     assert "profiles.json" in str(exc)
+
+
+def test_content_unavailable_is_not_a_not_found_error() -> None:
+    exc = errors.ContentUnavailableError("cloud-sync placeholder", ref="disk/Users/j/file.pdf")
+    assert isinstance(exc, errors.ApmRepoError)
+    # Deliberately NOT a NotFoundError: several call sites elsewhere in this
+    # SDK catch NotFoundError to treat an optional item as
+    # absent-and-skippable, and this must keep propagating through those
+    # instead of being silently swallowed as "doesn't exist".
+    assert not isinstance(exc, errors.NotFoundError)
+    assert not issubclass(errors.ContentUnavailableError, errors.NotFoundError)
 
 
 def test_profile_secret_backend_unavailable_is_not_key_material_error() -> None:

@@ -1,7 +1,10 @@
 """Unit tests for ``synology_apm_repo.cli.profile_store.resolve_profile_store``'s
 real body — every ``--profile``-driven CLI test (``test_cli_profile_option.py``
-and friends) monkeypatches this function out entirely (see ``cli.browse``'s
-own docstring), so its one-line delegation to
+and friends) monkeypatches this function out entirely, since ``ls``/``doctor``/
+``key``/``verify`` are all built on ``cli.repo_session.opened_repo()``, which
+imports and calls ``resolve_profile_store`` as a bare module-level name, so
+those tests patch ``cli.repo_session.resolve_profile_store`` rather than
+exercising the real body. Its one-line delegation to
 ``synology_apm_repo.sdk.profiles.build_store`` is otherwise exercised
 nowhere in this suite."""
 

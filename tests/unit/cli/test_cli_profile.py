@@ -2,8 +2,8 @@
 (``synology_apm_repo.cli.commands.profile``).
 
 Every profile-persistence function this command module imports
-(``list_profiles``/``get_profile``/``save_profile``/``delete_profile``) is
-monkeypatched to a thin wrapper binding ``config_dir=tmp_path`` — the CLI
+(``list_profiles_full``/``get_profile``/``save_profile``/``delete_profile``)
+is monkeypatched to a thin wrapper binding ``config_dir=tmp_path`` — the CLI
 itself exposes no ``--config-dir`` flag (only the SDK facade takes one, for
 tests), so this is the CLI-side equivalent of what
 ``tests/unit/sdk/test_profiles_facade.py`` does directly against the SDK.
@@ -39,8 +39,8 @@ async def _fake_store_from_fields(kind: object, fields: object) -> object:
 
 @pytest.fixture(autouse=True)
 def _config_dir(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
-    async def _list_profiles() -> list[sdk_profiles.ProfileSummary]:
-        return await sdk_profiles.list_profiles(config_dir=tmp_path)
+    async def _list_profiles_full() -> list[sdk_profiles.Profile]:
+        return await sdk_profiles.list_profiles_full(config_dir=tmp_path)
 
     async def _get_profile(name: str) -> sdk_profiles.Profile:
         return await sdk_profiles.get_profile(name, config_dir=tmp_path)
@@ -51,7 +51,7 @@ def _config_dir(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     async def _delete_profile(name: str) -> None:
         await sdk_profiles.delete_profile(name, config_dir=tmp_path)
 
-    monkeypatch.setattr(profile_cmd, "list_profiles", _list_profiles)
+    monkeypatch.setattr(profile_cmd, "list_profiles_full", _list_profiles_full)
     monkeypatch.setattr(profile_cmd, "get_profile", _get_profile)
     monkeypatch.setattr(profile_cmd, "save_profile", _save_profile)
     monkeypatch.setattr(profile_cmd, "delete_profile", _delete_profile)
@@ -443,6 +443,70 @@ def test_list_shows_saved_profiles(fake_keyring: None) -> None:
     assert result.exit_code == 0, result.output
     assert "demo" in result.output
     assert "s3" in result.output
+
+
+def test_list_verbose_empty_human() -> None:
+    result = runner.invoke(app, ["--verbose", "profile", "list"])
+    assert result.exit_code == 0, result.output
+    assert "no saved profiles" in result.output
+
+
+def test_list_verbose_human_separates_multiple_profiles_with_a_blank_line(fake_keyring: None) -> None:
+    runner.invoke(app, ["profile", "add", "one", "--backend", "s3", "--bucket", "b", "--no-verify"], input="\n\n")
+    runner.invoke(app, ["profile", "add", "two", "--backend", "s3", "--bucket", "b", "--no-verify"], input="\n\n")
+    result = runner.invoke(app, ["--verbose", "profile", "list"])
+    assert result.exit_code == 0, result.output
+    assert "name       : one" in result.output
+    assert "name       : two" in result.output
+    assert "\n\nname       : two" in result.output
+
+
+def test_list_verbose_human_shows_the_same_fields_show_does(fake_keyring: None) -> None:
+    runner.invoke(
+        app,
+        ["profile", "add", "demo", "--backend", "s3", "--bucket", "my-bucket", "--region", "us-east-1", "--no-verify"],
+        input="\n\n",
+    )
+    show = runner.invoke(app, ["profile", "show", "demo"])
+    result = runner.invoke(app, ["--verbose", "profile", "list"])
+    assert result.exit_code == 0, result.output
+    for line in ("backend    : s3", "bucket     : my-bucket", "region     : us-east-1", "verify_tls : True"):
+        assert line in show.output
+        assert line in result.output
+
+
+def test_list_verbose_json_shows_the_same_fields_show_does(fake_keyring: None) -> None:
+    runner.invoke(
+        app, ["profile", "add", "demo", "--backend", "azure", "--container", "my-container", "--no-verify"], input="\n"
+    )
+    show = runner.invoke(app, ["--json", "profile", "show", "demo"])
+    listing = runner.invoke(app, ["--json", "--verbose", "profile", "list"])
+    assert listing.exit_code == 0, listing.output
+    assert json.loads(listing.stdout) == [json.loads(show.stdout)]
+
+
+def test_list_verbose_covers_every_backend_kind(fake_keyring: None) -> None:
+    runner.invoke(app, ["profile", "add", "s3-demo", "--backend", "s3", "--bucket", "b", "--no-verify"], input="\n\n")
+    runner.invoke(
+        app, ["profile", "add", "azure-demo", "--backend", "azure", "--container", "c", "--no-verify"], input="\n"
+    )
+    runner.invoke(
+        app,
+        ["profile", "add", "smb-demo", "--backend", "smb", "--server", "s", "--share", "sh", "--no-verify"],
+        input="\n",
+    )
+    result = runner.invoke(app, ["--json", "--verbose", "profile", "list"])
+    assert result.exit_code == 0, result.output
+    reports = {r["name"]: r for r in json.loads(result.stdout)}
+    assert reports["s3-demo"]["bucket"] == "b"
+    assert reports["azure-demo"]["container"] == "c"
+    assert reports["smb-demo"]["server"] == "s"
+
+
+def test_list_non_verbose_output_is_unchanged_by_the_verbose_addition(fake_keyring: None) -> None:
+    runner.invoke(app, ["profile", "add", "demo", "--backend", "s3", "--bucket", "b", "--no-verify"], input="\n\n")
+    result = runner.invoke(app, ["--json", "profile", "list"])
+    assert json.loads(result.stdout) == [{"name": "demo", "kind": "s3"}]
 
 
 # -- show -----------------------------------------------------------------

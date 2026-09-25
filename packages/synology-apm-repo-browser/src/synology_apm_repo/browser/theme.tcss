@@ -1,6 +1,6 @@
-/* Shared styling for the Miller-column layout — every screen that
-   needs the three-column browse view or a status bar imports this one
-   stylesheet instead of redefining the same rules per screen. */
+/* Shared styling for the Miller-column and folder-tree/file-table browse
+   layouts — every screen that needs one of them or a status bar imports
+   this one stylesheet instead of redefining the same rules per screen. */
 
 Screen {
     layout: vertical;
@@ -11,15 +11,54 @@ Screen {
     height: 1fr;
 }
 
+/* scrollbar-gutter: stable -- without it, the vertical scrollbar's own
+   column only exists while show_vertical_scrollbar is true, so the
+   instant a row count crosses the visible-height threshold (a filter, a
+   load-more, a tree expand/collapse), the rightmost content column --
+   right where this same rule's own border sits -- jumps by the
+   scrollbar's width. A terminal's incremental (diff-only) repaint isn't
+   guaranteed to fully clear the column being reassigned, which is what
+   surfaces as a skewed/leftover border segment right at that boundary.
+   Reserving the gutter unconditionally removes the trigger entirely. */
 #columns DataTable,
 #columns Tree {
     width: 1fr;
     height: 1fr;
     border: solid $panel;
+    scrollbar-gutter: stable;
 }
 
 #columns DataTable:focus,
 #columns Tree:focus {
+    border: solid $accent;
+}
+
+/* UnitScreen's own folder-tree/file-table split -- unlike #columns'
+   three equal peer navigation levels, the tree pane here is
+   conventionally narrower than its content pane (folder names are
+   usually short; Name/Modified/Size needs the width). */
+#browser {
+    layout: horizontal;
+    height: 3fr;
+}
+
+/* scrollbar-gutter: stable -- see #columns's identical rule above for why. */
+#browser Tree {
+    width: 30%;
+    height: 1fr;
+    border: solid $panel;
+    scrollbar-gutter: stable;
+}
+
+#browser DataTable {
+    width: 1fr;
+    height: 1fr;
+    border: solid $panel;
+    scrollbar-gutter: stable;
+}
+
+#browser Tree:focus,
+#browser DataTable:focus {
     border: solid $accent;
 }
 
@@ -41,7 +80,7 @@ Screen {
     width: 1fr;
     height: 1fr;
     border: solid $panel;
-    padding: 1;
+    padding: 0 1;
 }
 
 #detail {
@@ -79,20 +118,6 @@ Screen {
     height: 1;
     background: $panel-darken-1;
     color: $text-muted;
-    padding: 0 1;
-}
-
-/* height:0 (not just empty text) when no job is running — otherwise
-   this reserves a visible, oddly-colored blank row on every screen even
-   when nothing is happening. Toggled by App._refresh_job_status_bar(). */
-#job-status-bar {
-    height: 0;
-}
-
-#job-status-bar.has-jobs {
-    height: 1;
-    background: $warning;
-    color: $text;
     padding: 0 1;
 }
 

@@ -94,15 +94,12 @@ class TestOverviewConsoleWidth:
         assert three - 4 == 3 * (one - 4)
 
     def test_no_columns_is_just_the_outer_border_term(self) -> None:
-        """A real, previously-unhandled crash: ``columns`` can genuinely
-        be empty even when the caller's own fetched item list isn't -- a
-        real List item's JSON body can itself be ``{}``, or every one of
-        its keys can get filtered away by ``visible_site_fields``. Before
-        this test surfaced it, this raised ``ValueError: max() arg is an
-        empty sequence`` (``max()`` over an empty generator, no
-        ``default=``) instead of degrading gracefully — confirmed
-        directly against the pre-fix source, not a hypothetical
-        scenario."""
+        """``columns`` can genuinely be empty even when the caller's own
+        fetched item list isn't -- a real List item's JSON body can itself
+        be ``{}``, or every one of its keys can get filtered away by
+        ``visible_site_fields``; this must degrade gracefully rather than
+        raising ``ValueError: max() arg is an empty sequence`` (``max()``
+        over an empty generator with no ``default=``)."""
         assert overview_console_width([]) == 4
 
 

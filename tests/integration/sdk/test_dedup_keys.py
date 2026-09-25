@@ -2,8 +2,9 @@
 repositories — replayed from committed fixtures, with **no external
 dependency**: this always runs, on CI or anywhere else, because it goes
 through ``ReplayStore`` instead of a real ``LocalFsStore``.
-``"NoEncryption"`` is a fixed sentinel for the unencrypted scenario, not
-real key material (see ``dedup.keys``'s own module docstring). The
+``"NoEncryption"`` (``NO_ENCRYPTION_USER_KEY_ID``) is a fixed sentinel
+marking an unencrypted repository with no VaultKey to resolve, not
+real key material. The
 encrypted scenarios' real vault keys are embedded below as literal
 constants (each sample's own generated key, not customer data) rather
 than read from a real sample tree at test time.

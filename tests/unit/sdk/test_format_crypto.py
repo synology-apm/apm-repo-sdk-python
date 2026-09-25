@@ -3,9 +3,7 @@
 Round-trips are constructed independently using the ``cryptography``
 library's *encrypt* side directly (not by calling back into any decrypt
 helper in this module), so a bug shared between encrypt-side test fixtures
-and decrypt-side implementation can't hide from these. See
-``tests/integration/sdk/test_crypto.py`` for cross-checks against real,
-production-encrypted sample bytes.
+and decrypt-side implementation can't hide from these.
 """
 
 from __future__ import annotations
@@ -69,8 +67,9 @@ class TestDecryptChunk:
 
     def test_accepts_a_memoryview_ciphertext_without_copying_first(self) -> None:
         # A caller slicing chunk ciphertext straight out of a merged
-        # run's I/O buffer can pass a memoryview through unchanged (see
-        # decrypt_chunk's own docstring) -- unlike compression.py's
+        # run's I/O buffer can pass a memoryview through unchanged --
+        # Cipher.decryptor().update() reads it via the buffer protocol
+        # with no copy needed -- unlike compression.py's
         # CompressType.NONE passthrough, there's no identity-preserving
         # fast path here (Cipher.decryptor().update() always allocates a
         # fresh output), so the real thing worth pinning is that a
@@ -112,10 +111,10 @@ class TestDecryptVersionSpec:
         assert json.loads(decrypt_version_spec(ciphertext_b64, version_uid, key)) == {"some": "spec"}
 
     def test_iv_is_first_16_hex_characters_of_md5_not_the_raw_digest(self) -> None:
-        # Independent of version_spec_iv() itself: crypto.py's own docstring
-        # warns that grabbing MD5's raw 16-byte digest (also exactly 16
-        # bytes) instead of the first 16 *characters* of its hex text is an
-        # easy trap that a round trip built via version_spec_iv() itself
+        # Independent of version_spec_iv() itself: MD5's raw digest is
+        # also exactly 16 bytes, which makes grabbing it directly
+        # (instead of the first 16 *characters* of its hex text) an easy
+        # trap that a round trip built via version_spec_iv() itself
         # can never catch. Build the expected IV by hand here and confirm
         # decryption only works with that value, not with the raw digest.
         key = os.urandom(AES_KEY_SIZE)

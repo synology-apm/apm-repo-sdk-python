@@ -5,7 +5,7 @@ contract, which lives in ``test_storage_object_store_contract.py``
 alongside ``LocalFsStore``/``S3Store``. Backed by a mocked
 ``BlobServiceClient`` rather than a live Azurite instance.
 
-The mock now models ``azure.storage.blob.aio``'s shapes rather than the
+The mock models ``azure.storage.blob.aio``'s shapes, not the
 synchronous SDK's: ``download_blob``/``get_blob_properties``
 are coroutines, the downloader's ``readall()`` is a coroutine, and
 ``walk_blobs()`` is a *synchronous* call returning an **async iterator**
@@ -129,7 +129,7 @@ class TestLazyImportPropagatesImportError:
         raise ``ImportError`` — a real, documented CPython import system
         behavior, simulating a broken/partial install without uninstalling
         it from this dev environment. The ``.aio`` subpackage is named
-        explicitly (as well as its parent) because ``AzureStore`` now
+        explicitly (as well as its parent) because ``AzureStore``
         imports from there, and a parent already cached in
         ``sys.modules`` would otherwise not stop the child import from
         resolving."""
@@ -237,8 +237,8 @@ class TestAcloseOwnedClient:
         await store.aclose()  # idempotent - must not raise
 
     async def test_aclose_leaves_an_injected_client_untouched(self) -> None:
-        # aclose()'s own docstring: "only for a client this class built
-        # itself -- an injected client belongs to whoever created it."
+        # aclose() only closes a client this class built itself -- an
+        # injected client belongs to whoever created it.
         service_client = _service_client_for({})
         store = AzureStore("some-container", client=service_client)
         assert store._owns_client is False
@@ -250,9 +250,9 @@ class TestCancellation:
     """Mirrors ``test_storage_s3.py``'s own ``TestCancellation`` for the
     identical hazard on the Azure side — but the fix looks different
     here: there is no per-connection handle reachable from
-    ``downloader``/``blob_client`` at all (unlike S3's response body),
-    only the shared top-level transport (``AzureStore.read()``'s own
-    comment has the full explanation). ``self._container``/``blob_client``'s own
+    ``downloader``/``blob_client`` at all (unlike S3's response body), so
+    the fix closes the shared top-level transport instead.
+    ``self._container``/``blob_client``'s own
     ``._pipeline._transport`` is a deliberate no-op wrapper — this test
     pins down that the fix reaches past it to
     ``self._service_client._pipeline._transport`` specifically, not
@@ -383,7 +383,7 @@ class TestSharedKeyCredentialResolution:
     ``"127.0.0.1"`` — any other Azurite-style endpoint (a real hostname, a
     remote IP, a docker service name) leaves it unable to determine the
     account name at all, raising ``ValueError: Unable to determine account
-    name for shared key credential`` (see that function's own docstring)."""
+    name for shared key credential``."""
 
     def test_account_name_recovered_from_production_subdomain_url(self) -> None:
         assert _account_name_from_url("https://myaccount.blob.core.windows.net") == "myaccount"
@@ -436,8 +436,7 @@ class TestSharedKeyCredentialResolution:
 class TestDefaultTimeouts:
     """Interactive callers (the TUI's connect dialog, in particular)
     building a client against an unreachable account URL must not inherit
-    azure-core's own 300s connect/300s read defaults — see the module
-    docstring."""
+    azure-core's own 300s connect/300s read defaults."""
 
     def test_fills_in_short_connect_and_read_timeouts_when_caller_passes_none(self) -> None:
         merged = _with_default_timeouts({"account_url": "https://example.invalid"})

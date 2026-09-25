@@ -10,6 +10,7 @@ from typing import cast
 
 import pytest
 
+from synology_apm_repo.sdk.asynccache import AsyncKeyedCache
 from synology_apm_repo.sdk.dedup.composition_reader import CompositionReader, CompositionRecord
 from synology_apm_repo.sdk.errors import DataCorruptError, FormatError, UnsupportedVersionError
 from synology_apm_repo.sdk.format.chunkmap import ChunkMapKind
@@ -150,17 +151,27 @@ class TestRecord:
             await reader.record(64)
 
 
+def _fake_page(start_entry: int, count: int) -> bytes:
+    """``count`` consecutive, valid 4096-byte-apart MAPPING records
+    starting at entry index ``start_entry`` — real enough for
+    ``_resolve_page`` to parse the last one for its own bookkeeping,
+    and for ``entries()``/``_locate()`` to walk meaningfully, without
+    needing a real on-disk fixture (``_PAGE_SIZE``'s 2048 entries/page
+    would need a multi-hundred-KB real fixture to reach a second page)."""
+    return b"".join(_mapping_record(i * 4096, addr_int=1, map_num=1) for i in range(start_entry, start_entry + count))
+
+
 class TestGetPageContiguousScanBookkeeping:
     """``_get_page``'s ``_contiguous_scanned`` prefix only ever advances
-    past a page fetched *in order* (its own field docstring) — a page
-    fetched out of order still gets cached for exact reuse, but doesn't
-    extend the prefix until the in-between pages are filled in too.
-    Exercised directly against a bare ``CompositionRecord`` with a faked
-    ``_fetch_page`` (no real bytes/store needed — a real 3-page fixture
-    would need over 4096 real chunk-map entries just to reach a third
-    page, per ``_PAGE_SIZE``'s own value) rather than through
-    ``entries()``'s public, always-sequential access pattern, which
-    never triggers an out-of-order fetch on its own."""
+    past a page fetched *in order* — a page
+    fetched out of order still gets its own end-offset recorded for exact
+    reuse, but doesn't extend the prefix until the in-between pages are
+    filled in too. Exercised directly against a bare ``CompositionRecord``
+    with a faked ``_fetch_page`` (no real bytes/store needed — a real
+    3-page fixture would need over 4096 real chunk-map entries just to
+    reach a third page, per ``_PAGE_SIZE``'s own value) rather than
+    through ``entries()``'s public, always-sequential access pattern,
+    which never triggers an out-of-order fetch on its own."""
 
     async def test_fetching_pages_out_of_order_then_catches_the_prefix_up_in_one_call(self) -> None:
         record = CompositionRecord(
@@ -171,22 +182,100 @@ class TestGetPageContiguousScanBookkeeping:
             reader=cast(CompositionReader, object()),
         )
 
-        async def fake_fetch_page(page_idx: int) -> list[object]:
-            return []
+        async def fake_fetch_page(page_idx: int) -> bytes:
+            start_entry, count = record._page_bounds(page_idx)
+            return _fake_page(start_entry, count)
 
-        record._fetch_page = fake_fetch_page  # type: ignore[method-assign,assignment]
+        record._fetch_page = fake_fetch_page  # type: ignore[method-assign]
 
         # Pages 2 then 1 fetched first: neither matches _contiguous_scanned
-        # (0), so both are cached without advancing the prefix.
+        # (0), so both get their own end-offset recorded without advancing
+        # the prefix.
         await record._get_page(2)
         await record._get_page(1)
         assert record._contiguous_scanned == 0
+        assert 1 in record._page_end_offsets
+        assert 2 in record._page_end_offsets
 
         # Page 0 finally arrives: the prefix catches up past all three
-        # pages already cached, in one call — the while loop's own
+        # pages already known, in one call — the while loop's own
         # second (and further) iteration.
         await record._get_page(0)
         assert record._contiguous_scanned == 3
+
+
+class TestPageCacheEviction:
+    """``_pages`` is a bounded LRU of raw page bytes (``_DEFAULT_PAGE_CACHE_MAXSIZE``,
+    128 by default) with an always-resident ``_page_end_offsets`` boundary
+    index alongside it — eviction from the former must never affect the
+    correctness of ``_locate()``/``entries()``, only whether a page's
+    content needs a real re-fetch. Uses an explicit small ``maxsize``
+    (a regular, constructor-overridable dataclass field) rather than a
+    real multi-hundred-page fixture, mirroring ``test_dedup_pool.py``'s
+    own ``TestLruEviction``."""
+
+    def _record_with_fetch_tracking(self) -> tuple[CompositionRecord, dict[int, int]]:
+        fetch_calls: dict[int, int] = {}
+        record = CompositionRecord(
+            head_off=0,
+            record_head=RecordHead(
+                status=CompositionStatus.COMPLETE, map_num=2 * 2048 + 5, map_crc=0, mode=0, attr_leng=0, attr_crc=0
+            ),
+            reader=cast(CompositionReader, object()),
+            _pages=AsyncKeyedCache(maxsize=2),
+        )
+
+        async def fake_fetch_page(page_idx: int) -> bytes:
+            fetch_calls[page_idx] = fetch_calls.get(page_idx, 0) + 1
+            start_entry, count = record._page_bounds(page_idx)
+            return _fake_page(start_entry, count)
+
+        record._fetch_page = fake_fetch_page  # type: ignore[method-assign]
+        return record, fetch_calls
+
+    async def test_evicted_page_is_dropped_but_its_end_offset_survives(self) -> None:
+        record, fetch_calls = self._record_with_fetch_tracking()
+
+        await record._get_page(0)
+        await record._get_page(1)
+        await record._get_page(2)  # maxsize=2: evicts page 0 (oldest)
+
+        assert 0 not in record._pages
+        assert set(record._pages) == {1, 2}
+        # Never evicted, unlike _pages -- this is what keeps _locate's
+        # binary search free of I/O regardless of what's still resident.
+        assert record._page_end_offsets.keys() == {0, 1, 2}
+        assert fetch_calls == {0: 1, 1: 1, 2: 1}
+
+    async def test_locate_finds_a_later_page_without_touching_an_evicted_earlier_one(self) -> None:
+        record, fetch_calls = self._record_with_fetch_tracking()
+        await record._get_page(0)
+        await record._get_page(1)
+        await record._get_page(2)  # evicts page 0
+        assert 0 not in record._pages
+
+        # Entry index 2*2048 + 1 = 4097 is the second entry of page 2,
+        # covering [4097*4096, 4098*4096).
+        target_offset = 4097 * 4096
+        page_idx, idx_in_page = await record._locate(target_offset)
+        assert (page_idx, idx_in_page) == (2, 1)
+        # Finding a page beyond the evicted one never needed to re-fetch it.
+        assert fetch_calls[0] == 1
+
+    async def test_entries_transparently_refetches_an_evicted_page_with_correct_content(self) -> None:
+        record, fetch_calls = self._record_with_fetch_tracking()
+        await record._get_page(0)
+        await record._get_page(1)
+        await record._get_page(2)  # evicts page 0
+        assert 0 not in record._pages
+
+        # Entry index 1 (of the now-evicted page 0) covers [4096, 8192).
+        result = [e async for e in record.entries(start=4096, end=8192)]
+        assert len(result) == 1
+        assert result[0].file_offset == 4096
+        # One real re-fetch happened to serve this -- content, not just
+        # the page index, was genuinely needed.
+        assert fetch_calls[0] == 2
 
 
 class TestEntries:
@@ -359,8 +448,7 @@ class TestEntries:
 class TestExtent:
     """``CompositionRecord.extent()`` — needed by PC/PS's per-region disk
     fragments, whose registered ``file_meta.file_size`` is the whole
-    disk's capacity, never the fragment's own real length (see the
-    method's own docstring)."""
+    disk's capacity, never the fragment's own real length."""
 
     async def test_empty_record_is_zero_to_zero(self, tmp_path: Path, reader: CompositionReader) -> None:
         record_bytes = _record_head_bytes(status=0, map_num=0)

@@ -36,9 +36,7 @@ class TestChunkAddress:
 
     def test_from_int_does_not_validate_chunk_idx_past_bucket_capacity(self) -> None:
         # chunk_idx field is 16 bits wide; [8192, 65536) is out of any real
-        # bucket's capacity, but ``from_int()`` trusts its input -- see
-        # ``ChunkAddress``'s own docstring for why range-checking here would
-        # be redundant with what already happens downstream / in ``verify``.
+        # bucket's capacity, but ``from_int()`` trusts its input.
         bad = (1 << 56) | (0 << 16) | 8192
         addr = ChunkAddress.from_int(bad)
         assert addr.chunk_idx == 8192
@@ -125,8 +123,8 @@ class TestGroupStartBucketId:
 
 class TestCompositionPaths:
     def test_session_dir_matches_real_sample_shape(self) -> None:
-        # confirmed: ``Composition/132/4.com/c0.39`` on apv-sample-1 (".39"
-        # is a sequence-id suffix resolved separately, see ``storage/seqid.py``).
+        # real shape: ``Composition/132/4.com/c0.39`` on apv-sample-1 (".39"
+        # is a sequence-id suffix resolved separately by ``storage/seqid.py``).
         assert composition_session_dir(StreamId(132), SessionId(4)) == "132/4.com"
         assert composition_path(StreamId(132), SessionId(4), 0) == "132/4.com/c0"
 
@@ -151,7 +149,7 @@ class TestCompositionOffsetSplit:
         assert split_composition_offset(sixteen_mib + 100) == (1, 100)
 
     def test_split_round_trips_via_the_documented_shift(self) -> None:
-        # (sub_id << 24) | sub_off, per this function's own docstring —
+        # (sub_id << 24) | sub_off is split_composition_offset()'s inverse —
         # inlined here rather than kept as a public ``join_*`` function,
         # since this read-only SDK only ever decodes existing offsets,
         # never constructs new ones.

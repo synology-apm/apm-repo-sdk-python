@@ -41,7 +41,8 @@ class PoolDescriptor:
         verify_ciphertext_crc: bool = False,
     ) -> PoolDescriptor | None:
         """``None`` when ``repo.store`` can't be reconstructed in a fresh
-        process (see ``describe_store()``'s own docstring) — the one place
+        process (an unrecognized store wrapper, or a backend built from
+        an already-live client with no picklable recipe) — the one place
         a caller assembles the other four fields alongside that probe,
         instead of each repeating the same "call ``describe_store``, check
         ``None``, then assemble" sequence inline."""
@@ -82,10 +83,10 @@ class PoolDescriptor:
 def build_worker_pool(descriptor: PoolDescriptor) -> tuple[ObjectStore, Pool]:
     """Rebuilds a fresh ``ObjectStore``/``DirCache``/``Pool`` from
     ``descriptor`` — called once per worker process (from a
-    ``ProcessPoolExecutor``'s synchronous ``initializer=``, since
-    ``rebuild_store()``'s own docstring confirms every real backend's
-    construction is synchronous and I/O-free), never once per task: the
-    resulting ``Pool``'s own caches (bucket readers, and — when
+    ``ProcessPoolExecutor``'s synchronous ``initializer=``, safe since
+    every real backend's constructor is synchronous and does no I/O),
+    never once per task: the resulting ``Pool``'s own caches (bucket
+    readers, and — when
     ``verify_fingerprint`` — its ``AllocationTableCache``) are only worth
     anything if they persist across every task that worker ever runs.
     """
@@ -107,13 +108,13 @@ async def aclose_worker_store(store: ObjectStore | None) -> None:
     release of a worker's own ``ObjectStore`` at shutdown — its ``aiohttp``
     connector, for ``S3Store``/``AzureStore``; a no-op for
     ``LocalFsStore``/``SmbStore``, or ``None`` (nothing was ever built).
-    The third ``isinstance(store, AsyncCloseable)`` guard in this codebase
-    (``api/session.py``'s ``Session.close()``, ``storage/recording.py``'s
-    ``TracingStore``/``RecordingStore.aclose()``) — each with its own
-    failure policy suited to its own caller (collect-and-report, propagate,
-    and here, swallow) rather than one shared, parameterized version, since
-    a worker's own shutdown hook (``_export_worker_shutdown``/
-    ``_verify_worker_shutdown``) has nothing left to report a failure to."""
+    A second, separate ``isinstance(store, AsyncCloseable)`` check rather
+    than a call to ``storage.base.aclose_if_possible`` (the one every
+    other caller — ``api/session.py``'s ``Session.close()``,
+    ``storage/recording.py``'s ``_InstrumentedStore.aclose()`` — shares):
+    that helper propagates a close failure, but a worker's own shutdown
+    hook (``_export_worker_shutdown``/``_verify_worker_shutdown``) has
+    nothing left to report a failure to, so this one swallows it instead."""
     if isinstance(store, AsyncCloseable):
         with contextlib.suppress(Exception):
             await store.aclose()

@@ -1,13 +1,12 @@
 """Conformance test: every ``ObjectStore`` wrapper in ``storage/recording.py``
 forwards ``aclose()`` to whatever it wraps.
 
-Guards against the exact bug fixed in commit ``105206c``: ``RecordingStore``/
-``TracingStore`` wrap a real ``ObjectStore`` but, before that fix, implemented
-no ``aclose()`` of their own. ``Session.close()`` decides whether to await a
-tracked store's ``aclose()`` via ``isinstance(store, AsyncCloseable)`` — a
-``@runtime_checkable`` Protocol that only checks method *presence* — so a
-wrapped ``S3Store``/``AzureStore`` silently failed that check and its real
-``aiohttp`` connector was never released. A parametrized case here for each
+Guards against a wrapper that implements no ``aclose()`` of its own:
+``Session.close()`` decides whether to await a tracked store's ``aclose()``
+via ``isinstance(store, AsyncCloseable)`` — a ``@runtime_checkable`` Protocol
+that only checks method *presence* — so a wrapper missing its own
+``aclose()`` silently fails that check and any real ``aiohttp`` connector it
+wraps is never released. A parametrized case here for each
 current wrapper means the next one added to this module gets the same
 guarantee checked automatically, rather than depending on its author
 remembering to wire ``aclose()`` through by hand.

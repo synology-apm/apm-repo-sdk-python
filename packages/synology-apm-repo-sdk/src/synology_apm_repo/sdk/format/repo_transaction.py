@@ -1,8 +1,8 @@
-"""``repo_transaction.<N>`` — magic ``rPTs``, the same generic
-``RepoJsonFileHeader`` shell ``repo_info.py`` uses (crc@8, data_size BE
-u64 @12), minus a meaningful repo-uuid field (bytes [20,36) are always
-zero-filled here) — followed by a small JSON payload (FORMAT-SPEC.md:
-generation-selection).
+"""``repo_transaction.<N>`` — magic ``rPTs``, the same ``headers.py``
+``parse_json_payload_header`` shell ``repo_info.py`` uses (crc@8,
+data_size BE u64 @12), minus a meaningful repo-uuid field (bytes [20,36)
+are always zero-filled here) — followed by a small JSON payload
+(FORMAT-SPEC.md: generation-selection).
 """
 
 from __future__ import annotations

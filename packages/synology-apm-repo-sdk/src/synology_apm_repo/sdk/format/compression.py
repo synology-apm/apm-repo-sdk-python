@@ -90,9 +90,8 @@ def decompress(ctype: CompressType, data: bytes | memoryview) -> bytes:
         case CompressType.ZSTD:
             # Not the one-shot decompress(data, max_output_size=...): that API
             # silently ignores max_output_size for any frame that declares its
-            # own decompressed content size in its header (the common case —
-            # see decompress_zstd_stream()'s own docstring for the verified
-            # zstandard behavior this works around), so a corrupt or hostile
+            # own decompressed content size in its header (the common case,
+            # since that's ZstdCompressor()'s default), so a corrupt or hostile
             # chunk claiming a huge declared size would decompress in full
             # before the length check below ever gets a chance to catch it.
             # Reading one bounded slice through the streaming reader instead

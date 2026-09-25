@@ -1,7 +1,7 @@
 """Regression test for ``synology-apm-repo-cli ls`` — replayed from a committed
 fixture recorded against real bytes, with **no external dependency** —
-same ``patch_profile_store`` fixture (``tests/conftest.py``) every
-sibling in this directory uses.
+same ``patch_profile_store`` fixture (``tests/integration/cli/conftest.py``)
+every sibling in this directory uses.
 
 A CLI ``<ref>`` argument is ``<fs_path>[#<fragment>]`` — with
 ``--profile`` supplying the store (instead of a literal filesystem
@@ -38,7 +38,7 @@ from types import ModuleType
 import pytest
 from typer.testing import CliRunner
 
-import synology_apm_repo.cli.browse as browse_mod
+import synology_apm_repo.cli.repo_session as repo_session_mod
 from synology_apm_repo.cli.main import app
 
 runner = CliRunner()
@@ -48,7 +48,7 @@ _VM_REF = "#cat:1/wl:2/ver:06b4b5e3-5490-4b6a-bee8-ce4287f7a9a7"
 
 @pytest.fixture(autouse=True)
 def _replay(patch_profile_store: Callable[[str, ModuleType], None]) -> None:
-    patch_profile_store("cli_ls_apv1_vault.json.gz", browse_mod)
+    patch_profile_store("cli_ls_apv1_vault.json.gz", repo_session_mod)
 
 
 def _rows(output: str) -> list[str]:

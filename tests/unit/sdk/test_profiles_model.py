@@ -38,8 +38,7 @@ def test_s3_client_kwargs_translates_to_boto_names() -> None:
 def test_azure_client_kwargs_uses_connection_verify_not_verify() -> None:
     """``azure.core.Configuration``'s own name for this is
     ``connection_verify``, deliberately different from boto3's ``verify``
-    — see the dataclass's own docstring for why this asymmetry is
-    intentional, not a bug to "fix" into consistency."""
+    — an intentional asymmetry, not a bug to "fix" into consistency."""
     config = AzureProfileConfig(container="c", account_url="https://acct.blob.core.windows.net", verify_tls=False)
     assert config.client_kwargs == {
         "connection_verify": False,
@@ -53,8 +52,10 @@ def test_smb_client_kwargs_omits_unset_username() -> None:
 
 
 def test_smb_client_kwargs_passes_domain_username_form_through_unsplit() -> None:
-    """``SmbProfileConfig`` never splits ``DOMAIN\\username`` itself — see
-    the dataclass's own docstring for why that's ``smbprotocol``'s job."""
+    """``SmbProfileConfig`` never splits ``DOMAIN\\username`` itself --
+    ``smbprotocol``'s own NTLM/SPNEGO layer splits the domain back out
+    of that single string, so there's no separate ``domain`` field to
+    keep in sync with it."""
     config = SmbProfileConfig(server="nas.example.com", share="backups", port=1445, username="WORKGROUP\\admin")
     assert config.client_kwargs == {"server": "nas.example.com", "port": 1445, "username": "WORKGROUP\\admin"}
 

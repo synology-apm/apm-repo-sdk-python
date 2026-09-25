@@ -51,9 +51,10 @@ recording time — deterministically, the same real value producing the
 same placeholder across runs unless it collides with a different real
 value's preferred hash slot in that particular run (in which case the
 other real values present that run can shift where it lands — see
-`tests/CLAUDE.md`'s "RecordingStore / ReplayStore" section) — see
-`scripts/anonymize_catalog_metadata.py`'s own docstring for exactly which
-fields and what each placeholder looks like.
+`tests/CLAUDE.md`'s "RecordingStore / ReplayStore" section) — the exact
+fields are registered in `scripts/anonymize_catalog_metadata.py`'s
+`SENSITIVE_FIELDS`, and no real-to-fake mapping is stored anywhere to make
+that determinism happen.
 
 **Fixture storage**: `tests/fixtures/*.json.gz` cassettes are committed
 gzip-compressed. Run this one-time local setup to get a readable `git
@@ -150,5 +151,5 @@ Public PyPI, via each package's own trusted-publishing environment in
 `-cli`, `-browser`) — triggered by pushing a `v*` tag. A PyPI project must
 have trusted publishing configured for that environment name once, by hand,
 before its first `publish-*` job can succeed (same one-time-setup shape as
-GitHub Pages needs — see `docs.yml`'s own header comment — or any other
-OIDC-trusted deploy target).
+GitHub Pages needs — enabled once under Settings > Pages with "Source:
+GitHub Actions" — or any other OIDC-trusted deploy target).

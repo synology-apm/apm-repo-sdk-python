@@ -8,9 +8,9 @@ conventions and the "adding a new command" recipe.
 The CLI talks to the SDK's `Session`/`Repository`/`Catalog` facade
 (`api/`) — never to `storage`/`dedup`/`catalog`/`units` directly, with one
 explicitly-named exception: `dump.py` reaches into `sdk.diagnostics`
-directly (see `sdk/api/__init__.py`'s own docstring for why that one's
-scoped outside the facade). See `ARCHITECTURE.md` for the facade contract
-and `NodeRef` format.
+directly for raw-file forensics outside any discovered repository, work
+the catalog-based facade has no way to do. See `ARCHITECTURE.md` for the
+facade contract and `NodeRef` format.
 
 ## Development Conventions
 
@@ -79,6 +79,7 @@ and global flags (`--verbose`, `--json`, `--progress`, `--trace`,
 `synology-apm-repo-cli <command> --help` rather than consulting a listing
 here that could drift from it. Shared infrastructure
 (`asyncio_support.py`'s `typer_async`, `browse.py`'s `NodeRef`-walking,
-`errors.py`, `options.py`, `paging.py`, `profile_store.py`,
+`repo_session.py`'s repo-open lifecycle, `naming.py`'s disambiguation/
+display helpers, `errors.py`, `options.py`, `paging.py`, `profile_store.py`,
 `progress_render.py`, `state.py`, `strings.py`,
 `trace_render.py`) sits alongside `commands/` at the package root.

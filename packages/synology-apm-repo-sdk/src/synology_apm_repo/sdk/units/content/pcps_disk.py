@@ -31,7 +31,6 @@ import sys
 from collections.abc import AsyncIterator, Awaitable, Callable
 from pathlib import Path
 
-from ...dedup.chunk_walk import build_export_executor
 from ...dedup.dedup_file import (
     DEFAULT_STREAM_BLOCK,
     DedupFile,
@@ -39,7 +38,8 @@ from ...dedup.dedup_file import (
     clamp_read_length,
     stream_via_read,
 )
-from ...dedup.pool import BucketReaderCache
+from ...dedup.export_scheduler import build_export_executor
+from ...dedup.pool import DEFAULT_BUCKET_CACHE_SIZE, BucketReaderCache
 from ...dedup.pool_descriptor import PoolDescriptor
 from ...dedup.presized_file import create_presized, open_destination
 
@@ -79,8 +79,7 @@ def _gaps(fragments: list[DiskFragment], size: int) -> list[tuple[int, int]]:
     own extent — a leading gap, any gap between fragments, and a
     trailing gap. ``fragments`` must already be sorted by ``start`` (as
     ``VirtualDiskContentSource`` always keeps its own list). Correct
-    even when fragments overlap (real ones do — see that class's own
-    docstring)."""
+    even when fragments overlap (real ones do)."""
     gaps = []
     pos = 0
     for frag in fragments:
@@ -99,9 +98,7 @@ def _gaps(fragments: list[DiskFragment], size: int) -> list[tuple[int, int]]:
 class DiskFragment:
     """One PC/PS per-region object, already resolved down to a
     ready-to-read ``DedupFile`` and the disk-absolute ``[start, end)``
-    range its own composition actually covers
-    (``CompositionRecord.extent`` — never ``file_meta.file_size``, see
-    this module's own docstring)."""
+    range its own composition actually covers (``CompositionRecord.extent``)."""
 
     fid: int
     start: int
@@ -171,8 +168,9 @@ class VirtualDiskContentSource:
             # all, and it fully covers it -- delegate straight through,
             # no bytearray/copy of our own. Only safe when nothing else
             # touches this range: fragments can genuinely overlap in real
-            # data (see this class's own docstring), so a fragment fully
-            # covering the request is *not* enough on its own if a
+            # data (a later region's real capture can share a chunk with
+            # an earlier region's zero-padded boundary), so a fragment
+            # fully covering the request is *not* enough on its own if a
             # second, higher-precedence fragment also overlaps some
             # sub-range of it -- that case must go through the assembly
             # path below to apply the real precedence rule correctly.
@@ -188,7 +186,20 @@ class VirtualDiskContentSource:
         # ``touching`` inherits self.fragments' own ascending-start order --
         # deliberately not re-sorted, so a later fragment's write below
         # naturally overwrites an earlier one's in whatever range they
-        # share ("higher start wins" -- see this class's own docstring).
+        # share ("higher start wins": a later region's real capture takes
+        # precedence over an earlier region's zero-padded boundary).
+        # Known, accepted limitation: a lower-precedence fragment's own
+        # read here still covers its full clipped range even where a
+        # later, higher-start fragment is about to overwrite part of it
+        # below -- real, if minor, redundant DedupFile.read()/decode work
+        # for bytes about to be discarded. Bounded in practice by real
+        # backup data's own shape -- overlap is at most about one
+        # 4096-byte chunk per fragment seam -- not by anything this loop
+        # enforces. Clipping each fragment's read
+        # range against the *next* higher-precedence fragment's own start
+        # before reading would close this, at the cost of real added
+        # complexity for a cost that's already small in practice --
+        # not worth it unless a real sample ever shows otherwise.
         for frag in touching:
             seg_start, seg_end = max(frag.start, offset), min(frag.end, end)
             chunk = await frag.dedup_file.read(seg_start, seg_end - seg_start)
@@ -202,7 +213,7 @@ class VirtualDiskContentSource:
     def supports_concurrent_export(self) -> bool:
         """Always ``True`` — ``export_to()`` accepts and forwards
         ``max_concurrent_reads``/``max_concurrent_opens`` to each of its
-        own fragments (see that method's own docstring)."""
+        own fragments."""
         return True
 
     async def export_to(
@@ -226,7 +237,13 @@ class VirtualDiskContentSource:
         unwritten in the pre-sized destination when ``sparse=True``
         (``presized_file.create_presized``), explicitly zero-filled
         otherwise. Every fragment shares one ``BucketReaderCache`` for
-        this call, so bucket-locality reuse persists across them.
+        this call, bounded to ``DEFAULT_BUCKET_CACHE_SIZE`` (16, the same
+        bound ``chunk_walk.py``/``export_scheduler.py`` share so the three
+        don't each drift with a separately hardcoded copy) rather than
+        left unbounded — a multi-fragment disk touching many distinct
+        buckets would otherwise grow this cache proportionally to the
+        total number of buckets touched across every fragment, so
+        bucket-locality reuse persists across fragments only up to that cap.
 
         ``ExportResult.holes``/``zeros``/``bytes_written`` are summed
         across fragments independently, so a byte range more than one
@@ -250,7 +267,7 @@ class VirtualDiskContentSource:
         gaps = _gaps(self.fragments, self.size)
         gap_total = sum(end - start for start, end in gaps)
 
-        export_cache = BucketReaderCache()
+        export_cache = BucketReaderCache(maxsize=DEFAULT_BUCKET_CACHE_SIZE)
         planned_total = sum(f.end - f.start for f in self.fragments) if progress else 0
         bytes_written = holes = zeros = 0
         done_before = 0

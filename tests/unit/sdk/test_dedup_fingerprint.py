@@ -263,7 +263,8 @@ class TestBatchedFingerprintReads:
 class TestAllocationTableCache:
     """``fingerprint()``'s optional ``cache=`` — shares one group's whole
     allocation table across separate calls/buckets instead of resolving it
-    fresh every time (see ``AllocationTableCache``'s own docstring)."""
+    fresh every time, since every bucket in a group shares the same
+    allocation-table bytes."""
 
     async def test_a_second_bucket_in_the_same_group_costs_no_further_inf_reads(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch

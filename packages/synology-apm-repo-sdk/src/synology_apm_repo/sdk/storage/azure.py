@@ -13,14 +13,18 @@ the way S3's ``CommonPrefixes``/``Contents`` split requires; the SDK's own
 ``ItemPaged``/``AsyncItemPaged`` iterator handles continuation-token
 pagination internally too.
 
-**Why ``azure.storage.blob.aio``**: this is network I/O; see
-``ObjectStore``'s docstring for why this and S3 are the two backends where
-async is real. Its client owns an ``aiohttp`` session that must be closed,
-hence ``AzureStore.aclose``, which ``Session.close()`` calls.
+**Why ``azure.storage.blob.aio``**: this is network I/O, and — like
+``S3Store`` — this module sits on ``aiohttp``, where many outstanding
+round-trips genuinely overlap on one thread; that's a real gain over a
+thread-pool wrapper around a synchronous client. Its client owns an
+``aiohttp`` session that must be closed, hence ``AzureStore.aclose``, which
+``Session.close()`` calls.
 
 Every client this module builds goes through ``_with_default_timeouts``,
-same rationale as the ``s3`` module's own module docstring — see that
-function's own docstring here for the exact values.
+which trims azure-core's batch-job-tuned defaults down to values an
+interactive caller — the TUI's connect dialog, in particular — can
+actually wait through when an endpoint is unreachable (see the
+module-level constants below for the exact values).
 """
 
 from __future__ import annotations
@@ -38,9 +42,9 @@ _NOT_FOUND = 404
 
 # azure-core's own defaults (300s connect, 300s read, plus a handful of
 # retries) are tuned for long-running batch jobs, not an interactive "is
-# this endpoint even reachable" probe — see the module docstring. These
-# apply to every client this module builds unless the caller already passed
-# the same keyword explicitly, in which case the caller's value wins.
+# this endpoint even reachable" probe. These apply to every client this
+# module builds unless the caller already passed the same keyword
+# explicitly, in which case the caller's value wins.
 _DEFAULT_CONNECTION_TIMEOUT = 5
 _DEFAULT_READ_TIMEOUT = 15
 _DEFAULT_RETRY_TOTAL = 1
@@ -53,8 +57,10 @@ _DEFAULT_RETRY_TOTAL = 1
 # limit_per_host=0 (unlimited, bounded only by that 100) -- already well
 # above _DEFAULT_MAX_POOL_CONNECTIONS's 32. Every sub-client this module
 # hands out (via get_blob_client()) shares that one parent
-# transport/session rather than opening its own — see read()'s own
-# docstring for the cancellation-handling implication.
+# transport/session rather than opening its own, which is why read()'s
+# CancelledError handler has to force-close that one shared transport on
+# cancellation (no per-connection handle exists to close instead) rather
+# than just the connection the cancelled read was using.
 
 
 def _account_name_from_url(account_url: str) -> str | None:
@@ -100,10 +106,11 @@ def _resolve_shared_key_credential(client_kwargs: dict[str, Any]) -> dict[str, A
 
 def _with_default_timeouts(client_kwargs: dict[str, Any]) -> dict[str, Any]:
     """``client_kwargs`` with interactive-friendly connect/read timeouts and
-    a low retry cap filled in — see the module-level constants above for
-    why. Uses ``setdefault`` rather than always overwriting, so a caller who
-    already passed ``connection_timeout``/``read_timeout``/``retry_total``
-    explicitly keeps their own value."""
+    a low retry cap filled in (values and rationale: the module-level
+    constants above). Uses ``setdefault`` rather than always overwriting,
+    so a caller who already passed
+    ``connection_timeout``/``read_timeout``/``retry_total`` explicitly keeps
+    their own value."""
     merged = dict(client_kwargs)
     merged.setdefault("connection_timeout", _DEFAULT_CONNECTION_TIMEOUT)
     merged.setdefault("read_timeout", _DEFAULT_READ_TIMEOUT)
@@ -129,9 +136,12 @@ async def _force_close_transport(service_client: Any) -> None:
 
 
 def _import_blob_service_client() -> Any:
-    """Lazy ``from azure.storage.blob.aio import BlobServiceClient`` — see
-    the module docstring for why this is imported lazily rather than at
-    module scope. Shared by every constructor/free function here that
+    """Lazy ``from azure.storage.blob.aio import BlobServiceClient``:
+    ``azure-storage-blob`` is always installed (a required dependency) but
+    pulls in a substantial import graph, and ``storage/__init__.py`` imports
+    this module unconditionally, so a module-level import would make every
+    caller of ``storage`` pay that cost even if it never touches
+    ``AzureStore``. Shared by every constructor/free function here that
     needs it, so the choice of what to import lives in one place."""
     from azure.storage.blob.aio import BlobServiceClient
 
@@ -233,8 +243,11 @@ class AzureStore:
         return int(properties.size)
 
     async def exists(self, path: str) -> bool:
-        """Same semantics as ``S3Store.exists`` (see there for the
-        ``layout.py`` rationale)."""
+        """``True`` for either a blob exactly at ``path``, or a
+        "directory" — a prefix with at least one blob under it: ``db``/
+        ``@data`` are never blobs in their own right on an object-storage
+        layout, only prefixes with real blobs underneath (``layout.py``
+        relies on this)."""
         from azure.core.exceptions import HttpResponseError
 
         blob_name = _key(path)
@@ -254,8 +267,10 @@ class AzureStore:
         )
 
     async def listdir(self, path: str) -> list[str]:
-        """Same semantics as ``S3Store.listdir`` (see there for why an
-        absent "directory" and an empty one are the same ``[]``)."""
+        """An absent "directory" (a prefix with zero blobs under it) and an
+        empty one are indistinguishable in an object store with no real
+        directory entities — both correctly report ``[]``, the same as
+        ``S3Store.listdir``."""
         prefix = _key(path)
         list_prefix = as_list_prefix(prefix)
         raw_names = [

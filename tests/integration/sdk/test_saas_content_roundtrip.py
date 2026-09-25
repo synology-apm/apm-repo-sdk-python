@@ -7,9 +7,10 @@ Deliberately narrow for Mail/Calendar: each test below only proves a real
 workload dispatches to the right provider and lists its own folder/
 calendar/event count correctly — none of them read an individual real
 message's body or event's own fields. A message's body and an event's
-summary/organizer/dates *are* their content (unlike a filename) — see
-``test_units_saas_mail.py``'s own docstring for why reading either anyway
-would defeat the point. Mail's ``X-ABL-ID`` reassembly/attachment round-trip fidelity is covered
+summary/organizer/dates *are* their content (unlike a filename): reading
+either would make ``RecordingStore`` capture that real content into the
+committed fixture regardless of what the test then asserts, since
+narrowing the assertion can't undo the capture. Mail's ``X-ABL-ID`` reassembly/attachment round-trip fidelity is covered
 synthetically by this file's own ``test_eml_fully_parses_with_byte_
 identical_attachment`` (below) and by
 ``tests/unit/sdk/test_units_saas_mail.py``; Calendar's ICS-building
@@ -19,7 +20,7 @@ Fixtures, all recorded against the plaintext ``apv-sample-1`` vault (no
 key material involved) via each test's own ``record_target()`` call —
 see ``tests/conftest.py`` and ``tests/CLAUDE.md``'s "Recording a fixture"
 section for the ``pytest --record-against=...`` workflow that
-(re-)records these; there is no separate recipe module anymore:
+(re-)records these:
 
 - ``saas_content_mail_family_apv1.json.gz`` — a real MAIL workload, a
   real GROUP_EXCHANGE workload's Mail+Calendar siblings, and a real
@@ -39,10 +40,9 @@ see that file's own third test), so this file doesn't need its own copy
 of that real data.
 
 The synthetic Mail round-trip test at the bottom
-(``test_eml_fully_parses_with_byte_identical_attachment``) has zero real-sample
-dependency in the original (a hand-built repository under ``tmp_path``, no
-``samples_dir``/``ReplayStore`` involved at all) — moved here as-is rather
-than left in ``tests/integration/``, which it never needed.
+(``test_eml_fully_parses_with_byte_identical_attachment``) builds a
+hand-built repository under ``tmp_path``, with zero real-sample
+dependency (no ``samples_dir``/``ReplayStore`` involved).
 """
 
 from __future__ import annotations
@@ -90,8 +90,10 @@ from synology_apm_repo.sdk.storage.layout import RepoKind, RepoLayout, detect_la
 from synology_apm_repo.sdk.units.base import Node, UnitProvider
 from synology_apm_repo.sdk.units.dispatch import saas_provider_for
 from synology_apm_repo.sdk.units.saas.calendar import CalendarProvider
+from synology_apm_repo.sdk.units.saas.composite_provider import CompositeSaasProvider
 from synology_apm_repo.sdk.units.saas.mail import MailProvider
-from synology_apm_repo.sdk.units.saas.provider import CompositeSaasProvider, SaasWorkloadProvider
+from synology_apm_repo.sdk.units.saas.provider import SaasWorkloadProvider
+from synology_apm_repo.sdk.units.saas.stream import SaasStreamCache
 
 #: Internal catalog identifiers -- stable and non-identifying (never
 #: touched by catalog-metadata anonymization, so the same values resolve
@@ -114,13 +116,14 @@ async def mail_family_repo(
     record_target: Callable[..., Awaitable[ObjectStore]],
 ) -> AsyncIterator[DedupRepo]:
     """Shared by the three tests below that all read
-    ``saas_content_mail_family_apv1.json.gz`` — see
-    ``test_catalog_connection.py``'s own ``repo`` fixture for why
-    sharing one opened ``ReplayStore``-backed repository across tests is safe
-    (it answers purely from a static dict, no call-order tracking). Each
+    ``saas_content_mail_family_apv1.json.gz``. Sharing one opened
+    ``ReplayStore``-backed repository across tests is safe because it
+    answers purely from a static dict, with no call-order tracking. Each
     test still builds and closes its own provider on top of it.
-    Function-scoped (not module-scoped) because ``record_target`` is
-    itself function-scoped — see its own docstring."""
+    Function-scoped (not module-scoped) because it depends on
+    ``record_target``, itself function-scoped (default pytest fixture
+    scope) — pytest forbids a wider-scoped fixture depending on a
+    narrower-scoped one."""
     async with await _open_repo(record_target, "saas_content_mail_family_apv1.json.gz") as r:
         yield r
 
@@ -132,15 +135,16 @@ async def test_alice_mail_workload_resolves_to_its_folder_and_lists_its_messages
     all_workloads = [w for c in await connections(repo) for w in await workloads(repo, c)]
     workload = next(w for w in all_workloads if w.workload_id == _MAIL_WORKLOAD_ID)
     version = next(v for v in await versions(repo, workload) if v.version_id == 9)
-    untyped_provider = await saas_provider_for(repo, workload, version)
-    assert isinstance(untyped_provider, SaasWorkloadProvider), type(untyped_provider)
-    provider = untyped_provider
-    try:
-        [folder] = await provider.children(provider.root())
-        mails = await provider.children(folder)
-        assert len(mails) == 25
-    finally:
-        await provider.close()
+    async with SaasStreamCache(repo) as saas_streams:
+        untyped_provider = await saas_provider_for(repo, workload, version, saas_streams)
+        assert isinstance(untyped_provider, SaasWorkloadProvider), type(untyped_provider)
+        provider = untyped_provider
+        try:
+            [folder] = await provider.children(provider.root())
+            mails = await provider.children(folder)
+            assert len(mails) == 25
+        finally:
+            await provider.close()
 
 
 async def test_group_exchange_mail_and_calendar_resolve_via_the_catalog_index_replayed(
@@ -150,25 +154,29 @@ async def test_group_exchange_mail_and_calendar_resolve_via_the_catalog_index_re
     all_workloads = [w for c in await connections(repo) for w in await workloads(repo, c)]
     workload = next(w for w in all_workloads if w.workload_id == _GROUP_EXCHANGE_WORKLOAD_ID)
     version = next(v for v in await versions(repo, workload) if v.version_id == 93)
-    untyped_provider = await saas_provider_for(repo, workload, version)
-    assert isinstance(untyped_provider, CompositeSaasProvider), type(untyped_provider)
-    provider = untyped_provider
-    try:
-        groups = await provider.children(provider.root())
-        group_names = {g.name for g in groups}
-        assert group_names == {"Mail", "Calendars"}, group_names
+    async with SaasStreamCache(repo) as saas_streams:
+        untyped_provider = await saas_provider_for(repo, workload, version, saas_streams)
+        assert isinstance(untyped_provider, CompositeSaasProvider), type(untyped_provider)
+        provider = untyped_provider
+        try:
+            groups = await provider.children(provider.root())
+            group_names = {g.name for g in groups}
+            assert group_names == {"Mail", "Calendars"}, group_names
 
-        mail_group = next(g for g in groups if g.name == "Mail")
-        [folder] = await provider.children(mail_group)
-        mails = await provider.children(folder)
-        assert len(mails) == 1
+            mail_group = next(g for g in groups if g.name == "Mail")
+            [folder] = await provider.children(mail_group)
+            mails = await provider.children(folder)
+            assert len(mails) == 1
 
-        calendar_group = next(g for g in groups if g.name == "Calendars")
-        [calendar_node] = await provider.children(calendar_group)
-        events = await provider.children(calendar_node)
-        assert events == []
-    finally:
-        await provider.close()
+            calendar_group = next(g for g in groups if g.name == "Calendars")
+            # One more synthetic level than before this group's own root:
+            # Calendar's own My/Other Calendars split.
+            [my_calendars] = await provider.children(calendar_group)
+            [calendar_node] = await provider.children(my_calendars)
+            events = await provider.children(calendar_node)
+            assert events == []
+        finally:
+            await provider.close()
 
 
 async def test_archive_mail_is_a_real_sibling_alongside_regular_mail_replayed(
@@ -178,19 +186,20 @@ async def test_archive_mail_is_a_real_sibling_alongside_regular_mail_replayed(
     all_workloads = [w for c in await connections(repo) for w in await workloads(repo, c)]
     workload = next(w for w in all_workloads if w.workload_id == _ARCHIVE_MAIL_WORKLOAD_ID)
     version = next(v for v in await versions(repo, workload) if v.version_id == 96)
-    untyped_provider = await saas_provider_for(repo, workload, version)
-    assert isinstance(untyped_provider, CompositeSaasProvider), type(untyped_provider)
-    provider = untyped_provider
-    try:
-        groups = await provider.children(provider.root())
-        group_names = {g.name for g in groups}
-        assert group_names == {"Mail", "Contacts", "Calendars", "Archive"}, group_names
+    async with SaasStreamCache(repo) as saas_streams:
+        untyped_provider = await saas_provider_for(repo, workload, version, saas_streams)
+        assert isinstance(untyped_provider, CompositeSaasProvider), type(untyped_provider)
+        provider = untyped_provider
+        try:
+            groups = await provider.children(provider.root())
+            group_names = {g.name for g in groups}
+            assert group_names == {"Mail", "Contacts", "Calendars", "Archive"}, group_names
 
-        archive_group = next(g for g in groups if g.name == "Archive")
-        folders = await provider.children(archive_group)
-        assert folders == []
-    finally:
-        await provider.close()
+            archive_group = next(g for g in groups if g.name == "Archive")
+            folders = await provider.children(archive_group)
+            assert folders == []
+        finally:
+            await provider.close()
 
 
 async def _count_leaves(provider: UnitProvider, node: Node) -> int:
@@ -207,11 +216,14 @@ async def _count_leaves(provider: UnitProvider, node: Node) -> int:
 async def test_m365_exchange_mail_workload_resolves_to_its_folder_and_lists_its_messages_replayed(
     record_target: Callable[..., Awaitable[ObjectStore]],
 ) -> None:
-    async with await _open_repo(record_target, "saas_content_mail_m365_grace_apv1.json.gz") as repo:
+    async with (
+        await _open_repo(record_target, "saas_content_mail_m365_grace_apv1.json.gz") as repo,
+        SaasStreamCache(repo) as saas_streams,
+    ):
         all_workloads = [w for c in await connections(repo) for w in await workloads(repo, c)]
         workload = next(w for w in all_workloads if w.workload_id == _M365_EXCHANGE_MAIL_WORKLOAD_ID)
         version = next(v for v in await versions(repo, workload) if v.version_id == 91)
-        untyped_provider = await saas_provider_for(repo, workload, version)
+        untyped_provider = await saas_provider_for(repo, workload, version, saas_streams)
         assert isinstance(untyped_provider, CompositeSaasProvider), type(untyped_provider)
         provider = untyped_provider
         try:
@@ -230,7 +242,10 @@ async def test_m365_exchange_mail_workload_resolves_to_its_folder_and_lists_its_
 async def test_calendar_workload_resolves_and_lists_a_real_event_count_replayed(
     record_target: Callable[..., Awaitable[ObjectStore]],
 ) -> None:
-    async with await _open_repo(record_target, "saas_content_calendar_alice_apv1.json.gz") as repo:
+    async with (
+        await _open_repo(record_target, "saas_content_calendar_alice_apv1.json.gz") as repo,
+        SaasStreamCache(repo) as saas_streams,
+    ):
         all_workloads = [w for c in await connections(repo) for w in await workloads(repo, c)]
         candidates = [
             v
@@ -240,20 +255,24 @@ async def test_calendar_workload_resolves_and_lists_a_real_event_count_replayed(
             if v.saas_stream_uuid == "KxMWSUvtSZiaDTDy" and not v.deleted
         ]
         version = max(candidates, key=lambda v: v.version_id)
-        provider = await CalendarProvider(repo, version)
+        provider = await CalendarProvider(repo, version, saas_streams)
         try:
             checked = 0
-            for calendar in await provider.children(provider.root()):
-                checked += len(await provider.children(calendar))
+            for category in await provider.children(provider.root()):
+                for calendar in await provider.children(category):
+                    checked += len(await provider.children(calendar))
             assert checked >= 41
         finally:
             await provider.close()
 
 
 # -- Mail half: synthetic (CBT1's real mail_table has zero real mail rows) --
-# Zero real-sample dependency to begin with (see this module's own
-# docstring) — moved here as-is rather than left in
-# tests/integration/, which it never needed.
+# A message's body and an attachment's bytes are content a real fixture
+# can't narrow around -- reading either would make RecordingStore capture
+# that real content regardless of what the test then asserts -- so
+# attachment round-trip fidelity is proven synthetically instead, kept
+# here alongside its real-replay siblings above rather than split into a
+# separate tests/unit/ file.
 
 _STREAM_ID = 18
 _CCID = 1
@@ -546,14 +565,14 @@ def _version() -> Version:
 
 
 async def test_eml_fully_parses_with_byte_identical_attachment(tmp_path: Path) -> None:
-    """Synthetic reproduction of the Mail round-trip property (see this
-    file's own module docstring) — a fully-controlled fixture,
+    """Synthetic reproduction of Mail's ``X-ABL-ID`` reassembly/attachment
+    round-trip fidelity — a fully-controlled fixture,
     independent of any one sample's real data shape."""
     _build_mail_repo(tmp_path)
     store = LocalFsStore(tmp_path)
     layout = RepoLayout(kind=RepoKind.VAULT, repo_root="")
-    async with await DedupRepo.open(store, layout) as repo:
-        provider = await MailProvider(repo, _version())
+    async with await DedupRepo.open(store, layout) as repo, SaasStreamCache(repo) as saas_streams:
+        provider = await MailProvider(repo, _version(), saas_streams)
         try:
             [folder] = await provider.children(provider.root())
             [mail] = await provider.children(folder)

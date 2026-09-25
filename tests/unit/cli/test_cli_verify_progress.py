@@ -2,8 +2,8 @@
 that it passes ``build_progress_meter(state).update`` into
 ``Repository.verify(level, progress=...)`` and that meter's rendering
 reaches stderr the same way every other command's discovery progress
-already does (see ``progress_render.py``). Distinct from
-``test_cli_verify.py``, which covers rendering, not progress wiring.
+already does. Distinct from ``test_cli_verify.py``, which covers
+rendering, not progress wiring.
 """
 
 from __future__ import annotations
@@ -42,7 +42,7 @@ def _fake_session(monkeypatch: pytest.MonkeyPatch) -> None:
         async def close(self) -> None:
             pass
 
-    monkeypatch.setattr("synology_apm_repo.cli.browse.Session", _FakeSession)
+    monkeypatch.setattr("synology_apm_repo.cli.repo_session.Session", _FakeSession)
 
 
 def test_json_full_level_emits_a_verifying_phase_ndjson_line(tmp_path: Path) -> None:
@@ -65,9 +65,8 @@ def test_zero_findings_renders_clean_in_human_output(tmp_path: Path) -> None:
     fabricated non-empty Finding, and the real fixture-backed
     integration coverage (``tests/integration/cli/test_cli_verify.py``)
     is deliberately non-clean now (``sample-1``'s own known
-    retention-gap findings) -- this fake repository's own ``verify()`` (see
-    this module's ``_fake_session`` fixture) is the only scenario left
-    that actually returns ``[]``."""
+    retention-gap findings) -- this fake repository's ``verify()``
+    is the only scenario left that actually returns ``[]``."""
     result = runner.invoke(app, ["verify", str(tmp_path), "--level", "quick"])
     assert result.exit_code == 0, result.output
     assert "clean" in result.output

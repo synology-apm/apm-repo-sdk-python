@@ -1,10 +1,10 @@
 """Regression tests for ``--object-db-id`` at the CLI — replayed from a
 committed fixture recorded against real bytes, with **no external
 dependency**: same ``patch_profile_store`` fixture
-(``tests/conftest.py``) this project's other CLI replay tests use — a
+(``tests/integration/cli/conftest.py``) this project's other CLI replay tests use — a
 canonical ``cat:``/``wl:``/``ver:`` ref never needs its ``fs_path``
-half at all (see ``Repository.resolve``'s own docstring:
-"``ref.repo_path`` is ignored entirely"), so ``--profile`` supplying the
+half at all (``Repository.resolve`` ignores ``ref.repo_path`` entirely for
+a canonical or human ref), so ``--profile`` supplying the
 store in place of a real local path changes nothing about what either
 scenario below exercises.
 
@@ -23,10 +23,8 @@ but content-mismatched one.
 
 The second scenario
 (``test_object_db_id_cli_end_to_end_ls_and_export_against_a_synthetic_degraded_version``)
-has zero real-sample dependency in the original (a hand-built repository under
-``tmp_path``, no ``samples_dir``/``ReplayStore`` involved at all) — moved
-here as-is rather than left in ``tests/integration/``, which it never
-needed.
+runs against a hand-built repository under ``tmp_path``, with zero
+real-sample dependency (no ``samples_dir``/``ReplayStore`` involved).
 """
 
 from __future__ import annotations
@@ -44,7 +42,7 @@ from pathlib import Path
 import zstandard
 from typer.testing import CliRunner
 
-import synology_apm_repo.cli.browse as browse_mod
+import synology_apm_repo.cli.repo_session as repo_session_mod
 from synology_apm_repo.cli.main import app
 from synology_apm_repo.sdk.catalog.connection import connections
 from synology_apm_repo.sdk.catalog.version import versions
@@ -62,9 +60,9 @@ from synology_apm_repo.sdk.storage.local import LocalFsStore
 
 runner = CliRunner()
 
-# Real values the fixture's recorded stream/version resolve to (see this
-# module's own docstring): stream uvWRSFkGxCcZAMwt, connection_config_id 3,
-# workload_id 16, this specific real chat version.
+# Real values the fixture's recorded stream/version resolve to: stream
+# uvWRSFkGxCcZAMwt, connection_config_id 3, workload_id 16, this specific
+# real chat version.
 _CCID = 3
 _WORKLOAD_ID = 16
 _VERSION_UID = "882d6f32-6cab-44e1-9b5c-cbb9d1bddcd3"
@@ -74,7 +72,7 @@ _STREAM_UUID = "uvWRSFkGxCcZAMwt"
 def test_object_db_id_is_ignored_by_the_cli_once_real_dispatch_succeeds_replayed(
     patch_profile_store: Callable[..., None],
 ) -> None:
-    patch_profile_store("object_db_id_cli_teams_chat_apv1.json.gz", browse_mod, allow_content=True)
+    patch_profile_store("object_db_id_cli_teams_chat_apv1.json.gz", repo_session_mod, allow_content=True)
 
     ref = f"#cat:{_CCID}/wl:{_WORKLOAD_ID}/ver:{_VERSION_UID}"
     bogus_object_db_id = f"{_STREAM_UUID}_999999999_1234"
@@ -92,8 +90,8 @@ def test_object_db_id_is_ignored_by_the_cli_once_real_dispatch_succeeds_replayed
     assert plain_result.stdout == pinned_result.stdout
 
 
-# -- synthetic fixture for the CLI end-to-end round trip (see this
-# module's own docstring) — duplicated from
+# -- synthetic fixture for the CLI end-to-end round trip: a hand-built
+# repository with zero real-sample dependency, duplicated from
 # tests/integration/sdk/test_api.py's _build_degraded_saas_repo rather than
 # imported, matching this codebase's "tests/ isn't a package" convention.
 _SYN_STREAM_ID = 41
@@ -314,8 +312,8 @@ def _build_synthetic_degraded_repo(tmp_path: Path, *, session_id: int = 8) -> st
     automatic discovery has nothing to show at all, but a caller who
     already knows the exact location can still reach it directly.
     Matches ``tests/integration/sdk/test_api.py``'s degraded-workload
-    fixture in every other respect (duplicated, not imported — see this
-    module's own docstring). Returns the one real ObjectDB's own
+    fixture in every other respect (duplicated, not imported, per this
+    codebase's "tests/ isn't a package" convention). Returns the one real ObjectDB's own
     ``object_db_id`` string, known here by construction rather than
     discovered via any scan."""
     _write_repo_info(tmp_path / "repo_info")
@@ -374,12 +372,12 @@ def _build_synthetic_degraded_repo(tmp_path: Path, *, session_id: int = 8) -> st
 
 
 def test_object_db_id_cli_end_to_end_ls_and_export_against_a_synthetic_degraded_version(tmp_path: Path) -> None:
-    """The manual-override CLI round trip against a synthetic fixture
-    (see this module's own docstring for why: no real version in this
-    project's samples reaches ``RawObjectProvider`` through normal CLI
-    dispatch, so testing ``--object-db-id`` actually *taking effect* end
-    to end needs one that does). The fixture's own object-name index is
-    deliberately absent (see its own docstring) — automatic discovery
+    """The manual-override CLI round trip against a synthetic fixture --
+    no real version in this project's samples reaches ``RawObjectProvider``
+    through normal CLI dispatch, so testing ``--object-db-id`` actually
+    *taking effect* end to end needs one that does. The fixture's own
+    object-name index is deliberately absent (``_version_spec_json()``
+    carries no ``additional_meta``) — automatic discovery
     has nothing to show, so this test also proves the manual override
     doesn't depend on one existing at all. Zero real-sample dependency —
     the CLI runs against a real, hand-built local repository under

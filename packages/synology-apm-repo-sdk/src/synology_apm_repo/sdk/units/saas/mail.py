@@ -13,11 +13,10 @@ current row only).
 M365 Mail's tree is normally ``RecursiveGroupFlatTree`` over
 ``mail_folder_table``'s own real, nested folder hierarchy
 (``_open_m365_folder_tree``) — every real folder shows up, including one
-with zero backed-up messages. That degrades to the older, flat,
-item-driven ``SyntheticGroupedTree`` (folder names resolved separately via
-``_m365_folder_names``) whenever the hierarchy table isn't indexed or
-doesn't validate — see ``_open_m365_folder_tree``'s own docstring for
-every such case. GWS has no folder hierarchy at all, only many-to-many
+with zero backed-up messages; see ``_open_m365_folder_tree`` for when it
+degrades to the older, flat, item-driven ``SyntheticGroupedTree`` instead
+(folder names resolved separately via ``_m365_folder_names``).
+GWS has no folder hierarchy at all, only many-to-many
 labels, surfaced as an ``extra_attrs`` field rather than a tree grouping
 (``_gws_mail_labels``), so it always uses the flat tree. Archive Mail is a
 real, separate M365-only mailbox with a schema byte-for-byte identical to
@@ -27,13 +26,12 @@ regular Mail's, resolved via the object-name index alone — see
 
 from __future__ import annotations
 
-import json
 from collections.abc import Awaitable, Callable
 
 from ...errors import DataCorruptError
 from ...storage.table import Column, Table
-from ..base import RestorableUnit, UnitKind
-from ..content.saas_artifact import LazyArtifact
+from ..base import RestorableUnit, UnitKind, mtime_attrs
+from ..content.saas_artifact import LazyArtifact, parse_meta_json
 from ..content.saas_mail import build_eml
 from .object_name_index import read_grouped_names, read_id_to_name_map
 from .objectdb import read_object
@@ -53,27 +51,26 @@ _MAIL_FOLDER_TABLE = "mail_folder_table"  # M365 only — see _open_m365_folder_
 # many-to-many labels) but ambiguously shared between two different real
 # meanings depending on which db holds it: mail_db's own copy is the
 # mail<->label *membership* join (mail_id, label_id); mail_label_db's own
-# copy is the label *definitions* (label_id, label_name) — see
-# _gws_mail_labels()'s own docstring for why a schema-based scan for
-# either one would have been fundamentally unreliable, not just slower.
+# copy is the label *definitions* (label_id, label_name) — a
+# schema-based scan couldn't tell these two meanings apart, since both
+# are named identically; only the object-name index (which db it
+# resolves to) can.
 _MAIL_LABEL_TABLE = "mail_label_table"
 # Catalog names for mail_folder_db's own object_id, in try-order
-# (USER_EXCHANGE and GROUP_EXCHANGE respectively) — see
-# _folder_names()'s own docstring.
+# (USER_EXCHANGE and GROUP_EXCHANGE respectively).
 _MAIL_FOLDER_DB_NAMES = ("mail_folder_db", "group_mail_folder_db")
 # Archive Mail (M365 only — see ARCHIVE_MAIL_CONFIG) has its own,
 # separate folder db under this one name — same schema, table name, and
 # column set as mail_folder_db's own.
 _ARCHIVE_MAIL_FOLDER_DB_NAMES = ("archive_mail_folder_db",)
-# Archive Mail's own mail_table — same schema as regular Mail's (module
-# docstring), implemented generically from that schema regardless of
-# whether any given account's Archive folder is ever populated, the
-# same precedent Teams/Chat's own not-yet-populated message content
-# follows.
+# Archive Mail's own mail_table — schema byte-for-byte identical to
+# regular Mail's; implemented generically regardless of whether any given
+# account's Archive folder is ever populated, the same precedent
+# Teams/Chat's own not-yet-populated message content follows.
 _ARCHIVE_MAIL_DB_NAMES = ("archive_mail_db",)
 _MAIL_LABEL_DB_NAMES = ("mail_label_db",)
 # The *membership* half of GWS labels lives inside mail_db itself, not
-# mail_label_db — see _MAIL_LABEL_TABLE's own comment.
+# mail_label_db.
 _MAIL_DB_NAMES_FOR_LABEL_MEMBERSHIP = ("mail_db",)
 _SKEL_TYPE = 0  # the EML skeleton itself, never a splice target
 _ALL_MAIL_GROUP = "Mail"
@@ -87,11 +84,18 @@ _MAIL_COLUMNS = [
     Column("subject"),
     Column("meta_object_id"),
     Column("parent_folder_id", required=False),
+    # Bare display name only — no email address is cached anywhere in
+    # this schema; the browser's own "Sender" column shows a name, same
+    # as a real Outlook/Gmail list view's own default.
+    Column("sender", required=False),
+    # Received/sent time — real on both platforms, and the same column
+    # order_by below sorts by.
+    Column("remote_timestamp", required=False),
 ]
 
-# folder_id/folder_name/parent_folder_id/is_root — see
-# _open_m365_folder_tree's own docstring. Used only by the hierarchy
-# path: _folder_names's own flat-lookup degrade path is separate
+# folder_id/folder_name/parent_folder_id/is_root — the columns
+# RecursiveGroupFlatTree needs to build the real M365 folder hierarchy.
+# Used only by the hierarchy path: _folder_names's own flat-lookup degrade path is separate
 # machinery (read_id_to_name_map, its own 2-column folder_id/folder_name
 # lookup) and never touches this constant. is_root must still be
 # declared here — root-anchor resolution below reads it, and Table only
@@ -216,8 +220,7 @@ async def _open_m365_folder_tree(provider: SaasWorkloadProvider) -> RecursiveGro
 
 async def _gws_mail_labels(provider: SaasWorkloadProvider) -> dict[str, list[str]] | None:
     """Best-effort ``mail_id -> [real label names]`` map for GWS's own
-    label mechanism (see this module's own docstring for why Gmail has
-    no folder hierarchy) — surfaced as an ``extra_attrs`` field
+    label mechanism, surfaced as an ``extra_attrs`` field
     (``MAIL_CONFIG``), not a tree grouping the way M365's real folders
     are.
 
@@ -243,8 +246,28 @@ async def _gws_mail_labels(provider: SaasWorkloadProvider) -> dict[str, list[str
     )
 
 
+def _common_mail_extra_attrs(row: _Row) -> dict[str, object]:
+    """``sender``/``mtime`` attrs shared by regular Mail and Archive
+    Mail — Archive Mail's schema is byte-for-byte identical to regular
+    Mail's."""
+    attrs: dict[str, object] = {}
+    sender = row.get("sender")
+    if sender:
+        attrs["sender"] = sender
+    attrs.update(mtime_attrs(row.get("remote_timestamp")))
+    return attrs
+
+
 def _mail_extra_attrs(provider: SaasWorkloadProvider, row: _Row) -> dict[str, object]:
-    return extras_attr(provider, "gws_mail_labels", row["mail_id"], "labels")
+    return {**_common_mail_extra_attrs(row), **extras_attr(provider, "gws_mail_labels", row["mail_id"], "labels")}
+
+
+def _archive_mail_extra_attrs(provider: SaasWorkloadProvider, row: _Row) -> dict[str, object]:
+    # Archive Mail is M365-only (GWS has no equivalent) — no GWS labels
+    # concept to merge in here, unlike regular Mail's own
+    # _mail_extra_attrs.
+    del provider
+    return _common_mail_extra_attrs(row)
 
 
 def _mail_display_name(row: _Row) -> str:
@@ -290,7 +313,7 @@ def _make_build_tree(
             columns=_MAIL_COLUMNS,
             id_column="mail_id",
             # GWS has no folder hierarchy at all (only many-to-many
-            # labels — see this module's own docstring) — group_column=
+            # labels, surfaced via extra_attrs instead) — group_column=
             # None means every message sits in the one synthetic
             # root_name group, queried without any WHERE at all.
             group_column="parent_folder_id" if is_m365 else None,
@@ -299,11 +322,12 @@ def _make_build_tree(
             # remote_timestamp (received/sent time) is real on both
             # platforms and indexed (remote_timestamp_index) — a closer
             # match to "inbox sorted by time" than subject would be, but
-            # not declared in _MAIL_COLUMNS at all —
-            # tree_strategy.py's _resolve_order_by()
-            # falls back to "subject" (always present) if a given schema
-            # genuinely lacks it, then SQLite's own implicit ``rowid`` as
-            # the deterministic pagination tiebreaker regardless.
+            # declared optional in _MAIL_COLUMNS since it's absent on
+            # some older schema versions — tree_strategy/_base.py's
+            # _resolve_order_by() falls back to "subject" (always
+            # present) if a given schema genuinely lacks it, then
+            # SQLite's own implicit ``rowid`` as the deterministic
+            # pagination tiebreaker regardless.
             order_by=["remote_timestamp", "subject"],
             # Newest-first: a real inbox's natural default view is
             # most-recent message first, not oldest-first.
@@ -330,10 +354,7 @@ def _declared_size(entry: dict[str, object]) -> int | None:
 async def _assemble_eml(provider: SaasWorkloadProvider, meta_object_id: str) -> bytes:
     object_db = provider.object_db(_MAIL_TABLE)
     meta_bytes = await read_object(object_db, provider.dedup_file, meta_object_id)
-    try:
-        meta = json.loads(meta_bytes)
-    except json.JSONDecodeError as exc:
-        raise DataCorruptError(f"mail META {meta_object_id!r} did not parse as JSON: {exc}") from exc
+    meta = parse_meta_json(meta_bytes, f"mail META {meta_object_id!r}", ref=meta_object_id)
     content_list = meta.get("content_list") or []
 
     skel_entry = next((c for c in content_list if c.get("type") == _SKEL_TYPE), None)
@@ -400,26 +421,31 @@ ARCHIVE_MAIL_CONFIG = SaasWorkloadConfig(
     tables=(_MAIL_TABLE,),
     tree_factory=_build_archive_tree,
     assemble=_assemble,
+    extra_attrs=_archive_mail_extra_attrs,
     object_names={
         _MAIL_TABLE: _ARCHIVE_MAIL_DB_NAMES,
         _MAIL_FOLDER_TABLE: _ARCHIVE_MAIL_FOLDER_DB_NAMES,
     },
-    # Same schema as mail_db — resolved via object-name index only (module
-    # docstring). If the object-name index doesn't have archive_mail_db,
-    # Archive is simply absent from this version's tree.
+    # Same schema as mail_db, so a schema-only scan couldn't tell the
+    # two mailboxes apart — resolved via the object-name index only. If
+    # the object-name index doesn't have archive_mail_db, Archive is
+    # simply absent from this version's tree.
 )
 
 
-#: Constructor-style factory over ``MAIL_CONFIG`` — see
-#: ``make_saas_provider``'s own docstring for what "constructor-style
-#: factory" and ``shared`` mean.
+#: Constructor-style factory over ``MAIL_CONFIG`` — callable exactly
+#: like a constructor (``await MailProvider(repo, version, saas_streams)``), with an
+#: optional ``shared`` context passed straight through to
+#: ``SaasWorkloadProvider.create`` for M365's multi-candidate
+#: ``USER_EXCHANGE``/``GROUP_EXCHANGE`` dispatch.
 MailProvider = make_saas_provider(MAIL_CONFIG, name="MailProvider")
 
 #: M365's Archive mailbox — a real, separate ``mail_table`` coexisting with
-#: regular Mail in the same ``USER_EXCHANGE`` version — see this module's
-#: own module docstring for its schema, and ``_ARCHIVE_MAIL_DB_NAMES``'s
-#: own comment for why it's implemented generically from that schema
-#: alone.
+#: regular Mail in the same ``USER_EXCHANGE`` version, with a schema
+#: byte-for-byte identical to regular Mail's — implemented generically
+#: from that schema regardless of whether any given account's Archive
+#: folder is ever populated (the same precedent Teams/Chat's own
+#: not-yet-populated message content follows).
 #:
 #: Raises ``UnsupportedDataFormatError`` whenever the object-name index doesn't
 #: resolve ``archive_mail_db`` for this version — there is no scan

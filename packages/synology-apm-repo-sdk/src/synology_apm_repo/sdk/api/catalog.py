@@ -1,10 +1,10 @@
 """``Catalog``/``Frame``: one catalog's own workload/version/provider
-operations — see ``synology_apm_repo.sdk.api``'s own module docstring for
-the whole Repository Layer's scope. ``Catalog`` is obtained from
+operations, part of the Repository Layer (the ``Session``/``Repository``/
+``Catalog`` split CLI/TUI code imports directly; everything below it is an
+implementation detail this package hides). ``Catalog`` is obtained from
 ``Repository.catalogs()``/``Repository.catalog_by_id()`` (the sibling
-``api.repository`` module), never constructed directly; the two modules
-meet at ``Repository.resolve()``'s canonical/human-ref dispatch, which
-``api.repository`` itself owns.
+``api.repository`` module); the two modules meet at ``Repository.resolve()``'s
+canonical/human-ref dispatch, which ``api.repository`` itself owns.
 """
 
 from __future__ import annotations
@@ -26,6 +26,7 @@ from ..units.base import Node, UnitProvider
 from ..units.dispatch import SUPPORTED_TARGET_TYPES as _DEVICE_FS_TARGET_TYPES
 from ..units.dispatch import provider_for, raw_fallback_provider_for, saas_provider_for
 from ..units.node_ref import ambiguous_matches, match_display_name, version_pairs, workload_pairs
+from ..units.saas.stream import SaasStreamCache
 from ..units.verify_reachable import verify_reachable
 
 
@@ -51,8 +52,7 @@ class Frame:
 class Catalog:
     """One catalog within an opened ``Repository``: a single ``db/
     connection_config`` row (``connection``) plus the workload/version/
-    provider operations scoped to it. Obtained from
-    ``Repository.catalogs()``, never constructed directly.
+    provider operations scoped to it. Never constructed directly.
 
     For a vault, several sibling ``Catalog``s share one underlying
     ``DedupRepo`` (one physical dedup pool) — this mirrors one opened
@@ -60,6 +60,11 @@ class Catalog:
     For object storage, each ``Catalog`` owns its own
     independently-opened ``DedupRepo`` — a distinct physical pool per
     sibling repo-id (FORMAT-SPEC.md: no cross-repo-id dedup).
+
+    ``saas_streams`` is shared, not owned: it's the ``Repository``-level
+    ``SaasStreamCache`` built against this same ``dedup_repo`` (see
+    ``api.repository._OpenCatalog``), borrowed by every SaaS provider this
+    catalog hands out via ``provider()`` rather than each opening its own.
 
     A provider this hands out is tracked by the owning ``Repository`` —
     ``Repository.close()`` closes it, not this object; ``Catalog`` itself
@@ -71,18 +76,22 @@ class Catalog:
         dedup_repo: DedupRepo,
         connection: Connection,
         *,
+        saas_streams: SaasStreamCache,
         track: Callable[[UnitProvider], UnitProvider],
         require_key_verified: Callable[[], None],
     ) -> None:
         self._dedup_repo = dedup_repo
         self.connection = connection
+        self._saas_streams = saas_streams
         self._track = track
         # The owning Repository's own gate (KeyRequiredError/KeyMismatchError before
         # any I/O a wrong/missing key would make meaningless) — bound in
         # rather than duplicated here, since key/encryption status is
         # Repository-wide state this class has no copy of. Repository.
-        # catalogs() itself is deliberately *not* gated (see its own
-        # docstring) — this is the first point that actually is.
+        # catalogs() itself is deliberately *not* gated (the connection_config
+        # rows it reads are plaintext regardless of encryption, and opening a
+        # DedupRepo never requires a key either) — this is the first point
+        # that actually is.
         self._require_key_verified = require_key_verified
 
     @property
@@ -91,8 +100,9 @@ class Catalog:
 
     @property
     def catalog_id(self) -> CatalogId:
-        """See ``identifiers.resolve_catalog_id``'s own docstring for the
-        shared formula: ``self._dedup_repo.layout.repo_id`` (this
+        """The shared repo-id/connection-config-id fallback formula (also used
+        by ``units.node_ref.canonical_ref_for``, so both call sites derive the
+        same id): ``self._dedup_repo.layout.repo_id`` (this
         catalog's own repo-id, set on every ``RepoLayout``
         ``catalog_repo_layouts()`` derives for ``OBJECT_STORE``) is used
         when available, falling back to ``str(connection_config_id)`` for
@@ -121,26 +131,31 @@ class Catalog:
         return await workloads(self._dedup_repo, self.connection)
 
     async def versions(self, workload: Workload, *, include_deleted: bool = False) -> list[Version]:
-        """The raw catalog read (``catalog.version.versions``'s own
-        docstring covers sort order) — nothing is filtered out. A version
+        """The raw catalog read (newest-first by real backup time, ties
+        broken by ``version_id`` descending) — nothing is filtered out. A version
         whose content later turns out unresolvable (a genuine gap, or
         routine backend-side generation rotation the resolving Unit already
         absorbs — see ``units.saas.stream``) raises when actually opened
         (VM/FS, GW/M365) or surfaces a diagnostic node in place of the
         missing disk (PC/PS — see ``units.device_pcps``), the same as
         ``verify()`` already treats it; this method never hides a real
-        catalog row in advance of that. Same key gate as ``workloads()`` —
-        see its own docstring."""
+        catalog row in advance of that. Same key gate as ``workloads()``."""
         self._require_key_verified()
         return await versions(self._dedup_repo, workload, include_deleted=include_deleted)
 
     async def provider(
         self, version: Version, *, object_db_id: str | None = None, force_raw: bool = False
     ) -> UnitProvider:
-        """See ``_provider_for_version``'s own docstring for exactly how
-        ``version`` gets dispatched."""
+        """Dispatches ``version`` to the right ``UnitProvider`` by
+        ``target_type``/``Workload.sub_type``, degrading to
+        ``RawObjectProvider`` when nothing recognizes it."""
         return await _provider_for_version(
-            self._dedup_repo, version, object_db_id=object_db_id, force_raw=force_raw, track=self._track
+            self._dedup_repo,
+            version,
+            saas_streams=self._saas_streams,
+            object_db_id=object_db_id,
+            force_raw=force_raw,
+            track=self._track,
         )
 
     async def verify(
@@ -154,11 +169,8 @@ class Catalog:
         ``DedupRepo``, this is the same check as every sibling's own
         ``verify()``, not one scoped to this catalog's own rows alone
         (the top-down walk checks the shared pool via *every* catalog's
-        own workloads/versions, not one connection's data alone — see
-        ``units.verify_reachable``'s own docstring). Same key gate as
-        ``workloads()``/``versions()`` — see its own docstring: without
-        it, a locked repository would walk zero versions and report a
-        misleadingly clean result instead of refusing to run."""
+        own workloads/versions, not one connection's data alone). Same key
+        gate as ``workloads()``/``versions()``."""
         self._require_key_verified()
         return await verify_reachable(self._dedup_repo, level, progress=progress)
 
@@ -192,6 +204,7 @@ async def _provider_for_version(
     dedup_repo: DedupRepo,
     version: Version,
     *,
+    saas_streams: SaasStreamCache,
     object_db_id: str | None = None,
     force_raw: bool = False,
     track: Callable[[UnitProvider], UnitProvider],
@@ -203,7 +216,8 @@ async def _provider_for_version(
     M365/GW, degrading to ``RawObjectProvider`` when nothing recognizes
     it — callers never see ``UnsupportedDataFormatError`` here. Every
     constructed provider is handed to ``track`` before being returned, so
-    its owning ``Repository`` can close it later.
+    its owning ``Repository`` can close it later. ``saas_streams`` is
+    ignored for VM/PC/PS/FS — only the SaaS branches below use it.
 
     ``object_db_id`` (manual disambiguation override) is ignored for
     VM/PC/PS/FS (a SaaS-only concept) and only reaches a constructed
@@ -218,11 +232,11 @@ async def _provider_for_version(
     if version.target_type in _DEVICE_FS_TARGET_TYPES:
         return track(await provider_for(dedup_repo, version))
     if force_raw:
-        return track(await raw_fallback_provider_for(dedup_repo, version, object_db_id=object_db_id))
+        return track(await raw_fallback_provider_for(dedup_repo, version, saas_streams, object_db_id=object_db_id))
     workload = await workload_by_id(dedup_repo, version.workload_id)
     if workload is None:
-        return track(await raw_fallback_provider_for(dedup_repo, version, object_db_id=object_db_id))
-    return track(await saas_provider_for(dedup_repo, workload, version, object_db_id=object_db_id))
+        return track(await raw_fallback_provider_for(dedup_repo, version, saas_streams, object_db_id=object_db_id))
+    return track(await saas_provider_for(dedup_repo, workload, version, saas_streams, object_db_id=object_db_id))
 
 
 _T = TypeVar("_T")

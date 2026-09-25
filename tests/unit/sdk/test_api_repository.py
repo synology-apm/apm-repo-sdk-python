@@ -30,6 +30,7 @@ from synology_apm_repo.sdk.catalog.connection import Connection
 from synology_apm_repo.sdk.catalog.version import Version
 from synology_apm_repo.sdk.catalog.workload import Workload
 from synology_apm_repo.sdk.dedup.keys import KeyMaterial, KeyVerification
+from synology_apm_repo.sdk.dedup.pool import INTERACTIVE_BUCKET_CACHE_SIZE
 from synology_apm_repo.sdk.dedup.repository import DedupRepo
 from synology_apm_repo.sdk.dedup.verify_checks import Finding, Stage, Symptom
 from synology_apm_repo.sdk.errors import KeyMismatchError, KeyRequiredError, NotFoundError
@@ -50,6 +51,7 @@ from synology_apm_repo.sdk.storage.base import ObjectStore
 from synology_apm_repo.sdk.storage.layout import RepoKind, RepoLayout, RepositoryLayout
 from synology_apm_repo.sdk.units.base import Node, RestorableUnit
 from synology_apm_repo.sdk.units.node_ref import NodeRef
+from synology_apm_repo.sdk.units.saas.stream import SaasStreamCache
 
 
 class _FakeStore:
@@ -90,10 +92,9 @@ class _FakeDedupRepo:
         self.close_count = 0
         # Unused by Session.discover() itself now (it probes via the
         # free function dedup.keys.probe_encrypted() against the store,
-        # before any DedupRepo is opened -- see api_session's own
-        # _probe_encrypted); kept for a caller that constructs a
-        # Repository directly with an explicit `encrypted=` and wants
-        # this fake's own probe_encrypted() to agree with it.
+        # before any DedupRepo is opened); kept for a caller that
+        # constructs a Repository directly with an explicit `encrypted=`
+        # and wants this fake's own probe_encrypted() to agree with it.
         self._encrypted = encrypted
 
     async def close(self) -> None:
@@ -131,10 +132,11 @@ def _repository_layout(repo_root: str = "") -> RepositoryLayout:
     bucket/vault, not one already-opened ``DedupRepo``). Every test
     here uses ``RepoKind.VAULT``, matching ``_layout()``'s own default:
     ``catalog_repo_layouts()`` always resolves a ``VAULT``
-    ``RepositoryLayout`` to exactly one derived ``RepoLayout``
-    (``storage.layout``'s own docstring), so a single-catalog fake
-    (``_FakeDedupRepo``) is always the right shape regardless of which of
-    the two layout types a given test builds by hand."""
+    ``RepositoryLayout`` to exactly one derived ``RepoLayout`` (a vault's
+    own catalogs come from querying ``db/connection_config`` after
+    opening, not a separate directory per catalog), so a single-catalog
+    fake (``_FakeDedupRepo``) is always the right shape regardless of
+    which of the two layout types a given test builds by hand."""
     return RepositoryLayout(kind=RepoKind.VAULT, repo_root=repo_root)
 
 
@@ -153,14 +155,25 @@ def _repo_with_fake_dedup(
     ``DedupRepo.open()`` rather than taking one ready-made. Monkeypatches
     ``DedupRepo.open`` to hand back ``fake`` regardless of which derived
     ``RepoLayout`` it's called with — fine for every test here, which only
-    ever has one single-catalog vault layout to open (see
-    ``_repository_layout()``'s own docstring). Construction itself never
+    ever has one single-catalog vault layout to open (every test here
+    builds a ``VAULT`` layout, which always resolves to exactly one
+    ``RepoLayout``). Construction itself never
     opens anything (only ``Session``'s own ``_confirm_real()`` or an
-    explicit ``catalogs()``/``_dedup_catalogs.resolve()`` call does) — a
+    explicit ``catalogs()``/``_open_catalogs.resolve()`` call does) — a
     test that only checks ``key_status``/``is_encrypted`` right after
     construction doesn't need this helper at all, a bare ``api.Repository(
-    _as_object_store(_FakeStore()), _repository_layout(), ...)`` is enough."""
+    _as_object_store(_FakeStore()), _repository_layout(), ...)`` is enough.
+
+    Also fakes ``api_repository.connections`` to return ``[]`` by default:
+    ``_open_catalog_resources`` resolves it eagerly alongside ``dedup_repo``
+    and caches it for this ``DedupRepo``'s whole lifetime, so any test
+    forcing a catalog open -- even just via ``_open_catalogs.resolve(0)``,
+    not ``catalogs()`` itself -- needs it faked too. A test that cares
+    about a specific connection list overrides this with its own
+    ``monkeypatch.setattr(api_repository, "connections", ...)`` call
+    afterward."""
     monkeypatch.setattr(DedupRepo, "open", _async_open(lambda *a, **k: fake))
+    monkeypatch.setattr(api_repository, "connections", _async_returning([]))
     return api.Repository(
         _as_object_store(_FakeStore()),
         layout if layout is not None else _repository_layout(),
@@ -265,9 +278,15 @@ def _make_catalog(
     gate (``_require_key_verified``) — for a test that needs a ``Catalog``
     in isolation, without going through a full ``repo.catalogs()``
     round-trip (which would additionally need ``connections()``/
-    ``DedupRepo.open()`` faked)."""
+    ``DedupRepo.open()`` faked). Builds its own ``SaasStreamCache`` against
+    ``dedup_repo`` -- none of this file's tests need to inspect it
+    directly, only that ``Catalog`` has one."""
     return api_catalog.Catalog(
-        dedup_repo, connection or _make_connection(), track=repo._track, require_key_verified=repo._require_key_verified
+        dedup_repo,
+        connection or _make_connection(),
+        saas_streams=SaasStreamCache(dedup_repo),
+        track=repo._track,
+        require_key_verified=repo._require_key_verified,
     )
 
 
@@ -277,8 +296,7 @@ def _make_catalog(
 def test_key_status_no_key_provided_when_encrypted_status_still_unknown() -> None:
     # ``encrypted`` left at its default (None) — the raw "never resolved"
     # case a bare Repository(...) constructor call gives; Session.discover()
-    # itself never leaves this unresolved for a real caller (see
-    # KeyStatus's own docstring).
+    # itself never leaves this unresolved for a real caller.
     repo = api.Repository(_as_object_store(_FakeStore()), _repository_layout(), keys=None, key_verification=None)
     assert repo.key_status is api.KeyStatus.NO_KEY_PROVIDED
 
@@ -294,7 +312,8 @@ def test_key_status_not_encrypted_when_probe_confirmed_unencrypted_even_without_
     # The whole point of resolving ``encrypted`` eagerly: a repository confirmed
     # NOT encrypted must report NOT_ENCRYPTED even though no key was
     # ever given — never NO_KEY_PROVIDED, which is reserved for a
-    # *confirmed*-encrypted repository (KeyStatus's own docstring).
+    # *confirmed*-encrypted repository (or the rare case encryption status
+    # genuinely couldn't be resolved at all).
     repo = api.Repository(
         _as_object_store(_FakeStore()), _repository_layout(), keys=None, key_verification=None, encrypted=False
     )
@@ -392,7 +411,7 @@ async def test_set_key_wrong_key_reports_invalid_not_no_key_provided(monkeypatch
     silently fall back to NO_KEY_PROVIDED."""
     fake_repo = _FakeDedupRepo(_layout())
     repo = _repo_with_fake_dedup(monkeypatch, fake_repo, keys=None, key_verification=None)
-    await repo._dedup_catalogs.resolve(0)  # populate the "already opened" catalog set_key() swaps
+    await repo._open_catalogs.resolve(0)  # populate the "already opened" catalog set_key() swaps
 
     bad_verification = KeyVerification(gcm_ok=False, vault_key=None)
     monkeypatch.setattr(KeyMaterial, "verify", _async_returning(bad_verification))
@@ -407,7 +426,7 @@ async def test_set_key_wrong_key_reports_invalid_not_no_key_provided(monkeypatch
 async def test_set_key_correct_key_swaps_in_new_dedup_repo_and_closes_old(monkeypatch: pytest.MonkeyPatch) -> None:
     fake_repo = _FakeDedupRepo(_layout())
     repo = _repo_with_fake_dedup(monkeypatch, fake_repo, keys=None, key_verification=None)
-    await repo._dedup_catalogs.resolve(0)  # populate the "already opened" catalog set_key() swaps
+    await repo._open_catalogs.resolve(0)  # populate the "already opened" catalog set_key() swaps
 
     good_verification = KeyVerification(gcm_ok=True, vault_key=b"x" * 32)
     monkeypatch.setattr(KeyMaterial, "verify", _async_returning(good_verification))
@@ -419,7 +438,7 @@ async def test_set_key_correct_key_swaps_in_new_dedup_repo_and_closes_old(monkey
     assert result is good_verification
     assert repo.key_status is api.KeyStatus.VERIFIED
     assert fake_repo.closed is True
-    assert await repo._dedup_catalogs.resolve(0) is _as_dedup_repo(new_repo)
+    assert (await repo._open_catalogs.resolve(0)).dedup_repo is _as_dedup_repo(new_repo)
 
 
 async def test_set_key_reraises_as_exception_group_when_a_reopen_fails(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -431,7 +450,7 @@ async def test_set_key_reraises_as_exception_group_when_a_reopen_fails(monkeypat
     just because the overall key was accepted."""
     fake_repo = _FakeDedupRepo(_layout())
     repo = _repo_with_fake_dedup(monkeypatch, fake_repo, keys=None, key_verification=None)
-    await repo._dedup_catalogs.resolve(0)  # populate the "already opened" catalog set_key() swaps
+    await repo._open_catalogs.resolve(0)  # populate the "already opened" catalog set_key() swaps
 
     good_verification = KeyVerification(gcm_ok=True, vault_key=b"x" * 32)
     monkeypatch.setattr(KeyMaterial, "verify", _async_returning(good_verification))
@@ -461,7 +480,7 @@ async def test_set_key_still_attempts_every_close_when_an_earlier_reopen_succeed
     from the other end of the swap."""
     fake_repo = _FakeRaisingDedupRepo(_layout())
     repo = _repo_with_fake_dedup(monkeypatch, fake_repo, keys=None, key_verification=None)
-    await repo._dedup_catalogs.resolve(0)  # populate the "already opened" catalog set_key() swaps
+    await repo._open_catalogs.resolve(0)  # populate the "already opened" catalog set_key() swaps
 
     good_verification = KeyVerification(gcm_ok=True, vault_key=b"x" * 32)
     monkeypatch.setattr(KeyMaterial, "verify", _async_returning(good_verification))
@@ -473,14 +492,14 @@ async def test_set_key_still_attempts_every_close_when_an_earlier_reopen_succeed
     assert isinstance(exc_info.value.exceptions[0], RuntimeError)
     assert fake_repo.closed is True  # the failing close was still attempted, not skipped
     assert repo.key_status is api.KeyStatus.VERIFIED
-    assert await repo._dedup_catalogs.resolve(0) is _as_dedup_repo(new_repo)
+    assert (await repo._open_catalogs.resolve(0)).dedup_repo is _as_dedup_repo(new_repo)
 
 
 async def test_set_key_then_correct_key_afterwards_recovers_to_verified(monkeypatch: pytest.MonkeyPatch) -> None:
     """wrong key -> INVALID, then a correct key afterwards -> VERIFIED."""
     fake_repo = _FakeDedupRepo(_layout())
     repo = _repo_with_fake_dedup(monkeypatch, fake_repo, keys=None, key_verification=None)
-    await repo._dedup_catalogs.resolve(0)  # populate the "already opened" catalog set_key() swaps
+    await repo._open_catalogs.resolve(0)  # populate the "already opened" catalog set_key() swaps
 
     bad_verification = KeyVerification(gcm_ok=False, vault_key=None)
     monkeypatch.setattr(KeyMaterial, "verify", _async_returning(bad_verification))
@@ -521,10 +540,57 @@ class TestWorkloadIsSupported:
 # this Repository's own already-opened DedupRepo — unlike
 # workloads()/versions() above, catalogs() itself is never gated on the key
 # (connections() reads plaintext connection_config rows regardless of
-# encryption; see Repository.catalogs()'s own docstring), and each Catalog's
+# encryption), and each Catalog's
 # own workloads()/versions()/provider()/verify() delegate to the exact same
 # module-level helpers Repository's own methods use, so a fake swapped in at
 # the module boundary is observed identically either way.
+
+
+async def test_open_catalog_resources_uses_the_larger_interactive_bucket_cache_size(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``Repository._open_catalog_resources()`` passes an explicit, larger
+    ``bucket_cache_size`` at this one call site — not the shared
+    ``DEFAULT_BUCKET_CACHE_SIZE`` every other ``Pool``-constructing call
+    site implicitly gets — since this is the one ``Pool`` every non-bulk
+    consumer of a catalog shares."""
+    captured_kwargs: dict[str, object] = {}
+    fake = _FakeDedupRepo(_layout())
+
+    def capturing_factory(*args: object, **kwargs: object) -> _FakeDedupRepo:
+        captured_kwargs.update(kwargs)
+        return fake
+
+    monkeypatch.setattr(DedupRepo, "open", _async_open(capturing_factory))
+    repo = api.Repository(_as_object_store(_FakeStore()), _repository_layout(), None, None)
+    monkeypatch.setattr(api_repository, "connections", _async_returning([_make_connection()]))
+
+    await repo.catalogs()
+
+    assert captured_kwargs.get("bucket_cache_size") == INTERACTIVE_BUCKET_CACHE_SIZE
+
+
+async def test_open_catalog_resources_closes_the_dedup_repo_when_connections_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``connections(dedup_repo)`` raising (a corrupt ``connection_config``
+    table) after ``DedupRepo.open()`` already succeeded must not leak the
+    real sqlite connections that open already made -- the same
+    close-what-was-already-opened posture every other partial-construction
+    failure in this codebase already follows."""
+    fake = _FakeDedupRepo(_layout())
+    monkeypatch.setattr(DedupRepo, "open", _async_open(lambda *a, **k: fake))
+    repo = api.Repository(_as_object_store(_FakeStore()), _repository_layout(), None, None)
+
+    async def failing_connections(dedup_repo: object) -> list[Connection]:
+        raise RuntimeError("synthetic corrupt connection_config")
+
+    monkeypatch.setattr(api_repository, "connections", failing_connections)
+
+    with pytest.raises(RuntimeError, match="synthetic corrupt connection_config"):
+        await repo.catalogs()
+
+    assert fake.closed is True
 
 
 async def test_catalogs_succeeds_even_when_key_required_and_not_yet_provided(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -577,7 +643,9 @@ async def test_catalogs_raises_instead_of_silently_dropping_a_sibling_that_fails
     catalogs"."""
     layout = RepositoryLayout(kind=RepoKind.OBJECT_STORE, repo_root="", catalog_ids=["good", "bad"])
 
-    async def selective_open(cls: object, /, store: object, repo_layout: RepoLayout, keys: object) -> DedupRepo:
+    async def selective_open(
+        cls: object, /, store: object, repo_layout: RepoLayout, keys: object, **kwargs: object
+    ) -> DedupRepo:
         if repo_layout.repo_id == "bad":
             raise NotFoundError("synthetic corrupt repo_info", ref="repo_info")
         return _as_dedup_repo(_FakeDedupRepo(repo_layout))
@@ -598,7 +666,9 @@ async def test_catalogs_reraises_cancellederror(monkeypatch: pytest.MonkeyPatch)
     cancellation swallowed."""
     layout = RepositoryLayout(kind=RepoKind.OBJECT_STORE, repo_root="", catalog_ids=["a"])
 
-    async def cancelled_open(cls: object, /, store: object, repo_layout: RepoLayout, keys: object) -> DedupRepo:
+    async def cancelled_open(
+        cls: object, /, store: object, repo_layout: RepoLayout, keys: object, **kwargs: object
+    ) -> DedupRepo:
         raise asyncio.CancelledError
 
     monkeypatch.setattr(DedupRepo, "open", classmethod(cancelled_open))
@@ -615,7 +685,9 @@ async def test_catalogs_reraises_a_non_apmrepoerror_too(monkeypatch: pytest.Monk
     between error kinds, only between "opened" and "didn't"."""
     layout = RepositoryLayout(kind=RepoKind.OBJECT_STORE, repo_root="", catalog_ids=["a"])
 
-    async def failing_open(cls: object, /, store: object, repo_layout: RepoLayout, keys: object) -> DedupRepo:
+    async def failing_open(
+        cls: object, /, store: object, repo_layout: RepoLayout, keys: object, **kwargs: object
+    ) -> DedupRepo:
         raise RuntimeError("synthetic transient I/O error")
 
     monkeypatch.setattr(DedupRepo, "open", classmethod(failing_open))
@@ -637,7 +709,9 @@ async def test_catalog_by_id_never_opens_a_sibling_whose_own_repo_id_cannot_matc
     layout = RepositoryLayout(kind=RepoKind.OBJECT_STORE, repo_root="", catalog_ids=["other", "wanted"])
     opened: list[str | None] = []
 
-    async def recording_open(cls: object, /, store: object, repo_layout: RepoLayout, keys: object) -> DedupRepo:
+    async def recording_open(
+        cls: object, /, store: object, repo_layout: RepoLayout, keys: object, **kwargs: object
+    ) -> DedupRepo:
         opened.append(repo_layout.repo_id)
         return _as_dedup_repo(_FakeDedupRepo(repo_layout))
 
@@ -662,7 +736,9 @@ async def test_catalog_by_id_raises_when_a_candidate_it_cannot_rule_out_fails_to
     "not found" for a catalog that's actually broken, not absent)."""
     layout = RepositoryLayout(kind=RepoKind.OBJECT_STORE, repo_root="", catalog_ids=None)
 
-    async def failing_open(cls: object, /, store: object, repo_layout: RepoLayout, keys: object) -> DedupRepo:
+    async def failing_open(
+        cls: object, /, store: object, repo_layout: RepoLayout, keys: object, **kwargs: object
+    ) -> DedupRepo:
         raise NotFoundError("synthetic corrupt repo_info", ref="repo_info")
 
     monkeypatch.setattr(DedupRepo, "open", classmethod(failing_open))
@@ -679,7 +755,7 @@ async def test_catalog_by_id_raises_when_a_candidate_it_cannot_rule_out_fails_to
 # that filter, from a genuinely non-browsable version. Without this gate,
 # verify() against an encrypted repository with no/wrong key would walk zero
 # versions and report a misleadingly clean result instead of refusing to
-# run -- same "workloads()/versions() gate" shape as the tests above,
+# run -- same "workloads()/versions() gate" shape as the tests above.
 
 
 async def test_repository_verify_raises_key_required_when_no_key_provided() -> None:
@@ -750,7 +826,7 @@ async def test_invalidate_directory_cache_delegates_to_the_underlying_dedup_repo
 
     fake_dedup_repo.dir_cache = _FakeDirCache()  # type: ignore[attr-defined]
     repo = _repo_with_fake_dedup(monkeypatch, fake_dedup_repo)
-    await repo._dedup_catalogs.resolve(0)  # only an already-opened catalog's dir_cache gets invalidated
+    await repo._open_catalogs.resolve(0)  # only an already-opened catalog's dir_cache gets invalidated
 
     await repo.invalidate_directory_cache()
 
@@ -762,10 +838,10 @@ async def test_invalidate_directory_cache_delegates_to_the_underlying_dedup_repo
 
 async def test_repository_context_manager_closes_underlying_dedup_repo(monkeypatch: pytest.MonkeyPatch) -> None:
     fake_repo = _FakeDedupRepo(_layout())
-    # ``async with`` — the synchronous ``__enter__``/``__exit__`` are gone.
+    # ``Repository`` only implements ``__aenter__``/``__aexit__``, not the sync pair.
     async with _repo_with_fake_dedup(monkeypatch, fake_repo) as repo:
         assert repo is not None
-        await repo._dedup_catalogs.resolve(0)  # only an already-opened catalog gets closed
+        await repo._open_catalogs.resolve(0)  # only an already-opened catalog gets closed
     assert fake_repo.closed is True
 
 
@@ -803,14 +879,15 @@ async def test_close_closes_every_tracked_closable_provider_not_just_the_last_on
 ) -> None:
     """``Repository._track`` records every provider handed out by
     ``provider()``/``file_map_tree()`` so ``close()`` can release each
-    one's own sqlite connection (an abandoned one hangs interpreter
-    shutdown — see ``Repository.__init__``'s own comment). Two separate
+    one's own sqlite connection (``aiosqlite`` dedicates a non-daemon
+    background thread to each connection's whole lifetime, so a leaked
+    one blocks interpreter shutdown forever). Two separate
     ``provider()`` calls in one session (e.g. two different versions
     browsed in the same TUI session) must both get closed, not just
     whichever was tracked last."""
     fake_dedup_repo = _FakeDedupRepo(_layout())
     repo = _repo_with_fake_dedup(monkeypatch, fake_dedup_repo)
-    catalog = _make_catalog(repo, await repo._dedup_catalogs.resolve(0))
+    catalog = _make_catalog(repo, (await repo._open_catalogs.resolve(0)).dedup_repo)
     first, second = _FakeClosableProvider(), _FakeClosableProvider()
     remaining = [first, second]
 
@@ -839,7 +916,7 @@ async def test_close_is_idempotent(monkeypatch: pytest.MonkeyPatch) -> None:
     already-closed provider/``DedupRepo``."""
     fake_dedup_repo = _FakeDedupRepo(_layout())
     repo = _repo_with_fake_dedup(monkeypatch, fake_dedup_repo)
-    catalog = _make_catalog(repo, await repo._dedup_catalogs.resolve(0))
+    catalog = _make_catalog(repo, (await repo._open_catalogs.resolve(0)).dedup_repo)
     provider = _FakeClosableProvider()
 
     async def fake_provider_for(r: object, v: object) -> object:
@@ -867,14 +944,13 @@ class _FakeRaisingClosableProvider(_FakeClosableProvider):
 async def test_close_still_closes_every_remaining_item_when_an_earlier_one_raises(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A leaked aiosqlite connection blocks interpreter exit forever (see
-    ``Repository.__init__``'s own comment) — one tracked provider's
-    ``close()`` raising must not abandon closing every later item
-    (including ``self._dedup_repo`` itself), only report the failure
-    once everything has been attempted."""
+    """A leaked aiosqlite connection blocks interpreter exit forever —
+    one tracked provider's ``close()`` raising must not abandon closing
+    every later item (including ``self._dedup_repo`` itself), only
+    report the failure once everything has been attempted."""
     fake_dedup_repo = _FakeDedupRepo(_layout())
     repo = _repo_with_fake_dedup(monkeypatch, fake_dedup_repo)
-    catalog = _make_catalog(repo, await repo._dedup_catalogs.resolve(0))
+    catalog = _make_catalog(repo, (await repo._open_catalogs.resolve(0)).dedup_repo)
     first, second = _FakeRaisingClosableProvider(), _FakeClosableProvider()
     remaining = [first, second]
 
@@ -912,16 +988,15 @@ async def test_close_does_not_hang_forever_when_one_providers_close_hangs(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """A tracked provider whose own ``close()`` *hangs* instead of
-    raising (a stuck server, a race like ``storage.smb.py``'s own
+    raising (a stuck server, a race like ``storage/smb.py``'s own
     ``_drop_slot_session`` one) must not block every other tracked resource's
-    own close attempt forever, and the interpreter along with it — see
-    ``_RESOURCE_CLOSE_TIMEOUT``'s own docstring. ``_RESOURCE_CLOSE_TIMEOUT``
-    is monkeypatched down so this test itself doesn't take the real
+    own close attempt forever, and the interpreter along with it.
+    ``_RESOURCE_CLOSE_TIMEOUT`` is monkeypatched down so this test itself doesn't take the real
     10 seconds to prove it."""
     monkeypatch.setattr(api_repository, "_RESOURCE_CLOSE_TIMEOUT", 0.05)
     fake_dedup_repo = _FakeDedupRepo(_layout())
     repo = _repo_with_fake_dedup(monkeypatch, fake_dedup_repo)
-    catalog = _make_catalog(repo, await repo._dedup_catalogs.resolve(0))
+    catalog = _make_catalog(repo, (await repo._open_catalogs.resolve(0)).dedup_repo)
     first, second = _FakeHangingClosableProvider(), _FakeClosableProvider()
     remaining = [first, second]
 
@@ -949,9 +1024,10 @@ async def test_close_also_closes_a_dedup_catalog_that_finishes_opening_after_clo
 ) -> None:
     """A ``catalogs()``/``verify()`` call already in flight (its own open
     not yet settled) when ``close()`` runs must still have its eventual
-    ``DedupRepo`` closed once it lands, not leaked -- see
-    ``AsyncKeyedCache.known_keys()``'s own docstring for why ``.values()``
-    alone couldn't see it."""
+    ``DedupRepo`` closed once it lands, not leaked -- ``.values()`` alone
+    only sees already-settled entries, so ``close()`` uses
+    ``known_keys()``'s broader view (settled plus in-flight) to catch a
+    fetch that a racing caller already started."""
     fake_repo = _FakeDedupRepo(_layout())
     started = asyncio.Event()
     release = asyncio.Event()
@@ -962,9 +1038,10 @@ async def test_close_also_closes_a_dedup_catalog_that_finishes_opening_after_clo
         return _as_dedup_repo(fake_repo)
 
     monkeypatch.setattr(DedupRepo, "open", classmethod(_slow_open))
+    monkeypatch.setattr(api_repository, "connections", _async_returning([]))
     repo = api.Repository(_as_object_store(_FakeStore()), _repository_layout(), None, None)
 
-    resolve_task = asyncio.create_task(repo._dedup_catalogs.resolve(0))
+    resolve_task = asyncio.create_task(repo._open_catalogs.resolve(0))
     await started.wait()  # the open is in flight (owner determined), not yet settled
 
     close_task = asyncio.create_task(repo.close())
@@ -996,7 +1073,7 @@ async def test_close_reports_but_does_not_abort_when_an_in_flight_open_fails(
     monkeypatch.setattr(DedupRepo, "open", classmethod(_slow_failing_open))
     repo = api.Repository(_as_object_store(_FakeStore()), _repository_layout(), None, None)
 
-    resolve_task = asyncio.create_task(repo._dedup_catalogs.resolve(0))
+    resolve_task = asyncio.create_task(repo._open_catalogs.resolve(0))
     await started.wait()
 
     close_task = asyncio.create_task(repo.close())
@@ -1041,12 +1118,11 @@ def _repo_with_catalog_stubs(
 ) -> api.Repository:
     """Fakes every module-level collaborator ``Repository.walk_human_ref``/
     ``Catalog.walk_human_ref`` reach through (``connections()``/
-    ``workloads()``/``versions()``/``provider_for()``) rather than the
-    retired per-instance ``Repository.connections``/``workloads``/
-    ``versions``/``provider`` methods this used to monkeypatch directly.
-    Every version built by these tests is ``"VM"`` (a device/fs target
-    type), so faking ``provider_for`` alone is enough to control what
-    ``Catalog.provider()`` returns."""
+    ``workloads()``/``versions()``/``provider_for()``) — ``Repository`` has
+    no equivalent instance methods to monkeypatch directly. Every version
+    built by these tests is ``"VM"`` (a device/fs target type), so faking
+    ``provider_for`` alone is enough to control what ``Catalog.provider()``
+    returns."""
     repo = _repo_with_fake_dedup(monkeypatch, _FakeDedupRepo(_layout()))
     monkeypatch.setattr(api_repository, "connections", _async_returning(connections or []))
     monkeypatch.setattr(api_catalog, "workloads", _async_returning(workloads or []))

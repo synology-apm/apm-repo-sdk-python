@@ -14,14 +14,16 @@ writing a single byte) — adapted via ``reading_progress_callback`` into a
 TUI computes rate/ETA itself.
 
 **Ctrl-C**: the export body runs as its own ``asyncio.Task``, cancelled by
-SIGINT — see ``_install_sigint_cancel``'s own docstring for the
-two-press contract and the ``except asyncio.CancelledError`` branch below
-for what "cancelled" actually does to the partial output
-(``--keep-partial`` controls whether it's kept or deleted).
+SIGINT — the first press cancels that Task for a clean unwind, a second
+press exits immediately (``os._exit()``) since a repeated Ctrl-C means the
+user has made clear they don't want to wait for anything; see the
+``except asyncio.CancelledError`` branch below for what "cancelled"
+actually does to the partial output (``--keep-partial`` controls whether
+it's kept or deleted).
 
-**Pre-existing destination**: an already-present ``FILE`` is refused
-before anything is opened — see the ``output.exists()`` check below;
-``--force`` overrides.
+**Pre-existing destination**: an already-present ``FILE`` is refused,
+via ``destination_available()``, before anything is opened; ``--force``
+overrides.
 """
 
 from __future__ import annotations
@@ -37,11 +39,12 @@ import typer
 from rich.console import Console
 
 from synology_apm_repo.cli.asyncio_support import typer_async
-from synology_apm_repo.cli.browse import open_single_repo, parse_ref_argument, resolve_restorable
-from synology_apm_repo.cli.errors import err_console, fail, friendly_message
+from synology_apm_repo.cli.browse import parse_ref_argument, resolve_restorable
+from synology_apm_repo.cli.errors import err_console, fail, fail_from_apm_error
 from synology_apm_repo.cli.options import KeyOption, ObjectDbIdOption, ProfileOption
 from synology_apm_repo.cli.profile_store import resolve_profile_store
 from synology_apm_repo.cli.progress_render import build_progress_meter, finish_live_progress
+from synology_apm_repo.cli.repo_session import open_single_repo
 from synology_apm_repo.cli.state import CliState
 from synology_apm_repo.cli.strings import (
     EXPORT_FORCE_HELP,
@@ -53,6 +56,12 @@ from synology_apm_repo.cli.strings import (
 from synology_apm_repo.cli.trace_render import build_trace_callback
 from synology_apm_repo.sdk.api import ExportResult, Session
 from synology_apm_repo.sdk.errors import ApmRepoError
+from synology_apm_repo.sdk.presentation.export_target import (
+    destination_available,
+    finalize_export,
+    part_path_for,
+    resolve_cancelled_partial,
+)
 from synology_apm_repo.sdk.presentation.format import format_bytes
 from synology_apm_repo.sdk.presentation.progress import reading_progress_callback
 
@@ -63,13 +72,19 @@ _T = TypeVar("_T")
 
 def handle_cancelled(part_path: Path, *, keep_partial: bool) -> str:
     """What to do with ``part_path`` once a cancelled export unwinds, and
-    the message to show for it. The decision is the same whichever
-    exception delivered the cancellation. Split out from ``export`` itself
-    so it (unlike the actual SIGINT plumbing around it) is unit-testable
-    without a real signal."""
-    if keep_partial:
+    the message to show for it — the CLI's own phrasing of
+    ``resolve_cancelled_partial()``'s shared decision. Split out from
+    ``export`` itself so it (unlike the actual SIGINT plumbing around it)
+    is unit-testable without a real signal."""
+    outcome = resolve_cancelled_partial(part_path, keep_partial=keep_partial)
+    if not outcome.ever_written:
+        # A cloud-sync placeholder's export_to() defers creating part_path
+        # until its first block reads successfully (unlike a dedup-backed
+        # export, which creates it immediately), so a cancellation that
+        # lands before that never writes it at all.
+        return "cancelled — no output file was ever written"
+    if outcome.kept:
         return f"cancelled — partial file kept as {part_path.name}"
-    part_path.unlink(missing_ok=True)
     return "cancelled — partial file removed (use --keep-partial to keep it)"
 
 
@@ -102,7 +117,7 @@ def _install_sigint_cancel(task: asyncio.Task[_T]) -> Callable[[], None]:
         if sigint_count == 1:
             loop.call_soon_threadsafe(task.cancel)
             err_console.print("\n[yellow]cancelling... (press Ctrl-C again to force quit)[/yellow]")
-        else:  # pragma: no cover - would terminate the test runner, see test_cli_export_cancel.py's own docstring
+        else:  # pragma: no cover - os._exit() below would kill pytest itself if this branch actually ran
             err_console.print("\n[red]force quit[/red]")
             # Bypasses all cleanup (atexit, finally blocks) — that's the point.
             os._exit(130)
@@ -133,10 +148,10 @@ async def export(
     # A separate concern from the .part-rename safety in the try/finally
     # below, which only guards a crash/cancel *during* the write: this
     # refuses an already-present OUTPUT before anything is even opened.
-    if output.exists() and not force:  # noqa: ASYNC240 - one cheap stat(), same tier as mkdir/replace/unlink below
+    if not destination_available(output, force=force):
         fail(f"{output} already exists — pass --force to overwrite it")
     session = Session()
-    part_path = output.with_name(output.name + ".part")
+    part_path = part_path_for(output)
     discover_meter = build_progress_meter(state)
     export_meter = build_progress_meter(state)
     trace = build_trace_callback(state)
@@ -167,7 +182,7 @@ async def export(
         # behavioral assumption. No concurrency kwargs to forward here —
         # export_to()'s own real parallelism (a multiprocess dispatch,
         # unconditional whenever the repository's store supports it) isn't
-        # a CLI-facing knob; see export_scheduler.py's own module docstring.
+        # a CLI-facing knob.
         return cast(
             ExportResult,
             await content.export_to(part_path, sparse=sparse, progress=on_export_progress),
@@ -177,32 +192,33 @@ async def export(
     restore_sigint = _install_sigint_cancel(task)
     try:
         result = await task
-        part_path.replace(output)
+        finalize_export(part_path, output)
     except asyncio.CancelledError:
-        # The first-Ctrl-C path (_install_sigint_cancel's own docstring
-        # has the two-press contract). Cancellation is prompt on the
-        # single-process (fallback) path, since the read path awaits per
-        # extent/chunk; on the real, unconditional multiprocess path
-        # (export_scheduler.py's own module docstring) it widens slightly
-        # instead — an already-running worker finishes its one in-flight
-        # bucket group's decode/write rather than being torn down
-        # mid-write, so this lands roughly one bucket group's own decode
-        # time after the signal, not instantly. Not built on opened_repo
-        # (see this module's own docstring), so this command clears its
-        # own leftover progress line before each of its own exit prints,
+        # This is the first-Ctrl-C path (a second press exits immediately
+        # via os._exit() instead of reaching here). Cancellation is prompt
+        # on the single-process (fallback) path, since the read path awaits
+        # per extent/chunk; on the real, unconditional multiprocess path
+        # (each claimed bucket group's decode+write dispatched to its own
+        # process) it widens slightly instead — an already-running worker
+        # finishes its one in-flight bucket group's decode/write rather
+        # than being torn down mid-write, so this lands roughly one bucket
+        # group's own decode time after the signal, not instantly. This
+        # command manages its own Session/progress lifecycle instead of
+        # going through opened_repo (whose shared skeleton doesn't fit
+        # export's own SIGINT/Task cancellation), so it clears its own
+        # leftover progress line before each of its own exit prints,
         # rather than getting it for free the way doctor/ls/tree/cat/key/
         # verify do.
         finish_live_progress(state)
         console.print(f"[yellow]{handle_cancelled(part_path, keep_partial=keep_partial)}[/yellow]")
         return
     except ApmRepoError as exc:
-        finish_live_progress(state)
-        fail(friendly_message(exc, verbose=state.verbose), cause=exc)
+        fail_from_apm_error(exc, state)
     finally:
         # Covers the success path (this line only clears something once,
         # even though the two branches above already called it once each
-        # for their own timing needs — see this module's own comment) and,
-        # unlike those two, also a non-ApmRepoError/CancelledError
+        # for their own timing needs) and, unlike those two, also a
+        # non-ApmRepoError/CancelledError
         # exception this function doesn't otherwise catch at all (a bug,
         # not an expected failure).
         finish_live_progress(state)

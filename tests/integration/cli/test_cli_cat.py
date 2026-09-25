@@ -1,7 +1,7 @@
 """Regression test for ``synology-apm-repo-cli cat`` — replayed from a committed
 fixture recorded against real bytes, with **no external dependency** —
-same ``patch_profile_store`` fixture (``tests/conftest.py``) every
-sibling in this directory uses. ``cat`` resolves its ref via ``Repository.resolve()``, not
+same ``patch_profile_store`` fixture (``tests/integration/cli/conftest.py``)
+every sibling in this directory uses. ``cat`` resolves its ref via ``Repository.resolve()``, not
 ``walk()``/``walk_ref()`` the way ``ls``/``tree`` do — a different
 internal call sequence even against the same real repository.
 
@@ -12,8 +12,8 @@ against the real VM disk image's first 520 bytes
 device folder node, resolved but never opened, for the folder-ref
 failure case (``test_a_folder_ref_fails_cleanly_replayed``) — both tests
 are this fixture's recording recipe, neither is a subset of the other.
-Both refs are canonical (immune to catalog-metadata anonymization — see
-``test_cli_ls.py``'s own docstring).
+Both refs are canonical — internal catalog identifiers, immune to
+catalog-metadata anonymization.
 """
 
 from __future__ import annotations
@@ -23,7 +23,7 @@ from collections.abc import Callable
 import pytest
 from typer.testing import CliRunner
 
-import synology_apm_repo.cli.browse as browse_mod
+import synology_apm_repo.cli.repo_session as repo_session_mod
 from synology_apm_repo.cli.main import app
 
 runner = CliRunner()
@@ -34,7 +34,7 @@ _DISK_REF = f"{_VM_REF}/device:241/object:1"
 
 @pytest.fixture(autouse=True)
 def _replay(patch_profile_store: Callable[..., None]) -> None:
-    patch_profile_store("cli_cat_apv1_vault.json.gz", browse_mod, allow_content=True)
+    patch_profile_store("cli_cat_apv1_vault.json.gz", repo_session_mod, allow_content=True)
 
 
 def test_reads_a_real_mbr_gpt_header_replayed() -> None:

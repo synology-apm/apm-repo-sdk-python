@@ -4,7 +4,7 @@ files only, no sample repositories required.
 Only ``LocalFsStore``-specific internals live here (the readahead hint,
 ``..``-escape prevention) — the generic ``read``/``size``/``exists``/
 ``listdir`` contract every ``ObjectStore`` backend shares is tested once,
-parametrized across all three backends, in
+parametrized across all four backends, in
 ``test_storage_object_store_contract.py``."""
 
 from __future__ import annotations
@@ -32,10 +32,11 @@ def store(tmp_path: Path) -> LocalFsStore:
 
 
 async def test_read_offset_at_eof_with_no_length_returns_empty_bytes(store: LocalFsStore) -> None:
-    # Distinct from test_read_short_at_eof_does_not_raise above: no
-    # explicit length means _read_sync computes one itself, and an
-    # offset exactly at EOF computes to 0 rather than a short positive
-    # read — the length <= 0 fast path skips os.pread() entirely.
+    # Distinct from test_storage_object_store_contract.py's own
+    # test_read_short_at_eof_does_not_raise: no explicit length means
+    # _read_sync computes one itself, and an offset exactly at EOF
+    # computes to 0 rather than a short positive read — the length <= 0
+    # fast path skips os.pread() entirely.
     assert await store.read("a.txt", offset=10) == b""
 
 
@@ -97,11 +98,11 @@ async def test_open_raising_permissionerror_on_a_real_directory_raises_not_found
 ) -> None:
     """Windows raises PermissionError (not IsADirectoryError) from
     os.open() when the target is a directory -- os.path.isdir()
-    disambiguates this from a genuine permission denial (see
-    _read_sync's own comment). Forced here via monkeypatch since this
-    project's own CI runs on Linux/macOS, where os.open() succeeds on a
-    directory instead (see test_open_raising_isadirectoryerror_raises_
-    not_found above), never raising PermissionError for one at all."""
+    disambiguates this from a genuine permission denial (deliberately
+    os.path.isdir(), not Path.is_dir(), since the latter re-raises
+    PermissionError from its own stat() on an unsearchable parent).
+    Forced here via monkeypatch, since CI (Linux/macOS) never raises
+    PermissionError for a directory open to begin with."""
 
     def raising_open(path: object, *a: object, **k: object) -> int:
         raise PermissionError()
@@ -145,8 +146,8 @@ class TestPermissionDenied:
         self, store: LocalFsStore, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         """Unlike ``read``/``size``/``listdir``, ``exists()`` never raises —
-        see ``ObjectStore.exists()``'s own docstring for why a probe over
-        many candidates must not abort on one inaccessible sibling."""
+        access denied is folded into ``False``, the same as a merely-absent
+        path."""
 
         def raising_exists(self: Path) -> bool:
             raise PermissionError()
@@ -158,7 +159,7 @@ class TestPermissionDenied:
 class TestReadaheadHint:
     """``read()``'s readahead hint (``posix_fadvise(WILLNEED)`` on Linux,
     ``F_RDADVISE`` on macOS) for the merged multi-chunk reads
-    ``dedup/pool.py::BucketReader.read_chunks`` now issues."""
+    ``dedup/pool/_bucket_reader.py``'s ``BucketReader.read_chunks`` issues."""
 
     async def test_fires_for_a_read_at_or_above_the_threshold(
         self, store: LocalFsStore, monkeypatch: pytest.MonkeyPatch
@@ -181,13 +182,11 @@ class TestReadaheadHint:
 
     def test_hint_willneed_itself_swallows_a_bad_fd(self) -> None:
         # Direct test of the real _hint_willneed() against an fd that
-        # can't possibly support a readahead hint — proves the actual
-        # contract read() relies on (see its own docstring: "an
-        # optimization that can't fire must never turn a working read
-        # into a failure") without needing to first get a real read()
-        # call into a state where the hint would fail, which isn't
-        # realistically constructible (the fd read() passes it always
-        # just came from a successful os.open()).
+        # can't possibly support a readahead hint — proves the contract
+        # read() relies on: an optimization that can't fire must never
+        # turn a working read into a failure. Not constructible via a
+        # real read() call, since the fd it passes always came from a
+        # successful os.open().
         local_mod._hint_willneed(-1, 0, 4096)  # must not raise
 
     async def test_a_real_large_read_still_succeeds_with_the_real_hint_wired_in(self, store: LocalFsStore) -> None:
@@ -200,12 +199,10 @@ class TestReadaheadHint:
 
     def test_posix_fadvise_branch_on_a_platform_that_has_it(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """Neither ``os.posix_fadvise`` nor ``os.POSIX_FADV_WILLNEED``
-        exist on macOS at all (only the ``sys.platform == "linux"``-gated
-        branch reaches either) — this project's own CI runs on Linux, where
-        this branch is exercised for real; here it's exercised by patching
-        in fake attributes and forcing ``sys.platform`` to ``"linux"``, to
-        test the branch's own logic independent of which platform this
-        happens to run on."""
+        exist on macOS at all — only the ``sys.platform == "linux"``-gated
+        branch reaches either, so this test forces ``sys.platform`` to
+        ``"linux"`` and patches in fake attributes to exercise the branch's
+        logic regardless of which platform actually runs it."""
         calls: list[tuple[int, int, int, object]] = []
         monkeypatch.setattr(sys, "platform", "linux")
         monkeypatch.setattr(os, "POSIX_FADV_WILLNEED", "WILLNEED-sentinel", raising=False)
@@ -221,11 +218,10 @@ class TestReadaheadHint:
     def test_pread_fallback_reads_the_same_bytes_os_pread_would(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """``os.pread`` doesn't exist on Windows — this project's own CI
-        runs on Linux/macOS, where the ``sys.platform != "win32"`` branch
-        is always taken; here the ``lseek``+``read`` fallback is exercised
-        directly by forcing ``sys.platform`` to ``"win32"``, proving it
-        reads the same bytes at the same offset ``os.pread`` would."""
+        """``os.pread`` doesn't exist on Windows, so its ``lseek``+``read``
+        fallback is exercised directly here by forcing ``sys.platform`` to
+        ``"win32"``, proving it reads the same bytes at the same offset
+        ``os.pread`` would."""
         monkeypatch.setattr(sys, "platform", "win32")
         payload = b"0123456789"
         (tmp_path / "f.bin").write_bytes(payload)

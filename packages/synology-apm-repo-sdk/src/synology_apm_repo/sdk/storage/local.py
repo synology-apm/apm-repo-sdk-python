@@ -14,8 +14,8 @@ from ..errors import NotFoundError, PermissionDeniedError
 _O_BINARY = getattr(os, "O_BINARY", 0)
 
 # Readahead hint (``posix_fadvise(WILLNEED)`` on Linux, ``F_RDADVISE`` on macOS)
-# for the merged multi-chunk reads ``dedup/pool.py::BucketReader``
-# issues — gated on a minimum length so it fires for those
+# for the merged multi-chunk reads ``dedup/pool/_bucket_reader.py``'s
+# ``BucketReader`` issues — gated on a minimum length so it fires for those
 # genuinely-merged reads without adding a syscall to every routine small
 # read this store also serves (SQLite page reads, single-chunk-locator
 # reads, header reads, ...), which would cost more than the hint could ever
@@ -70,9 +70,9 @@ class LocalFsStore:
     itself, rather than this store deciding on its own, opaquely, whether
     or how long to keep something cached.
 
-    **On the async interface**: see ``ObjectStore``'s docstring for why
-    this store's four methods are ``asyncio.to_thread()`` wrappers around
-    a synchronous body.
+    **On the async interface**: this store's four methods are
+    ``asyncio.to_thread()`` wrappers around a synchronous body — local I/O
+    has no native async form in CPython to wrap instead.
     """
 
     def __init__(self, root: str | Path) -> None:
@@ -172,11 +172,11 @@ class LocalFsStore:
         try:
             return p.exists()
         except PermissionError:
-            # See ObjectStore.exists()'s own docstring: a probe that can
-            # raise would abort a caller's whole candidate search over one
-            # irrelevant, inaccessible sibling — this reads as "not found"
-            # the same as pathlib's own ENOENT/ENOTDIR/EBADF/ELOOP handling
-            # inside Path.exists(), just extended to cover EACCES too.
+            # A probe that can raise would abort a caller's whole candidate
+            # search over one irrelevant, inaccessible sibling — this reads
+            # as "not found" the same as pathlib's own
+            # ENOENT/ENOTDIR/EBADF/ELOOP handling inside Path.exists(), just
+            # extended to cover EACCES too.
             return False
 
     def _listdir_sync(self, path: str) -> list[str]:

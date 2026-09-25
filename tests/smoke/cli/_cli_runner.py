@@ -40,8 +40,7 @@ class CliResult:
 
 class CliRunner:
     """Invokes the real ``synology-apm-repo-cli`` binary via ``uv run``,
-    with two defaults baked into every call (see this module's own
-    docstring for why):
+    with two defaults baked into every call:
 
     - ``--no-input`` is always passed, so a ``profile add``/``remove``
       invocation never blocks forever on an interactive prompt with no
@@ -139,14 +138,14 @@ class CliRunner:
         override here, since a fresh subprocess can't be monkeypatched
         directly) -- not just for isolation, but because the real
         backend can block indefinitely on a GUI authorization prompt in
-        a headless context (observed against the real macOS Keychain
-        under a freshly-sandboxed ``HOME``). ``null.Keyring`` no-ops
+        a headless context. ``null.Keyring`` no-ops
         every operation rather than ``fail.Keyring`` erroring outright
         (which ``profiles/secrets.py``'s own ``_require_keyring()``
         explicitly rejects) -- accepted as "usable" and silently
         discards the secret, which this phase never needs back (``get_
         profile()``/``list_profiles()`` never touch the keyring at all,
-        per that module's own docstring)."""
+        so a ``list``/``show``-shaped caller structurally cannot leak a
+        secret regardless)."""
         return {
             "HOME": str(home_dir),
             "XDG_CONFIG_HOME": str(home_dir / ".config"),

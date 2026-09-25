@@ -16,6 +16,7 @@ from synology_apm_repo.sdk.profiles import (
     delete_profile,
     get_profile,
     list_profiles,
+    list_profiles_full,
     list_remote_items,
     load_profile,
     save_profile,
@@ -48,18 +49,61 @@ async def test_save_then_list_and_get(tmp_path: Path, fake_keyring: None) -> Non
     assert profile.config.verify_tls is False
 
 
+async def test_list_profiles_full_empty_when_none_saved(tmp_path: Path) -> None:
+    assert await list_profiles_full(config_dir=tmp_path) == []
+
+
+async def test_list_profiles_full_returns_the_whole_profile_not_just_the_summary(
+    tmp_path: Path, fake_keyring: None
+) -> None:
+    """The one thing ``list_profiles_full`` exists for: a caller gets every
+    saved profile's own backend fields directly, without a further
+    ``get_profile()`` call per name re-reading the same file each time
+    (``list_profiles()`` itself only ever hands back name+kind)."""
+    await save_profile(
+        "demo",
+        BackendKind.S3,
+        {"bucket": "b", "endpoint": "http://minio:9000", "verify_tls": False, "access_key": "AKIA", "secret_key": "s"},
+        config_dir=tmp_path,
+    )
+    profiles = await list_profiles_full(config_dir=tmp_path)
+    assert len(profiles) == 1
+    profile = profiles[0]
+    assert profile.name == "demo"
+    assert isinstance(profile.config, S3ProfileConfig)
+    assert profile.config.bucket == "b"
+    assert profile.config.endpoint == "http://minio:9000"
+
+
+async def test_list_profiles_full_sorted_by_name_not_read_order(
+    tmp_path: Path, fake_keyring: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from synology_apm_repo.sdk.profiles import config_file
+    from synology_apm_repo.sdk.profiles.model import BackendKind as _BackendKind
+    from synology_apm_repo.sdk.profiles.model import Profile, S3ProfileConfig
+
+    def fake_read_profiles(*, config_dir: Path | None = None) -> dict[str, Profile]:
+        return {
+            name: Profile(name=name, kind=_BackendKind.S3, config=S3ProfileConfig(bucket="b"))
+            for name in ("zebra", "alpha", "mike")
+        }
+
+    monkeypatch.setattr(config_file, "read_profiles", fake_read_profiles)
+    profiles = await list_profiles_full(config_dir=tmp_path)
+    assert [p.name for p in profiles] == ["alpha", "mike", "zebra"]
+
+
 async def test_list_profiles_sorted_by_name_not_read_order(
     tmp_path: Path, fake_keyring: None, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    # list_profiles()'s own docstring: "sorted by name". Going through
+    # list_profiles() is documented as sorted by name. Going through
     # save_profile()/config_file.read_profiles() for this wouldn't
     # actually prove it -- write_profiles() writes profiles.json with
     # json.dump(..., sort_keys=True), so read_profiles() already comes
     # back alphabetical regardless of save order or of list_profiles()'s
-    # own sorted() call (confirmed: with that sorted() temporarily
-    # removed, a save-order-based version of this test still passed).
-    # Monkeypatching read_profiles() directly to hand back a
-    # deliberately out-of-order dict isolates list_profiles()'s own sort.
+    # own sorted() call. Monkeypatching read_profiles() directly to hand
+    # back a deliberately out-of-order dict isolates list_profiles()'s
+    # own sort.
     from synology_apm_repo.sdk.profiles import config_file
     from synology_apm_repo.sdk.profiles.model import BackendKind as _BackendKind
     from synology_apm_repo.sdk.profiles.model import Profile, S3ProfileConfig
@@ -76,8 +120,8 @@ async def test_list_profiles_sorted_by_name_not_read_order(
 
 
 async def test_get_profile_never_carries_secrets(tmp_path: Path, fake_keyring: None) -> None:
-    """``get_profile()`` must not touch the keyring at all — deleting the
-    fake keyring's only entry after saving must not affect it."""
+    """``get_profile()``'s returned config carries no secret field at all,
+    proving it never reads them back out of the keyring."""
     await save_profile(
         "demo", BackendKind.S3, {"bucket": "b", "access_key": "AKIA", "secret_key": "s"}, config_dir=tmp_path
     )
@@ -95,7 +139,8 @@ async def test_get_profile_missing_raises_profile_not_found(tmp_path: Path) -> N
 async def test_load_profile_s3_returns_endpoint_and_region_when_set(tmp_path: Path, fake_keyring: None) -> None:
     # Every other S3 load_profile test in this file leaves endpoint/region
     # unset (bucket-only, or blank-secret cases) -- _non_secret_fields()'s
-    # own two "is not None" guards for them are otherwise never exercised.
+    # single "is not None" filter would otherwise never be exercised for
+    # these two fields.
     await save_profile(
         "demo",
         BackendKind.S3,

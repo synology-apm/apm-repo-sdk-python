@@ -2,9 +2,10 @@
 synthetic bytes for ``sniff()``, a lightweight fake ``DedupFile`` (same
 pattern as ``test_units_saas_objectdb.py``) for ``inspect_object()``
 (see ``tests/integration/sdk/test_saas_stream_and_objectdb_discovery.py``
-for the cross-check against real apv-sample-1 service DBs). No
-schema-scanning fallback exists anywhere behind this module — see
-``units/saas/provider.py``'s own module docstring."""
+for the cross-check against real apv-sample-1 service DBs). An
+object's location always comes from the connector's own object-name
+index, never a schema scan; ``sniff()`` only guesses which service owns
+an already-located ``SERVICE_DB`` blob from its table names."""
 
 from __future__ import annotations
 
@@ -174,19 +175,17 @@ class TestSniff:
         """A candidate whose zstd magic matches but whose decompressed
         size exceeds ``_MAX_SNIFF_DECOMPRESS`` must fall back to
         ``BINARY``, the same as a genuinely non-zstd candidate — never
-        raise out of ``sniff()`` itself (its own docstring: "Never
-        raises"). ``_MAX_SNIFF_DECOMPRESS`` monkeypatched down so this
+        raise out of ``sniff()`` itself, which never raises.
+        ``_MAX_SNIFF_DECOMPRESS`` monkeypatched down so this
         test doesn't need an actual 128 MiB payload to trip it.
 
-        Regression coverage for the real bug this cap exists to guard
-        against: ``zstandard``'s one-shot ``decompress(data,
+        Regression coverage for the cap's own reason to exist:
+        ``zstandard``'s one-shot ``decompress(data,
         max_output_size=N)`` silently ignores the cap for a frame that
         declares its own content size — the shape ``_build_service_db``
-        always produces, and the common real-world shape — so this test
-        would have wrongly landed on ``SERVICE_DB`` before
-        ``decompress_zstd_stream`` stopped using that API for the
-        bounded path (see that function's own docstring in
-        ``format/compression.py``)."""
+        always produces, and the common real-world shape — so the
+        bounded path must use the streaming decompressor instead, or
+        this candidate would wrongly land on ``SERVICE_DB``."""
         import synology_apm_repo.sdk.units.saas.services as services_module
 
         monkeypatch.setattr(services_module, "_MAX_SNIFF_DECOMPRESS", 1024)
@@ -213,12 +212,12 @@ class TestInspectObject:
     async def test_reads_the_full_object_when_over_the_cap_but_zstd_magic_matches(self) -> None:
         """A small head is read first to check the zstd magic; only a
         genuine match costs the second, full read a real Teams
-        channel's message DB (compressed size 47.3 MiB, well over this
-        cap) needs — a real service DB carrying a large, incompressible
+        channel's message DB (well over this cap, compressed) needs — a
+        real service DB carrying a large, incompressible
         BLOB row stands in for "a real object big enough to need the
-        full read" (see ``_build_service_db``'s own ``padding_blob``
-        docstring for why this, not trailing garbage after the frame,
-        is the realistic shape)."""
+        full read" (not trailing garbage after the frame, which
+        ``inspect_object()`` never actually sees -- see
+        ``_build_service_db``'s ``padding_blob`` parameter above)."""
         big = _build_service_db("item_table", padding_blob=os.urandom(9 << 20))
         assert len(big) > (8 << 20), "test invariant: must actually be large enough to trip the 8 MiB cap"
         fake = _FakeDedupFile(big)
@@ -229,12 +228,12 @@ class TestInspectObject:
 
 
 class TestDecompressServiceDb:
-    """``decompress_service_db`` became ``async`` specifically so its own
-    ``peel()`` call could hop to ``asyncio.to_thread`` — a real Teams
-    channel's message DB decompresses to 83.2 MiB (this module's own
-    ``_MAX_SNIFF_DECOMPRESS`` comment), the same class of "multi-MB
+    """``decompress_service_db`` is ``async`` so its own
+    ``peel()`` call can hop to ``asyncio.to_thread`` — a real Teams
+    channel's message DB decompresses to tens of MiB, well within
+    real-world scale for a service DB, the same class of "multi-MB
     decrypt+decompress must not block the event loop" work
-    ``dedup/pool.py`` already has a stated policy for."""
+    ``dedup/pool/_bucket_reader.py`` already has a stated policy for."""
 
     async def test_decompresses_a_real_service_db(self) -> None:
         blob = _build_service_db("item_table")
@@ -286,11 +285,11 @@ class TestOpenServiceDb:
     async def test_raises_data_corrupt_on_severely_truncated_zstd_frame(self) -> None:
         """Truncated right after the frame header, with none of the
         actual compressed block surviving. ``decompress_service_db``'s
-        own "unbounded" path is the streaming reader now, not the
-        one-shot API with a size cap (``services.py``'s own module
-        docstring: a real cap couldn't fit this real Teams sticker
-        object either) — for input this short, the streaming reader
-        itself doesn't raise, it simply produces zero bytes. Still
+        own "unbounded" path is deliberately unbounded, not the one-shot
+        API with a size cap, since a real cap couldn't fit a real
+        service DB's legitimate size — for input this short, the
+        streaming reader itself doesn't raise, it simply produces zero
+        bytes. Still
         correctly surfaces as ``DataCorruptError`` one layer down: zero bytes
         is obviously not a SQLite file either."""
         compressed = zstandard.ZstdCompressor().compress(b"x" * 10_000)

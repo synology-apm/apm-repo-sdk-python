@@ -17,6 +17,9 @@ from typing import Any
 
 from textual.widgets import Input, Tree
 
+from synology_apm_repo.browser.core.browse.select import CatalogTreeKey
+from synology_apm_repo.browser.view.reconcile import Binding
+
 from ..._shared_refs import RepresentativeRef
 from .._context import SmokeContext
 from ._shared import connect_local, expand_first_repo, wait_until
@@ -28,7 +31,7 @@ async def run(ctx: SmokeContext, app: Any, pilot: Any) -> None:
         ctx.skip("key_dialog", "key_dialog.no_encrypted_sample", "no encrypted, unambiguous sample configured")
         return
 
-    async def _connect_and_enter_connection() -> Tree[Any]:
+    async def _connect_and_enter_connection() -> Tree[Binding[CatalogTreeKey]]:
         await connect_local(app, pilot, ref.repo_path)
         tree = await expand_first_repo(app, pilot)
         repo_node = tree.root.children[-1]
@@ -50,7 +53,8 @@ async def run(ctx: SmokeContext, app: Any, pilot: Any) -> None:
         await wait_until(
             pilot, lambda: not isinstance(app.screen, KeyDialog), timeout=15.0, message="KeyDialog never dismissed"
         )
-        return app.repo is not None and app.repo.key_status.value == "verified"
+        repo = app.current_repo
+        return repo is not None and repo.key_status.value == "verified"
 
     verified = await ctx.call("key_dialog", f"key_dialog.{ref.sample_name}.unlock", _unlock)
     if verified is not None:

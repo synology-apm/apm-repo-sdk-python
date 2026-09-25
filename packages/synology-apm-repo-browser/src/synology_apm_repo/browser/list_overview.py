@@ -96,8 +96,8 @@ def render_overview_table(header: str, rows: list[dict[str, object]], *, truncat
         table.add_row(*(safe(truncate_cell(row.get(column))) for column in columns))
     buffer = io.StringIO()
     # force_terminal=False, not Console()'s own "auto" default: an ambient
-    # FORCE_COLOR in the launching shell (checked ahead of an isatty()
-    # probe -- see Console.is_terminal's own docstring) would otherwise
+    # FORCE_COLOR in the launching shell (Console.is_terminal returns
+    # true for it before ever calling isatty()) would otherwise
     # make Rich emit real ANSI escapes into this buffer even though it's
     # never a real terminal, corrupting the plain string this function
     # promises -- the box-drawing rows would carry a different number of

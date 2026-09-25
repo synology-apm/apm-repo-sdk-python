@@ -7,14 +7,15 @@ module's role is different: given an already-located object's raw
 bytes, determine (``sniff``) or read (``inspect_object``) *what it is*
 — the corruption check every object-name-index caller still wants (confirm
 it decompresses, confirm it's really SQLite, confirm it defines the
-expected table), never discovery of an unknown object's location; see
-``provider.py``'s own module docstring for the canonical explanation of
-why every provider here locates things by index lookup, never a scan.
+expected table), never discovery of an unknown object's location; every
+provider locates objects by direct index lookup because a schema-only
+scan couldn't reliably tell apart schema-identical tables (Archive
+Mail's ``mail_table`` from regular Mail's, say).
 
 Raw bytes classify into one of ``ServiceKind``'s members by a fixed
-prefix rule — see that class's own docstring. (Real ``SnapshotDB``
-reassembly is unavailable offline; see ``objectdb.py``'s own module
-docstring.)
+prefix rule: ZSTD-framed SQLite, then a JSON object, then an RFC822
+header, else binary. (Real ``SnapshotDB`` reassembly is unavailable
+offline.)
 """
 
 from __future__ import annotations
@@ -49,9 +50,8 @@ _MAX_SNIFF_DECOMPRESS = 128 << 20
 # Objects at or under this size get their zstd-magic checked against a
 # small head read first; only a genuine match triggers a second, full
 # read (``inspect_object``) — never for large objects generically.
-# Magic-gated, not a blind size cutoff,
-# so a large real service DB (see ``_MAX_SNIFF_DECOMPRESS``'s own
-# comment) still gets classified correctly rather than misreported as
+# Magic-gated, not a blind size cutoff, so a large real service DB
+# still gets classified correctly rather than misreported as
 # ``ServiceKind.BINARY``.
 _FULL_READ_CAP = 8 << 20
 _HEAD_SIZE = 4096
@@ -124,13 +124,15 @@ async def decompress_service_db(data: bytes) -> bytes:
     a resolved-but-wrong location is caught by the schema check every
     caller already does afterward, not by refusing to decompress
     upfront. Also deliberately unbounded in *size* -- large real service
-    DBs are expected (see ``_MAX_SNIFF_DECOMPRESS``'s own comment) --
-    which is exactly why this is ``async`` and hops to a real OS thread
-    for the decrypt+decompress itself: peel() stays synchronous by
-    design (storage/sqlite_source.py's own TestPeel docstring), but
-    leaving a large decompress on the event loop would stall every
-    other Task for its duration, the same reasoning dedup/pool.py's own
-    stated policy already covers.
+    DBs are expected -- which is exactly why this is ``async`` and hops
+    to a real OS thread for the decrypt+decompress itself: ``peel()``
+    itself is pure, synchronous bytes work with no I/O, but leaving a
+    large decrypt+decompress on
+    the event loop would stall every other Task (TUI redraws, a
+    progress callback, a concurrent metadata read) for its duration —
+    the same responsiveness reasoning behind
+    ``dedup/pool/_bucket_reader.py``'s own per-chunk-vs-per-run
+    thread-hop split.
 
     Raises:
         DataCorruptError: ``data`` isn't ZSTD-framed SQLite.
@@ -240,9 +242,8 @@ async def inspect_object(dedup_file: DedupFile, offset: int, length: int) -> Sni
     classify (``sniff``) and validate it — never a step in
     *finding* the object: ``offset``/``length`` always come from the
     connector's own object-name index or from an already-resolved INDEX
-    object's own entries. Applies ``_FULL_READ_CAP``
-    (magic-byte-gated, not a blind size cutoff — see that constant's
-    own comment)."""
+    object's own entries. Applies ``_FULL_READ_CAP`` (magic-gated, not a
+    blind size cutoff)."""
     if length <= _FULL_READ_CAP:
         return await sniff(await dedup_file.read(offset, length))
     head = await dedup_file.read(offset, _HEAD_SIZE)

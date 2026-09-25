@@ -66,8 +66,9 @@ async def run_for_repo(ctx: SmokeContext, ri: RepoInfo) -> None:
     _ri, _workload, _version, picked_provider, picked_leaf = picked
 
     # The winning candidate is this call's own to close once done --
-    # pick_workload_with_retry only closes rejected ones (see its own
-    # docstring).
+    # pick_workload_with_retry closes every rejected candidate's provider
+    # immediately as it searches, but returns the winner still open for its
+    # caller to use (and close).
     try:
 
         async def _get_provider(provider: UnitProvider = picked_provider) -> UnitProvider:

@@ -46,12 +46,12 @@ async def resolve_seq_path(dir_cache: DirCache, dir_path: str, logical_name: str
     and ``dir_path``/physical-name join around it — the shared shape
     behind every "resolve one ``.<N>``-suffixed per-generation file inside
     a known directory" call site (``dedup/repository.py``,
-    ``dedup/verify_checks.py``, ``pool.py``, ``fingerprint.py``,
-    ``composition_reader.py``). Each
+    ``dedup/verify_checks.py``, ``dedup/pool/__init__.py``,
+    ``dedup/fingerprint.py``, ``dedup/composition_reader.py``). Each
     caller still builds its own ``dir_path``/``logical_name`` split
     (layer paths split differently — see e.g.
-    ``pool.py``'s own ``bucket_path``); this only covers the three lines
-    common past that point.
+    ``dedup/pool/__init__.py``'s own ``bucket_path``); this only covers
+    the three lines common past that point.
 
     Not for ``units/saas/stream.py``'s own ``_resolve_db_path``, which
     looks similar but has a genuine extra rule (preferring the

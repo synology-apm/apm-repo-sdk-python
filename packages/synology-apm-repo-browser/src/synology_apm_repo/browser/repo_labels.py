@@ -8,15 +8,15 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from synology_apm_repo.sdk.api import Catalog, KeyStatus, Repository
+from synology_apm_repo.sdk.api import Catalog, KeyStatus, RepositoryLayout
+from synology_apm_repo.sdk.presentation.markup import safe
 
 #: Internal store-relative marker segments ``layout.repo_root`` may
 #: start with — never meaningful to a user, who only ever typed a real
 #: filesystem path; stripped before display (see ``_repo_label``).
 _INTERNAL_MARKER_PREFIXES = ("@ActiveProtectVault", "@ActiveProtectData")
 
-#: Every ``KeyStatus`` gets a hint — see ``KeyStatus``'s own docstring
-#: for what each value guarantees.
+#: Every ``KeyStatus`` value gets a hint here — none is left unmapped.
 _KEY_STATUS_LABELS = {
     KeyStatus.NOT_ENCRYPTED: "not encrypted",
     KeyStatus.NO_KEY_PROVIDED: "key needed",
@@ -44,33 +44,42 @@ def _strip_internal_marker(repo_root: str) -> str:
     return "/".join(segments)
 
 
-def _repo_path_component(repo: Repository, scan_path: str) -> str:
+def _repo_path_component(layout: RepositoryLayout, scan_path: str) -> str:
     """The *scanned directory's own name* (what the user actually
     typed — ``layout.repo_root`` on its own is an internal,
     store-relative fragment that means nothing to them) plus whatever
     residual part of ``repo_root`` survives ``_strip_internal_marker`` (only
     present at all for the multi-repository object-store case). Shared by
     ``_repo_label`` (which adds the key-status/diagnostic suffix) and the
-    breadcrumb (which doesn't need either)."""
+    breadcrumb (which doesn't need either). Takes ``layout`` directly,
+    not a ``Repository`` -- a real ``Repository`` owns a closable
+    connection and can't live in ``core/browse/model.py``'s own frozen
+    ``BrowseModel``, only its own ``RepoState`` snapshot of these two
+    cheap, sync properties."""
     base = Path(scan_path).name or scan_path or "(current directory)"
-    residual = _strip_internal_marker(repo.layout.repo_root)
+    residual = _strip_internal_marker(layout.repo_root)
     return f"{base}/{residual}" if residual else base
 
 
-def _repo_label(repo: Repository, scan_path: str, *, verbose: bool) -> str:
-    """A column-1 repository label, carrying no internal ids in normal mode —
-    see ``_repo_path_component``'s own docstring for the path half. A
-    key-status hint (``· LABEL``, matching ``doctor``'s own subtitle
-    style) is appended only once it's actually known. The layout-kind
-    suffix is appended only in verbose mode — ``uuid``/``catalog_id``
-    are shown per-catalog instead (see ``Catalog.info``), not at this
-    whole-repository label."""
-    label = _repo_path_component(repo, scan_path)
-    key_hint = _KEY_STATUS_LABELS.get(repo.key_status)
+def _repo_label(layout: RepositoryLayout, key_status: KeyStatus, scan_path: str, *, verbose: bool) -> str:
+    """A column-1 repository label, carrying no internal ids in normal
+    mode. The path half is ``_repo_path_component``'s own scanned-directory
+    name plus any residual multi-repository marker text. A key-status hint (``· LABEL``, matching ``doctor``'s
+    own subtitle style) is appended only once it's actually known. The
+    layout-kind suffix is appended only in verbose mode —
+    ``uuid``/``catalog_id`` are shown per-catalog instead (see
+    ``Catalog.info``), not at this whole-repository label. ``_repo_path_
+    component``'s own return value is real, user-typed filesystem-path
+    text -- escaped here at the call site (shared with the breadcrumb,
+    which escapes at its own call site too): unescaped, dynamic text like
+    this can crash a TUI widget on an unmatched or unresolvable markup tag,
+    or make the CLI silently swallow a bracketed suffix."""
+    label = safe(_repo_path_component(layout, scan_path))
+    key_hint = _KEY_STATUS_LABELS.get(key_status)
     if key_hint is not None:
         label += f" · {key_hint}"
     if verbose:
-        label += f" (layout: {repo.layout.kind.value})"
+        label += f" (layout: {layout.kind.value})"
     return label
 
 
@@ -85,7 +94,10 @@ def _catalog_label(catalog: Catalog, name: str, *, verbose: bool) -> str:
     docstrings) — for a vault, ``catalog_id`` collapses to a small integer
     that's easy to misread as identical across sibling catalogs, whereas
     ``connection_id`` is always a distinct opaque per-catalog string,
-    vault or not."""
+    vault or not. ``name``/``uuid``/``connection_id`` are all real,
+    dynamic content -- escaped before reaching this label's own ``Tree``
+    node, since unescaped it can crash the widget on an unmatched or
+    unresolvable markup tag."""
     if not verbose:
-        return name
-    return f"{name} (uuid: {catalog.info.uuid}, id: {catalog.connection.connection_id})"
+        return safe(name)
+    return f"{safe(name)} (uuid: {safe(catalog.info.uuid)}, id: {safe(catalog.connection.connection_id)})"

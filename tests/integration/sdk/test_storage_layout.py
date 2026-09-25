@@ -7,8 +7,9 @@ The fixture (``tests/fixtures/storage_layout_all_samples.json.gz``)
 was produced once by ``RecordingStore`` wrapping a real store rooted at
 the whole ``samples/`` tree, recording every ``exists()``/``listdir()``
 call ``iter_layouts`` makes while walking it — ``iter_layouts``/
-``detect_layout`` never call ``read()``/``size()`` at all (see
-``layout.py``'s own docstring: "cheap by construction"), unlike most
+``detect_layout`` never call ``read()``/``size()`` at all, only
+``exists()``/``listdir()`` at each level, never a scan into
+``Pool``/``Composition``/``db``, unlike most
 other fixtures in this directory, which do read real content.
 ``az-test-1`` (an untracked extra sample directory) was absent from the
 tree at recording time, same as it is in this repository's own CI/dev-machine
@@ -84,9 +85,11 @@ async def test_replayed_object_store_repos_have_key_root(
 async def test_replayed_each_vault_root_detected_standalone(
     record_target: Callable[[str], Awaitable[ObjectStore]],
 ) -> None:
-    # See this module's own docstring for why ``root=vault_rel`` against
-    # the one tree-rooted store replaces the real test's separate
-    # per-vault ``LocalFsStore``.
+    # ``root=vault_rel`` against the one tree-rooted store produces the
+    # exact same ``exists()`` keys the recorded whole-tree walk already
+    # visited internally, replacing what would otherwise be a separate
+    # per-vault ``LocalFsStore`` (just a different path prefix over the
+    # same real files) with no extra fixture needed.
     store = await record_target("storage_layout_all_samples.json.gz")
     for vault_rel in _EXPECTED_VAULTS:
         layout = await detect_layout(store, root=vault_rel)

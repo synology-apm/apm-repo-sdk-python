@@ -1,94 +1,42 @@
 """Entry point for the ``synology-apm-repo-browser`` command. Owns the one
 long-lived ``Session`` every screen shares, the ``verbose`` flag every
 screen reads to decide whether to show internal identifiers, the
-``default_sparse`` setting every export starts from (see ``main``'s own
-docstring), and the background job registry that lets an export keep
-running while the user carries on browsing.
+``default_sparse`` setting every export starts from (set once at launch,
+never offered per-export), and the app-level MVU store that lets a
+background export keep running while the user carries on browsing.
 """
 
 from __future__ import annotations
 
 import argparse
-import dataclasses
-import enum
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from importlib.metadata import version as _pkg_version
 from pathlib import Path
-from typing import Literal
 
 from textual.app import App, ComposeResult
-from textual.widgets import Footer, Header, Static
+from textual.reactive import var
+from textual.widgets import Header, Static
 from textual.worker import Worker
 
+from synology_apm_repo.browser.core.app.cmd import AppCmd
+from synology_apm_repo.browser.core.app.model import AppModel, Job
+from synology_apm_repo.browser.core.app.model import JobStatus as JobStatus
+from synology_apm_repo.browser.core.app.msg import AppMsg
+from synology_apm_repo.browser.core.app.update import update
+from synology_apm_repo.browser.core.keys import JobId, RepoHandle
 from synology_apm_repo.browser.keymap import COMMON_BINDINGS, WORKLIST_BINDING
+from synology_apm_repo.browser.runtime.app_effects import AppEffects
+from synology_apm_repo.browser.runtime.browse_effects import BROWSE_REPO_CLOSE_GROUP
+from synology_apm_repo.browser.runtime.resources import ResourceTable
+from synology_apm_repo.browser.runtime.store import Store
+from synology_apm_repo.browser.runtime.unit_effects import UNIT_PROVIDER_CLOSE_GROUP
 from synology_apm_repo.browser.screens.browse_screen import BrowseScreen
-from synology_apm_repo.browser.strings import EXPORT_NOTIFY_TITLE
 from synology_apm_repo.browser.worker_drain import drain
 from synology_apm_repo.sdk.api import Repository, Session
 from synology_apm_repo.sdk.concurrency import preload_resource_tracker
 from synology_apm_repo.sdk.presentation.logging_setup import configure_logging
-from synology_apm_repo.sdk.presentation.markup import safe
 
 _CSS_PATH = Path(__file__).with_name("theme.tcss")
-
-
-class JobStatus(enum.StrEnum):
-    """A ``BackgroundJob``'s own lifecycle — ``RUNNING`` until something
-    (the export screen's Esc/cancel button, or ``WorklistScreen``'s ``x``)
-    requests cancellation, never reversed back to ``RUNNING`` afterward.
-    A ``StrEnum`` so status bar/worklist text built from it (e.g.
-    ``f"{label} ({job.status})"``) keeps reading as the plain
-    "running"/"cancelling" text it always has."""
-
-    RUNNING = "running"
-    CANCELLING = "cancelling"
-
-
-@dataclasses.dataclass(frozen=True)
-class BackgroundJob:
-    """One backgroundable long-running operation, shown in the status bar
-    and the worklist — currently only ``ExportScreen`` creates these.
-
-    ``worker`` is the actual Textual ``Worker`` doing the work: an async
-    (non-threaded) worker, i.e. a plain ``asyncio.Task`` on this App's own
-    event loop.
-
-    Cancelling a job cancels that task — the async SDK accepts no
-    ``cancel=`` parameter of its own, so this is the only cancellation
-    mechanism there is — and ``CancelledError`` is delivered at the SDK
-    call's next ``await``, with its own ``try/finally`` blocks (e.g.
-    ``export_to``'s partial-file close) still running on the way out. Same
-    mechanism as pressing Esc while watching the export, just reachable
-    after backgrounding.
-
-    Frozen: every field but ``id``/``label`` changes over a job's
-    lifetime (``worker`` once attached, ``done``/``total`` on every
-    progress tick, ``status`` on cancellation) — ``ApmRepoBrowserApp``'s
-    own ``attach_worker``/``update_job``/``mark_job_cancelling`` are the
-    only places that replace an entry in its ``jobs`` registry, so every
-    reader (the status bar, ``WorklistScreen``) always sees one
-    consistent instance per id rather than racing a mutation."""
-
-    id: int
-    label: str
-    worker: Worker[None] | None = None
-    done: int = 0
-    total: int | None = None
-    status: JobStatus = JobStatus.RUNNING
-
-    def cancel(self) -> None:
-        """Cancel the underlying async worker, if one is attached yet."""
-        if self.worker is not None:
-            self.worker.cancel()
-
-    @property
-    def percent(self) -> int | None:
-        """Whole-percent completion, or ``None`` when ``total`` isn't
-        known (falsy) yet — the same guard the status bar and
-        ``WorklistScreen`` both need before dividing by it."""
-        if not self.total:
-            return None
-        return int(100 * self.done / self.total)
 
 
 class ApmRepoBrowserApp(App[None]):
@@ -97,37 +45,96 @@ class ApmRepoBrowserApp(App[None]):
 
     Holds exactly the state shared across every screen: the one ``Session``
     (closed on exit — it owns every connection it opens and is the single
-    place responsible for releasing them), which ``Repository`` is currently
-    selected, whether verbose mode (``d``) is on, and ``default_sparse``
-    (every export starts from this session-wide setting, not a per-export
-    choice — see ``main``). Screen-specific state stays on the screen itself,
-    not here."""
+    place responsible for releasing them), which repository is currently
+    selected (``repo_handle``), whether verbose mode (``d``) is on, ``default_sparse``
+    (every export starts from this session-wide setting, set once at
+    launch, not a per-export choice), ``resources`` (the one
+    ``ResourceTable`` every screen's own ``Store``-held
+    ``ProviderHandle``/``RepoHandle`` resolves through, because a
+    ``Repository``/``UnitProvider`` owns a non-daemon-thread ``aiosqlite``
+    connection that a frozen ``core.*`` model can't hold without leaking
+    threads across repeated version visits), and ``store``, the app-level
+    MVU loop every screen dispatches a job-related ``AppMsg`` into
+    (``ExportScreen`` on Export/Cancel, ``WorklistScreen``'s own ``x``)
+    and can subscribe to for job state. Screen-specific state stays on
+    the screen itself, not here."""
 
     TITLE = "APM Repository Browser"
     CSS_PATH = _CSS_PATH
     BINDINGS = [*COMMON_BINDINGS, WORKLIST_BINDING]
 
+    #: Toggled by ``d``. A screen that has anything verbose-mode-dependent
+    #: to redraw registers ``self.watch(self.app, "verbose",
+    #: self.refresh_for_verbose_mode, init=False)`` in its own ``on_mount``
+    #: (see ``BrowseScreen``/``UnitScreen``) — that watch fires regardless
+    #: of whether the registering screen is currently on top of the screen
+    #: stack. The reactive's own ``init=False`` is
+    #: a separate, unrelated knob (whether *this* class's own
+    #: ``watch_verbose`` fires once automatically right after the App
+    #: mounts) — left at ``var``'s own default of ``True`` here would
+    #: fire an unwanted "verbose mode off" notification on every launch
+    #: even though the user never pressed ``d``.
+    verbose: var[bool] = var(False, init=False)
+
+    #: A mirror of ``self.store.model.jobs``, kept in sync by the
+    #: subscription registered in ``__init__`` below. Exists as a real
+    #: reactive (rather than reading ``self.store.model.jobs`` directly)
+    #: because ``self.watch(self.app, "jobs", ...)`` — how
+    #: ``NavigableScreen``'s own breadcrumb tasks-hint (shared by
+    #: ``BrowseScreen``/``UnitScreen``) stays in sync regardless of
+    #: screen-stack position, and how ``WorklistScreen`` reacts live —
+    #: needs an actual ``Reactive`` descriptor to hook into, not just a
+    #: same-named plain attribute (``Store.subscribe`` has no equivalent
+    #: "fires regardless of who's currently on top" behavior of its own).
+    jobs: var[Mapping[JobId, Job]] = var(dict)
+
     def __init__(self, *, default_sparse: bool = True) -> None:
         super().__init__()
         self.session = Session()
-        self.repo: Repository | None = None
-        self.verbose: bool = False
+        self.resources = ResourceTable(self.session)
+        #: The currently-selected repository's own handle -- never the live
+        #: object itself, since ``ResourceTable`` is the sole owner of the
+        #: live ``Repository`` for its whole lifetime. Every
+        #: reader dereferences through ``self.resources.repo(...)`` at the
+        #: point of use rather than caching the live object, so a repo
+        #: released between selection and use naturally reads back as
+        #: ``None`` instead of needing a separate, hand-synchronized reset.
+        self.repo_handle: RepoHandle | None = None
         self.default_sparse = default_sparse
-        self.jobs: dict[int, BackgroundJob] = {}
-        self._next_job_id = 1
+        self.store: Store[AppModel, AppMsg, AppCmd] = Store(AppModel(), update, self._perform)
+        self.effects = AppEffects(self, self.store)
+        self.store.subscribe(lambda model: model.jobs, self._sync_jobs, init=False)
+
+    @property
+    def current_repo(self) -> Repository | None:
+        """``repo_handle`` dereferenced through ``resources`` -- the one
+        place every reader does this, rather than repeating the same
+        ``resources.repo(repo_handle) if repo_handle is not None else
+        None`` ternary at each call site."""
+        return self.resources.repo(self.repo_handle) if self.repo_handle is not None else None
+
+    def _perform(self, cmd: AppCmd) -> None:
+        self.effects.perform(cmd)
+
+    def _sync_jobs(self, jobs: Mapping[JobId, Job]) -> None:
+        # A plain assignment, not mutate_reactive(): update() always
+        # returns a fresh dict on any real change (never mutates
+        # model.jobs in place), so Textual's own reactive `!=` check
+        # already fires exactly when the mirror genuinely needs to.
+        self.jobs = jobs
 
     def compose(self) -> ComposeResult:
         yield Header()
         yield Static(id="root-placeholder")
-        yield Static("", id="job-status-bar")  # empty (and so invisible) whenever self.jobs is empty
-        yield Footer()
 
     def on_mount(self) -> None:
-        # BrowseScreen is the only root screen — pushed exactly once,
-        # never popped (see its own action_go_back's comment) — but it
-        # starts with nothing to show: picking *what* to browse is
-        # entirely ConnectDialog's job now (see that module's own
-        # docstring), so it's auto-opened immediately on top, the exact
+        # BrowseScreen is the only root screen -- pushed exactly once, here,
+        # and never popped by anything else -- but it starts with nothing to
+        # show: picking *what* to browse (a local directory, an S3/Azure
+        # Blob Storage-backed repository, or an SMB share) is entirely
+        # ConnectDialog's job now -- it's the only place a source is ever
+        # picked, and BrowseScreen has no path field of its own -- so it's
+        # auto-opened immediately on top, the exact
         # same push ``c``/action_connect_remote triggers later. Esc-ing out
         # of this first dialog without connecting anything just leaves
         # BrowseScreen empty, reopenable any time with ``c``.
@@ -136,14 +143,23 @@ class ApmRepoBrowserApp(App[None]):
         screen.action_connect_remote()
 
     async def on_unmount(self) -> None:
-        # ``async def`` deliberately: ``Session.close()`` is a coroutine —
-        # see keymap.py's module docstring for why Textual allows an
-        # ``async def`` handler here.
+        # ``async def`` deliberately: ``Session.close()`` is a coroutine.
+        # Textual dispatches handlers through ``textual._callback.invoke()``,
+        # which awaits the result when it's awaitable, so an ``async def``
+        # handler here is awaited to completion exactly like any other
+        # handler.
+
+        # Closed first so a job's own worker racing this shutdown (its
+        # CancelledError handler dispatching ExportFinished) can't reach
+        # back into a store that's mid-teardown -- matches every screen's
+        # own on_unmount, which closes its store before touching workers.
+        self.store.close()
 
         # Textual's own shutdown already cancels every outstanding worker
-        # before dispatching Unmount — same mechanism as BackgroundJob.worker's
-        # own docstring. Cancelling each job explicitly here is kept anyway, so
-        # the ordering holds without depending on Textual's internals.
+        # before dispatching Unmount — same mechanism cancel_group relies
+        # on below. Cancelling each job's own group explicitly here is
+        # kept anyway, so the ordering holds without depending on
+        # Textual's internals.
         #
         # Then *waited for*: cancellation only lands at the job's next await,
         # and ``session.close()`` closes the providers those jobs are still
@@ -153,11 +169,30 @@ class ApmRepoBrowserApp(App[None]):
         # not come back until that read returns, and quitting must not hang on
         # it. A job that outlives the bound is left to the cancellation it was
         # already handed; only the ordering guarantee is given up, not the
-        # cancel.
-        jobs = [job for job in self.jobs.values() if job.worker is not None]
-        for job in jobs:
-            job.cancel()
-        await drain([job.worker for job in jobs if job.worker is not None])
+        # cancel. cancel_group's own return value is exactly the workers it
+        # actually cancelled, so nothing here needs its own live-Worker
+        # bookkeeping.
+        # Read from the store directly, not the `jobs` mirror -- close()
+        # just above already dropped every subscription, so the mirror
+        # stops receiving further updates from this point on; the store's
+        # own model is still readable and remains the source of truth.
+        cancelled: list[Worker[None]] = []
+        for job in self.store.model.jobs.values():
+            cancelled.extend(self.workers.cancel_group(self, job.group))
+        await drain(cancelled)
+
+        # A provider-close/repo-close worker (a UnitScreen's/BrowseScreen's
+        # own, hosted here on the App rather than the screen -- Textual's
+        # own ``Widget._on_unmount`` cancels every worker on a node once that
+        # node unmounts, regardless of its own group, so a close worker
+        # hosted on the screen could be cancelled out from under itself
+        # mid-close, exactly the leaked-connection failure mode closing a
+        # provider exists to prevent) is never cancelled, only drained: unlike a job,
+        # its own cleanup must actually finish, not just stop, before
+        # ``session.close()`` below closes the same connections it's still
+        # releasing.
+        resource_closes = [w for w in self.workers if w.group in (UNIT_PROVIDER_CLOSE_GROUP, BROWSE_REPO_CLOSE_GROUP)]
+        await drain(resource_closes)
         await self.session.close()
 
     def action_quit_app(self) -> None:
@@ -165,17 +200,10 @@ class ApmRepoBrowserApp(App[None]):
 
     def action_toggle_verbose(self) -> None:
         self.verbose = not self.verbose
-        self.set_class(self.verbose, "verbose")
-        self.notify(f"verbose mode {'on' if self.verbose else 'off'}")
-        # Duck-typed hook: a screen may hold already-rendered labels that
-        # embed verbose-mode-dependent text (BrowseScreen's own repository
-        # labels, uuid/layout appended only when verbose), which would
-        # otherwise stay stale on screen until the next unrelated
-        # re-render. Screens with nothing verbose-dependent to redraw
-        # simply don't define this method.
-        refresh = getattr(self.screen, "refresh_for_verbose_mode", None)
-        if callable(refresh):
-            refresh()
+
+    def watch_verbose(self, verbose: bool) -> None:
+        self.set_class(verbose, "verbose")
+        self.notify(f"verbose mode {'on' if verbose else 'off'}")
 
     def action_show_help(self) -> None:
         from synology_apm_repo.browser.screens.help_screen import HelpScreen
@@ -190,68 +218,6 @@ class ApmRepoBrowserApp(App[None]):
         from synology_apm_repo.browser.screens.worklist_screen import WorklistScreen
 
         self.push_screen(WorklistScreen())
-
-    # -- background job registry (backgroundable exports) ---------------
-
-    def start_job(self, label: str) -> BackgroundJob:
-        # ``worker`` is None here — attached by the caller after this call
-        # returns (see ExportScreen._start) — both happen synchronously, so
-        # a job is never observably cancellable-but-unattached.
-        job = BackgroundJob(id=self._next_job_id, label=label)
-        self._next_job_id += 1
-        self.jobs[job.id] = job
-        self._refresh_job_status_bar()
-        return job
-
-    def attach_worker(self, job_id: int, worker: Worker[None]) -> BackgroundJob:
-        """Record ``worker`` as ``job_id``'s own cancellable task, once
-        started (``ExportScreen._start``, right after ``app.run_worker``)
-        — returns the updated instance so the caller can rebind its own
-        reference too, since ``BackgroundJob`` is frozen."""
-        job = dataclasses.replace(self.jobs[job_id], worker=worker)
-        self.jobs[job_id] = job
-        return job
-
-    def mark_job_cancelling(self, job_id: int) -> None:
-        """Record that ``job_id``'s own ``cancel()`` was already called
-        and it's now waiting for its worker to actually stop —
-        ``ExportScreen``'s own cancel action and ``WorklistScreen``'s
-        ``x`` both call this right after ``BackgroundJob.cancel()``."""
-        job = self.jobs.get(job_id)
-        if job is not None:
-            self.jobs[job_id] = dataclasses.replace(job, status=JobStatus.CANCELLING)
-
-    def update_job(self, job_id: int, done: int, total: int | None) -> None:
-        job = self.jobs.get(job_id)
-        if job is None:  # already finished/removed — a late progress tick, not an error
-            return
-        self.jobs[job_id] = dataclasses.replace(job, done=done, total=total)
-        self._refresh_job_status_bar()
-
-    def finish_job(
-        self, job_id: int, message: str, *, severity: Literal["information", "warning", "error"] = "information"
-    ) -> None:
-        self.jobs.pop(job_id, None)
-        self._refresh_job_status_bar()
-        self.notify(message, severity=severity, title=EXPORT_NOTIFY_TITLE)
-
-    def _refresh_job_status_bar(self) -> None:
-        bar = self.query_one("#job-status-bar", Static)
-        bar.set_class(bool(self.jobs), "has-jobs")
-        if not self.jobs:
-            bar.update("")
-            return
-        # job.label embeds a real unit name (filename/subject) — escaped
-        # before reaching this Static, per sdk/presentation/markup.py's docstring.
-        parts = []
-        for job in self.jobs.values():
-            label = safe(job.label)
-            if job.percent is not None:
-                parts.append(f"{label} {job.percent}% ({job.status})")
-            else:
-                parts.append(f"{label} ({job.status})")
-        suffix = " · press t for tasks" if len(self.jobs) > 1 else ""
-        bar.update(" | ".join(parts) + suffix)
 
 
 def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
@@ -279,8 +245,9 @@ def main(argv: list[str] | None = None) -> None:  # pragma: no cover - opens a r
     fixed argument list.
 
     ``--no-sparse-export`` sets ``ApmRepoBrowserApp.default_sparse`` for the
-    whole session — see ``ExportScreen``'s own module docstring for why
-    there's no per-export toggle instead.
+    whole session; ``ExportScreen`` has no per-export toggle, because
+    skipping sparse writes is a rare exception not worth asking about on
+    every export.
 
     Excluded from the coverage gate: ``.run()`` opens a real terminal —
     ``App.run_test()`` (used everywhere else in this package's tests) is
@@ -289,14 +256,21 @@ def main(argv: list[str] | None = None) -> None:  # pragma: no cover - opens a r
     # A TUI cannot share its terminal: anything a dependency writes to
     # stderr lands on top of the rendered screen while the app runs, and
     # after it exits, in the user's shell. Shared with the CLI's own call
-    # site (cli/main.py::main()), since both must behave identically here
-    # — see configure_logging()'s own module docstring for the mechanism
-    # and the escape hatch (SYNOLOGY_APM_REPO_LOG) for debugging a backend.
+    # site (cli/main.py::main()), since both must behave identically here.
+    # configure_logging() adds a NullHandler to the root logger so
+    # logging's last-resort handler (which would otherwise dump every
+    # WARNING and above from a dependency like smbprotocol straight to
+    # stderr) never fires -- or redirects everything to a file named by
+    # SYNOLOGY_APM_REPO_LOG instead, for debugging a backend.
     configure_logging()
     args = _parse_args(argv)
     # Must happen before .run(): once the app is running, Textual redirects
-    # sys.stderr to its own capture stream for the whole session, and
-    # preload_resource_tracker() needs the real one — see its own docstring.
+    # sys.stderr to its own capture stream, whose fileno() returns a
+    # sentinel instead of raising. preload_resource_tracker()'s launch code
+    # appends sys.stderr.fileno() to the file descriptors it hands the
+    # tracker helper with no validation, and crashes the first
+    # ProcessPoolExecutor built afterward if that value isn't a real, open
+    # descriptor -- so it needs the real stderr, captured here first.
     preload_resource_tracker()
     ApmRepoBrowserApp(default_sparse=not args.no_sparse_export).run()
 

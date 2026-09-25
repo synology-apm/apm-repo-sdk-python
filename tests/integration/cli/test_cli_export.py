@@ -1,15 +1,15 @@
 """Regression test for ``synology-apm-repo-cli export`` — replayed from a committed
 fixture recorded against real bytes, with **no external dependency**.
 
-``export.py`` doesn't route through ``cli.browse.opened_repo()`` the
+``export.py`` doesn't route through ``cli.repo_session.opened_repo()`` the
 way every other command here does — it calls ``resolve_profile_store``
-directly (its own SIGINT-cancellable ``_do_export()`` Task needs to
-control ``Session``/``open_single_repo`` itself, per the module's own
-docstring), so the monkeypatch target is
+directly, owning its own ``Session``/``open_single_repo`` lifecycle for
+clean Ctrl-C cancellation rather than handing that off to a shared helper,
+so the monkeypatch target is
 ``cli.commands.export.resolve_profile_store``, not
-``cli.browse.resolve_profile_store`` — the ``patch_profile_store``
-fixture (``tests/conftest.py``) takes the target module as its own
-argument for exactly this reason.
+``cli.repo_session.resolve_profile_store`` — the ``patch_profile_store``
+fixture (``tests/integration/cli/conftest.py``) takes the target module
+as its own argument for exactly this reason.
 
 Fixture: ``cli_export_apv1_vault.json.gz``, this file's own dedicated
 recording against ``apv-sample-1/@ActiveProtectVault`` — covers the real
@@ -17,8 +17,8 @@ recording against ``apv-sample-1/@ActiveProtectVault`` — covers the real
 the whole point of this scenario), actually run through
 ``content.export_to()`` during recording (not just read).
 ``test_exports_a_small_non_dedup_file_replayed`` is this fixture's
-recording recipe; its ref is canonical (immune to catalog-metadata
-anonymization — see ``test_cli_ls.py``'s own docstring).
+recording recipe; its ref is canonical — an internal catalog
+identifier, immune to catalog-metadata anonymization.
 ``test_failed_export_leaves_no_final_file_replayed`` needs no recording
 at all — a canonical ref naming a version UUID that doesn't exist fails
 to resolve without ever touching the real backend.

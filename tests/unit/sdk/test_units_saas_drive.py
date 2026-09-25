@@ -1,9 +1,7 @@
 """Unit tests for ``synology_apm_repo.sdk.units.saas.drive`` — a full
 synthetic repository root (same building blocks as
 ``test_units_saas_raw_object.py``), with a real ZSTD-compressed
-``item_table`` service DB embedded in its ``saas_obj`` content (see
-``tests/integration/sdk/test_units_saas_drive.py`` for the cross-check
-against real apv-sample-1 Drive data)."""
+``item_table`` service DB embedded in its ``saas_obj`` content."""
 
 from __future__ import annotations
 
@@ -14,6 +12,7 @@ import struct
 import tempfile
 import zlib
 from collections.abc import AsyncIterator, Sequence
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import cast
 
@@ -46,8 +45,9 @@ from synology_apm_repo.sdk.storage.layout import RepoKind, RepoLayout
 from synology_apm_repo.sdk.storage.local import LocalFsStore
 from synology_apm_repo.sdk.units.base import Node, SupportsDirectRefLookup, UnitKind
 from synology_apm_repo.sdk.units.resolve import find_node, find_path_with_children
-from synology_apm_repo.sdk.units.saas.drive import DriveProvider, _root_folder_id
+from synology_apm_repo.sdk.units.saas.drive import DriveProvider, _extra_attrs, _root_folder_id
 from synology_apm_repo.sdk.units.saas.provider import SaasWorkloadProvider
+from synology_apm_repo.sdk.units.saas.stream import SaasStreamCache
 from synology_apm_repo.sdk.units.saas.tree_strategy import RecursiveTree
 
 _STREAM_ID = 12
@@ -135,8 +135,13 @@ def _write_saas_version_db(path: Path) -> None:
 def _write_copy_target_version_db(
     path: Path, *, version_uid: str, object_db_id: str, db_objects: list[tuple[str, str]]
 ) -> None:
-    """See test_units_dispatch_saas.py's own
-    ``_write_copy_target_version_db`` docstring."""
+    """The connector's own index bookkeeping
+    (``synology_apm_repo.sdk.units.saas.object_name_index``) -- every
+    ``SaasWorkloadProvider``/``TeamsChatProvider`` construction resolves
+    its service DB(s) only through this table, with no scan-based
+    fallback, so a fixture repository that wants a table found must
+    record it here. Plain, unencrypted JSON -- these fixture repositories
+    never configure a vault_key."""
     path.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(path)
     conn.execute("CREATE TABLE copy_target_version(version_uid TEXT PRIMARY KEY, version_spec TEXT)")
@@ -351,8 +356,8 @@ async def provider(tmp_path: Path) -> AsyncIterator[SaasWorkloadProvider]:
     _build_drive_repo(tmp_path)
     store = LocalFsStore(tmp_path)
     layout = RepoLayout(kind=RepoKind.VAULT, repo_root="")
-    async with await DedupRepo.open(store, layout) as repo:
-        p = await DriveProvider(repo, _version())
+    async with await DedupRepo.open(store, layout) as repo, SaasStreamCache(repo) as saas_streams:
+        p = await DriveProvider(repo, _version(), saas_streams)
         try:
             yield p
         finally:
@@ -369,6 +374,15 @@ class TestTree:
         assert file_a.is_leaf is True
         assert file_a.kind is UnitKind.DRIVE_ITEM
         assert file_a.size == len(_CONTENT_A)
+
+    async def test_root_lists_the_folder_before_the_file_despite_alphabetical_order(
+        self, provider: SaasWorkloadProvider
+    ) -> None:
+        # "file-a.txt" < "folder-1" alphabetically (byte comparison: 'i'
+        # < 'o') -- asserting the folder still comes first proves the
+        # dir-first rank, not just the name tiebreaker, is applied.
+        top = await provider.children(provider.root())
+        assert [n.name for n in top] == ["folder-1", "file-a.txt"]
 
     async def test_nested_folder_lists_its_own_child(self, provider: SaasWorkloadProvider) -> None:
         top = await provider.children(provider.root())
@@ -396,7 +410,30 @@ class TestTree:
         top = await provider.children(provider.root())
         file_a = next(n for n in top if n.name == "file-a.txt")
         assert file_a.attrs["content_object_id"] == "content_a"
-        assert file_a.attrs["mtime"] == 0
+        assert file_a.attrs["mtime"] == datetime.fromtimestamp(0, UTC)
+
+    async def test_folder_has_no_mtime_attr(self, provider: SaasWorkloadProvider) -> None:
+        # extra_attrs only ever runs for a leaf row (provider.py's own
+        # _node_for) -- a folder's own mtime, though item_table carries
+        # one for every row regardless of type, is never surfaced.
+        top = await provider.children(provider.root())
+        folder = next(n for n in top if n.name == "folder-1")
+        assert "mtime" not in folder.attrs
+
+    def test_an_out_of_range_mtime_degrades_to_no_mtime_attr(self) -> None:
+        """``item_table.mtime`` is a raw, unvalidated integer -- an
+        out-of-``datetime``-range value (corrupt data, not a real Drive
+        fact) must degrade to no ``mtime`` attr at all rather than
+        raising out of ``_extra_attrs`` and failing that row's whole
+        listing."""
+        row: dict[str, object | None] = {
+            "content_object_id": "content_a",
+            "hash": None,
+            "mtime": 99999999999999,
+        }
+        attrs = _extra_attrs(cast(SaasWorkloadProvider, None), row)
+        assert "mtime" not in attrs
+        assert attrs["content_object_id"] == "content_a"
 
     async def test_pagination(self, provider: SaasWorkloadProvider) -> None:
         full = await provider.children(provider.root())
@@ -482,8 +519,8 @@ class TestContent:
         _build_drive_repo(tmp_path, extra_items=[("item-c", "empty.txt", "root-id", 1, 0, "", "")])
         store = LocalFsStore(tmp_path)
         layout = RepoLayout(kind=RepoKind.VAULT, repo_root="")
-        async with await DedupRepo.open(store, layout) as repo:
-            provider = await DriveProvider(repo, _version())
+        async with await DedupRepo.open(store, layout) as repo, SaasStreamCache(repo) as saas_streams:
+            provider = await DriveProvider(repo, _version(), saas_streams)
             try:
                 top = await provider.children(provider.root())
                 empty_item = next(n for n in top if n.name == "empty.txt")
@@ -504,8 +541,8 @@ class TestContent:
         _build_drive_repo(tmp_path, extra_items=[("item-d", "stale.txt", "root-id", 1, 1, "missing-content-id", "")])
         store = LocalFsStore(tmp_path)
         layout = RepoLayout(kind=RepoKind.VAULT, repo_root="")
-        async with await DedupRepo.open(store, layout) as repo:
-            provider = await DriveProvider(repo, _version())
+        async with await DedupRepo.open(store, layout) as repo, SaasStreamCache(repo) as saas_streams:
+            provider = await DriveProvider(repo, _version(), saas_streams)
             try:
                 top = await provider.children(provider.root())
                 stale_item = next(n for n in top if n.name == "stale.txt")
@@ -520,8 +557,8 @@ class TestSchemaTolerance:
         _build_drive_repo(tmp_path, missing_hash_column=True)
         store = LocalFsStore(tmp_path)
         layout = RepoLayout(kind=RepoKind.VAULT, repo_root="")
-        async with await DedupRepo.open(store, layout) as repo:
-            provider = await DriveProvider(repo, _version())
+        async with await DedupRepo.open(store, layout) as repo, SaasStreamCache(repo) as saas_streams:
+            provider = await DriveProvider(repo, _version(), saas_streams)
             try:
                 top = await provider.children(provider.root())
                 file_a = next(n for n in top if n.name == "file-a.txt")
@@ -610,8 +647,8 @@ class TestDirectRefLookup:
         )
         store = LocalFsStore(tmp_path)
         layout = RepoLayout(kind=RepoKind.VAULT, repo_root="")
-        async with await DedupRepo.open(store, layout) as repo:
-            provider = await DriveProvider(repo, _version())
+        async with await DedupRepo.open(store, layout) as repo, SaasStreamCache(repo) as saas_streams:
+            provider = await DriveProvider(repo, _version(), saas_streams)
             try:
                 assert isinstance(provider, SupportsDirectRefLookup)
                 orphan = await provider.resolve_extra(("item-orphan",))
@@ -661,9 +698,9 @@ class TestDegradation:
 
         store = LocalFsStore(tmp_path)
         layout = RepoLayout(kind=RepoKind.VAULT, repo_root="")
-        async with await DedupRepo.open(store, layout) as repo:
+        async with await DedupRepo.open(store, layout) as repo, SaasStreamCache(repo) as saas_streams:
             with pytest.raises(UnsupportedDataFormatError):
-                await DriveProvider(repo, _version())
+                await DriveProvider(repo, _version(), saas_streams)
 
     async def test_a_databaseerror_from_objectdb_load_surfaces_as_unsupported_data_format(
         self, provider: SaasWorkloadProvider, monkeypatch: pytest.MonkeyPatch
@@ -707,8 +744,8 @@ async def test_root_folder_id_falls_back_to_empty_string_when_config_table_has_n
     _build_drive_repo(tmp_path, root_folder_id=None)
     store = LocalFsStore(tmp_path)
     layout = RepoLayout(kind=RepoKind.VAULT, repo_root="")
-    async with await DedupRepo.open(store, layout) as repo:
-        provider = await DriveProvider(repo, _version())
+    async with await DedupRepo.open(store, layout) as repo, SaasStreamCache(repo) as saas_streams:
+        provider = await DriveProvider(repo, _version(), saas_streams)
         try:
             assert await _root_folder_id(provider) == ""
         finally:

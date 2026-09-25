@@ -314,11 +314,10 @@ class TestProbeEncrypted:
     browser needs to know *before* trying to load a workload list, not
     after hitting ``KeyRequiredError`` three clicks deep).
 
-    Reads ``db/vault_encryption_key`` directly now (see ``probe_encrypted``'s
-    own docstring for why) rather than opening a real bucket's header — the
-    bucket this module's other tests write (``_write_bucket``) never
-    carries a real vault-encrypted header at all, so these tests vary the
-    db row instead of the bucket bytes."""
+    Reads ``db/vault_encryption_key`` directly, rather than opening a
+    real bucket's header — the bucket this module's other tests write
+    (``_write_bucket``) never carries a real vault-encrypted header at
+    all, so these tests vary the db row instead of the bucket bytes."""
 
     async def test_returns_false_when_the_key_record_says_no_encryption(
         self, tmp_path: Path, vault_layout: RepoLayout
@@ -394,8 +393,8 @@ class TestDb:
     async def test_concurrent_opens_for_the_same_name_build_the_source_only_once(
         self, tmp_path: Path, vault_layout: RepoLayout, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """``_db_sources`` is an ``AsyncKeyedCache`` (see its own docstring
-        for the in-flight de-dup mechanism this exercises): concurrent
+        """``_db_sources`` is an ``AsyncKeyedCache``, whose ``resolve()``
+        de-duplicates in-flight fetches. Concurrent
         misses on the *same* name must build exactly one ``SqliteSource``,
         with every caller sharing that one cached connection afterwards."""
         _build_full_repo(tmp_path)
@@ -667,12 +666,13 @@ class TestCloseAndContextManager:
         self, tmp_path: Path, vault_layout: RepoLayout
     ) -> None:
         """Same in-flight race as ``api.Repository.close()``'s own
-        ``AsyncKeyedCache.settle_all()``-based fix (``test_api.py``) --
+        ``AsyncKeyedCache.settle_all()``-based fix (``test_api_repository.py``) --
         a ``db()`` call already in flight (its own ``SqliteSource`` open
         not yet settled) when ``close()`` runs must still have that
         connection closed once it lands, not left invisible to a plain
-        ``_db_sources.values()`` snapshot -- see
-        ``AsyncKeyedCache.known_keys()``'s own docstring for why."""
+        ``_db_sources.values()`` snapshot -- ``.values()`` only sees
+        already-settled entries, so ``close()`` uses ``known_keys()``'s
+        broader view (settled plus in-flight) instead."""
         _build_full_repo(tmp_path)
         store = LocalFsStore(tmp_path)
         repo = await DedupRepo.open(store, vault_layout)
@@ -732,14 +732,24 @@ class TestCloseAndContextManager:
 
         monkeypatch.setattr(failing_source, "close", _failing_close)
 
-        with pytest.raises(ExceptionGroup) as exc_info:
-            await repo.close()
-        assert len(exc_info.value.exceptions) == 1
-        assert isinstance(exc_info.value.exceptions[0], RuntimeError)
-        # the other source still got its own close attempt despite the
-        # first one's failure, and the cache itself was still cleared.
-        assert other_source._closed is True
-        assert repo._db_sources == {}
+        try:
+            with pytest.raises(ExceptionGroup) as exc_info:
+                await repo.close()
+            assert len(exc_info.value.exceptions) == 1
+            assert isinstance(exc_info.value.exceptions[0], RuntimeError)
+            # the other source still got its own close attempt despite the
+            # first one's failure, and the cache itself was still cleared.
+            assert other_source._closed is True
+            assert repo._db_sources == {}
+        finally:
+            # The monkeypatched close() above never releases the real
+            # aiosqlite connection underneath it (that's the point -- it
+            # simulates a close that genuinely fails) -- close it directly
+            # here, bypassing the broken wrapper, so this test doesn't
+            # leak a live connection/background thread for the rest of
+            # the session (see "Closing a provider built directly against
+            # a repository" for what that can surface as, elsewhere).
+            await failing_source.connection.close()
 
 
 async def test_bad_repo_info_magic_raises_data_corrupt(tmp_path: Path, vault_layout: RepoLayout) -> None:

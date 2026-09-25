@@ -12,7 +12,8 @@ each workload reinventing it.
 
 Performance-critical property: every ``read()``/``extents()`` call
 resolves its starting chunk-map record via ``CompositionRecord.entries``'s
-binary search, never a linear scan — see that method's own docstring.
+binary search — over already-known page boundaries, page-sized reads for
+anything not yet cached — never a linear, one-entry-at-a-time scan.
 """
 
 from __future__ import annotations
@@ -68,9 +69,9 @@ async def stream_via_read(source: _Readable, block: int = DEFAULT_STREAM_BLOCK) 
     fragment stitching, ...) gets a correct ``stream()`` for free, with
     no separate bulk-read path to keep in sync. ``ContentSource`` is
     deliberately a structural ``Protocol``, not an ABC, so implementers
-    don't need a common base class (see that Protocol's own docstring)
-    — but nothing then forced them to share this identical loop either;
-    this closes that gap without adding one. Not used by every
+    don't need a common base class — but nothing then forced them to
+    share this identical loop either; this closes that gap without
+    adding one. Not used by every
     ``ContentSource`` implementer: ``LazyArtifact`` (assembled
     ``.eml``/``.ics`` content) has its own, different ``stream()`` that
     slices an already-materialized in-memory buffer instead, since its
@@ -93,11 +94,10 @@ def clamp_read_length(offset: int, length: int | None, size: int) -> int:
     """Resolve a ``read(offset, length)`` request against a known
     ``size``: fills in the default length (``offset`` to ``size``) and
     clamps a request extending past ``size`` down to what's actually
-    there. Every ``ContentSource`` implementer shares this contract (see
-    ``units.base.ContentSource.read``'s own docstring): reading past the
-    end returns fewer bytes, never an error — only a negative
-    ``offset``/``length`` is left for the caller to reject before calling
-    this.
+    there. Every ``ContentSource`` implementer shares this contract:
+    reading past the end returns fewer bytes, never an error — only a
+    negative ``offset``/``length`` is left for the caller to reject before
+    calling this.
     """
     available = size - offset
     if length is None:
@@ -107,7 +107,7 @@ def clamp_read_length(offset: int, length: int | None, size: int) -> int:
 
 class ExtentKind(enum.Enum):
     """A file, as seen through ``DedupFile.extents()``, is a sequence of
-    these three kinds. ``ZERO`` (an explicit ``Type::Zero``
+    these three kinds. ``ZERO`` (an explicit ``ChunkMapKind.ZERO``
     chunk-map record) and ``HOLE`` (no record at all, i.e. a gap between
     records) are deliberately distinct even though both read back as
     zero bytes — a ``HOLE`` is a real sparse gap worth preserving as one
@@ -157,6 +157,72 @@ class ExportResult:
     zeros: int
 
 
+async def _resolve_bucket_group(
+    pool: Pool,
+    stream_id: StreamId,
+    bucket_id: BucketId,
+    items: list[tuple[ChunkIdx, list[int]]],
+) -> dict[int, bytes | memoryview]:
+    """Resolve every ``chunk_idx`` in ``items`` (one ``_fill_data_extent``
+    call's own ``(stream_id, bucket_id)`` group) to its plaintext.
+
+    Splits into already-cached (``Pool.cached_chunk``) and not-yet-cached
+    chunks first: only the not-yet-cached ones go through
+    ``BucketReader.read_chunks()``'s own merged-read fetch, keeping the
+    read-merging benefit that fetch provides for genuinely-cold chunks,
+    then backfills (``Pool.backfill_chunk``) only what it actually
+    fetched — a cache hit doesn't need re-inserting, and a backfill is
+    skipped entirely if ``Pool.release_epoch`` moved while the fetch was
+    in flight. Both groups are folded into one combined
+    ``verify_fingerprints()`` call, so a cache hit here is still checked,
+    not silently skipped, matching ``Pool.read_chunk()``'s own "a cache
+    hit is checked too" contract.
+
+    Deliberately not full in-flight de-duplication: two concurrent callers
+    that both miss the same not-yet-cached chunk here each fetch and
+    backfill it independently (harmless — the same key always decodes to
+    identical plaintext, just occasionally-redundant work), unlike
+    ``Pool.read_chunk()``'s own ``AsyncKeyedCache.resolve()``-backed path.
+    Not a simple gap to close: routing each chunk through ``resolve()``
+    individually would restore that guarantee but forces one physical read
+    per chunk, discarding exactly the read-merging ``read_chunks()`` exists
+    to provide; coordinating at this group's own granularity would need a
+    lock/in-flight registry this codebase doesn't have for this shape
+    today, plus correct handling of two concurrent requests whose needed
+    chunk sets only partially overlap.
+    """
+    already_cached: dict[int, bytes | memoryview] = {}
+    still_needed: list[ChunkIdx] = []
+    for chunk_idx, _ks in items:
+        cached = pool.cached_chunk(ChunkAddress(stream_id, bucket_id, chunk_idx))
+        if cached is not None:
+            already_cached[chunk_idx] = cached
+        else:
+            still_needed.append(chunk_idx)
+
+    decoded: dict[int, bytes | memoryview] = {}
+    if still_needed:
+        release_epoch = pool.release_epoch
+        reader = await pool.bucket(stream_id, bucket_id)
+        requests = sorted((chunk_idx, ChunkAddress(stream_id, bucket_id, chunk_idx)) for chunk_idx in still_needed)
+        decoded = await reader.read_chunks(requests)
+        # This fetch never registered with Pool._chunks's own
+        # AsyncKeyedCache (the whole point of going through read_chunks()
+        # instead of resolve()), so nothing else would stop a backfill
+        # from resurrecting an entry into a Pool a concurrent
+        # release_caches() call just emptied.
+        if pool.release_epoch == release_epoch:
+            for chunk_idx in still_needed:
+                pool.backfill_chunk(ChunkAddress(stream_id, bucket_id, chunk_idx), bytes(decoded[chunk_idx]))
+
+    resolved = {**already_cached, **decoded}
+    # read_chunks() bypasses Pool.read_chunk() entirely, so its own
+    # fingerprint-verification policy doesn't apply here unless applied
+    # explicitly, via this call.
+    await pool.verify_fingerprints(stream_id, bucket_id, resolved)
+    return resolved
+
+
 async def _fill_data_extent(
     pool: Pool,
     extent: Extent,
@@ -173,11 +239,9 @@ async def _fill_data_extent(
     Exactly one distinct chunk needed goes through ``Pool.read_chunk``
     unchanged, staying covered by ``Pool``'s own cross-call cache. More
     than one distinct chunk is grouped by ``(stream_id, bucket_id)`` (a
-    single extent can still straddle a bucket boundary) and
-    fetched via one ``BucketReader.read_chunks``
-    call per bucket instead of one ``Pool.read_chunk`` per chunk —
-    deliberately bypassing ``Pool``'s own cache in that case, the same
-    reasoning ``Pool.read_chunk``'s ``cache=False`` documents.
+    single extent can still straddle a bucket boundary) and resolved via
+    ``_resolve_bucket_group``, which still consults/backfills ``Pool``'s
+    cache for this case, unlike ``BucketReader.read_chunks()`` on its own.
 
     Implements this bucket-grouped fetch independently rather than calling
     into ``chunk_walk.py``'s plan/execute engine: this function's own range
@@ -214,16 +278,9 @@ async def _fill_data_extent(
         for (stream_id, bucket_id, chunk_idx), ks in needed.items():
             by_bucket.setdefault((stream_id, bucket_id), []).append((chunk_idx, ks))
         for (stream_id, bucket_id), items in by_bucket.items():
-            reader = await pool.bucket(stream_id, bucket_id)
-            requests = sorted((chunk_idx, ChunkAddress(stream_id, bucket_id, chunk_idx)) for chunk_idx, _ks in items)
-            decoded = await reader.read_chunks(requests)
-            # read_chunks() bypasses Pool.read_chunk() entirely -- its own
-            # fingerprint-verification policy doesn't apply here unless
-            # applied explicitly (see Pool.verify_fingerprints's own
-            # docstring for why this call site needs it).
-            await pool.verify_fingerprints(stream_id, bucket_id, decoded)
+            resolved = await _resolve_bucket_group(pool, stream_id, bucket_id, items)
             for chunk_idx, ks in items:
-                plain = decoded[chunk_idx]
+                plain = resolved[chunk_idx]
                 for k in ks:
                     fetched[k] = plain
 
@@ -253,13 +310,12 @@ async def _run_export_to(
     """Shared body of ``DedupFile.export_to()``/``ByteRangeView.export_to()``
     — both are already the same call into ``export_to``
     (which itself branches on ``isinstance(file_like, ByteRangeView)``),
-    so only one class's own ``export_to()`` docstring needs to state what
-    each keyword does."""
+    so keyword semantics are documented once, on ``DedupFile.export_to()``,
+    rather than kept in a second, driftable copy here."""
     # Deferred, not module-level: chunk_walk.py/export_scheduler.py both
     # import DedupFile from this module at their own module level, so a
-    # module-level import here would be a real circular import -- the
-    # same kind of crossing _Readable's own docstring above explains for
-    # units.base.ContentSource.
+    # module-level import back from either of them here would close the
+    # loop into a real circular import.
     from .chunk_walk import DEFAULT_WINDOW_ENTRIES
     from .export_scheduler import export_to as _export_to
 
@@ -279,8 +335,7 @@ async def _run_export_to(
 
 
 class DedupFile:
-    """The sole cross-layer contract: a logical,
-    byte-addressable file backed by one composition record.
+    """A logical, byte-addressable file backed by one composition record.
 
     ``size`` is supplied by the caller (``file_meta.file_size``,
     ``object_table.file_size``, ...) — this layer never infers it from the
@@ -322,10 +377,33 @@ class DedupFile:
         ``BucketReaderCache`` rather than one read at a time."""
         return self._pool
 
-    async def _get_record(self) -> CompositionRecord:
+    async def cached_record(self) -> CompositionRecord:
+        """This file's own ``CompositionRecord``, fetched once and cached
+        for the life of this ``DedupFile`` — a cold fetch on the first
+        call, the cached instance on every one after.
+
+        Exposed (not fully private) because ``CompositionRecord`` is a
+        real, shared unit with this class rather than an implementation
+        detail confined to it: ``units/device_pcps.py`` and
+        ``units/verify_reachable.py`` both need direct access to it (the
+        latter also via ``seed_record()``, to share one already-resolved
+        record across several ``DedupFile``s that address the same
+        composition) — one documented accessor here instead of each
+        reaching into ``._record`` on its own.
+        """
         if self._record is None:
             self._record = await self._comp_reader.record(self._comp_offset)
         return self._record
+
+    def seed_record(self, record: CompositionRecord) -> None:
+        """Sets this file's own cached ``CompositionRecord`` directly,
+        skipping the fetch ``cached_record()`` would otherwise make —
+        for a caller (``units/verify_reachable.py``) that already
+        resolved the same composition's record via a different
+        ``DedupFile`` sharing the same key, and wants every ``DedupFile``
+        addressing it to reuse that one instance rather than each
+        re-fetching its own copy."""
+        self._record = record
 
     async def _extents(self, start: int = 0, end: int | None = None) -> AsyncIterator[Extent]:
         """Yield ``Extent``\\ s covering ``[start, end)`` (default:
@@ -347,7 +425,7 @@ class DedupFile:
         for physical-chunk selection (``chunk_walk.py``); everything else
         wants ``read``/``stream``/``export_to``.
         """
-        record = await self._get_record()
+        record = await self.cached_record()
         cursor = start
         async for entry in record.entries(start, end):
             if entry.length == 0:
@@ -402,11 +480,11 @@ class DedupFile:
         return bytes(out)
 
     def stream(self, block: int = DEFAULT_STREAM_BLOCK) -> AsyncIterator[tuple[int, bytes]]:
-        """Yield ``(offset, bytes)`` blocks front-to-back — see
-        ``stream_via_read``'s own docstring for why this is just a
-        ``read(offset, block)`` loop (it inherits ``_fill_data_extent``'s
-        own bucket-merged reads for free; no separate bulk-read path to
-        keep in sync)."""
+        """Yield ``(offset, bytes)`` blocks front-to-back — just a
+        ``read(offset, block)`` loop, since ``read()`` already handles its
+        own chunking, so it inherits ``_fill_data_extent``'s own
+        bucket-merged reads for free; no separate bulk-read path to
+        keep in sync."""
         return stream_via_read(self, block)
 
     async def export_to(
@@ -435,8 +513,10 @@ class DedupFile:
 
         No ``verify_map_crc`` option here (or anywhere in the export
         path) — chunk-map CRC validation is ``verify``'s job specifically
-        (``synology-apm-repo-cli verify --level full``), not export's; see
-        ``units/verify_reachable.py``'s own module docstring."""
+        (``synology-apm-repo-cli verify --level full``), not export's:
+        FULL already does an equally thorough, equally costly check, so
+        export re-running it would only double that cost for no new
+        information."""
         return await _run_export_to(
             self,
             dst,
@@ -465,10 +545,9 @@ class DedupFile:
 class ByteRangeView:
     """A named sub-range of a ``DedupFile`` — the same read-contract
     shape (``size``/``read``/``stream``/``export_to``), coordinates
-    translated. Shared by every workload whose "file" is really just an
-    offset+length window into a bigger dedup file (FS's
-    ``content_dedup_id``, SaaS's ``object_table`` rows) rather than its
-    own composition record.
+    translated, for a workload whose "file" is really just an
+    offset+length window into a bigger dedup file rather than its own
+    composition record.
     """
 
     def __init__(self, base: DedupFile, offset: int, length: int) -> None:
