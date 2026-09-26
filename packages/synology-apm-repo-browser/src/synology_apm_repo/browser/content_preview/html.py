@@ -7,9 +7,7 @@ from __future__ import annotations
 
 import re
 
-from synology_apm_repo.sdk.presentation.format import format_bytes
-
-from ._common import _drop_trailing_unterminated_tag, _html_to_text, _truncate
+from ._common import _html_bytes_to_text_with_truncation_note, _truncate
 
 _HTML_SNIFF_RE = re.compile(rb"<!doctype\s+html|<html[\s>]", re.IGNORECASE)
 _HTML_SNIFF_WINDOW = 1024
@@ -30,15 +28,7 @@ def render_html_preview(data: bytes, *, max_chars: int = 4000) -> str | None:
     probe = data[:_HTML_SNIFF_WINDOW].lstrip(b"\xef\xbb\xbf \t\r\n")
     if not _HTML_SNIFF_RE.match(probe):
         return None
-    trimmed, dropped_label = _drop_trailing_unterminated_tag(data)
-    text = _html_to_text(trimmed.decode("utf-8", errors="replace"))
-    if dropped_label is not None:
-        # ">=": the read window itself is size-capped, so a real
-        # attribute this large may well continue past it — this is a
-        # lower bound on what was cut, verified as such, never claimed
-        # to be the attachment's real total size.
-        placeholder = f"[{dropped_label}, ≥{format_bytes(len(data) - len(trimmed))}, not shown in preview]"
-        text = f"{text}\n\n{placeholder}" if text else placeholder
+    text, _ = _html_bytes_to_text_with_truncation_note(data)
     if not text:
         return None
     return _truncate(text, max_chars)

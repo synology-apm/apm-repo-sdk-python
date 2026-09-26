@@ -136,11 +136,10 @@ def test_same_real_value_in_json_and_path_gets_identical_placeholder(anon: Modul
 def test_same_real_value_stable_across_separate_runs(anon: ModuleType) -> None:
     """No shared state is passed between the two calls below at all -- each
     gets its own fresh ``resolved`` *and* there is no module-level
-    ``ASSIGNMENTS``-equivalent to leak through either. This is the actual
-    property the redesign is for: two genuinely separate invocations
-    (different day, different process, different other fixtures in the
-    batch) derive the identical placeholder from the real value's hash
-    alone, not from anything remembered between them."""
+    ``ASSIGNMENTS``-equivalent to leak through either: two genuinely
+    separate invocations (different day, different process, different
+    other fixtures in the batch) derive the identical placeholder from the
+    real value's hash alone, not from anything remembered between them."""
     data = _workload_config_db({"spec": {"workload_name": "real-device-01"}})
 
     first_resolved: dict[str, str] = {}

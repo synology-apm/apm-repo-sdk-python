@@ -116,16 +116,11 @@ class _InstrumentedStore:
         return entries
 
     async def aclose(self) -> None:
-        """Forwards to ``backing``'s own ``aclose()`` when it has one
-        (``S3Store``/``AzureStore``); a no-op otherwise (``LocalFsStore``/
-        ``SmbStore``, which have nothing to close). Shared by
-        ``RecordingStore``/``TracingStore`` so wrapping a store this way
-        never silently drops its own close contract — without this,
-        ``Session.close()``'s own ``isinstance(store, AsyncCloseable)``
-        check finds no ``aclose`` on the wrapper at all (``@runtime_
-        checkable`` only looks at method *presence*), so a traced/recorded
-        ``S3Store``/``AzureStore``'s real ``aiohttp`` connector is never
-        closed."""
+        """Forwards to ``backing``'s own ``aclose()`` when it has one; a
+        no-op otherwise. Without this, ``Session.close()``'s
+        ``isinstance(store, AsyncCloseable)`` check would find no
+        ``aclose`` on the wrapper at all, leaving a traced/recorded
+        ``S3Store``/``AzureStore``'s real connector never closed."""
         await aclose_if_possible(self._backing)
 
 

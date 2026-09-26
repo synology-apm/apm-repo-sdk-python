@@ -96,11 +96,10 @@ class SaasStream:
         # DeviceProvider._resolve_meta_dir().
         self._stream_root = join_path(repo.layout.repo_root, "saas", str(connection_config_id), stream_uuid)
         # Single-value-per-key AsyncKeyedCache, keyed by logical name
-        # ("saas_snapshot"/"saas_version") -- gives concurrent callers on
-        # the same not-yet-opened connection real in-flight de-duplication
-        # instead of a race on a plain `if self._X is None: ...` check, now
-        # that SaasStreamCache (below) can share one SaasStream instance
-        # across concurrent Catalog.provider() calls.
+        # ("saas_snapshot"/"saas_version") -- real in-flight de-duplication
+        # (not a bare null-check race) now that SaasStreamCache (below) can
+        # share one SaasStream instance across concurrent Catalog.provider()
+        # calls.
         self._db_source_cache: AsyncKeyedCache[str, SqliteSource] = AsyncKeyedCache(self._fetch_db_source)
         # Deliberately its own cache, never sharing _db_source_cache's
         # "saas_version" entry even though stream_info and version_info
@@ -142,20 +141,12 @@ class SaasStream:
         self._last_open_resolution: tuple[VersionUid, int, int] | None = None
 
     async def close(self) -> None:
-        """Release every sqlite connection this instance opened.
-
-        Settles each cache before closing its entries: this instance can be
-        shared across concurrent callers (see ``SaasStreamCache``), so a
-        concurrent ``open_saas_obj()`` call can genuinely still be
-        resolving a connection at the moment the owning ``SaasStreamCache``
-        evicts and closes this stream, and a value that lands afterward
-        must not go unclosed.
-
-        The table cache goes with them: each ``Table`` it holds is bound to one
-        of these connections, so keeping them would turn this instance's
-        documented lazy-reopen (every ``_*_connection()`` getter rebuilds from
-        scratch) into a failure against a closed connection.
-        """
+        """Release every sqlite connection this instance opened. Settles
+        each cache before closing its entries — a connection can still be
+        resolving when a shared instance (see ``SaasStreamCache``) is
+        evicted, and settling first ensures it doesn't leak unclosed.
+        Invalidates the table cache too: its ``Table`` objects are bound
+        to these connections."""
         self._table_cache.invalidate()
         db_sources, _errors = await self._db_source_cache.settle_all()
         for source in db_sources.values():
@@ -227,21 +218,11 @@ class SaasStream:
     async def _snapshot_connection_via_generation_fallback(self) -> aiosqlite.Connection:
         """Re-resolve ``saas_snapshot`` skipping the bare-file preference,
         closing and replacing whatever ``_snapshot_connection`` had
-        already cached.
-
-        Safe under concurrency only because this method's sole caller
-        (``_open_table_with_fallback``, via ``stream_version_for``'s fixed
-        ``"snapshot_info"`` table_name/columns) is itself serialized by
-        ``_table_cache``'s own in-flight de-duplication: at most one
-        execution of ``primary``/``fallback`` for this table ever runs at
-        a time per ``SaasStream`` instance, no matter how many concurrent
-        catalog ``Version`` resolutions are in flight. Calling this
-        directly, outside that guarantee, while a concurrent
-        ``_snapshot_connection()`` fetch for the same key is genuinely
-        in flight would silently return that other call's own
-        non-fallback result instead of ever running this fetch —
-        ``AsyncKeyedCache.resolve()``'s override-fetch argument only ever
-        reaches the fetch's "owner", never a later "waiter"."""
+        already cached. Safe only when reached through
+        ``_open_table_with_fallback`` (which serializes it via
+        ``_table_cache``'s in-flight de-duplication) — a direct concurrent
+        call could silently return another in-flight fetch's non-fallback
+        result instead of running the fallback."""
         existing = self._db_source_cache.get("saas_snapshot")
         if existing is not None:
             await existing.close()
@@ -254,12 +235,9 @@ class SaasStream:
         return source.connection
 
     async def _version_connection_via_generation_fallback(self) -> aiosqlite.Connection:
-        """``_snapshot_connection_via_generation_fallback``'s counterpart
-        for ``saas_version``. Carries the identical concurrency
-        precondition: safe only because its sole caller
-        (``_open_table_with_fallback``, via ``stream_version_for``'s fixed
-        ``"version_info"`` table_name/columns) is serialized one level up
-        by ``_table_cache``'s in-flight de-duplication."""
+        """``saas_version``'s counterpart to
+        ``_snapshot_connection_via_generation_fallback`` — same shape,
+        same concurrency precondition."""
         existing = self._db_source_cache.get("saas_version")
         if existing is not None:
             await existing.close()
@@ -280,16 +258,10 @@ class SaasStream:
         return source.connection
 
     async def _stream_info_connection_via_generation_fallback(self) -> aiosqlite.Connection:
-        """``_version_connection_via_generation_fallback``'s counterpart,
-        scoped to ``_stream_info_source_cache`` alone -- deliberately
-        never falls back through ``_db_source_cache``'s own
-        ``"saas_version"`` entry, for the same reason ``__init__`` keeps
-        the two caches separate in the first place. Carries the identical
-        concurrency precondition as its two siblings above: safe only
-        because its sole caller (``_open_table_with_fallback``, via
-        ``_fetch_latest_complete_version``'s fixed ``"stream_info"``
-        table_name/columns) is serialized one level up by
-        ``_table_cache``'s in-flight de-duplication."""
+        """``_snapshot_connection_via_generation_fallback``'s counterpart
+        for ``_stream_info_source_cache`` — kept separate from
+        ``_db_source_cache`` (see ``__init__``); same concurrency
+        precondition as its two siblings above."""
         existing = self._stream_info_source_cache.get(None)
         if existing is not None:
             await existing.close()
@@ -594,22 +566,16 @@ class SaasStreamCache:
         self._in_use: dict[tuple[int, str], int] = {}
 
     async def _stream_for(self, key: tuple[int, str]) -> SaasStream:
-        """The bounded-LRU counterpart of what ``AsyncKeyedCache.resolve``
-        would do here — hand-rolled rather than built on that primitive
-        since evicting a live resource needs an explicit close, which
-        ``AsyncKeyedCache`` has no hook for. Evicts (and closes) the
-        least-recently touched stream **not currently in use** once
-        inserting a new one pushes this cache past ``maxsize`` — skips
-        eviction entirely for this call if every existing entry is
-        in use, rather than closing one still being read from.
+        """Bounded-LRU stream lookup, hand-rolled rather than built on
+        ``AsyncKeyedCache`` (which has no hook for closing an evicted
+        entry). Evicts and closes the least-recently-touched stream not
+        currently in use once a new entry pushes past ``maxsize``;
+        exceeds ``maxsize`` rather than closing one still in use.
 
-        Requires ``key`` to already be marked in ``_in_use`` by the caller
-        (``open_saas_obj``, before this method is ever called) — this
-        method itself can ``await`` below (closing an evicted sibling),
-        and without that precondition a concurrent caller racing through
-        this same eviction loop for a *different* key could otherwise
-        pick this call's own just-inserted, not-yet-protected entry as
-        its victim."""
+        Requires ``key`` already marked in ``_in_use`` by the caller
+        (``open_saas_obj``) before this runs — otherwise a concurrent
+        eviction for a different key could pick this call's own
+        not-yet-protected entry as its victim."""
         stream = self._streams.get(key)
         if stream is not None:
             self._streams.move_to_end(key)
@@ -638,21 +604,11 @@ class SaasStreamCache:
         """``version``'s ``saas_obj``, via the shared ``SaasStream`` for
         its ``(connection_config_id, saas_stream_uuid)`` — see
         ``SaasStream.open_saas_obj`` for resolution/error semantics.
-
-        Marked in-use for this call's duration *before* ``_stream_for``
-        even runs, not after it returns: ``_stream_for`` itself can
-        ``await`` (closing an evicted sibling) between inserting this
-        call's own key and handing the stream back, and a concurrent
-        call for a different key racing through its own eviction loop
-        during that window would otherwise see this key as not-yet-in-use
-        and evict-and-close it out from under this call before it ever
-        gets to mark it (see ``_in_use``).
-
-        The ``finally`` block below tolerates ``key`` already being gone
-        from ``_in_use`` — a concurrent ``close()`` of this whole cache
-        clears it unconditionally, and this call's own bookkeeping must
-        not raise ``KeyError`` on top of (and masking) whatever
-        ``close()`` racing this call already did to the stream itself."""
+        Marks the key in-use *before* ``_stream_for`` runs, since that
+        call can itself await (closing an evicted sibling) — marking
+        first prevents a concurrent eviction from closing this key out
+        from under it. Tolerates the key already being gone from
+        ``_in_use`` (a concurrent whole-cache ``close()``)."""
         key = _stream_key(version)
         self._in_use[key] = self._in_use.get(key, 0) + 1
         try:

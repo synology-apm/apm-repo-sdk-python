@@ -7,6 +7,8 @@ from __future__ import annotations
 import re
 from html.parser import HTMLParser
 
+from synology_apm_repo.sdk.presentation.format import format_bytes
+
 #: Shared placeholder for a real field this specific unit genuinely
 #: doesn't have a value for (an event with no location, a contact with
 #: no email, ...) — never a raw internal id or a blank line standing in
@@ -107,15 +109,12 @@ def _drop_trailing_unterminated_tag(data: bytes) -> tuple[bytes, str | None]:
         placeholder built from it instead of the content just vanishing
         with no trace.
     """
-    # CPython's HTMLParser.close() dumps an unterminated tag's whole
-    # remaining buffer as literal text when it finds no closing ``>``/``<``
-    # anywhere in it — guaranteed for base64, whose alphabet has neither
-    # character — so raw base64 would otherwise fill the whole detail
-    # pane. Dropping back to the last real ``>`` is safe by construction
-    # for base64 (``>`` never appears in it); it merely bounds, rather
-    # than eliminates, the residual risk for some other very-long
-    # attribute value that happens to contain a literal ``>`` before its
-    # own closing quote.
+    # CPython's HTMLParser silently drops an unterminated tag (and anything
+    # read into it, e.g. a large base64 payload) rather than emitting it as
+    # text. Without this guard a real trailing tag (an image, a cut-off
+    # field) simply vanishes from the preview with no indication anything
+    # was cut; this turns that silent loss into an explicit, labeled
+    # placeholder.
     safe_end = data.rfind(b">")
     if safe_end < 0:
         return data, None
@@ -125,3 +124,36 @@ def _drop_trailing_unterminated_tag(data: bytes) -> tuple[bytes, str | None]:
         return data, None  # trailing plain text/whitespace, not a truncated tag — nothing to flag
     label = _TRUNCATED_TAG_LABELS.get(tag_match.group(1).lower(), _TRUNCATED_TAG_DEFAULT_LABEL)
     return data[: safe_end + 1], label
+
+
+def _truncation_placeholder(label: str, dropped_bytes: int) -> str:
+    """The note shown in place of whatever ``_drop_trailing_unterminated_tag``
+    dropped — shared by every renderer that can hit that guard. ``≥``:
+    the read window itself is size-capped, so a real attribute this large
+    may well continue past it — ``dropped_bytes`` is a lower bound on what
+    was cut, never claimed to be the attachment's real total size."""
+    return f"[{label}, ≥{format_bytes(dropped_bytes)}, not shown in preview]"
+
+
+def _html_bytes_to_text_with_truncation_note(data: bytes) -> tuple[str, bool]:
+    """``_drop_trailing_unterminated_tag`` + ``_html_to_text`` + an explicit
+    note for whatever the trim dropped — shared by every renderer that
+    converts a self-contained HTML byte string straight to plain text.
+    ``teams_chat.py``'s own transcript parser needs its own conversion
+    step, so it calls ``_drop_trailing_unterminated_tag``/
+    ``_truncation_placeholder`` directly instead of this one.
+
+    Returns ``(text, has_real_content)`` — ``has_real_content`` is whether
+    ``_html_to_text``'s own converted output was non-blank *before* any
+    truncation note got appended, so a caller with somewhere else to fall
+    back to (``mail.py``) can tell "this alternative had real content plus
+    a note about what got cut" apart from "this alternative had nothing
+    but the note" — a placeholder-only result isn't the alternative
+    actually working."""
+    trimmed, dropped_label = _drop_trailing_unterminated_tag(data)
+    real_text = _html_to_text(trimmed.decode("utf-8", errors="replace"))
+    text = real_text
+    if dropped_label is not None:
+        placeholder = _truncation_placeholder(dropped_label, len(data) - len(trimmed))
+        text = f"{text}\n\n{placeholder}" if text else placeholder
+    return text, bool(real_text.strip())

@@ -35,17 +35,11 @@ _SQLITE_MAGIC = b"SQLite format 3\x00"
 
 
 def _build_service_db(table_name: str, *, padding_blob: bytes = b"") -> bytes:
-    """A real, valid SQLite file with a table name that
-    ``_SERVICE_TABLE_HINTS`` recognizes, ZSTD-compressed the way a real
-    service-level DB snapshot is stored inside a ``saas_obj`` object.
-    ``padding_blob``, when given, is stored as an extra ``config_table``
-    row's own BLOB value — inflating both the raw and (being close to
-    incompressible for random bytes) the compressed size without any
-    bytes existing outside the one real zstd frame, unlike padding the
-    *compressed* output with trailing garbage (a shape
-    ``inspect_object()`` never actually sees: its own ``length`` always
-    comes from the connector's object-name index, exactly sized to the real
-    object)."""
+    """A real, valid SQLite file with a table name ``_SERVICE_TABLE_HINTS``
+    recognizes, ZSTD-compressed the way a real service-level DB snapshot is
+    stored. ``padding_blob``, when given, is stored as an extra
+    ``config_table`` row's BLOB value, inflating size without adding bytes
+    outside the one real zstd frame."""
     with tempfile.TemporaryDirectory() as td:
         path = Path(td) / "svc.db"
         conn = sqlite3.connect(path)
@@ -108,11 +102,8 @@ class TestSniff:
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         """``sniff()``'s own speculative ``peel()`` call (up to
-        ``_MAX_SNIFF_DECOMPRESS`` = 128 MiB, on data not yet confirmed to
-        even be real SQLite) is the other independent thread-hop this
-        module needed — a different call site than
-        ``TestDecompressServiceDb``'s, so verified separately rather than
-        assumed to follow from that one passing."""
+        ``_MAX_SNIFF_DECOMPRESS`` = 128 MiB) is a separate thread-hop from
+        ``TestDecompressServiceDb``'s, verified independently."""
         import synology_apm_repo.sdk.units.saas.services as services_module
 
         blob = _build_service_db("item_table")
@@ -173,19 +164,14 @@ class TestSniff:
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         """A candidate whose zstd magic matches but whose decompressed
-        size exceeds ``_MAX_SNIFF_DECOMPRESS`` must fall back to
-        ``BINARY``, the same as a genuinely non-zstd candidate — never
-        raise out of ``sniff()`` itself, which never raises.
-        ``_MAX_SNIFF_DECOMPRESS`` monkeypatched down so this
-        test doesn't need an actual 128 MiB payload to trip it.
-
-        Regression coverage for the cap's own reason to exist:
-        ``zstandard``'s one-shot ``decompress(data,
-        max_output_size=N)`` silently ignores the cap for a frame that
-        declares its own content size — the shape ``_build_service_db``
-        always produces, and the common real-world shape — so the
-        bounded path must use the streaming decompressor instead, or
-        this candidate would wrongly land on ``SERVICE_DB``."""
+        size exceeds ``_MAX_SNIFF_DECOMPRESS`` falls back to ``BINARY``,
+        never raises. ``zstandard``'s one-shot ``decompress(data,
+        max_output_size=N)`` silently ignores the cap for a
+        self-describing frame (the shape ``_build_service_db`` produces),
+        so the bounded path must use the streaming decompressor instead —
+        otherwise this candidate would wrongly land on ``SERVICE_DB``.
+        ``_MAX_SNIFF_DECOMPRESS`` monkeypatched down so the test doesn't
+        need an actual 128 MiB payload."""
         import synology_apm_repo.sdk.units.saas.services as services_module
 
         monkeypatch.setattr(services_module, "_MAX_SNIFF_DECOMPRESS", 1024)
@@ -211,13 +197,8 @@ class TestInspectObject:
 
     async def test_reads_the_full_object_when_over_the_cap_but_zstd_magic_matches(self) -> None:
         """A small head is read first to check the zstd magic; only a
-        genuine match costs the second, full read a real Teams
-        channel's message DB (well over this cap, compressed) needs — a
-        real service DB carrying a large, incompressible
-        BLOB row stands in for "a real object big enough to need the
-        full read" (not trailing garbage after the frame, which
-        ``inspect_object()`` never actually sees -- see
-        ``_build_service_db``'s ``padding_blob`` parameter above)."""
+        genuine match costs the second, full read. ``padding_blob``
+        simulates a real object large enough to need it."""
         big = _build_service_db("item_table", padding_blob=os.urandom(9 << 20))
         assert len(big) > (8 << 20), "test invariant: must actually be large enough to trip the 8 MiB cap"
         fake = _FakeDedupFile(big)
@@ -228,12 +209,11 @@ class TestInspectObject:
 
 
 class TestDecompressServiceDb:
-    """``decompress_service_db`` is ``async`` so its own
-    ``peel()`` call can hop to ``asyncio.to_thread`` — a real Teams
-    channel's message DB decompresses to tens of MiB, well within
-    real-world scale for a service DB, the same class of "multi-MB
-    decrypt+decompress must not block the event loop" work
-    ``dedup/pool/_bucket_reader.py`` already has a stated policy for."""
+    """``decompress_service_db`` is ``async`` so its ``peel()`` call can
+    hop to ``asyncio.to_thread`` — a real Teams channel's message DB
+    decompresses to tens of MiB, the same "must not block the event
+    loop" class of work ``dedup/pool/_bucket_reader.py`` already
+    handles."""
 
     async def test_decompresses_a_real_service_db(self) -> None:
         blob = _build_service_db("item_table")
@@ -284,30 +264,23 @@ class TestOpenServiceDb:
 
     async def test_raises_data_corrupt_on_severely_truncated_zstd_frame(self) -> None:
         """Truncated right after the frame header, with none of the
-        actual compressed block surviving. ``decompress_service_db``'s
-        own "unbounded" path is deliberately unbounded, not the one-shot
-        API with a size cap, since a real cap couldn't fit a real
-        service DB's legitimate size — for input this short, the
-        streaming reader itself doesn't raise, it simply produces zero
-        bytes. Still
-        correctly surfaces as ``DataCorruptError`` one layer down: zero bytes
-        is obviously not a SQLite file either."""
+        compressed block surviving. ``decompress_service_db``'s streaming
+        path is deliberately uncapped (a real cap couldn't fit a real
+        service DB's size), so for input this short it produces zero
+        bytes rather than raising — still correctly surfaces as
+        ``DataCorruptError`` one layer down, since zero bytes isn't a
+        SQLite file either."""
         compressed = zstandard.ZstdCompressor().compress(b"x" * 10_000)
         with pytest.raises(DataCorruptError, match="not a SQLite file"):
             await open_service_db(compressed[:8])
 
     async def test_raises_on_mid_frame_truncation_of_a_real_multi_block_db(self) -> None:
-        """Unlike the severely-truncated case above, truncating a
-        *larger*, multi-block real payload partway through produces
-        real, SQLite-magic-matching output: the early pages survive,
-        later ones don't. ``open_service_db`` itself doesn't raise for
-        this (it only materializes the bytes and opens a connection,
-        the same as it would for a real, intact file — SQLite itself is
-        lazy about page validation), exactly like every real caller in
-        this package that goes on to actually query the result. Caught
-        one layer down instead, the moment a real query touches the
-        malformed pages: real SQLite's own internal consistency check
-        raises."""
+        """Unlike the severely-truncated case, truncating a larger,
+        multi-block payload partway through produces real,
+        SQLite-magic-matching output where early pages survive but later
+        ones don't. ``open_service_db`` itself doesn't raise (SQLite is
+        lazy about page validation) — caught one layer down, the moment
+        a real query touches the malformed pages."""
         with tempfile.TemporaryDirectory() as td:
             path = Path(td) / "big.db"
             conn = sqlite3.connect(path)

@@ -1,57 +1,24 @@
-"""``SmbStore`` — a real, executable ``ObjectStore`` implementation for a
-repository reached over the MS-SMB protocol (SMB2/3) rather than a
-locally-mounted share.
+"""``SmbStore`` — an ``ObjectStore`` implementation for a repository reached
+over SMB2/3 rather than a locally-mounted share.
 
-``smbprotocol`` is imported lazily, inside ``__init__`` and each method,
-rather than at module scope — the same rationale ``storage/s3.py``'s module
-docstring gives for ``aioboto3``: it's always installed (a required
-dependency), but this module is imported unconditionally by
-``storage/__init__.py``, so a module-level import would make every caller
-of ``storage`` pay for it even when it never touches SMB.
+``smbclient`` is imported lazily (each method calls ``_import_smbclient``)
+and has no native-async surface, so this store's four methods are thin
+``asyncio.to_thread()`` wrappers around its synchronous API. Each instance
+keeps its own ``connection_cache`` rather than sharing ``smbclient``'s
+process-wide, server-keyed session bookkeeping, so closing one ``SmbStore``
+never tears down a connection a sibling instance is still using.
 
-Unlike ``S3Store``/``AzureStore``, ``smbprotocol`` has no native-async
-surface (no ``aiohttp`` foundation to sit on) — its ``smbclient`` submodule
-is a synchronous, ``os``-shaped API (``open_file``/``stat``/``listdir``,
-file objects with ``seek``/``read``). This store's four methods are thin
-``asyncio.to_thread()`` wrappers around that synchronous body, the same
-shape ``LocalFsStore`` uses for ``os.pread``/``os.fstat``/``iterdir`` —
-not the native-async pattern the other two network backends use.
+Requests are routed through a small pool of independent sessions
+(``_DEFAULT_CONNECTION_POOL_SIZE``) rather than one shared session, because
+an SMB2 connection's flow-control credit window starts at exactly 1 and
+only grows as the server replies — two requests in flight at once on one
+connection would race for that single credit.
 
-``smbclient``'s session/connection bookkeeping is process-wide by default
-(keyed by server/port), which would let ``aclose()`` on one ``SmbStore``
-tear down a connection a sibling instance sharing the same server is still
-using. Every call here passes its own ``connection_cache`` dict instead,
-scoping each underlying SMB session to this instance alone — the same
-per-instance isolation ``S3Store``/``AzureStore`` get for free from owning
-their own client object.
-
-This store keeps a small *pool* of independent sessions
-(``_DEFAULT_CONNECTION_POOL_SIZE``), not one shared session — see
-``_ConnectionSlot`` and ``_call_with_retry`` for why: an SMB2 connection's
-own client-side flow-control window (``smbprotocol``'s "credits") starts at
-exactly 1 and only grows as the server grants more back on replies, so any
-two requests genuinely in flight at once on *one* connection race for that
-single credit and one of them gets a raised ``smbprotocol.exceptions.
-SMBException``. Rather than track that live, per-connection credit count
-(which would mean reaching into ``smbprotocol`` internals this module
-otherwise stays well clear of), every operation is instead routed through
-one of a small number of independent connections, each never handling more
-than one in-flight request at a time — real, safe parallelism up to the
-pool size, without ever needing to know how large any one connection's
-window currently is.
-
-One contract difference from ``LocalFsStore``, in the other direction from
-``S3Store``/``AzureStore``: an SMB share has real directory entities (like
-a local filesystem, unlike an object store's prefixes), so ``listdir`` on
-a missing path raises ``NotFoundError``, matching ``LocalFsStore`` rather than
-the S3/Azure prefix-probing behavior.
-
-Unlike ``S3Store``/``AzureStore``, ``smbprotocol`` gives this module no
-timeout/retry knobs of its own to configure past the initial connect —
-a stalled share would otherwise block a call forever, and neither a
-connect nor a later operation failure carries any signal distinguishing
-"worth retrying" from "never will be" — so this module adds both itself,
-via ``_DEFAULT_OPERATION_TIMEOUT``/``_DEFAULT_MAX_ATTEMPTS`` below.
+Unlike ``S3Store``/``AzureStore``, an SMB share has real directory entities,
+so ``listdir`` on a missing path raises ``NotFoundError`` (matching
+``LocalFsStore``). ``smbprotocol`` also gives no timeout/retry past the
+initial connect, so this module adds both itself
+(``_DEFAULT_OPERATION_TIMEOUT``/``_DEFAULT_MAX_ATTEMPTS`` below).
 """
 
 from __future__ import annotations
@@ -71,129 +38,76 @@ _T = TypeVar("_T")
 
 _DEFAULT_PORT = 445
 
-# smbprotocol's own default connect timeout (60s, smbclient.register_session's
-# own connection_timeout parameter) is tuned for a long-running batch job, not
-# an interactive "is this share even reachable" probe — S3Store/AzureStore cap
-# their own long batch-job default timeouts the same way, down to a value an
-# interactive caller (the TUI's connect dialog, in particular) can actually
-# wait through when an endpoint is unreachable.
+# smbprotocol's own connect timeout (60s) is tuned for a batch job, not an
+# interactive reachability probe — capped here the same way S3Store/AzureStore
+# cap theirs, to a value the TUI's connect dialog can wait through.
 _DEFAULT_CONNECTION_TIMEOUT = 5
 
-# smbprotocol has no timeout of its own for anything *after* a successful
-# connect: its underlying socket is switched to blocking mode with no
-# timeout the moment connect() succeeds
-# (smbprotocol.transport.Tcp.connect()'s own self._sock.settimeout(None)),
-# so a share that stops responding mid-operation would otherwise block a
-# real open_file()/read()/stat()/listdir() call forever, unlike
-# S3Store/AzureStore (whose own read_timeout already covers this). Every
-# one of this store's four methods routes through _call_with_retry, which
-# wraps the blocking call in asyncio.wait_for(timeout=this) instead — the
-# calling coroutine gets its own bounded wait even though the underlying
-# blocked worker thread itself can't be cancelled (the same trade-off any
-# asyncio.to_thread() call around a library with no native cancellation
-# has) and is simply abandoned until its own call eventually returns or
-# the process exits.
+# smbprotocol has no timeout after a successful connect (its socket becomes
+# blocking with no timeout), so every method routes through _call_with_retry,
+# which wraps the blocking call in asyncio.wait_for(timeout=this).
 _DEFAULT_OPERATION_TIMEOUT = 15
 
-# smbprotocol has no retry mechanism of its own for either the initial
-# connect or a later operation — both go through this store's own retry
-# loop instead, matching storage/s3.py's own _DEFAULT_MAX_ATTEMPTS value.
-# A retried operation always drops its own slot's session first (see
-# _drop_slot_session) so the retry reconnects rather than reusing a
-# connection already known to be stuck.
+# smbprotocol has no retry of its own; a retried operation drops its slot's
+# session first (see _drop_slot_session) so the retry reconnects rather than
+# reusing a connection already known to be stuck.
 _DEFAULT_MAX_ATTEMPTS = 2
 
-# Each slot is a real, separately-authenticated SMB session — costly to
-# establish, unlike a pooled HTTP socket — so this stays far smaller than
-# S3Store's _DEFAULT_MAX_POOL_CONNECTIONS (32). It's also deliberately kept
-# below units/verify_reachable.py's own _MAX_CONCURRENT_BUCKET_CHECKS (8):
-# FULL verify's multiprocess dispatch already runs up to
-# concurrency.default_worker_count() (commonly 8) separate worker
-# processes for a describable store like this one, each independently
-# rebuilding its *own* pool of this size, so the real worst case for one
-# repository's FULL verify is `workers * this constant` concurrent
-# sessions against the same physical server, not this constant alone.
+# Each slot is a real, separately-authenticated SMB session, costly to
+# establish — far smaller than S3Store's _DEFAULT_MAX_POOL_CONNECTIONS (32),
+# and deliberately kept below units/verify_reachable.py's own
+# _MAX_CONCURRENT_BUCKET_CHECKS (8): FULL verify's multiprocess dispatch runs
+# up to concurrency.default_worker_count() worker processes, each rebuilding
+# its own pool of this size, so the real worst case is `workers * this
+# constant` concurrent sessions against one server, not this constant alone.
 _DEFAULT_CONNECTION_POOL_SIZE = 2
 
-# A short pause before retrying a credit-exhaustion race (see
-# _is_credit_exhaustion) rather than immediately re-attempting — gives
-# whatever raced this store's own request for the connection's sole
-# starting credit a moment to return it. Deliberately much shorter than a
-# real reconnect: the connection itself is healthy here, this is only ever
-# waiting out a transient flow-control condition.
+# Short pause before retrying a credit-exhaustion race (see
+# _is_credit_exhaustion) — the connection itself is healthy, this only waits
+# out a transient flow-control condition.
 _CREDIT_RETRY_DELAY = 0.1
 
-#: ``OSError.errno`` values ``smbclient`` raises for "this path doesn't
-#: exist"-shaped failures — ``ENOENT`` (missing path), ``ENOTDIR`` (a path
-#: component, or the ``listdir`` target itself, isn't a directory), and
-#: ``EISDIR`` (opening a directory for a byte-oriented ``read()``). All three
-#: are this contract's own ``NotFoundError``, the same set ``LocalFsStore``
-#: maps from the equivalent builtin exception types.
+#: ``OSError.errno`` values ``smbclient`` raises for a missing path:
+#: ``ENOENT``, ``ENOTDIR``, and ``EISDIR`` (opening a directory for a
+#: byte-oriented ``read()``) — mapped to ``NotFoundError``, the same set
+#: ``LocalFsStore`` maps from the equivalent builtin exceptions.
 _NOT_FOUND_ERRNOS = frozenset({errno.ENOENT, errno.ENOTDIR, errno.EISDIR})
 
-#: ``OSError.errno`` values for "the path exists but access was denied"
-#: (share/file permissions, or a credential without list/read rights) —
-#: this contract's own ``PermissionDeniedError``, the same distinction
-#: ``LocalFsStore`` draws from the equivalent builtin ``PermissionError``.
-#: Deliberately not ``errno.EPERM``: ``smbclient``'s own error-mapping table
+#: ``OSError.errno`` for "exists but access denied" -> ``PermissionDeniedError``.
+#: Deliberately not ``errno.EPERM``: ``smbclient``'s error-mapping table
 #: (``smbprotocol.exceptions.SMBOSError.__init__``) uses ``EPERM``
 #: exclusively for ``STATUS_SHARING_VIOLATION`` (a file locked by another
-#: client, a transient conflict, not an access-control failure) — folding
-#: it in here would mislabel that case.
+#: client — a transient conflict, not an access-control failure).
 _PERMISSION_DENIED_ERRNOS = frozenset({errno.EACCES})
 
-#: ``smbprotocol``'s own ``NtStatus.STATUS_ACCESS_DENIED`` (0xC0000022) —
-#: hardcoded rather than importing ``smbprotocol.header.NtStatus`` at
-#: module scope, the same lazy-import policy the module docstring above
-#: gives for ``smbprotocol`` itself (and the same trade-off
-#: ``storage/local.py``'s
-#: ``_DARWIN_F_RDADVISE`` constant already makes). This is the actual NT
-#: status an SMB server sends for a plain "access denied" (an unlistable
-#: directory's real-world response) — yet ``SMBOSError``'s own mapping
-#: table above has no entry for it at all, so it falls through to that
-#: table's default and comes back as ``errno=0``. A permission failure
-#: over real SMB therefore has to be recognized by this raw status code,
-#: not by ``errno`` alone.
+#: ``smbprotocol``'s ``NtStatus.STATUS_ACCESS_DENIED`` (0xC0000022), hardcoded
+#: rather than imported: ``SMBOSError``'s own mapping table has no entry for
+#: it, so it falls through to ``errno=0`` — a permission failure over real
+#: SMB has to be recognized by this raw status code, not by ``errno`` alone.
 _STATUS_ACCESS_DENIED = 0xC0000022
 
 
 def _is_permission_denied(exc: OSError) -> bool:
-    """Whether ``exc`` is a permission-denied condition: either an errno
-    ``smbclient`` does map to one (``EACCES``, from
-    ``STATUS_PRIVILEGE_NOT_HELD``), or the raw NT status it currently maps
-    to no errno at all (``STATUS_ACCESS_DENIED`` — see
-    ``_STATUS_ACCESS_DENIED``'s comment above for why that one has no
-    errno). ``.ntstatus`` is ``SMBOSError``-specific, not a plain
-    ``OSError`` attribute — absent on any other ``OSError`` this might be,
-    hence ``getattr`` with a default rather than a plain attribute
-    access."""
+    """Whether ``exc`` is a permission-denied condition: an errno
+    ``smbclient`` maps to one, or the raw NT status it maps to no errno at
+    all (``_STATUS_ACCESS_DENIED``). ``.ntstatus`` is ``SMBOSError``-specific,
+    hence ``getattr`` with a default."""
     return exc.errno in _PERMISSION_DENIED_ERRNOS or getattr(exc, "ntstatus", None) == _STATUS_ACCESS_DENIED
 
 
 def _is_credit_exhaustion(exc: Exception) -> bool:
     """Whether ``exc`` is smbprotocol's own SMB2 credit-window-exhaustion
-    signal (``Connection._send()``'s own flow-control check) — a transient,
-    connection-level condition, not real corruption. ``SMBException`` (a
-    plain ``Exception`` subclass, not an ``OSError``) has no distinct
-    subtype or attribute for this specific case, so — like
-    ``_is_permission_denied`` above matching on a raw NT status where
-    ``smbprotocol`` gives no dedicated errno — this matches on the fixed
-    message text ``_send()`` always raises with. Each pooled slot normally
-    handles one request at a time — the pool exists specifically so no two
-    requests ever race the same connection's single starting credit — so
-    this should be rare in practice; it's a defense-in-depth catch for whatever
-    the pool doesn't cover (a fresh connection's own background
-    keepalive/echo traffic racing this store's first real request on it,
-    say), not the primary fix."""
+    signal — a transient, connection-level condition, not real corruption.
+    ``SMBException`` has no distinct subtype for this case, so this matches
+    on the fixed message text ``Connection._send()`` always raises with."""
     from smbprotocol.exceptions import SMBException
 
     return isinstance(exc, SMBException) and "credits are available" in str(exc)
 
 
 def _import_smbclient() -> Any:
-    """Lazy ``import smbclient``, same rationale as the module docstring
-    above. Shared by every method here so the choice of what to import
-    lives in one place."""
+    """Lazy ``import smbclient`` — shared by every method here so the
+    choice of what to import lives in one place."""
     import smbclient
 
     return smbclient
@@ -216,15 +130,10 @@ def _raise_if_permission_denied(exc: OSError, path: str) -> None:
 
 
 class _ConnectionSlot:
-    """One pooled SMB session's own bookkeeping: ``connection_cache`` (the
-    per-session dict passed to every ``smbclient`` call) and ``ready``
-    (whether ``register_session`` has succeeded for it yet).
-
-    Needs no lock of its own to guard this state: ``SmbStore._acquire_slot``/
-    ``._release_slot`` (via the pool's semaphore + free-stack) guarantee a
-    slot is only ever checked out to one caller at a time, so no two callers
-    can ever race on the same slot's ``ready``/``connection_cache``
-    concurrently."""
+    """One pooled SMB session's bookkeeping: ``connection_cache`` (passed to
+    every ``smbclient`` call) and ``ready`` (whether ``register_session`` has
+    succeeded for it yet). Needs no lock: the pool's semaphore + free-stack
+    guarantee a slot is only ever checked out to one caller at a time."""
 
     __slots__ = ("connection_cache", "ready")
 
@@ -240,23 +149,14 @@ class SmbStore:
 
     ``username`` accepts the Windows-native ``DOMAIN\\username`` (or
     ``user@domain`` UPN) form directly; ``smbprotocol``'s own NTLM/SPNEGO
-    layer splits the domain back out of that single string, so this class
-    has no separate ``domain`` field to keep in sync with it. Leaving
-    ``username``/``password`` unset attempts an anonymous/guest session,
-    same as leaving S3/Azure's credential fields unset falls back to their
-    own ambient credential chains.
+    layer splits the domain back out. Leaving ``username``/``password``
+    unset attempts an anonymous/guest session.
 
-    Backed by a small pool of ``_DEFAULT_CONNECTION_POOL_SIZE`` independent
-    SMB sessions, not one shared session — an SMB2 connection's own
-    client-side flow-control window starts at exactly 1, so two requests
-    in flight at once on one connection would race for that single
-    credit — each created lazily on first checkout rather than in
-    ``__init__`` (which does no I/O). A call checks out whichever slot is
-    currently free — preferring one already connected, via a LIFO
-    free-stack, so sequential, non-overlapping calls keep reusing the same
-    session instead of needlessly spreading across the whole pool — and
-    holds it exclusively until that call (including any of its own
-    retries) finishes.
+    Backed by a pool of independent SMB sessions (see module docstring),
+    each created lazily on first checkout. A call checks out whichever slot
+    is free, preferring one already connected via a LIFO free-stack so
+    sequential calls reuse the same session, and holds it exclusively until
+    that call (including its own retries) finishes.
     """
 
     def __init__(
@@ -286,10 +186,9 @@ class SmbStore:
         return f"{base}\\{combined}" if combined else base
 
     async def _acquire_slot(self) -> _ConnectionSlot:
-        """Waits for a free slot (bounded by ``_pool_semaphore``) and pops
-        one off the LIFO free-stack — see the class docstring for why LIFO,
-        not round-robin. Always paired with ``_release_slot`` in a
-        ``finally`` by ``_call_with_retry``, the only caller."""
+        """Waits for a free slot and pops one off the LIFO free-stack.
+        Always paired with ``_release_slot`` in a ``finally`` by
+        ``_call_with_retry``, the only caller."""
         await self._pool_semaphore.acquire()
         return self._free_slots.pop()
 
@@ -299,17 +198,12 @@ class SmbStore:
 
     async def _ensure_slot_session(self, slot: _ConnectionSlot) -> Any:
         """The registered SMB session for ``slot``, created on first use.
-        Needs no lock: a slot is only ever passed in here by
-        ``_call_with_retry`` while that slot is checked out exclusively to
-        the current caller, so no other caller can be concurrently
-        touching the same slot's ``ready``/``connection_cache``.
+        Needs no lock: only ever called while ``slot`` is checked out
+        exclusively to the current caller.
 
-        The connect attempt itself is retried up to ``_DEFAULT_MAX_ATTEMPTS``
-        times — ``smbprotocol`` raises a plain ``ValueError``/``OSError``
-        for a connect timeout/failure (``smbprotocol.transport.Tcp.connect``),
-        with nothing further downstream distinguishing "worth retrying"
-        from "never will be," so this retries either kind alike, the same
-        blanket policy ``storage/s3.py``'s own ``max_attempts`` applies."""
+        The connect attempt is retried up to ``_DEFAULT_MAX_ATTEMPTS`` times
+        on either ``ValueError``/``OSError`` (``smbprotocol`` gives no way to
+        distinguish "worth retrying" from "never will be")."""
         smbclient = _import_smbclient()
         if not slot.ready:
             last_exc: Exception | None = None
@@ -334,30 +228,21 @@ class SmbStore:
         return smbclient
 
     def _drop_slot_session(self, slot: _ConnectionSlot) -> None:
-        """Discard ``slot``'s own session/``connection_cache`` without
-        attempting a graceful close — used by ``_call_with_retry`` after a
-        timed-out operation, whose underlying connection may itself be
-        unable to complete a clean ``smbclient.delete_session()``
-        round-trip (the same reason the operation timed out in the first
-        place). The next attempt on this slot re-establishes a fresh
-        session via ``_ensure_slot_session()`` instead of reusing a
-        connection already known to be stuck."""
+        """Discard ``slot``'s session/``connection_cache`` without a
+        graceful close — the next attempt re-establishes a fresh session via
+        ``_ensure_slot_session()`` instead of reusing a connection already
+        known to be stuck."""
         slot.ready = False
         slot.connection_cache = {}
 
     async def _call_with_retry(self, fn: Callable[[dict[Any, Any]], _T]) -> _T:
-        """Checks out one pooled slot (see ``_acquire_slot``) and runs
-        ``fn`` — each public method below passes its own ``_*_sync`` call,
-        already bound to its own path/offset/length arguments, as a closure
-        taking just the connection cache to use — in a worker thread,
-        bounded by ``_DEFAULT_OPERATION_TIMEOUT``. Retried up to
-        ``_DEFAULT_MAX_ATTEMPTS`` times on either a timeout (which also
-        drops the slot's session, so the retry reconnects rather than
-        reusing a connection already known to be stuck) or a credit-
-        exhaustion race (see ``_is_credit_exhaustion`` — the session itself
-        is fine there, so it's kept, just after a short pause). The slot is
-        always released back to the pool in a ``finally``, whether this
-        call ultimately succeeds or exhausts every attempt.
+        """Checks out one pooled slot and runs ``fn`` (each public method
+        below passes its own ``_*_sync`` call, bound to its own
+        path/offset/length arguments) in a worker thread, bounded by
+        ``_DEFAULT_OPERATION_TIMEOUT``. Retried up to ``_DEFAULT_MAX_ATTEMPTS``
+        times on a timeout (drops the slot's session first) or a credit-
+        exhaustion race (session kept, see ``_is_credit_exhaustion``). The
+        slot is always released back to the pool in a ``finally``.
         """
         slot = await self._acquire_slot()
         try:
@@ -381,23 +266,14 @@ class SmbStore:
             self._release_slot(slot)
 
     async def aclose(self) -> None:
-        """Tear down every pooled slot's own SMB session that was ever
-        used — safe to call more than once, and scoped to this instance's
-        own slots alone (each with its own private ``connection_cache``,
-        rather than sharing ``smbclient``'s process-wide, server-keyed
-        session bookkeeping), so it never disturbs another
-        ``SmbStore`` sharing the same server.
+        """Tear down every pooled slot's SMB session — safe to call more
+        than once, and scoped to this instance's own slots (never disturbs
+        a sibling ``SmbStore`` on the same server).
 
-        Acquires every slot's own checkout permit first (the same
-        semaphore ``_acquire_slot`` uses, drained down to zero free slots)
-        before touching any slot's ``ready``/``connection_cache`` — a slot
-        still checked out to an in-flight ``_call_with_retry`` caller (mid
-        ``_ensure_slot_session``, or mid read/stat/listdir on an already
-        -established one) can't have its own permit acquired here until
-        that caller releases it, so this never tears a slot down out from
-        under one. Releases every permit back afterward, so this store is
-        still usable (a later call simply re-establishes whichever
-        sessions it needs) rather than left permanently unusable."""
+        Acquires every slot's checkout permit first, so an in-flight
+        ``_call_with_retry`` caller can't have its slot torn down mid-call;
+        releases every permit afterward, so the store is still usable (a
+        later call simply re-establishes whichever sessions it needs)."""
         for _ in self._slots:
             await self._pool_semaphore.acquire()
         try:
@@ -442,14 +318,10 @@ class SmbStore:
     ) -> bytes:
         unc = self._unc(path)
         try:
-            # share_access="rwd": smbclient.open_file()'s own default for
-            # mode="rb" only implies FILE_SHARE_READ, unlike its stat()/
-            # listdir() (which already request full "rwd" sharing) - a
-            # live repository can have a file open for writing elsewhere
-            # (this is an offline *reader*, never the only client touching
-            # it), and a narrower share mode here would raise a spurious
-            # STATUS_SHARING_VIOLATION purely from this store's own
-            # unnecessarily strict open request, not a real conflict.
+            # share_access="rwd": mode="rb"'s own default only implies
+            # FILE_SHARE_READ, which would raise a spurious
+            # STATUS_SHARING_VIOLATION against a file open for writing
+            # elsewhere (this is an offline reader, never the only client).
             with smbclient.open_file(unc, mode="rb", share_access="rwd", connection_cache=connection_cache) as f:
                 if offset:
                     f.seek(offset)

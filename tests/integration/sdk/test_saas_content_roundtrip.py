@@ -120,10 +120,8 @@ async def mail_family_repo(
     ``ReplayStore``-backed repository across tests is safe because it
     answers purely from a static dict, with no call-order tracking. Each
     test still builds and closes its own provider on top of it.
-    Function-scoped (not module-scoped) because it depends on
-    ``record_target``, itself function-scoped (default pytest fixture
-    scope) — pytest forbids a wider-scoped fixture depending on a
-    narrower-scoped one."""
+    Function-scoped because ``record_target``, which it depends on, is
+    itself function-scoped."""
     async with await _open_repo(record_target, "saas_content_mail_family_apv1.json.gz") as r:
         yield r
 
@@ -229,11 +227,9 @@ async def test_m365_exchange_mail_workload_resolves_to_its_folder_and_lists_its_
         try:
             groups = await provider.children(provider.root())
             mail_group = next(g for g in groups if g.name == "Mail")
-            # The real mail_folder_table hierarchy resolves now (more than
-            # the single flat bucket a purely item-driven listing showed)
-            # — count messages across however many real folders/subfolders
-            # they're actually spread across, rather than assuming exactly
-            # one top-level folder holds all of them.
+            # The real mail_folder_table hierarchy can nest a message under
+            # any depth of subfolders, so count leaves recursively rather
+            # than assuming one top-level folder holds all of them.
             assert await _count_leaves(provider, mail_group) == 122
         finally:
             await provider.close()
@@ -267,12 +263,6 @@ async def test_calendar_workload_resolves_and_lists_a_real_event_count_replayed(
 
 
 # -- Mail half: synthetic (CBT1's real mail_table has zero real mail rows) --
-# A message's body and an attachment's bytes are content a real fixture
-# can't narrow around -- reading either would make RecordingStore capture
-# that real content regardless of what the test then asserts -- so
-# attachment round-trip fidelity is proven synthetically instead, kept
-# here alongside its real-replay siblings above rather than split into a
-# separate tests/unit/ file.
 
 _STREAM_ID = 18
 _CCID = 1

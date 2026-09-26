@@ -62,23 +62,17 @@ _Key = tuple[str, ...]
 
 @dataclasses.dataclass(frozen=True)
 class SharedSaasContext:
-    """What every sibling candidate for a multi-candidate
-    ``Workload.sub_type`` (M365's ``USER_EXCHANGE``/``GROUP_EXCHANGE`` —
-    see ``units/dispatch.py``'s ``_SAAS_SUB_TYPE_CANDIDATES``) would
-    otherwise each independently resolve from the exact same ``(repo,
-    version)``: the version's ``saas_obj`` and its object-name index.
-    Resolved once via ``resolve_shared_saas_context`` and handed to
-    every candidate factory (see ``SaasWorkloadProvider.create``'s
-    ``shared`` parameter), instead of each of the 3-4 siblings paying
-    for its own ``open_saas_obj``/``resolve_object_name_index`` call for a
-    guaranteed byte-identical result.
+    """The ``(dedup_file, object_name_index)`` pair every sibling
+    candidate for a multi-candidate ``sub_type`` (M365's
+    ``USER_EXCHANGE``/``GROUP_EXCHANGE`` — see ``units/dispatch.py``'s
+    ``_SAAS_SUB_TYPE_CANDIDATES``) would otherwise each resolve
+    independently for the same ``(repo, version)`` — resolved once via
+    ``resolve_shared_saas_context`` and passed to every candidate factory
+    (``SaasWorkloadProvider.create``'s ``shared`` parameter).
 
-    Neither field needs closing: ``DedupFile`` has no ``close()`` at
-    all (a stateless, explicit-offset read view), and ``ObjectNameIndex``
-    is a plain, connection-free dataclass. The stream this was resolved
-    through (the caller's shared ``SaasStreamCache``) is borrowed, not
-    owned, by ``resolve_shared_saas_context`` either — there is nothing
-    left for this dataclass itself to release."""
+    Neither field needs closing: ``DedupFile`` has no ``close()`` (a
+    stateless, explicit-offset read view), and ``ObjectNameIndex`` is a
+    plain, connection-free dataclass."""
 
     dedup_file: DedupFile
     object_name_index: ObjectNameIndex | None
@@ -87,15 +81,10 @@ class SharedSaasContext:
 async def resolve_shared_saas_context(
     repo: DedupRepo, version: Version, saas_streams: SaasStreamCache
 ) -> SharedSaasContext:
-    """Resolve the one ``(dedup_file, object_name_index)`` pair every
-    candidate for a multi-candidate ``sub_type`` would otherwise
-    resolve independently for itself (see ``SharedSaasContext`` for why
-    neither field needs closing). ``saas_streams`` is borrowed, not
-    owned — the caller's shared ``SaasStreamCache`` opens (and keeps
-    open, for reuse by other versions of the same stream) the
+    """Resolve the pair ``SharedSaasContext`` documents. ``saas_streams``
+    is borrowed, not owned — opens (and keeps open, for reuse) the
     ``SaasStream`` this resolves ``dedup_file`` through, rather than a
-    throwaway instance this function would otherwise need to close
-    itself."""
+    throwaway instance this function would need to close itself."""
     dedup_file = await saas_streams.open_saas_obj(version)
     object_name_index = await resolve_object_name_index(repo, version)
     return SharedSaasContext(dedup_file=dedup_file, object_name_index=object_name_index)
@@ -415,16 +404,12 @@ class SaasWorkloadProvider:
 
     @property
     def object_name_index(self) -> ObjectNameIndex | None:
-        """The same ``ObjectNameIndex`` resolution ``create`` already did
-        once — ``None`` under the exact same conditions documented
-        there. A config's own ``tree_factory``/``assemble`` callbacks
-        that need to look up a secondary table via
-        ``read_indexed_table`` (``mail.py``'s folder-name/label
-        lookups, ``contact.py``'s equivalents) should read this rather
-        than calling ``resolve_object_name_index`` again — same repository, same
-        version, guaranteed identical result, so a second call only
-        pays for a repeat SQL query and JSON parse (an extra vault-key
-        decrypt too, on an encrypted repository) for nothing."""
+        """The same resolution ``create`` already did once — read this
+        rather than calling ``resolve_object_name_index`` again (a
+        config's ``tree_factory``/``assemble`` callbacks doing secondary
+        lookups): same repository and version guarantee an identical
+        result, so a second call only repeats a SQL query, JSON parse,
+        and vault-key decrypt for nothing."""
         return self._object_name_index
 
     @property

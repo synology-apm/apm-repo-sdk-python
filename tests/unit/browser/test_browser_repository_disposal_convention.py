@@ -2,9 +2,7 @@
 ``.close()`` on it directly, anywhere in ``browser/`` — disposal always
 goes through ``Session.close_repo()`` instead. A bare
 ``repo.close()`` leaves that repository's S3/Azure/SMB connector
-referenced by the ``Session`` for the rest of the process; this test
-makes that mistake structurally impossible to introduce anywhere in the
-package, rather than relying on it being remembered.
+referenced by the ``Session`` for the rest of the process.
 
 Detection is a naming-convention heuristic, not real type inference
 (mypy is the only thing in this toolchain that actually knows a given
@@ -74,9 +72,7 @@ def test_close_on_an_unrelated_name_is_not_flagged() -> None:
 
 def test_repository_disposal_stays_on_session_close_repo() -> None:
     """The real guard — every ``.py`` file under the actual
-    ``browser/`` source tree, not a synthetic one. No monkeypatching:
-    this turns the actual invariant into a named, individually-runnable
-    assertion instead of only living in a commit message."""
+    ``browser/`` source tree, not a synthetic one."""
     violations: list[str] = []
     for path in sorted(_BROWSER_SRC.rglob("*.py")):
         tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))

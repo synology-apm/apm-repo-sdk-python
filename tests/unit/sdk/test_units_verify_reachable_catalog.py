@@ -232,9 +232,7 @@ def _write_composition(
     actually written to disk differ from the bytes ``map_crc`` is computed
     over, and ``trailer`` is appended right after them -- together express a
     record whose on-disk chunk-map array is corrupted but parity-recoverable
-    via a real Redundancy blob appended after it. Every existing caller
-    leaves both at their defaults and gets today's exact behavior
-    unchanged."""
+    via a real Redundancy blob appended after it."""
     map_num = len(entries) // 20
     head = bytearray(_record_head_bytes(map_num=map_num, map_crc=zlib.crc32(entries) & 0xFFFFFFFF))
     if corrupt_record_head:
@@ -395,7 +393,7 @@ def _write_fs_workload(
         # the copy_meta_file/<meta_dirname> directory to actually show up
         # in a listing -- target.db above already guarantees that in
         # practice, but a dedicated marker file makes the dependency
-        # explicit rather than incidental.
+        # explicit.
         (tmp_path / "copy_meta_file" / meta_dirname / "version.db.zst").touch()
     dedup_img_path = f"{target_id}/{dedup_version_id}/dedup.img"
     if dedup_img_size is not None:
@@ -415,10 +413,8 @@ async def _open(tmp_path: Path) -> DedupRepo:
 
 
 class TestOrphanedFileMapRow:
-    """The actual regression this whole redesign exists for: a
-    ``file_map`` row nothing in the catalog resolves to must never be
-    visited/flagged by the top-down walk, unlike the old bottom-up scan's
-    blind row-by-row sweep."""
+    """A ``file_map`` row nothing in the catalog resolves to must never be
+    visited/flagged by the top-down walk."""
 
     async def test_orphaned_row_is_never_visited(self, tmp_path: Path) -> None:
         plaintexts = [bytes([1]) * 4096]
@@ -437,10 +433,8 @@ class TestOrphanedFileMapRow:
                 (dedup_img_path, _STREAM_ID, _SESSION_ID, _COMP_OFFSET, 1, 2),
                 # An orphaned row: no version_table/target.db anywhere
                 # points at this path, no matter what stream/session/
-                # comp_offset it names. If the old bottom-up scan ran, its
-                # missing composition subfile would surface as a
-                # Stage.FILE_MAP DATA_MISSING finding; the top-down walk
-                # must never even look at it.
+                # comp_offset it names. The top-down walk must never even
+                # look at it.
                 ("orphan/999/dedup.img", 99, 99, 0, 1, 2),
             ],
         )
@@ -503,9 +497,8 @@ class TestOrphanedFileMapRow:
 
 class TestUnresolvableVersion:
     """A version whose own catalog rows claim it should resolve to real
-    content but doesn't. Every catalog-listed, non-deleted version is now
-    attempted directly — no shallow pre-filter decides in advance whether
-    to bother — and the failure is classified by exception type: a
+    content but doesn't. Every catalog-listed, non-deleted version is
+    attempted directly, and the failure is classified by exception type: a
     missing-file failure (``NotFoundError``) becomes a ``Symptom.DATA_MISSING``
     Finding worded to name the likely cause (a stale/rotated version
     reference), while genuine corruption
@@ -514,8 +507,7 @@ class TestUnresolvableVersion:
 
     async def test_missing_target_db_is_a_version_stage_finding(self, tmp_path: Path) -> None:
         """A version whose ``target.db`` was never written is invisible in
-        every browsing path already, but verify now reports it directly
-        rather than silently converging with that."""
+        every browsing path already; verify reports it as its own finding."""
         _write_fs_workload(
             tmp_path,
             workload_id=10,
@@ -540,8 +532,7 @@ class TestUnresolvableVersion:
         (``target.db`` itself opens and resolves fine, but the
         ``dedup.img`` it points to has no ``db/file_map`` row at all)
         reaches the same classification — it's the exception type, not
-        which specific check happened to fail, that decides the symptom
-        now that there's no separate shallow-vs-deep distinction."""
+        which specific check happened to fail, that decides the symptom."""
         _write_fs_workload(
             tmp_path,
             workload_id=10,

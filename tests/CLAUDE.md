@@ -51,34 +51,23 @@ not exist.
 
 A file's basename is unique only within its own `unit`/`integration`
 split, not across them — `test_units_device.py` exists in both
-`tests/unit/sdk/` and `tests/integration/sdk/`, one of several
-basename-collision cases in this suite. This is safe to collect and type-check
-because `pyproject.toml` opts both tools into resolving by full
-directory path rather than bare basename: pytest's own
-`--import-mode=importlib`, and mypy's `mypy_path` including `"tests"`
-alongside the package `src` dirs (`explicit_package_bases`/
-`namespace_packages` alone aren't sufficient — verified empirically).
-A same-named file needs no disambiguating suffix (e.g. a `_replay`
-suffix) to avoid this collision — the directory already says it
-replays, and the mechanism above already resolves the collision; don't
-add one "to be safe" for a new same-named file.
+`tests/unit/sdk/` and `tests/integration/sdk/`. This is safe because
+`pyproject.toml` resolves both tools by full directory path rather than
+bare basename: pytest's `--import-mode=importlib`, and mypy's `mypy_path`
+including `"tests"` alongside the package `src` dirs. A same-named file
+needs no disambiguating suffix (e.g. `_replay`) to avoid this collision.
 
 **No test module ever imports from another — `tests/` isn't a package.**
-This is why the same small "write fake on-disk bytes" builder helpers
-(`_encode_size_store`, `_write_composition`, `_write_repo_info`, ...) show
-up byte-for-byte identical across dozens of files instead of living in one
-shared module: each test file is self-contained on purpose, so a change to
-one file's fixtures can never silently ripple into an unrelated one's. If
-you're fixing one of these builder helpers' bit-packing and it looks wrong,
-grep for the other copies before assuming you found the only one — the
-duplication is real, just not a sign nobody normalized it. This is
-different from this project's sanctioned sharing mechanism: `tests/conftest.py`'s
-`wait_until`/`open_browser_pilot` (shared across every distribution and
-both the unit/integration split), `tests/unit/conftest.py`'s `fake_keyring`
-(unit-only), and `tests/integration/cli/conftest.py`'s `patch_profile_store`
-(CLI-integration-only) are all fixtures a genuinely repeated multi-line
-setup sequence belongs in, not copy-pasted a 63rd time — pick whichever
-conftest already matches how widely the new sequence is actually shared.
+Small builder helpers (`_encode_size_store`, `_write_composition`,
+`_write_repo_info`, ...) are duplicated byte-for-byte across dozens of
+files by design, so a fixture change in one file never ripples into
+another — grep for other copies before assuming a bit-packing fix is
+needed in only one. The sanctioned sharing mechanism is a `conftest.py`
+fixture instead: `tests/conftest.py`'s `wait_until`/`open_browser_pilot`
+(shared everywhere), `tests/unit/conftest.py`'s `fake_keyring`
+(unit-only), `tests/integration/cli/conftest.py`'s `patch_profile_store`
+(CLI-integration-only) — pick whichever already matches how widely a
+genuinely repeated setup sequence is shared.
 
 ## `RecordingStore` / `ReplayStore` — this project's answer to cassette testing
 
@@ -93,16 +82,13 @@ it (or narrow it, below) rather than inventing a mechanism to smuggle the
 real value in some other way; it gets a synthetic test instead, with
 content-decoding correctness proven there.
 
-This policy is actively enforced, not just stated: during a
-`--record-against` session, `record_target`'s guard (`ContentRecordingBlocked`,
-wrapping `RestorableUnit.open()` and `BucketReader.read_chunk`/`read_chunks`)
-raises loudly the moment a test reads real backed-up content without
-declaring it needs to, rather than letting real bytes quietly reach the
-recorded fixture. `record_target(name, allow_content=True)` is the opt-out
-for a test that genuinely needs real content bytes as a structural oracle
-(a hash/signature check that never asserts on the content's own meaning) —
-see `test_api.py`/`test_api_resolve.py`/`test_dedup_dedup_file.py` for real
-examples, each explaining locally why that particular read is safe.
+This policy is actively enforced: during a `--record-against` session,
+`record_target`'s `ContentRecordingBlocked` guard (wrapping
+`RestorableUnit.open()` and `BucketReader.read_chunk`/`read_chunks`) raises
+the moment a test reads real content without declaring it needs to.
+`record_target(name, allow_content=True)` is the opt-out for a test that
+genuinely needs real content bytes as a structural oracle — see
+`test_api.py` for an example.
 
 `storage/recording.py`'s `RecordingStore`/`ReplayStore` — see
 `ARCHITECTURE.md`'s "Cross-cutting shared mechanisms" for what it is;
@@ -128,52 +114,34 @@ make record-fixture TARGET=local:<path-to-sample-dir> \
     TEST=tests/integration/<path>/test_<name>.py::<test_function>
 ```
 
-scoped to the one real root and test that fixture needs — one invocation,
-one backend. This keeps a
-fixture's recipe permanently in sync with the test it backs: a test whose
-assertions no longer hold against the real backend (moved, renamed,
-restructured data) simply fails and writes nothing, the same as any other
-test failure. Every fixture belongs to exactly one real, always-running
-replay test, whose own pass/fail is both its regression check and its
-recording recipe.
+Every fixture belongs to exactly one real, always-running replay test,
+whose own pass/fail is both its regression check and its recording recipe.
 
-A test that navigates to a specific real target keeps that navigation
-recordable by using a **canonical** ref (`cat:<id>/wl:<id>/ver:<uid>`,
-optionally `/device:<id>/object:<id>` deeper) rather than a human
-display-name path — canonical segments are internal catalog identifiers,
-immune to catalog-metadata anonymization, so the same literal ref string
-resolves the same real node whether replaying an anonymized fixture or
-recording fresh. A human ref built from real display names only ever
-matches the *anonymized* text once it's committed, so recording it fresh
-fails immediately (the real display name isn't "Test-Workload-4a5e").
-Human-ref parsing/walking/disambiguation itself belongs in a synthetic
-unit test (fake connections/workloads, no real backend) rather than a
-replay test — see `tests/unit/cli/test_cli_tree.py`/`test_cli_ls.py` and
-`tests/unit/sdk/test_units_node_ref.py` for the pattern.
+A test that navigates to a specific real target uses a **canonical** ref
+(`cat:<id>/wl:<id>/ver:<uid>`, optionally `/device:<id>/object:<id>`
+deeper), never a human display-name path — canonical segments are immune
+to catalog-metadata anonymization, so the same ref string resolves the
+same real node whether replaying an anonymized fixture or recording fresh
+(a human display-name path only matches post-anonymization text, so
+recording it fresh fails immediately). Human-ref parsing/walking belongs
+in a synthetic unit test instead — see `tests/unit/cli/test_cli_tree.py`/
+`test_cli_ls.py`/`tests/unit/sdk/test_units_node_ref.py`.
 
 **A replay test never hardcodes an anonymized display-name string as its
 expected value** — a connection/workload `display_name`, a device's
-`host_name`-derived name, a SaaS site/team/group name, or any other
-field `scripts/anonymize_catalog_metadata.py`'s `SensitiveField`/`_POOLS`
-list scrubs. That's synthetic unit-test territory: a fake, controlled
-name proves the same rendering/parsing logic without ever drifting
-across a re-recording. A replay test may still assert that such a value
-*doesn't leak* somewhere it shouldn't (an id-only view), or compare one
-freshly-fetched real value against another from the *same* recorded
-session rather than a hardcoded literal — never the placeholder itself.
-**A negative check (`not in`, `!=`) against a
-specific anonymized string is a silent-failure trap**: once that
-placeholder drifts on a later re-recording, the check keeps passing
-without testing anything (the stale string was never going to appear
-either way), unlike a positive check, which at least fails loudly —
-prefer a structural check (a row/line count, a shape assertion) that
-fails loudly either way. This doesn't apply to a version's own
-`display_name` (a backup-time *timestamp*, never anonymized — see
-"Timezone-rendered assertions" below), a fixed (not per-value)
-placeholder like the `gws_domain` category's constant
-`gwsdemo.example.com`, or a field never in `SensitiveField` to begin
-with (`subtitle`, `workload_type`, `sub_type`, real disk/SaaS *content*
-names like a filename or a SharePoint list's own fixed category labels).
+`host_name`-derived name, a SaaS site/team/group name, or any other field
+`scripts/anonymize_catalog_metadata.py`'s `SensitiveField`/`_POOLS` list
+scrubs. Test that logic with a synthetic unit test's fake name instead. A
+replay test may assert a value *doesn't leak* somewhere it shouldn't, or
+compare one freshly-fetched real value against another from the *same*
+session — never against a hardcoded placeholder. A negative check
+(`not in`, `!=`) against a specific anonymized string is a silent-failure
+trap once that placeholder drifts on re-recording — prefer a structural
+check (row/line count, shape assertion). Exceptions: a version's own
+`display_name` (a timestamp, never anonymized — see "Timezone-rendered
+assertions" below), the fixed `gws_domain` constant `gwsdemo.example.com`,
+and any field never in `SensitiveField` (`subtitle`, `workload_type`,
+`sub_type`, real disk/SaaS content names).
 
 If a replay test can't prove real-data resolution without materializing an
 object's content (e.g. a `LazyArtifact`, whose `.size` is `None` until
@@ -184,21 +152,14 @@ content-assembly proof to a synthetic unit test with fake data.
 level: real dispatch/listing only, content-assembly proven synthetically
 instead.
 
-A fixture recording an AHLT-encrypted `target.db` (any `copy_meta_file/
-<vm>/target.db` under an encrypted vault) needs enough of its own
-recording for the anonymizer's `target.db`-scrubbing pass to resolve a
-vault key from it alone: a walk of `iter_layouts()` (which recurses up
-to 2 levels, so the fixture can be rooted either directly at
-`@ActiveProtectVault` or one level higher, at the sample directory) plus
-one recorded `KeyMaterial.resolve_vault_key()` probe of its own — even
-if no test in the file exercises that call directly — so its recording
-carries the `exists()`/`listdir()`/`db/vault_encryption_key` reads both
-passes need. Missing either raises `LookupError` at anonymize time
-(loud, not silent — it runs inside `pytest_sessionfinish`, so it
-surfaces even though the fixture's own replay tests still pass fine
-against the un-scrubbed bytes), rather than depending on some other
-fixture from the same sample having resolved the key first in the same
-`anonymize_fixtures()` batch.
+A fixture recording an AHLT-encrypted `target.db` (`copy_meta_file/<vm>/
+target.db` under an encrypted vault) must also record one
+`KeyMaterial.resolve_vault_key()` probe — even if no test in the file
+calls it directly — so the anonymizer's `target.db`-scrubbing pass can
+resolve a vault key from this fixture alone (`iter_layouts()` recurses up
+to 2 levels, so the fixture may be rooted at `@ActiveProtectVault` or one
+level higher). A missing probe raises `LookupError` at anonymize time
+(inside `pytest_sessionfinish`), not at test time.
 
 `record_target()` shares one `RecordingStore` across every test in the
 run that requests the same fixture name (keyed at module level in
@@ -210,35 +171,27 @@ or the whole file, in one `pytest --record-against=...` invocation —
 `ReplayStore`/`RecordingStore` are already order-insensitive, so it
 doesn't matter what order the sharing tests run in.
 
-Anonymized placeholder text for a given real value isn't guaranteed
-identical across separate recording sessions: `scripts/
-anonymize_catalog_metadata.py`'s placeholder minting probes forward from
-a value's preferred hash slot when it collides with another value's
-preferred slot *already claimed in that same run* — so the same real
-category name can land on a different placeholder in a run that
-anonymizes a different set of real values alongside it. After
-re-recording a fixture, check what the fresh output actually renders
-(e.g. via `ReplayStore.from_path(...)` against the just-written fixture)
-rather than assuming a previously-hardcoded placeholder string still
-matches.
+Anonymized placeholder text for a real value isn't guaranteed identical
+across separate recording sessions — a hash-slot collision with another
+value present in that run can shift where it lands. After re-recording a
+fixture, check what the fresh output actually renders (e.g. via
+`ReplayStore.from_path(...)`) rather than assuming a previously-hardcoded
+placeholder still matches.
 
 **Real-value constants repeated verbatim across files, by design**: a
 few real, credential-shaped constants recur identically across several
-self-contained replay test files (`tests/` isn't a package — see
-above — so a shared value can't be imported, only duplicated). Each is
-a real generated artifact belonging to one sample, not customer data,
-and safe to commit for that reason — not because it merely looks inert:
+replay test files (`tests/` isn't a package, so a shared value can't be
+imported, only duplicated). Each is a real generated artifact belonging
+to one sample, not customer data, and safe to commit for that reason.
 
 | Constant | Belongs to | Appears in |
 |---|---|---|
 | `_ENCRYPTED_KEY_STRING`/`_APV2_ENCRYPTED_KEY_STRING` | `apv-sample-2-encrypted`'s own generated vault key | every replay test opening that sample's vault with a real key |
 | `_S3SAMPLE2_ENCRYPTED_KEY_STRING` | `s3-sample-2-encrypted`'s own generated vault key | dedup/fingerprint-layer replay tests exercising its encryption |
 
-A new file needing one of these copies the literal value from any
-existing occurrence (already established as safe) rather than
-re-deriving it or reading it from a real sample tree at test time. Add
-a row here for any new repeated real-value constant rather than leaving
-individual files to cite whichever one used it first.
+A new file needing one of these copies the literal value from an
+existing occurrence rather than re-deriving it. Add a row here for any
+new repeated real-value constant.
 
 Each `test_*.py` file owns its own dedicated fixture(s), recorded
 independently even when a sibling file happens to open the same real
@@ -272,21 +225,16 @@ name/email/path.
 
 A committed `.json.gz` diffs as binary by default; see `CONTRIBUTING.md`'s
 "Sample data" section for the one-time `git config` step that makes
-`git diff`/`git log -p` on a re-recorded fixture readable text again.
+`git diff`/`git log -p` readable again.
+
 Before adding a `record_target` call to a new replay test, check the
-resulting fixture's *decompressed* size once recorded — a real "no
-shortcuts" traversal (e.g. an uncapped recursive tree search) can rack up
-thousands of distinct reads and grow to many MB even when the target data
-itself is small, since `RecordingStore` stores every real `(path, offset,
-length)` call verbatim with no cross-entry deduplication; that's a sign
-the code path itself is expensive independent of real-vs-replayed I/O,
-not something recording (or compressing the committed `.gz`) fixes — a
-well-compressed but call-bloated fixture is still the same smell. This is
-a one-time check at recording time, not something a fixture's own
-docstring needs to state for a reader afterward — any number written
-there (exact or bucketed) goes stale the moment a later re-recording
-changes it, with nothing forcing the docstring to catch up; a test's own
-docstring describes what a fixture covers, not how big it happens to be.
+resulting fixture's *decompressed* size once recorded: `RecordingStore`
+stores every real `(path, offset, length)` call verbatim with no
+cross-entry deduplication, so an uncapped traversal can grow to many MB
+even when the target data is small — that's a sign the code path itself
+is expensive, not something re-recording or compression fixes. Don't
+record this number in the fixture's own test docstring; it goes stale on
+the next re-recording.
 
 **Detects call-sequence drift, not semantic drift.** `ReplayStore` only
 fails when a call it never recorded shows up — if production code starts
@@ -299,14 +247,9 @@ changed, not only when its call shape did.
 **A new fixture always gets its own file**, even when an existing one
 already covers the same real root via the same entry point (`Session.
 open_remote()`, bare `DedupRepo.open()`, `ConnectDialog.
-_build_local_store()`'s TUI path, ...). This keeps `make record-fixture`
-pointed at one test as the whole recipe for every fixture, file by file —
-the fixture format (a flat `{reads, sizes, exists, listdirs}` dict) makes
-merging two files' fixtures into one a trivial union, but the result
-needs its own cross-file recording exercise to stay current. Some
-duplicated real bytes across `tests/fixtures/` when two files touch the
-same real root is the trade-off for every file staying independently
-recordable.
+_build_local_store()`'s TUI path, ...) — some duplicated real bytes
+across `tests/fixtures/` is the trade-off for every file staying
+independently recordable.
 
 ## Disk image fixtures
 
@@ -338,54 +281,29 @@ rather than whatever your own machine happens to render.
 
 ## Driving a `Pilot` test: wait for the state, never for a duration
 
-A `Pilot` test decides when to take its next step by checking the state that
-step needs, via `tests/conftest.py`'s `wait_until` — never by sleeping and
-assuming. `await pilot.pause(0.03)` between an action and a read is the shape
-that produced most of this suite's flakiness: it passes on an idle machine and
-silently does the wrong thing on a busy one, usually by sending a keypress into
-a widget that is not ready for it.
+A `Pilot` test waits for the state a step needs via `tests/conftest.py`'s
+`wait_until` — never `pilot.pause(n)` between an action and a read, which
+passes on an idle machine and flakes on a busy one (usually a keypress
+reaching a widget that isn't ready for it).
 
 Three preconditions are easy to assume and must be waited on instead:
+focus (wait for `has_focus` before pressing a key — `UnitScreen` granting
+its tree focus takes a turn or two), cursor placement (`Tree.move_cursor()`
+needs `_ = tree._tree_lines` forced first, then wait for `tree.cursor_node
+is node`), and a rebuilt tree (`d`/`r` rebuild the whole tree, so
+re-acquire any `TreeNode` picked before them rather than reusing it).
 
-- **Focus.** A key goes to whatever *actually* has focus. `UnitScreen` focuses
-  its own tree (`_populate_root`), but that is a request the app grants a turn
-  or two later — until then keys still reach the screen below. Focus the widget
-  and wait for `has_focus` before pressing, the same way
-  `_drill_to_a_real_mail_units_screen` already does for every other widget.
-- **Cursor placement.** `Tree.move_cursor()` only takes effect against an
-  up-to-date line map; force it with `_ = tree._tree_lines` first, then wait for
-  `tree.cursor_node is node`.
-- **A rebuilt tree.** `d` (verbose) and `r` (refresh) both re-dispatch the
-  provider and rebuild the whole tree, so any `TreeNode` picked before them is
-  gone afterwards — re-acquire, don't reuse.
+Use `tests/conftest.py`'s `ui_timeout` fixture for a synchronous UI change
+(`push_screen`, a widget attribute) and `sdk_timeout` for anything gated on
+a real SDK/Store/provider dispatch, even a fast one — `wait_until` returns
+the instant its condition is true, so neither budget costs anything on a
+healthy run. Exception: a condition that's a transient window closing on
+its own (e.g. a loading indicator) keeps its own fixed, commented timeout
+instead — a wider ceiling there can poll *after* the window already closed
+(see `test_browser_pilot_hex_filter_refresh.py`).
 
-Budgets split by whether reaching the condition requires an `await` into the
-SDK/Store/provider layer, not by how fast the underlying call sounds — a
-synchronous `push_screen`/`pop_screen` or widget-attribute change gets
-`tests/conftest.py`'s `ui_timeout` fixture; anything gated on a real dispatch
-(`Catalog`/`Repository` call, a `ChildrenRequested`/`RootRequested`/
-`WorkloadsLoaded` dispatch, `provider.unit()`, `ContentSource.read()`, ...)
-gets `sdk_timeout`, even when that dispatched work is itself cheap — a
-`KeyDialog` closing after a real (but practically instant)
-`Repository.set_key()`, or a hex-preview page turn after a tiny chunk decode,
-both need `sdk_timeout` for this reason.
-
-Neither budget is part of what the test asserts: `wait_until` returns the
-instant its condition is true, so both fixtures are pure poll-loop ceilings
-with zero cost on a healthy run, only mattering when something is genuinely
-stuck. The one exception is a wait whose condition is itself a transient
-window that closes again on its own (e.g. a loading indicator that
-disappears once the operation it was covering finishes) — there, unlike a
-condition that stays true once reached, a wider ceiling can make the poll
-check *after* the window has already closed, turning an occasional flake
-into a guaranteed miss. Such a wait keeps its own fixed, individually-reasoned
-timeout instead of `ui_timeout`/`sdk_timeout`, with a comment explaining why
-(`test_browser_pilot_hex_filter_refresh.py`'s two loading-indicator-vs-slow-operation
-tests are the current examples).
-
-Two cases legitimately keep a fixed `pause`: asserting that something *never*
-happens (there is no readiness signal for an absence), and sampling state at
-intervals on purpose. Both say so in a comment at the call site.
+A fixed `pause` is legitimate only to assert something *never* happens, or
+to sample state at intervals on purpose — say so in a comment either way.
 
 ## Closing a provider built directly against a repository
 

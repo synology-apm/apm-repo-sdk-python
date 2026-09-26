@@ -47,28 +47,23 @@ COMPOSITION_ROOT = "@data/Composition"
 DB_ROOT = "db"
 REPO_INFO_NAME = "repo_info"
 
-# Bounds one SqliteSource.close() call -- a hung close must not block the
-# rest of _db_sources from ever getting a close attempt of their own. Same
-# rationale and value as api.repository.Repository's own
-# _RESOURCE_CLOSE_TIMEOUT one layer up; not imported from there since this
-# module sits below api/ (see ARCHITECTURE.md's "dependencies only point
-# downward").
+# Bounds one SqliteSource.close() call so a hung close doesn't block the
+# rest of _db_sources from ever getting a close attempt. Same value as
+# api.repository.Repository's own constant one layer up (not imported
+# from there — this module sits below api/).
 _RESOURCE_CLOSE_TIMEOUT = 10.0
 
 
 async def _resolve_versioned(
     store: ObjectStore, dir_cache: DirCache, layout: RepoLayout, dir_path: str, logical_name: str
 ) -> str:
-    """The generation-aware counterpart to ``resolve_seq_path``,
-    for the two logical names FORMAT-SPEC.md: generation-selection's transaction-log
-    algorithm actually governs (``repo_info``, ``db/<name>``) —
-    everything else in this module (Pool/Composition per-generation
-    files) keeps using the plain ``resolve_seq_path``
-    rule instead. Only actually branches for
-    ``RepoKind.OBJECT_STORE`` —
-    ``VAULT`` layouts never have ``.<N>``-suffixed files at all, and
-    ``resolve_generation`` already degrades to the bare name when
-    there's nothing to select between.
+    """The generation-aware counterpart to ``resolve_seq_path``, for the
+    two logical names FORMAT-SPEC.md: generation-selection's
+    transaction-log algorithm governs (``repo_info``, ``db/<name>``) —
+    everything else keeps using plain ``resolve_seq_path``. Only branches
+    for ``RepoKind.OBJECT_STORE``: ``VAULT`` layouts never have
+    ``.<N>``-suffixed files, and ``resolve_generation`` already degrades
+    to the bare name when there's nothing to select between.
     """
     if layout.kind is not RepoKind.OBJECT_STORE:
         return await resolve_seq_path(dir_cache, dir_path, logical_name)
@@ -140,34 +135,22 @@ class DedupRepo:
             chunk_cache_size=chunk_cache_size,
             verify_fingerprint=verify_fingerprint,
         )
-        # AsyncKeyedCache, not a hand-rolled dict+lock: two concurrent
-        # db() calls for different names (e.g. "file_map" and "repo_info")
-        # only ever contend on the same key here, never on each other, so
-        # unrelated names build in parallel instead of one blocking behind
-        # the other's full SqliteSource.from_raw_store() (which can be a
-        # real S3/Azure GET). See probe_encrypted()'s cache below for the
-        # other reason this class already leans on this same mechanism.
-        # Deliberately left unbounded, unlike units.saas.stream.SaasStreamCache's
-        # own bounded SaasStream cache -- this one's key space is a small, fixed
-        # set of logical db/<name> names per repository, not one per generation
-        # or per distinct remote object, so it can't reproduce that fd-exhaustion
-        # failure mode. Revisit with the same bounded-LRU-plus-close-on-evict
-        # pattern if that ever stops being true.
+        # AsyncKeyedCache, not a hand-rolled dict+lock: concurrent db()
+        # calls for different names only contend on the same key, so
+        # unrelated names build in parallel. Deliberately unbounded,
+        # unlike units.saas.stream.SaasStreamCache: this key space is a
+        # small, fixed set of logical db/<name> names per repository, not
+        # one per remote object, so it can't reproduce that cache's
+        # fd-exhaustion failure mode.
         self._db_sources: AsyncKeyedCache[str, SqliteSource] = AsyncKeyedCache(self._build_db_source)
-        # probe_encrypted()'s cache, and _get_file_meta_table()'s —
-        # single-value AsyncKeyedCache instances (a constant ``None`` key)
-        # rather than a hand-rolled bool/lock pair each: both results are
-        # legitimately ``None`` ("checked, found nothing" — the
-        # encryption-key record is entirely absent for probe_encrypted, or
-        # this repository shape has no usable file_meta table for
-        # _get_file_meta_table), which
-        # AsyncKeyedCache's own presence check (``key in self._store``, not
-        # ``... is not None``) caches correctly rather than re-probing
-        # forever. A repository opened read-only never rewrites its own
-        # encryption-key record or file_meta shape mid-session, so caching
-        # either "unknown"/"unavailable" outcome for this
-        # DedupRepo's whole lifetime is safe, not just an
-        # optimization that could go stale.
+        # probe_encrypted()'s cache and _get_file_meta_table()'s:
+        # single-value AsyncKeyedCache instances (a constant None key)
+        # rather than a hand-rolled bool/lock pair, since both results are
+        # legitimately None ("checked, found nothing") and
+        # AsyncKeyedCache's presence check caches that correctly instead
+        # of re-probing forever. Safe for this DedupRepo's whole
+        # lifetime: a read-only repository never rewrites its
+        # encryption-key record or file_meta shape mid-session.
         self._probe_cache: AsyncKeyedCache[None, bool | None] = AsyncKeyedCache(
             lambda _: _probe_encrypted(self._store, self.layout)
         )
@@ -178,9 +161,8 @@ class DedupRepo:
         """The underlying ``ObjectStore`` this repository was opened
         against — exposed for Catalog-Layer-and-above callers that
         occasionally need a raw path read outside the
-        ``Pool``/``CompositionReader``/``db()``
-        machinery (e.g. catalog's object-store link-key display-name
-        lookup, which lists ``@ActiveProtectKey/link/`` directly)."""
+        ``Pool``/``CompositionReader``/``db()`` machinery (e.g.
+        catalog's object-store link-key display-name lookup)."""
         return self._store
 
     @property
@@ -188,28 +170,26 @@ class DedupRepo:
         """The resolved VaultKey, if any (``None`` for an unencrypted
         repository or one opened without key material) — exposed for
         Unit-Layer-and-above callers that need to decrypt something
-        outside the
-        ``Pool``/``CompositionReader`` machinery (e.g. ``DeviceProvider``
-        peeling an ``aHlT``-enveloped ``target.db``)."""
+        outside the ``Pool``/``CompositionReader`` machinery (e.g.
+        ``DeviceProvider`` peeling an ``aHlT``-enveloped ``target.db``)."""
         return self._vault_key
 
     @property
     def dir_cache(self) -> DirCache:
-        """This repository's shared ``DirCache`` — exposed for the same
-        reason as ``store``/``vault_key`` — a caller outside
-        ``Pool``/``CompositionReader`` (``verify_checks.check_repo_info``,
-        ``units/verify_reachable.py``'s top-down walk building its own
-        ``CompositionReader``) needs to resolve a ``.<seqId>``-suffixed
-        path itself, without duplicating a second, uncached ``listdir``."""
+        """This repository's shared ``DirCache`` — exposed for a caller
+        outside ``Pool``/``CompositionReader`` (``verify_checks.
+        check_repo_info``, ``units/verify_reachable.py``'s top-down walk)
+        that needs to resolve a ``.<seqId>``-suffixed path itself,
+        without a second, uncached ``listdir``."""
         return self._dir_cache
 
     @property
     def comp_root(self) -> str:
         """``<repo_root>/@data/Composition`` — exposed so
         ``units/verify_reachable.py``'s top-down walk can build its own
-        ``CompositionReader`` per visited composition record without
-        ``open_composition()``'s ``DedupFile`` wrapping (verify wants the
-        raw record/header, not a readable byte range)."""
+        ``CompositionReader`` per visited record without
+        ``open_composition()``'s ``DedupFile`` wrapping (verify wants
+        the raw record/header, not a readable byte range)."""
         return self._comp_root
 
     @property
@@ -218,8 +198,7 @@ class DedupRepo:
         ``comp_root``: ``units/verify_reachable.py``'s top-down walk
         constructs its own private ``Pool`` (forcing
         ``verify_fingerprint``/``verify_ciphertext_crc`` on for the run,
-        rather than mutating this repository's own shared one), which
-        needs this repository's ``pool_root`` to do so."""
+        rather than mutating this repository's shared one)."""
         return self._pool_root
 
     @classmethod
@@ -274,29 +253,27 @@ class DedupRepo:
     async def db(self, name: str) -> aiosqlite.Connection:
         """Open (and cache) a connection to ``db/<name>``.
 
-        Read-only against the store either way: the fast path opens the real
-        file immutable, and the slow path opens a private materialized copy
-        read-write (see ``storage/sqlite.py``) so an index hint can take
-        effect — writes there never reach the store.
+        Read-only against the store either way: the fast path opens the
+        real file immutable, and the slow path opens a private
+        materialized copy read-write so an index hint can take effect —
+        writes there never reach the store.
 
-        ``name`` is resolved through
-        ``PHYSICAL_NAME_ALIASES``
-        first (e.g. ``"copy_target_file"`` has no on-disk object of its
-        own; its table lives inside whichever generation
+        ``name`` is resolved through ``PHYSICAL_NAME_ALIASES`` first
+        (e.g. ``"copy_target_file"`` has no on-disk object of its own;
+        its table lives inside whichever generation
         ``"copy_target_version"`` resolves to), so requesting either
-        aliased name transparently shares one connection.
+        aliased name shares one connection.
 
-        On a ``RepoKind.OBJECT_STORE``
-        layout, the real generation is selected by
-        FORMAT-SPEC.md: generation-selection's transaction-log algorithm (``resolve_generation``),
-        not the naive "largest ``.<N>`` suffix" rule every other
-        per-generation file uses — a ``db/<name>.<N>`` generation can
-        exist on disk before the transaction referencing it commits.
+        On a ``RepoKind.OBJECT_STORE`` layout, the real generation is
+        selected by FORMAT-SPEC.md: generation-selection's
+        transaction-log algorithm (``resolve_generation``), not the
+        naive "largest ``.<N>`` suffix" rule every other per-generation
+        file uses — a ``db/<name>.<N>`` generation can exist on disk
+        before the transaction referencing it commits.
 
         ``db/<name>`` is always raw (never ``aHlT``/zstd-enveloped), so
-        ``SqliteSource.from_raw_store`` skips straight to
-        materializing it — no envelope detection needed here, unlike
-        every other envelope→SQLite path in this project.
+        ``SqliteSource.from_raw_store`` skips straight to materializing
+        it, unlike every other envelope→SQLite path in this project.
         """
         name = PHYSICAL_NAME_ALIASES.get(name, name)
         source = await self._db_sources.resolve(name)
@@ -377,27 +354,17 @@ class DedupRepo:
         return [row[0] for row in await cursor.fetchall()]
 
     async def _get_file_meta_table(self) -> Table | None:
-        """The (cached) ``file_meta`` ``Table``, or ``None`` if this repository
-        shape has no ``file_meta`` db file at all, or has one missing
-        the table itself — two genuinely different reasons kept
-        distinguishable in the check below rather than conflated into
-        one bare ``except``, but both cache to the same ``None``
-        result: the ``file_meta`` db file may not exist on this repository
-        shape (``NotFoundError`` from ``db``), or it may exist but be missing
-        the table/column (``Table.exists_in`` and ``Table``'s own
-        optional-column handling, respectively).
+        """The (cached) ``file_meta`` ``Table``, or ``None`` if this
+        repository shape has no ``file_meta`` db file, or has one
+        missing the table itself.
 
-        Cached (including the ``None`` outcome) rather than rebuilt on
-        every call: unlike ``db``, whose own connection cache already
-        covers the underlying sqlite connection, building a ``Table``
-        costs two more ``PRAGMA table_info`` queries — real repeated
-        cost under ``locate_file``'s concurrent per-fragment PC/PS
-        disk callers (``units/device.py``'s ``asyncio.gather``, which is
-        also exactly why this goes through
-        ``AsyncKeyedCache`` rather
-        than a bare instance attribute — its in-flight de-duplication
-        means concurrent fragments miss together and only one of them
-        actually builds the ``Table``).
+        Cached (including the ``None`` outcome): building a ``Table``
+        costs two ``PRAGMA table_info`` queries, real repeated cost
+        under ``locate_file``'s concurrent per-fragment PC/PS disk
+        callers — going through ``AsyncKeyedCache`` (not a bare
+        attribute) means its in-flight de-duplication lets concurrent
+        fragments miss together and only one actually builds the
+        ``Table``.
         """
         return await self._file_meta_table_cache.resolve(None)
 
@@ -451,26 +418,14 @@ class DedupRepo:
         return DedupFile(comp_reader, self._pool, comp_offset, size=size)
 
     async def probe_encrypted(self) -> bool | None:
-        """Cheaply determine whether this repository is actually vault-encrypted
-        — no key needed at all, and never raises ``KeyRequiredError``. Reads
-        the repository's own encryption-key record directly
-        (``probe_encrypted``) — never opens a bucket file, never touches
-        the Pool. Not the compile-time ``RepoInfo.encrypt_algorithm`` field
-        (see ``BucketFileHeader.is_vault_encrypted``'s docstring for why
-        that's unreliable); this reads the same live, per-repository record
-        ``KeyMaterial.resolve_vault_key`` already reads to find one
-        specific candidate key's wrapped VaultKey, just its latest entry
-        rather than one looked up by id.
+        """Cheaply determine whether this repository is vault-encrypted —
+        no key needed, never raises ``KeyRequiredError``. See
+        ``keys.probe_encrypted`` for the mechanism; ``None`` means
+        "couldn't tell" (record absent), distinct from
+        confirmed-unencrypted (``False``).
 
-        ``None`` means "couldn't tell" (the encryption-key record itself
-        is entirely absent, which should not happen for a properly
-        initialized repository) — a genuinely different answer from
-        "confirmed not encrypted" (``False``), the same distinction
-        ``KeyStatus``'s own ``NO_KEY_PROVIDED`` draws for the same reason.
-
-        Result is cached for the lifetime of this (read-only,
-        never-changes-under-us) ``DedupRepo`` — repeated calls cost
-        nothing after the first.
+        Cached for this ``DedupRepo``'s whole lifetime — repeated calls
+        cost nothing after the first.
         """
         return await self._probe_cache.resolve(None)
 
@@ -480,18 +435,11 @@ class DedupRepo:
         repository's in-memory Pool caches.
 
         Settles every in-flight ``db()`` fetch first, not just what's
-        already landed in ``_db_sources`` -- a fetch cancelled mid-flight
-        (a TUI worker torn down while a catalog load was still running,
-        say) can already have opened a real, connected ``SqliteSource``
-        that nothing else references; skipping straight to ``.values()``
-        would abandon exactly that connection's aiosqlite background
-        thread forever — the same reasoning
-        ``api.repository.Repository.close()`` applies to its own
-        dedup-catalog cache one layer up.
-
-        Every source gets a close attempt regardless of whether an
-        earlier one raised or hung -- same "attempt all, then report"
-        posture as ``Repository.close()``, for the same reason.
+        already landed — a fetch cancelled mid-flight can still have
+        opened a real ``SqliteSource`` nothing else references, and
+        skipping to ``.values()`` would abandon its aiosqlite background
+        thread forever. Every source gets a close attempt regardless of
+        whether an earlier one raised or hung.
         """
         sources, errors = await self._db_sources.settle_all()
         for source in sources.values():
@@ -500,10 +448,9 @@ class DedupRepo:
             except Exception as exc:
                 errors.append(exc)
         self._db_sources.invalidate()
-        # Connections are only half of what this repository holds: the Pool's
-        # decoded-chunk/bucket/allocation caches are plain memory that nothing
-        # else ever drops, and a caller still referencing this object (or the
-        # Repository above it) would keep them alive for the whole process.
+        # Connections are only half of what this repository holds — the
+        # Pool's own decoded-chunk/bucket/allocation caches are plain
+        # memory nothing else ever drops.
         self._pool.release_caches()
         if errors:
             raise ExceptionGroup("DedupRepo.close() failed to close every tracked resource", errors)

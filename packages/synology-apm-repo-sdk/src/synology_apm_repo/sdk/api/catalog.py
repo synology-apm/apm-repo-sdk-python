@@ -1,7 +1,6 @@
 """``Catalog``/``Frame``: one catalog's own workload/version/provider
-operations, part of the Repository Layer (the ``Session``/``Repository``/
-``Catalog`` split CLI/TUI code imports directly; everything below it is an
-implementation detail this package hides). ``Catalog`` is obtained from
+operations, part of the Repository Layer (see ``api/__init__.py``).
+``Catalog`` is obtained from
 ``Repository.catalogs()``/``Repository.catalog_by_id()`` (the sibling
 ``api.repository`` module); the two modules meet at ``Repository.resolve()``'s
 canonical/human-ref dispatch, which ``api.repository`` itself owns.
@@ -55,20 +54,12 @@ class Catalog:
     provider operations scoped to it. Never constructed directly.
 
     For a vault, several sibling ``Catalog``s share one underlying
-    ``DedupRepo`` (one physical dedup pool) — this mirrors one opened
-    ``Pool``/``db`` set queried for several ``connection_config`` rows.
-    For object storage, each ``Catalog`` owns its own
-    independently-opened ``DedupRepo`` — a distinct physical pool per
-    sibling repo-id (FORMAT-SPEC.md: no cross-repo-id dedup).
-
-    ``saas_streams`` is shared, not owned: it's the ``Repository``-level
-    ``SaasStreamCache`` built against this same ``dedup_repo`` (see
-    ``api.repository._OpenCatalog``), borrowed by every SaaS provider this
-    catalog hands out via ``provider()`` rather than each opening its own.
-
-    A provider this hands out is tracked by the owning ``Repository`` —
-    ``Repository.close()`` closes it, not this object; ``Catalog`` itself
-    has no ``close()``.
+    ``DedupRepo``; for object storage, each owns its own independently-
+    opened ``DedupRepo`` (FORMAT-SPEC.md: no cross-repo-id dedup).
+    ``saas_streams`` is shared, not owned — the ``Repository``-level
+    ``SaasStreamCache`` built against this same ``dedup_repo``. A provider
+    this hands out is tracked and closed by the owning ``Repository``;
+    ``Catalog`` itself has no ``close()``.
     """
 
     def __init__(
@@ -84,14 +75,6 @@ class Catalog:
         self.connection = connection
         self._saas_streams = saas_streams
         self._track = track
-        # The owning Repository's own gate (KeyRequiredError/KeyMismatchError before
-        # any I/O a wrong/missing key would make meaningless) — bound in
-        # rather than duplicated here, since key/encryption status is
-        # Repository-wide state this class has no copy of. Repository.
-        # catalogs() itself is deliberately *not* gated (the connection_config
-        # rows it reads are plaintext regardless of encryption, and opening a
-        # DedupRepo never requires a key either) — this is the first point
-        # that actually is.
         self._require_key_verified = require_key_verified
 
     @property
@@ -100,46 +83,29 @@ class Catalog:
 
     @property
     def catalog_id(self) -> CatalogId:
-        """The shared repo-id/connection-config-id fallback formula (also used
-        by ``units.node_ref.canonical_ref_for``, so both call sites derive the
-        same id): ``self._dedup_repo.layout.repo_id`` (this
-        catalog's own repo-id, set on every ``RepoLayout``
-        ``catalog_repo_layouts()`` derives for ``OBJECT_STORE``) is used
-        when available, falling back to ``str(connection_config_id)`` for
-        a vault (whose ``RepoLayout.repo_id`` is always ``None``) and for
-        the one object-storage edge case with no derivable repo-id (see
-        ``storage.layout``'s ``_data_dir_ancestor``) — safe there too,
-        since that case only arises when this is the sole catalog
-        reachable from its ``Repository`` anyway."""
+        """This catalog's repo-id, falling back to
+        ``str(connection_config_id)`` for a vault (whose ``RepoLayout.
+        repo_id`` is always ``None``) — the same fallback formula
+        ``units.node_ref.canonical_ref_for`` uses."""
         return resolve_catalog_id(self._dedup_repo.layout.repo_id, self.connection.connection_config_id)
 
     @property
     def info(self) -> RepoInfo:
-        """This catalog's own ``repo_info`` — genuinely per-catalog for
-        object storage (each repo-id has its own marker file), and the
-        vault-wide one shared by every sibling for a vault."""
+        """This catalog's own ``repo_info`` — per-catalog for object
+        storage, vault-wide for a vault."""
         return self._dedup_repo.info
 
     async def workloads(self) -> list[Workload]:
-        """Raises ``KeyRequiredError``/``KeyMismatchError`` before any I/O if the
-        owning repository is encrypted and not yet key-verified — see
-        ``Repository._require_key_verified``. Without this, a locked
-        repository's workload list would otherwise come back silently empty or
-        wrong, indistinguishable from "this catalog genuinely has no
-        workloads"."""
+        """Raises ``KeyRequiredError``/``KeyMismatchError`` before any I/O if
+        the owning repository is encrypted and not yet key-verified."""
         self._require_key_verified()
         return await workloads(self._dedup_repo, self.connection)
 
     async def versions(self, workload: Workload, *, include_deleted: bool = False) -> list[Version]:
         """The raw catalog read (newest-first by real backup time, ties
-        broken by ``version_id`` descending) — nothing is filtered out. A version
-        whose content later turns out unresolvable (a genuine gap, or
-        routine backend-side generation rotation the resolving Unit already
-        absorbs — see ``units.saas.stream``) raises when actually opened
-        (VM/FS, GW/M365) or surfaces a diagnostic node in place of the
-        missing disk (PC/PS — see ``units.device_pcps``), the same as
-        ``verify()`` already treats it; this method never hides a real
-        catalog row in advance of that. Same key gate as ``workloads()``."""
+        broken by ``version_id`` descending) — nothing is filtered out; a
+        version whose content later turns out unresolvable is handled at
+        open time instead. Same key gate as ``workloads()``."""
         self._require_key_verified()
         return await versions(self._dedup_repo, workload, include_deleted=include_deleted)
 
@@ -164,23 +130,18 @@ class Catalog:
         *,
         progress: Callable[[Progress], Awaitable[None]] | None = None,
     ) -> list[Finding]:
-        """Integrity check over this catalog's own ``DedupRepo`` — for
-        a vault, where several sibling ``Catalog``s share one
-        ``DedupRepo``, this is the same check as every sibling's own
-        ``verify()``, not one scoped to this catalog's own rows alone
-        (the top-down walk checks the shared pool via *every* catalog's
-        own workloads/versions, not one connection's data alone). Same key
-        gate as ``workloads()``/``versions()``."""
+        """Integrity check over this catalog's own ``DedupRepo`` — for a
+        vault, where several sibling ``Catalog``s share one ``DedupRepo``,
+        this is the same check as every sibling's own ``verify()``, not one
+        scoped to this catalog's rows alone. Same key gate as
+        ``workloads()``/``versions()``."""
         self._require_key_verified()
         return await verify_reachable(self._dedup_repo, level, progress=progress)
 
     async def walk_human_ref(self, segments: tuple[str, ...], *, object_db_id: str | None = None) -> Frame:
         """The three levels below a chosen catalog — workload -> version
-        -> item — raising ``NotFoundError`` the moment a segment doesn't match.
-        ``segments`` is never empty here: ``Repository.walk_human_ref``
-        (this method's only caller) already returns its own ``"catalog"``
-        ``Frame`` directly once a human ref names nothing past the
-        catalog itself."""
+        -> item — raising ``NotFoundError`` the moment a segment doesn't
+        match. ``segments`` is never empty here."""
         assert segments, "Repository.walk_human_ref returns before delegating to an empty segments tuple"
         workloads_list = await self.workloads()
         pairs, hints = workload_pairs(workloads_list)
@@ -210,24 +171,13 @@ async def _provider_for_version(
     track: Callable[[UnitProvider], UnitProvider],
 ) -> UnitProvider:
     """The shared body behind ``Catalog.provider`` — dispatches ``version``
-    to the right ``UnitProvider``:
-    ``DeviceProvider``/``FsProvider`` for VM/PC/PS/FS, an
+    to ``DeviceProvider``/``FsProvider`` for VM/PC/PS/FS, an
     application-layer SaaS provider chosen by ``Workload.sub_type`` for
-    M365/GW, degrading to ``RawObjectProvider`` when nothing recognizes
-    it — callers never see ``UnsupportedDataFormatError`` here. Every
-    constructed provider is handed to ``track`` before being returned, so
-    its owning ``Repository`` can close it later. ``saas_streams`` is
-    ignored for VM/PC/PS/FS — only the SaaS branches below use it.
-
-    ``object_db_id`` (manual disambiguation override) is ignored for
-    VM/PC/PS/FS (a SaaS-only concept) and only reaches a constructed
-    provider on the ``RawObjectProvider`` fallback path.
-
-    ``force_raw`` (also SaaS-only, also ignored for VM/PC/PS/FS): skips
-    the application-layer candidate loop and goes straight to
-    ``RawObjectProvider`` even when an application-layer provider would
-    otherwise recognize the version — the TUI's diagnostic (``d``) mode
-    uses this to show raw index entries on demand.
+    M365/GW, degrading to ``RawObjectProvider`` when nothing recognizes it.
+    Every constructed provider is handed to ``track`` before being
+    returned. ``object_db_id`` and ``force_raw`` are SaaS-only (the TUI's
+    diagnostic ``d`` mode uses ``force_raw`` to show raw index entries on
+    demand) and ignored for VM/PC/PS/FS.
     """
     if version.target_type in _DEVICE_FS_TARGET_TYPES:
         return track(await provider_for(dedup_repo, version))
@@ -251,14 +201,9 @@ def _match_or_raise(
     hints: Sequence[str | None] | None = None,
 ) -> _T:
     """``match_display_name``, raising ``NotFoundError`` on a miss instead of
-    returning ``None`` — the "match this segment against candidates, or
-    fail with `no {kind} named ...`" shape ``walk_human_ref`` repeats for
-    each of its four levels (both ``Catalog.walk_human_ref`` here and
-    ``Repository.walk_human_ref``'s own first level). A miss that's
-    actually a collision (``segment`` is the pre-suffix name of two or
-    more candidates, so none of their disambiguated forms equal it
-    exactly) raises a distinct "ambiguous" message naming the real,
-    disambiguated candidates instead of the generic "no X named" — see
+    returning ``None``. A miss that's actually a collision (``segment`` is
+    the pre-suffix name of two or more candidates) raises a distinct
+    "ambiguous" message naming the real candidates instead — see
     ``ambiguous_matches``."""
     matched = match_display_name(segment, pairs, objects, hints=hints)
     if matched is not None:

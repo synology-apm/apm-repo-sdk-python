@@ -397,15 +397,12 @@ async def test_reload_catalogs_after_key_verified_refreshes_and_selects_the_targ
 async def test_reload_catalogs_after_key_verified_fetches_every_sibling_concurrently(wait_until: Any) -> None:
     """Each sibling's own ``catalog_by_id()`` is an independent
     round-trip -- fetched via ``asyncio.gather``, not one at a time.
-    Proven by a repo whose own ``catalog_by_id`` records a call the
-    *instant* it's invoked, then blocks on one shared gate every sibling
-    waits on together: with a truly concurrent fan-out, every sibling's
-    own call has already started (and so been recorded) before any of
-    them can possibly resolve, since nothing releases the shared gate
-    until this test does so itself. A sequential ``await``-in-a-loop
-    implementation would only ever have recorded the *first* sibling's
-    own call by that same point -- the second could not even start until
-    the first (blocked on the same never-yet-released gate) returned."""
+    Proven by a repo whose ``catalog_by_id`` records a call the instant
+    it's invoked, then blocks on one shared gate every sibling waits on
+    together: a concurrent fan-out records every sibling's call before
+    any can resolve, since nothing releases the gate until this test
+    does; a sequential implementation would only have recorded the
+    first."""
     started: list[str] = []
     gate = asyncio.Event()
 

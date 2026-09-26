@@ -146,16 +146,10 @@ async def _layouts_at(store: ObjectStore, root: str) -> list[RepoLayout] | None:
         return layouts
 
     if await _looks_like_object_store_repo(store, root):
-        # ``root`` is itself an individual object-store repository directory. Its
-        # sibling @ActiveProtectKey/ lives one level *above* @ActiveProtectData
-        # (never under the repo id itself), so when `root` is recognizably an
-        # `@ActiveProtectData/<repoId>` path, look for it there instead of
-        # under `root` — the same store still reaches it, `root` only narrows
-        # where the scan started. Otherwise (root's parent segment isn't
-        # literally @ActiveProtectData — a caller pointed straight at some
-        # other, unrelated repository directory) the key tree truly is unreachable
-        # from this store; supply key material some other way, or reopen a
-        # store rooted at the bucket level to get key_root/repo_id populated.
+        # ``root`` is one object-store repository directory. Its sibling
+        # @ActiveProtectKey/ lives one level above @ActiveProtectData, so
+        # when `root` is an `@ActiveProtectData/<repoId>` path, look for it
+        # there instead. Otherwise the key tree is unreachable from here.
         ancestor = _data_dir_ancestor(root)
         key_root = ancestor[0] if ancestor is not None else root
         narrowed_repo_id = ancestor[1] if ancestor is not None else None
@@ -230,19 +224,12 @@ async def detect_layout(store: ObjectStore, root: str = "") -> RepoLayout:
 
 # -- Repository/Catalog model ------------------------------------------
 #
-# `RepositoryLayout` below is the Repository-level counterpart to
-# `RepoLayout` above. `api/session.py`/`api/repository.py` build on the
-# functions below (`iter_repository_layouts`, `key_probe_layout`,
-# `catalog_repo_layouts`); `RepoLayout`/`iter_layouts`/`detect_layout`
-# remain public SDK exports (`sdk/__init__.py`/`sdk/storage/__init__.py`)
-# for an external caller that wants the narrower, one-catalog-at-a-time
-# shape. Where `RepoLayout` represents one *catalog*-level location (one
-# vault, or one individual `<repo-id>` directory -- the level a caller has
-# to disambiguate down to one of, by hand, when a bucket holds several),
-# `RepositoryLayout` represents the *Repository* level: one vault (still
-# 1:1), or one whole object-store bucket, carrying every sibling
-# `<repo-id>` it found as `catalog_ids` rather than requiring the caller
-# to have already picked one.
+# `RepositoryLayout` is the Repository-level counterpart to `RepoLayout`
+# above: `RepoLayout` names one catalog-level location (one vault, or one
+# `<repo-id>` directory a caller has disambiguated down to); `RepositoryLayout`
+# names the Repository level (one vault, or one whole bucket), carrying
+# every sibling `<repo-id>` as `catalog_ids` instead of one already picked.
+# `api/session.py`/`api/repository.py` build on the functions below.
 
 
 @dataclasses.dataclass(frozen=True)
@@ -251,21 +238,15 @@ class RepositoryLayout:
     lives within an ``ObjectStore``.
 
     ``repo_root``/``key_root`` are store-relative paths (``""`` means "the
-    store's own root"), never absolute — same convention as
-    ``RepoLayout``.
+    store's own root"), never absolute.
 
     ``catalog_ids`` is populated for ``OBJECT_STORE`` by listing
-    ``@ActiveProtectData/``'s children (cheap — already known at
-    detection time, the same listing ``_layouts_at``'s own second branch
-    already does); left ``None`` for ``VAULT``, whose catalogs
-    (``db/connection_config`` rows) can only be found later, by querying
-    after opening — and also left ``None`` for the one genuinely
-    ambiguous ``OBJECT_STORE`` case: ``root`` is itself an individual
-    repository directory with no derivable bucket-root ancestor (see
-    ``_data_dir_ancestor``), where the one implicit catalog living there
-    can't be independently identified either. An empty list (as opposed
-    to ``None``) means a real, listable ``@ActiveProtectData`` was found
-    but currently has zero valid repo-id children.
+    ``@ActiveProtectData/``'s children; ``None`` for ``VAULT`` (catalogs
+    are found later via ``db/connection_config``) and for the one
+    ambiguous ``OBJECT_STORE`` case (``root`` is an individual repository
+    directory with no derivable bucket-root ancestor — see
+    ``_data_dir_ancestor``). An empty list (vs. ``None``) means a real
+    ``@ActiveProtectData`` was found with zero valid repo-id children.
     """
 
     kind: RepoKind
@@ -300,22 +281,17 @@ async def _repository_layout_at(store: ObjectStore, root: str) -> RepositoryLayo
         )
 
     if await _looks_like_object_store_repo(store, root):
-        # `root` is itself one object-store catalog directory. If it's
-        # recognizably an `@ActiveProtectData/<repoId>` path, the real
-        # Repository is the bucket root two levels up -- redirect there
-        # and list every sibling catalog found under it (the same as the
-        # branch above), rather than reporting only the one catalog this
-        # particular narrowed `root` happened to hit: the Repository is
-        # the same whole bucket regardless of which catalog a caller's
-        # own scan started at.
+        # `root` is one object-store catalog directory. If it's an
+        # `@ActiveProtectData/<repoId>` path, the real Repository is the
+        # bucket root two levels up — redirect there and list every
+        # sibling catalog, since the Repository is the same whole bucket
+        # regardless of which catalog a caller's scan started at.
         ancestor = _data_dir_ancestor(root)
         if ancestor is not None:
             bucket_root, _narrowed_repo_id = ancestor
             return await _repository_layout_at(store, bucket_root)
-        # Genuinely ambiguous: no derivable bucket-root ancestor, so
-        # neither the key tree nor this catalog's own canonical id can be
-        # located from here — report it as its own, single, unenumerable
-        # implicit catalog (`catalog_ids=None`).
+        # No derivable bucket-root ancestor: report it as its own, single,
+        # unenumerable implicit catalog (`catalog_ids=None`).
         key_dir = join_path(root, _KEY_DIR)
         return RepositoryLayout(
             kind=RepoKind.OBJECT_STORE, repo_root=root, key_root=key_dir if await store.exists(key_dir) else None
@@ -388,15 +364,10 @@ def catalog_repo_layouts(layout: RepositoryLayout) -> list[RepoLayout]:
 def key_probe_layout(layout: RepositoryLayout) -> RepoLayout:
     """A throwaway ``RepoLayout`` carrying only the fields ``dedup.keys``'
     free functions (``probe_encrypted``/``resolve_vault_key``/``verify``)
-    actually read for key/encryption resolution, straight off a
-    bucket-rooted ``RepositoryLayout`` — safe to build with no catalog
-    opened at all: ``VAULT`` reads ``repo_root`` (a vault's own
-    ``repo_root`` is the same value either way), ``OBJECT_STORE`` reads
-    only ``key_root`` (shared by every sibling catalog, never
-    ``repo_root``). Used both before a ``Repository`` exists yet
-    (``api.session``'s own discovery-time key/encryption probe) and by an
-    already-constructed one (``Repository.set_key()``) — the one shared
-    place this derivation lives, rather than two copies drifting apart.
+    read for key/encryption resolution, straight off a bucket-rooted
+    ``RepositoryLayout`` — safe to build with no catalog opened at all.
+    Used both before a ``Repository`` exists (``api.session``'s discovery
+    probe) and by ``Repository.set_key()``.
     """
     return RepoLayout(kind=layout.kind, repo_root=layout.repo_root, key_root=layout.key_root)
 

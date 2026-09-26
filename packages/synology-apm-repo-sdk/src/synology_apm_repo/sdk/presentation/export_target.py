@@ -62,9 +62,7 @@ def resolve_cancelled_partial(part_path: Path, *, keep_partial: bool) -> Cancell
     """Decides what happens to ``part_path`` once a cancelled export
     unwinds, and performs it (deletes it unless ``keep_partial``) — the
     one place this decision is made, rather than the CLI and TUI each
-    hand-rolling their own (previously already diverged: the CLI deleted
-    a cancelled export's partial file by default, the TUI always kept
-    it).
+    hand-rolling their own.
 
     ``keep_partial=False`` always reports (and performs) removal, even
     when ``part_path`` never existed to begin with — "nothing left

@@ -305,14 +305,12 @@ def test_unit_screen_filter_narrows_then_esc_restores_replayed(
             # fast_browser_debounce for why this test session's delay isn't
             # literally its 0.3s production default) -- wait for the
             # model's own committed filter text rather than a fixed pause
-            # shorter than the debounce. Unlike the pre-reconciler rebuild,
-            # a still-matching node (``needle`` is a prefix of the first
-            # child's own label, by construction above) keeps its own
-            # TreeNode object across this re-render -- reconcile_children
-            # keys survivors by domain identity rather than position, so
-            # only what's genuinely new or gone is added or removed -- and
-            # "every node replaced" is no longer the right signal to
-            # wait for.
+            # shorter than the debounce. A still-matching node (``needle``
+            # is a prefix of the first child's own label, by construction
+            # above) keeps its own TreeNode object across this re-render --
+            # reconcile_children keys survivors by domain identity rather
+            # than position -- so "every node replaced" isn't a reliable
+            # signal to wait for here.
             filter_input.value = needle
             await wait_until(
                 pilot,

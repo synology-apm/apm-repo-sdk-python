@@ -257,8 +257,7 @@ async def _resolve_record_backend(spec: str) -> ObjectStore:
 @pytest.fixture
 def record_target(request: pytest.FixtureRequest) -> Callable[..., Awaitable[ObjectStore]]:
     """``store = await record_target("name.json.gz")`` -- the one call every
-    ``tests/integration/**/test_*.py`` file makes to get its store,
-    replacing the old ``ReplayStore.from_path(_FIXTURES / name)`` one-liner.
+    ``tests/integration/**/test_*.py`` file makes to get its store.
 
     ``allow_content=True`` opts one call out of the real-content recording
     guard installed below (default: guarded) -- pass it only for a test
@@ -268,8 +267,9 @@ def record_target(request: pytest.FixtureRequest) -> Callable[..., Awaitable[Obj
     content into the fixture, instead of that mistake surfacing only in a
     later manual audit.
 
-    No ``--record-against``: identical behavior to that one-liner (this is
-    every normal ``make test``/CI run). With it: wraps the real backend
+    No ``--record-against``: returns ``ReplayStore.from_path(_FIXTURES /
+    name)`` directly (this is every normal ``make test``/CI run). With it:
+    wraps the real backend
     ``--record-against`` resolves to in a ``RecordingStore`` -- shared
     across every test in this invocation that requests the same ``name``
     (see ``_RECORDING_SESSIONS``), not a fresh one per test. Multiple tests

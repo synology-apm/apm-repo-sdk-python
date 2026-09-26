@@ -228,9 +228,7 @@ def _write_composition(
     actually written to disk differ from the bytes ``map_crc`` is computed
     over, and ``trailer`` is appended right after them -- together express a
     record whose on-disk chunk-map array is corrupted but parity-recoverable
-    via a real Redundancy blob appended after it. Every existing caller
-    leaves both at their defaults and gets today's exact behavior
-    unchanged."""
+    via a real Redundancy blob appended after it."""
     map_num = len(entries) // 20
     head = bytearray(_record_head_bytes(map_num=map_num, map_crc=zlib.crc32(entries) & 0xFFFFFFFF))
     if corrupt_record_head:
@@ -391,7 +389,7 @@ def _write_fs_workload(
         # the copy_meta_file/<meta_dirname> directory to actually show up
         # in a listing -- target.db above already guarantees that in
         # practice, but a dedicated marker file makes the dependency
-        # explicit rather than incidental.
+        # explicit.
         (tmp_path / "copy_meta_file" / meta_dirname / "version.db.zst").touch()
     dedup_img_path = f"{target_id}/{dedup_version_id}/dedup.img"
     if dedup_img_size is not None:
@@ -477,8 +475,7 @@ async def _open(tmp_path: Path) -> DedupRepo:
 
 class TestCompositionStageFindings:
     """A corrupt composition sub-file header or ``RecordHead`` surfaces as
-    its own ``Finding``, exactly like the bottom-up scanner's identical
-    checks — proving ``_check_extent`` actually appends what
+    its own ``Finding`` — proving ``_check_extent`` actually appends what
     ``check_composition_header``/``check_record_head`` return, not just
     calls them for effect."""
 
@@ -977,8 +974,7 @@ class TestMapCrcRepairPropagation:
         ``ValueError`` (raised when a concurrent writer changes a record
         between two independent reads of it) is caught at its own call
         site in ``_discover_extent`` and turned into a
-        ``Symptom.CORRUPTION`` finding — the same outcome the old, broader
-        shared ``except`` used to produce, now scoped to just this call."""
+        ``Symptom.CORRUPTION`` finding."""
 
         async def failing_seed(self: CompositionRecord, array_raw: bytes) -> None:
             raise ValueError("synthetic reseed failure")

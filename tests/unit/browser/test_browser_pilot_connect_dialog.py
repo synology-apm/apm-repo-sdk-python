@@ -315,7 +315,7 @@ class TestLocalBackend:
 
         async def scenario() -> tuple[str, str]:
             async with _open_connect_dialog() as (app, pilot, dialog):
-                assert len(app.screen.query("#connect-local-up")) == 0, "the old Up button must be gone"
+                assert len(app.screen.query("#connect-local-up")) == 0, "no separate Up button"
                 tree = app.screen.query_one("#connect-local-tree", DirectoryTree)
                 tree.path = str(child)
                 await wait_until(pilot, lambda: tree.root.children, timeout=ui_timeout, interval=0.1)

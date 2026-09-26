@@ -77,15 +77,11 @@ def test_safe_handles_the_exact_real_sample_shape() -> None:
     _update(f"[red]error:[/red] {safe(_REAL_SHAPE_MESSAGE)}")  # must not raise
 
 
-# An uppercase-starting "[Key=" -- Textual's own markup grammar reads
-# this as a real key=value tag attribute, then fails to resolve the
-# value (TOKEN/VARIABLE_REF need a leading letter/"$", COLOR needs
-# "#"/"rgb"/"hsl", and PERCENT's own leading "-" still needs a digit
-# right after it). rich.markup.escape() itself leaves the leading "["
-# untouched too (its own regex only escapes one immediately followed by
-# a lowercase letter, "#", "/", or "@", so the uppercase "K" here
-# defeats it) -- this is exactly why safe() escapes every "[" rather
-# than reusing rich.markup.escape()'s narrower heuristic.
+# An uppercase-starting "[Key=" is read as a real key=value tag attribute
+# by Textual's markup grammar and fails to resolve; rich.markup.escape()
+# also misses it (its regex only escapes "[" followed by a lowercase
+# letter, "#", "/", or "@") -- why safe() escapes every "[" instead of
+# reusing that narrower heuristic.
 _KEYVALUE_BRACKET_MESSAGE = 'see [Ticket=-MVP-5002577"\nfor details'
 
 

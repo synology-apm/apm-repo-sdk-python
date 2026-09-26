@@ -1,37 +1,16 @@
-"""``update(model, msg) -> (model, cmds)`` for ``BrowseScreen``'s own
-store -- pure, synchronous, exhaustive (``case _: assert_never(msg)``,
-so a new unhandled ``BrowseMsg`` case is a mypy error, not a silent
-no-op).
+"""``update(model, msg) -> (model, cmds)`` for ``BrowseScreen``'s store --
+pure, synchronous, exhaustive (``case _: assert_never(msg)``).
 
-Only ``CatalogsLoaded``/``CatalogsLoadFailed`` (column 1) check their own
-``epoch``/``request`` against the model's current ones before applying --
-a widget-level collapse/re-expand of the same repository node can
-dispatch a second ``CatalogsRequested`` while the first is still in
-flight (the node has no children yet either way, so the screen's own
-``if event.node.children: return`` guard doesn't catch it), the same
-per-``Slot`` overlap ``core/unit/update.py`` closes for a tree node's own
-children fetch. A catalog/workload selection's own fetch
-(``WorkloadsLoaded``/``VersionsLoaded``) needs no such check: it's keyed
-by the *selected* catalog/workload object itself
-(``catalog_workloads``/``workload_versions``), so a differently-selected
-fetch's late result can never overwrite what's currently rendered
-regardless of arrival order -- only a reselect of the exact same,
-already-in-flight catalog/workload could race with itself, and
-``catalog.workloads()``/``catalog.versions()`` are idempotent reads of
-already-recorded backup data, so whichever overlapping call resolves
-last simply overwrites its own key with an equivalent result. The cache
-write and the render are the same operation here: ``select.py``
-re-derives column 2/3 from ``model.selected_catalog``/
-``model.catalog_workloads``/``model.workload_versions`` on every dispatch
-regardless of which field changed.
-
-That data-level safety is still not a reason to let ``CatalogSelected``/
-``WorkloadSelected``/``RefreshRequested`` dispatch a second, overlapping
-fetch for the same key: each duplicate still spawns its own worker and its
-own loading-indicator sink on the same widget, the same worker/indicator
-duplication ``CatalogsRequested``'s guard closes for column 1 -- see
-``core/remote_data.py``'s own ``is_pending_or_done``, used by all three
-cases below for exactly this."""
+Only ``CatalogsLoaded``/``CatalogsLoadFailed`` (column 1) check
+``epoch``/``request`` against the model's current ones, since a
+widget-level collapse/re-expand can dispatch a second ``CatalogsRequested``
+while the first fetch is still in flight. A catalog/workload selection's
+fetch needs no such check: it's keyed by the selected object itself, so a
+differently-selected fetch's late result can never overwrite what's
+rendered. That data-level safety still doesn't excuse a duplicate,
+overlapping fetch for the same key -- ``core/remote_data.py``'s
+``is_pending_or_done`` guards ``CatalogSelected``/``WorkloadSelected``/
+``RefreshRequested`` against spawning a redundant worker/loading-indicator."""
 
 from __future__ import annotations
 
@@ -118,7 +97,7 @@ def update(model: BrowseModel, msg: BrowseMsg) -> tuple[BrowseModel, tuple[Brows
             return new_model, close_cmds
 
         case RepoAdded(repo=repo, layout=layout, key_status=key_status):
-            is_first = not model.repos  # computed before inserting -- the sole "adopt as app_state.repo_handle" trigger
+            is_first = not model.repos  # computed before inserting -- the "adopt as current repo" trigger
             new_model = dataclasses.replace(
                 model, repos={**model.repos, repo: RepoState(layout=layout, key_status=key_status)}
             )
@@ -130,19 +109,11 @@ def update(model: BrowseModel, msg: BrowseMsg) -> tuple[BrowseModel, tuple[Brows
 
         case CatalogsRequested(repo=repo):
             if repo not in model.repos:
-                # The dispatching Tree.NodeExpanded event can be stale --
-                # queued before a RescanStarted wiped model.repos out from
-                # under it. The same kind of race CatalogsLoaded/
-                # CatalogsLoadFailed's own is_stale check covers for a
-                # fetch already in flight; this is the equivalent guard
-                # for one that hasn't started yet.
+                # A stale Tree.NodeExpanded event, queued before a
+                # RescanStarted wiped model.repos out from under it.
                 return model, ()
             if is_pending_or_done(model.repos[repo].catalogs):
-                # Defense in depth: BrowseScreen.on_tree_node_expanded
-                # already guards this before dispatching, but update()
-                # shouldn't rely on every future caller remembering to check
-                # first.
-                return model, ()
+                return model, ()  # defense in depth; the screen already guards this before dispatching
             request, new_model = _next_request(model)
             new_model = dataclasses.replace(new_model, inflight={**new_model.inflight, catalogs_slot(repo): request})
             requested_repo = new_model.repos[repo]
@@ -180,10 +151,7 @@ def update(model: BrowseModel, msg: BrowseMsg) -> tuple[BrowseModel, tuple[Brows
             )
             existing_workloads = new_model.catalog_workloads.get(key, NotAsked())
             if is_pending_or_done(existing_workloads):
-                # Skip-refetch cache hit, or already fetching: a duplicate
-                # dispatch would still spawn its own worker/loading-
-                # indicator for no benefit.
-                return new_model, ()
+                return new_model, ()  # skip-refetch cache hit, or already fetching
             new_model = dataclasses.replace(
                 new_model, catalog_workloads={**new_model.catalog_workloads, key: Loading()}
             )
@@ -196,12 +164,8 @@ def update(model: BrowseModel, msg: BrowseMsg) -> tuple[BrowseModel, tuple[Brows
 
         case WorkloadsLoadFailed(catalog=key, real_catalog=catalog, info=info):
             if info.kind == FailureKind.KEY_REQUIRED:
-                # Reset to NotAsked, never cached as a FailureInfo/rendered
-                # as an error leaf -- column 2 stays blank and this only
-                # prompts for the key. NotAsked also misses CatalogSelected's
-                # own skip-refetch cache check on a later reselect (only
-                # Success counts as a hit), so a reselect after this always
-                # retries.
+                # Reset to NotAsked, never cached as a hit, so a reselect
+                # after providing the key always retries.
                 new_model = dataclasses.replace(model, catalog_workloads={**model.catalog_workloads, key: NotAsked()})
                 return new_model, (PromptForKey(repo=key.repo, catalog=catalog),)
             new_model = dataclasses.replace(model, catalog_workloads={**model.catalog_workloads, key: info})
@@ -225,12 +189,9 @@ def update(model: BrowseModel, msg: BrowseMsg) -> tuple[BrowseModel, tuple[Brows
             return dataclasses.replace(model, repos={**model.repos, repo: new_repo_state}), ()
 
         case CatalogsRefreshFailed(repo=repo, message=message):
-            # Found *before* any catalog was ever (re)selected, so there's
-            # no CatalogKey yet to hang a normal per-catalog
-            # catalog_workloads FailureInfo entry off of, the way
-            # CatalogsLoadFailed/WorkloadsLoadFailed do. Blanks column 2/3,
-            # since neither is meaningful once the catalog list itself
-            # failed to refresh.
+            # No CatalogKey yet to hang a per-catalog FailureInfo off of;
+            # blanks column 2/3 since neither is meaningful once the
+            # catalog list itself failed to refresh.
             return dataclasses.replace(model, selected_catalog=None, selected_workload=None, reload_failure=message), ()
 
         case WorkloadSelected(workload=workload):
@@ -240,10 +201,7 @@ def update(model: BrowseModel, msg: BrowseMsg) -> tuple[BrowseModel, tuple[Brows
             new_model = dataclasses.replace(model, selected_workload=workload)
             existing_versions = new_model.workload_versions.get(wk_key, NotAsked())
             if is_pending_or_done(existing_versions):
-                # Skip-refetch cache hit, or already fetching: a duplicate
-                # dispatch would still spawn its own worker/loading-
-                # indicator for no benefit.
-                return new_model, ()
+                return new_model, ()  # skip-refetch cache hit, or already fetching
             new_model = dataclasses.replace(
                 new_model, workload_versions={**new_model.workload_versions, wk_key: Loading()}
             )
@@ -256,12 +214,8 @@ def update(model: BrowseModel, msg: BrowseMsg) -> tuple[BrowseModel, tuple[Brows
             return dataclasses.replace(model, workload_versions={**model.workload_versions, key: Success(versions)}), ()
 
         case VersionsLoadFailed(workload=key, message=message):
-            # Rendered as column 3's own single error row (select.py's
-            # version_load_error), never cached as a hit -- same
-            # "FailureInfo is never a skip-refetch cache hit" rule as
-            # catalog_workloads/repos above, so a later reselect of this
-            # exact workload always retries rather than replaying the
-            # failure forever.
+            # Never cached as a hit, so a later reselect always retries
+            # rather than replaying the failure forever.
             new_model = dataclasses.replace(
                 model, workload_versions={**model.workload_versions, key: FailureInfo(message=message)}
             )
@@ -274,23 +228,12 @@ def update(model: BrowseModel, msg: BrowseMsg) -> tuple[BrowseModel, tuple[Brows
                 wk_key = workload_key(ck, model.selected_workload)
                 stale_versions = model.workload_versions.get(wk_key, NotAsked())
                 if isinstance(stale_versions, Loading):
-                    # A refresh is already in flight -- unlike
-                    # CatalogSelected/WorkloadSelected's own skip-refetch
-                    # guard (is_pending_or_done), Success must still fall
-                    # through below: refresh's whole point is to re-fetch
-                    # a Success. Only re-triggering a Loading refresh needs
-                    # blocking, both to avoid a second worker/loading-
-                    # indicator and because a second loading_preserving()
-                    # call here would drop the first call's own
-                    # carried-forward previous, below.
+                    # A refresh is already in flight; a second
+                    # loading_preserving() call here would drop the first
+                    # call's carried-forward previous, below.
                     return model, ()
-                # loading_preserving: a refresh's own Success -> Loading
-                # transition (unlike CatalogSelected/WorkloadSelected, which
-                # skip re-fetching entirely once a slot already holds a
-                # Success, so they never reach a Success -> Loading
-                # transition at all) keeps the stale-but-real version list
-                # on screen while the refetch is in flight, per
-                # RemoteData.Loading.previous's own documented intent.
+                # loading_preserving keeps the stale-but-real version list
+                # on screen while the refetch is in flight.
                 new_model = dataclasses.replace(
                     model, workload_versions={**model.workload_versions, wk_key: loading_preserving(stale_versions)}
                 )

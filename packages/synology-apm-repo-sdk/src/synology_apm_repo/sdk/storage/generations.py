@@ -56,20 +56,11 @@ SUPPLEMENTAL_TABLES = frozenset(
     }
 )
 
-#: Logical ``db/<name>`` names that are not their own on-disk object at
-#: all — ``copy_target_file`` has no ``copy_target_file[.N]`` object
-#: anywhere on a real repository; the ``copy_target_file`` *table* lives inside
-#: whichever generation ``copy_target_version[.N]`` resolves to (same
-#: physical sqlite file — both tables are written through one connection
-#: on the write side).
-#: Without this alias, ``DedupRepo.db("copy_target_file")`` would
-#: search ``db/`` for an object literally named that and raise ``NotFoundError``
-#: — there is none — starving the PC/PS browse path
-#: (``PcpsDiskTree.object_nodes()``) of its whole object list. Consulted by
-#: ``DedupRepo.db`` *before* any generation resolution happens, so
-#: it applies uniformly on both ``VAULT`` and ``OBJECT_STORE`` layouts —
-#: this is a fact about how the two tables are physically stored, not an
-#: object-store-specific generation-selection quirk.
+#: Logical ``db/<name>`` names with no on-disk object of their own —
+#: ``copy_target_file`` has no ``copy_target_file[.N]`` object; that table
+#: lives inside whichever generation ``copy_target_version[.N]`` resolves
+#: to (same physical sqlite file). Consulted by ``DedupRepo.db`` before any
+#: generation resolution, on both ``VAULT`` and ``OBJECT_STORE`` layouts.
 PHYSICAL_NAME_ALIASES: dict[str, str] = {"copy_target_file": "copy_target_version"}
 
 REPO_TRANSACTIONS_DIR = "repo_transactions"

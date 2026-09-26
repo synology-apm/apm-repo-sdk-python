@@ -121,14 +121,8 @@ async def _catalog_report(repo: Repository, catalog: Catalog, verbose: bool) -> 
 
 async def _build_report(repository: Repository, state: CliState) -> _DoctorReport:
     catalogs = await repository.catalogs()
-    # Concurrent, not serial -- mirrors Repository.catalogs()'s own
-    # unbounded gather over this same "list of catalogs" collection
-    # (a repo's own backup-source count, never item-tree scale). For a
-    # vault (sibling catalogs sharing one serialized aiosqlite connection)
-    # this is safe but may show little wall-clock gain; for object storage
-    # (each catalog its own connection/store, genuinely non-blocking S3/
-    # Azure I/O) it can scale with catalog count. asyncio.gather preserves
-    # input order, so this list's shape is unchanged either way.
+    # Concurrent, not serial — mirrors Repository.catalogs()'s own gather
+    # over the same catalog list; asyncio.gather preserves input order.
     catalog_reports = await asyncio.gather(
         *(_catalog_report(repository, catalog, state.verbose) for catalog in catalogs)
     )

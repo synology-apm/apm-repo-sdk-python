@@ -4,24 +4,16 @@ and TUI never each pick their own for the same concept.
 
 from __future__ import annotations
 
-#: Keyed by ``FileState.value`` (``sdk.units.base.FileState``), not the
-#: enum itself — this module, like every other presentation helper, has
-#: no SDK-internal import of its own. A caller holding the real enum
-#: looks up ``FILE_STATE_ICON[state.value]``; ``""`` (``NORMAL``) means
-#: no suffix. Appended by the caller at render time, never carried
-#: across the SDK/CLI/TUI boundary as a pre-rendered string — only
-#: ``file_state``'s own semantic value crosses that boundary.
+#: Keyed by ``FileState.value``, not the enum itself — this module has no
+#: SDK-internal import of its own. ``""`` (``NORMAL``) means no suffix,
+#: appended by the caller at render time.
 #:
-#: ``cloud_only``'s glyph is the bare U+2601 codepoint, not U+2601+U+FE0F
-#: (the VS16 emoji-presentation sequence): U+2601 is ``Neutral`` width per
-#: Unicode's own East Asian Width property, so both that and
-#: ``rich.cells.cell_len`` — what the TUI's ``DataTable`` sizes a column
-#: from — already agree it's one cell; adding VS16 would make that
-#: agreement depend on however a given terminal/font and ``rich`` version
-#: each choose to size the emoji-presentation form, rather than a single
-#: property this file can verify on its own. ``encrypted`` needs no such
-#: care either way: U+1F512 alone is already ``Wide`` (two cells) by the
-#: same property, nothing for VS16 to change.
+#: ``cloud_only``'s glyph is bare U+2601, not U+2601+U+FE0F (the VS16
+#: emoji-presentation sequence): U+2601 is ``Neutral`` width per Unicode's
+#: East Asian Width property, matching how ``rich.cells.cell_len`` sizes it
+#: at one cell — VS16 would make that depend on the terminal/font's own
+#: emoji-presentation choice instead. ``encrypted`` needs no such care:
+#: U+1F512 is already ``Wide`` (two cells) either way.
 FILE_STATE_ICON: dict[str, str] = {
     "normal": "",
     "encrypted": "🔒",

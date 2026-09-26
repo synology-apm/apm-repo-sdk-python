@@ -175,31 +175,13 @@ class VirtualDiskContentSource:
             # sub-range of it -- that case must go through the assembly
             # path below to apply the real precedence rule correctly.
             return await touching[0].dedup_file.read(offset, end - offset)
-        # No memoryview-based zero-copy path here despite the temptation:
-        # DedupFile.read() already returns plain bytes, so the one copy
-        # that matters (Pool decompressing a chunk into a buffer) already
-        # happened upstream -- slicing into this bytearray is only a
-        # second, unavoidable copy, and only for a read that straddles
-        # more than one fragment (the single-fragment fast path above
-        # skips it entirely otherwise).
         out = bytearray(end - offset)
-        # ``touching`` inherits self.fragments' own ascending-start order --
-        # deliberately not re-sorted, so a later fragment's write below
-        # naturally overwrites an earlier one's in whatever range they
-        # share ("higher start wins": a later region's real capture takes
-        # precedence over an earlier region's zero-padded boundary).
-        # Known, accepted limitation: a lower-precedence fragment's own
-        # read here still covers its full clipped range even where a
-        # later, higher-start fragment is about to overwrite part of it
-        # below -- real, if minor, redundant DedupFile.read()/decode work
-        # for bytes about to be discarded. Bounded in practice by real
-        # backup data's own shape -- overlap is at most about one
-        # 4096-byte chunk per fragment seam -- not by anything this loop
-        # enforces. Clipping each fragment's read
-        # range against the *next* higher-precedence fragment's own start
-        # before reading would close this, at the cost of real added
-        # complexity for a cost that's already small in practice --
-        # not worth it unless a real sample ever shows otherwise.
+        # ``touching`` keeps fragments' ascending-start order, so a later
+        # fragment's write below naturally overwrites an earlier one's in
+        # any shared range ("higher start wins"). Known, accepted cost: a
+        # lower-precedence fragment's read can still cover bytes a later
+        # fragment overwrites — redundant, bounded in real data to about
+        # one 4096-byte chunk per fragment seam.
         for frag in touching:
             seg_start, seg_end = max(frag.start, offset), min(frag.end, end)
             chunk = await frag.dedup_file.read(seg_start, seg_end - seg_start)
@@ -239,11 +221,7 @@ class VirtualDiskContentSource:
         otherwise. Every fragment shares one ``BucketReaderCache`` for
         this call, bounded to ``DEFAULT_BUCKET_CACHE_SIZE`` (16, the same
         bound ``chunk_walk.py``/``export_scheduler.py`` share so the three
-        don't each drift with a separately hardcoded copy) rather than
-        left unbounded — a multi-fragment disk touching many distinct
-        buckets would otherwise grow this cache proportionally to the
-        total number of buckets touched across every fragment, so
-        bucket-locality reuse persists across fragments only up to that cap.
+        don't each drift with a separately hardcoded copy).
 
         ``ExportResult.holes``/``zeros``/``bytes_written`` are summed
         across fragments independently, so a byte range more than one
@@ -253,15 +231,11 @@ class VirtualDiskContentSource:
         true size.
 
         Shares **one** multiprocess executor across every fragment's own
-        ``export_to()`` call instead of letting each spin one up
-        independently — the same "one executor per logical export, not
-        per inner call" contract ``Repository.verify()``'s own
-        multi-catalog fan-out follows, for the same reason (a fragment's
-        own pool-spawn cost would otherwise be paid once per fragment).
-        Built only when every fragment actually resolves to the identical
-        ``PoolDescriptor`` (same store/``pool_root``/vault key) — true for
-        every real disk today (every fragment belongs to the same
-        repository/pool), checked rather than assumed.
+        ``export_to()`` call, the same "one executor per logical export"
+        contract ``Repository.verify()``'s multi-catalog fan-out follows.
+        Built only when every fragment resolves to the identical
+        ``PoolDescriptor`` (same store/``pool_root``/vault key) — checked,
+        not assumed.
         """
         await asyncio.to_thread(create_presized, dst, self.size, sparse=sparse)
         gaps = _gaps(self.fragments, self.size)
@@ -278,17 +252,12 @@ class VirtualDiskContentSource:
         executor = build_export_executor(first, str(dst)) if share_one_executor and first is not None else None
         try:
             # Fragments are walked sequentially, one fully finishing before
-            # the next starts -- parallelizing across fragments would need
-            # to preserve the "higher start wins" overlap precedence (class
-            # docstring) under concurrent writes, not attempted here (each
-            # fragment's own internal bucket-group dispatch is where the
-            # real parallelism happens once `executor` is set).
-            # max_concurrent_opens matters more here than for a comparable VM
-            # range, since PC/PS's Pool data is typically spread across
-            # smaller, more numerous buckets (left None, it auto-derives from
-            # max_concurrent_reads the same way export_scheduler.export_to()
-            # does for every other caller) -- only relevant on the fallback
-            # path anyway, when `executor` is None.
+            # the next starts, to preserve the "higher start wins" overlap
+            # precedence (class docstring) under concurrent writes -- the
+            # real parallelism happens inside each fragment's own bucket-
+            # group dispatch once `executor` is set. `max_concurrent_opens`
+            # left None auto-derives from `max_concurrent_reads`, same as
+            # every other `export_scheduler.export_to()` caller.
             for frag in self.fragments:
                 frag_progress = _make_progress(progress, done_before, planned_total) if progress is not None else None
                 view = frag.dedup_file.view(frag.start, frag.end - frag.start)

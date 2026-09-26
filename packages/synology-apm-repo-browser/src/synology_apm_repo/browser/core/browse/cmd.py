@@ -3,15 +3,10 @@
 ``assert cmds == (LoadWorkloads(...),)`` is a one-line test with no
 Pilot involved.
 
-Pushing a screen (``KeyDialog``, a fresh ``UnitScreen``, ``ConnectDialog``)
-is deliberately *not* a ``Cmd`` here -- a synchronous navigation with no
-effect on this model, the same posture ``UnitScreen`` already takes for
-its own ``ExportScreen``/``HexPreviewScreen`` pushes. ``PromptForKey``
-below is the one exception: it still needs a ``Cmd`` (an effect, not a
-screen method, owns dispatching ``KeyVerified`` back once ``KeyDialog``
-resolves), so it carries no callback of its own -- see
-``BrowseEffects.perform``'s own handler for where that closure actually
-lives."""
+Pushing a screen is deliberately not a ``Cmd`` -- a synchronous navigation
+with no effect on this model. ``PromptForKey`` is the exception: an
+effect, not a screen method, must dispatch ``KeyVerified`` once
+``KeyDialog`` resolves."""
 
 from __future__ import annotations
 
@@ -26,8 +21,7 @@ from synology_apm_repo.sdk.identifiers import CatalogId
 @dataclasses.dataclass(frozen=True)
 class CloseRepos:
     """Releases every repository discarded by a rescan/unmount -- plural,
-    unlike ``UnitCmd.CloseProvider``, since a rescan can discard several
-    at once (one scan can discover more than one repository)."""
+    since one scan can discover more than one repository."""
 
     repos: tuple[RepoHandle, ...]
 
@@ -46,10 +40,7 @@ class LoadCatalogsFor:
 
 @dataclasses.dataclass(frozen=True)
 class LoadWorkloads:
-    """No ``epoch``/``request`` -- unlike a catalogs fetch, this result is
-    keyed by the currently-selected catalog itself, so a
-    differently-selected fetch's late result can never overwrite what's
-    rendered."""
+    """No ``epoch``/``request`` -- keyed by the selected catalog itself."""
 
     repo: RepoHandle
     catalog: Catalog
@@ -69,10 +60,9 @@ class ReloadCatalogsAfterKeyVerified:
 
 @dataclasses.dataclass(frozen=True)
 class LoadVersions:
-    """``repo`` travels alongside ``catalog`` (not re-derivable from it
-    alone) so the effect can compute this fetch's own ``WorkloadKey``
-    without ever reading ``model.selected_catalog`` live -- capture at
-    dispatch, never re-read live state inside the worker."""
+    """``repo`` travels alongside ``catalog`` so the effect can compute
+    this fetch's ``WorkloadKey`` without reading ``model.selected_catalog``
+    live inside the worker."""
 
     repo: RepoHandle
     catalog: Catalog

@@ -52,11 +52,8 @@ _OFF_CRC_OF_CHUNK_CRC = 29  # not contiguous with the [8, 20) group above
 
 COMPRESS_TYPE_BY_VALUE = {member.value: member for member in CompressType}
 """Plain-dict stand-in for ``CompressType(value)``, used in
-``parse_size_store``'s per-chunk hot loop (up to 8192 calls per bucket) in
-place of ``Enum.__call__``'s own value-lookup machinery. Every other
-``CompressType(...)`` call site in this codebase is cold (once per chunk at
-most, not in a hot per-bucket loop) and is left as the plain, self-explaining
-enum call."""
+``parse_size_store``'s per-chunk hot loop (up to 8192 calls per bucket) to
+avoid ``Enum.__call__``'s lookup overhead."""
 
 _COMPRESS_TYPE_NONE_VALUE = CompressType.NONE.value
 COMPRESS_TYPE_COMPACTED_VALUE = CompressType.COMPACTED.value
@@ -113,12 +110,10 @@ class SizeStoreEntry(NamedTuple):
     recorded in ``SizeStore`` (FORMAT-SPEC.md: SizeStore).
 
     ``NamedTuple``, not this project's usual ``@dataclass(frozen=True)`` —
-    a deliberate exception: ``parse_size_store`` constructs up to 8192 of
-    these per bucket, millions in aggregate across a real export, and a
-    plain ``NamedTuple`` build has identical attribute access with no
-    introspection callers to break, at lower construction cost than
-    ``@dataclass``. ``parse_size_store`` hands these out lazily via
-    ``_SizeStoreArray`` rather than building every entry up front.
+    a deliberate exception: constructed up to 8192 times per bucket, cheaper
+    than dataclass construction at that volume. ``parse_size_store`` hands
+    these out lazily via ``_SizeStoreArray`` rather than building every
+    entry up front.
     """
 
     compress_type: CompressType
@@ -219,10 +214,9 @@ class _SizeStoreArray(_ArrayBackedSequence[SizeStoreEntry]):
 
     def raw_compress_types(self) -> array.array[int]:
         """The raw per-chunk ``CompressType`` values, zero-copy — for a
-        caller that needs O(1) access to every chunk's compress type
-        without constructing a single ``SizeStoreEntry``, unlike even
-        this class's own lazy ``__getitem__``. See ``raw_chunk_arrays``,
-        the intended way to reach this."""
+        caller that needs O(1) access without constructing a single
+        ``SizeStoreEntry``. See ``raw_chunk_arrays``, the intended way to
+        reach this."""
         return self._compress_types
 
 
@@ -235,13 +229,10 @@ def chunk_size_store_tight_length(chunk_num: int) -> int:
 _SIZE_STORE_GROUP_RECORDS = 8
 """8 consecutive 15-bit records pack into exactly 120 bits, 15 whole bytes,
 no overlap into the next group of 8, since
-``lcm(SIZE_STORE_REC_BIT_NUM, 8) / SIZE_STORE_REC_BIT_NUM == 8``. This lets
-``parse_size_store`` decode a whole group from one ``int.from_bytes()``
-call instead of one ``struct.unpack()`` per record, each of which had to
-recompute its own byte offset and bit shift. Tied to the current
-``SIZE_STORE_REC_BIT_NUM == 15`` by the assertion right below — if that
-spec constant ever changed, this grouping would need to change with it,
-not silently decode wrong."""
+``lcm(SIZE_STORE_REC_BIT_NUM, 8) / SIZE_STORE_REC_BIT_NUM == 8`` — tied to
+the current ``SIZE_STORE_REC_BIT_NUM == 15`` by the assertion right below,
+so a future spec change to that constant fails loudly here instead of
+silently decoding wrong."""
 _SIZE_STORE_GROUP_BYTES = 15
 _SIZE_STORE_GROUP_BITS = _SIZE_STORE_GROUP_BYTES * 8
 assert _SIZE_STORE_GROUP_RECORDS * SIZE_STORE_REC_BIT_NUM == _SIZE_STORE_GROUP_BITS, (
@@ -372,19 +363,14 @@ class _ChunkLocatorArray(_ArrayBackedSequence[ChunkLocator]):
         return ChunkLocator(offset=self._offsets[index], length=self._lengths[index])
 
     def raw_offsets(self) -> array.array[int]:
-        """The raw per-chunk ``offset`` values, zero-copy — for a caller
-        that needs O(1) access to every chunk's offset without
-        constructing a single ``ChunkLocator``, unlike even this class's
-        own lazy ``__getitem__``. See ``raw_chunk_arrays``, the intended
-        way to reach this."""
+        """The raw per-chunk ``offset`` values, zero-copy — see
+        ``_SizeStoreArray.raw_compress_types`` for why, and
+        ``raw_chunk_arrays`` for the intended way to reach this."""
         return self._offsets
 
     def raw_lengths(self) -> array.array[int]:
-        """The raw per-chunk ``length`` values, zero-copy — for a caller
-        that needs O(1) access to every chunk's length without
-        constructing a single ``ChunkLocator``, unlike even this class's
-        own lazy ``__getitem__``. See ``raw_chunk_arrays``, the intended
-        way to reach this."""
+        """The raw per-chunk ``length`` values, zero-copy — same as
+        ``raw_offsets``."""
         return self._lengths
 
 
@@ -404,11 +390,8 @@ def chunk_locators(header: BucketFileHeader, entries: Sequence[SizeStoreEntry]) 
         ]
 
     if isinstance(entries, _SizeStoreArray):
-        # "I" (unsigned int): a bucket's whole compressed region tops out
-        # at COMPRESS_RESERVED_LENG + BUCKET_MAX_CHUNK_NUM * FIXED_CHUNK_LENGTH
-        # (~33.6 MB) — nowhere near "I"'s ~4.3 GB ceiling, but well past
-        # "H"'s. No need for "Q"'s 8 bytes/chunk for an offset that always
-        # fits in one .buk file's own byte range.
+        # "I": a bucket's compressed region tops out at ~33.6 MB
+        # (COMPRESS_RESERVED_LENG + BUCKET_MAX_CHUNK_NUM * FIXED_CHUNK_LENGTH).
         effective_lens = entries.effective_lens()
         offsets = array.array("I", bytes(4 * len(effective_lens)))
         running = COMPRESS_RESERVED_LENG
@@ -432,8 +415,7 @@ def raw_chunk_arrays(
     """``(compress_type_values, offsets, lengths)`` as three flat
     ``array.array`` buffers — O(1) per-chunk access to every field
     ``SizeStoreEntry``/``ChunkLocator`` carry without constructing either
-    object, for a caller whose access pattern is dense enough (every chunk
-    in every bucket it opens) that even lazy construction adds up.
+    object.
 
     Zero-copy whenever ``header.is_compressed`` — every current writer's
     layout — returning the exact arrays ``parse_size_store``/

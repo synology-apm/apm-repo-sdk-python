@@ -36,13 +36,7 @@ from synology_apm_repo.sdk.profiles import BackendKind, ProfileSummary
 @asynccontextmanager
 async def _open_connect_dialog() -> AsyncIterator[tuple[ApmRepoBrowserApp, Pilot[None], ConnectDialog]]:
     """Mounts a fresh app, waits for the auto-opened ``ConnectDialog``
-    to appear, and yields ``(app, pilot, dialog)`` — the boilerplate every
-    ``scenario()`` closure below starts with, replacing a hand-rolled
-    ``app = ApmRepoBrowserApp()`` + ``async with app.run_test(...) as
-    pilot:`` + pause + isinstance-assert block. Still an ``async with
-    app.run_test(...)`` underneath — nothing changes about ``app``'s own
-    lifecycle, this just factors out the mount-and-wait every caller did
-    identically."""
+    to appear, and yields ``(app, pilot, dialog)``."""
     app = ApmRepoBrowserApp()
     async with app.run_test(size=(140, 45)) as pilot:
         await pilot.pause()
@@ -616,10 +610,9 @@ class TestProfileManagement:
         sdk_timeout: float,
     ) -> None:
         """Azure's own counterpart to ``test_connect_dialog_save_profile_flow``
-        (S3's) — the "Save as profile..." button's own flow (as opposed to
-        selecting an already-saved profile, which
-        ``test_connect_dialog_selecting_an_azure_profile_refills_its_own_fields``
-        already covers) had no direct Azure-tab coverage before this."""
+        (S3's) — the "Save as profile..." flow, not the already-saved-profile
+        selection ``test_connect_dialog_selecting_an_azure_profile_refills_its_own_fields``
+        covers."""
         store = _make_fake_profile_store(monkeypatch)
 
         async def scenario() -> tuple[bool, bool, str]:
@@ -659,8 +652,7 @@ class TestProfileManagement:
         sdk_timeout: float,
     ) -> None:
         """SMB's own counterpart to ``test_connect_dialog_save_profile_flow``
-        (S3's) — confirms the save flow works identically for the third
-        backend, not just the two the mechanism was originally built for."""
+        (S3's)."""
         store = _make_fake_profile_store(monkeypatch)
 
         async def scenario() -> tuple[bool, bool, str]:

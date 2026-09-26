@@ -114,12 +114,10 @@ class TestResolveCatalogIndexMissingLocation:
     async def test_a_parse_version_spec_failure_returns_none(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """The decrypt+parse step itself is ``catalog.version.parse_version_spec``
-        (shared with ``catalog/version.py``'s own status filter) — this
-        module has no decrypt/detect logic of its own to fail
-        independently, so any failure there (wrong key, corrupt ciphertext,
-        ...) is exercised here by monkeypatching that shared function
-        directly rather than re-deriving one of its own failure modes."""
+        """``catalog.version.parse_version_spec`` (shared with
+        ``catalog/version.py``'s status filter) has no decrypt/detect
+        logic of its own — any failure there is exercised here by
+        monkeypatching the shared function directly."""
         _write_repo_info(tmp_path / "repo_info")
         _write_copy_target_version(tmp_path / "db" / "copy_target_version", "not json at all")
         store = LocalFsStore(tmp_path)

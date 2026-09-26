@@ -531,13 +531,9 @@ def test_export_screen_calling_start_twice_only_creates_one_job(
 
 
 def test_export_screen_empty_destination_warns_and_does_not_start(open_export_screen: _OpenExportScreen) -> None:
-    """The warning now fires via ``app.notify()``, not ``screen.notify()``
-    — ``StartExport``'s own validation moved into ``core/app/update.py``
-    (pure, testable there directly), returning a ``Notify`` command
-    ``AppEffects.perform`` carries out on the App itself. ``Widget.notify``
-    (which ``Screen`` inherits) is documented as delegating straight to
-    ``self.app.notify()`` regardless, so this is an internal plumbing
-    change only — not a user-visible one."""
+    """``StartExport``'s validation lives in ``core/app/update.py`` (pure,
+    testable there directly), returning a ``Notify`` command
+    ``AppEffects.perform`` carries out via ``app.notify()``."""
 
     async def scenario() -> tuple[list[str], bool]:
         content = _RecordingArtifactSource()
@@ -654,7 +650,7 @@ def test_export_screen_cancelling_a_queued_export_shows_cancelled_not_cancelling
     tmp_path: Path, wait_until: Any, ui_timeout: float, sdk_timeout: float, open_export_screen: _OpenExportScreen
 ) -> None:
     """``_cancel_job`` dispatches ``CancelJobRequested`` then
-    unconditionally used to write "cancelling..." afterward -- but for a
+    unconditionally writes "cancelling..." afterward -- but for a
     still-``QUEUED`` job (this one, blocked behind unit_a's own running
     export), that dispatch removes the job and renders its real terminal
     status *synchronously*, before ``_cancel_job``'s own next line would

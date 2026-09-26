@@ -1,29 +1,21 @@
 """Tests for ``sdk/concurrency.py``.
 
-``preload_resource_tracker()``'s own test is mock-based, no real process
-spawn needed, since the whole contract is "delegates to
-``multiprocessing.resource_tracker.ensure_running()``, now, with whatever
-``sys.stderr`` currently is" -- capturing "now" matters since the TUI later
+``preload_resource_tracker()``'s test is mock-based: the contract is
+"delegates to ``resource_tracker.ensure_running()``, now, with whatever
+``sys.stderr`` currently is" — capturing "now" matters since the TUI later
 replaces ``sys.stderr`` with something whose ``fileno()`` can't be trusted.
 
-``run_in_worker_loop()``/``close_worker_loop()``'s own tests exercise the
-module-private ``_worker_runner`` global directly, in-process — no real
-``ProcessPoolExecutor`` needed to prove the loop-lifetime contract itself.
-They don't re-test ``asyncio.Runner.close()``'s own teardown behavior
-(cancelling a leftover pending task, say) — that's stdlib, already tested
-upstream; these tests only cover the thin lazy-create/reuse/reset wrapper
-this module adds around it.
+``run_in_worker_loop()``/``close_worker_loop()``'s tests exercise the
+module-private ``_worker_runner`` global directly — no real
+``ProcessPoolExecutor`` needed, and stdlib ``asyncio.Runner.close()``'s own
+teardown isn't re-tested here.
 
-No test here spins up a real ``new_process_pool()`` worker to confirm an
-``atexit`` hook fires on normal shutdown: this project's ``tests/`` tree
-(``--import-mode=importlib``, no ``tests/__init__.py``) isn't a real,
-``sys.path``-importable package, so a function defined in a test file
-can't be pickled and re-imported as a ``spawn``-context initializer/target
-— only real, installed ``synology_apm_repo.*`` code can serve that role
-under pytest here. See ``dedup/export_scheduler.py``'s/``units/verify_reachable.py``'s
-own test files' ``TestMultiprocessExecutorTeardown`` for the real-subprocess
-coverage that *is* possible this way, and each's own shutdown-hook tests
-for what's covered by direct calls instead.
+No test here spins up a real ``new_process_pool()`` worker to confirm the
+``atexit`` hook fires: a function defined in this ``tests/`` tree can't be
+pickled as a ``spawn``-context target under pytest's import mode here. See
+``dedup/export_scheduler.py``'s/``units/verify_reachable.py``'s own test
+files' ``TestMultiprocessExecutorTeardown`` for that real-subprocess
+coverage.
 """
 
 from __future__ import annotations
@@ -161,15 +153,11 @@ async def test_bounded_gather_never_exceeds_max_concurrent_in_flight() -> None:
 
 
 async def test_bounded_gather_on_done_runs_after_the_semaphore_is_released() -> None:
-    """Regression test: ``on_done`` must not itself count against
-    ``max_concurrent`` -- a caller's own slow/throttled post-completion
-    callback (a progress tick that awaits, say) must not hold up the
-    next item's own dispatch, the same reasoning ``dispatch_to_pool``'s
-    own ``on_result`` already documents. Verified by driving
-    ``max_concurrent=1`` with an ``on_done`` that blocks until a second
-    ``worker`` call has already started -- which can only happen if the
-    semaphore slot ``on_done``'s own item held was already released
-    before ``on_done`` ran."""
+    """``on_done`` must not itself count against ``max_concurrent`` — a
+    caller's slow post-completion callback must not hold up the next
+    item's dispatch. Verified with ``max_concurrent=1`` and an ``on_done``
+    that blocks until a second ``worker`` call has already started, which
+    can only happen if its own semaphore slot was already released first."""
     worker_starts = 0
     second_worker_started = asyncio.Event()
 

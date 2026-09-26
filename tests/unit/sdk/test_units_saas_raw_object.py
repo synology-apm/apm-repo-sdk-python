@@ -497,12 +497,9 @@ class TestObjectDbIdOverride:
     async def test_mismatched_stream_uuid_closes_its_stream_instead_of_leaking_it(
         self, opened_repo: DedupRepo, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """Regression test: the mismatch check raises before ``_manual_db``/
-        ``_indexed_db`` are ever assigned (this provider's own instance
-        attrs), and this is the guaranteed-to-succeed fallback provider,
-        reachable directly from CLI/TUI diagnostic tooling's
-        ``--object-db-id`` — create() must call close() on this failure
-        path rather than only on success."""
+        """The mismatch check raises before ``_manual_db``/``_indexed_db``
+        are assigned — ``create()`` must still call ``close()`` on this
+        failure path, not just on success."""
         closed_instances = []
         original_close = RawObjectProvider.close
 
@@ -518,14 +515,10 @@ class TestObjectDbIdOverride:
 
 
 class TestCreateFailureCleanup:
-    """``create()``'s own broad ``except Exception: await self.close();
-    raise`` (unlike the narrower, already-tested mismatched-``--object-db-id``
-    case above) — a real, unexpected failure loading the *indexed* ObjectDB
-    (a stale/corrupt index entry, not a missing index) must still call
-    close() rather than leak whatever it already opened, the same as every
-    sibling application-layer provider's (Drive, Mail, Calendar, Site)
-    equivalent test of a real corrupt/failing load during its own
-    ``create()``."""
+    """``create()``'s broad ``except Exception: await self.close(); raise``
+    — a real, unexpected failure loading the indexed ObjectDB must still
+    call ``close()``, the same as every sibling provider's (Drive, Mail,
+    Calendar, Site) equivalent test."""
 
     async def test_a_corrupt_indexed_objectdb_closes_the_stream_instead_of_leaking_it(
         self, opened_repo: DedupRepo, monkeypatch: pytest.MonkeyPatch

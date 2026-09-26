@@ -92,18 +92,15 @@ or `make smoke-test` (runs `sdk`/`cli`/`browser` together; not part of
 the unambiguous case where a sample entry's own config resolves to exactly
 one repository, so there's no "which sibling does this key belong to" question to
 guess around. In that case the ref used is the *broad*, un-narrowed one
-(`RepoInfo.broad_repo_ref`), the only path empirically verified to accept
-`--key` for both vault and object-store layouts alike.
+(`RepoInfo.broad_repo_ref`), which accepts `--key` for both vault and
+object-store layouts alike.
 
 For a shared bucket's non-sole sibling (`sample-1`'s own "two repositories sharing
 one bucket" case), no key is passed at all, and the ref falls back to the
 narrowed, single-repository location (`RepoInfo.narrow_repo_ref`) instead -- a
 narrowed rescan's own key-verification probe reports "no repository found"
 rather than gracefully ignoring an unneeded key, even for the sibling that
-doesn't actually need it (empirically verified against
-`sample-1`/`s3-sample-2-encrypted`'s real bytes -- both siblings fail
-identically with the shared key, both succeed identically without it).
-`sample-1`'s shared-bucket case is exercised both by this domain's own
+doesn't actually need it. `sample-1`'s shared-bucket case is exercised both by this domain's own
 ref-selection walk (above) and, separately, by `errors`' own dedicated
 wrong-key check, which reports a normal `KeyMismatchError` rather than a broken
 discovery when it deliberately supplies an incorrect key.

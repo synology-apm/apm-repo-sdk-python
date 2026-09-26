@@ -19,21 +19,14 @@ from typing import BinaryIO
 
 from ...base import FileState
 
-# Pin dissect.util's read-alignment granularity so it isn't affected by
-# whichever Python interpreter's own io.DEFAULT_BUFFER_SIZE happens to be
-# in effect (Python 3.14 changed that stdlib default from 8192 to
-# 131072). Must run before dissect.util.stream is ever imported, which
-# only happens lazily inside this package's own _try_import calls, at
-# call time -- executing this here, at this leaf module's own import
-# time, is early enough since every _try_import call across the whole
-# package happens later, inside a function body. 8192 is deliberate, not
-# just inherited: a read below this size already rounds up to a full
-# aligned block regardless of the value chosen, while a sequential read
-# at or above it already collapses into one underlying call no matter how
-# large the alignment is (AlignedStream.read()'s own divmod-based
-# batching) — so a larger alignment only adds wasted bytes on the many
-# small/scattered reads real filesystem browsing does, with no offsetting
-# benefit.
+# Pin dissect.util's read-alignment granularity (Python 3.14 changed
+# io.DEFAULT_BUFFER_SIZE, dissect.util's inherited default, from 8192 to
+# 131072) -- must run before dissect.util.stream is first imported,
+# which this module's own import time precedes. 8192 stays deliberate: a
+# read below it already rounds up to one aligned block, and a read at or
+# above it already collapses into one call (AlignedStream's own
+# divmod-based batching) -- a larger value only wastes bytes on real
+# filesystem browsing's small/scattered reads.
 os.environ.setdefault("DISSECT_STREAM_BUFFER_SIZE", "8192")
 
 
@@ -49,12 +42,10 @@ class _DirEntry:
     """One directory's real child, as every format's own ``iterdir``
     reports it — the ``_Format.iterdir`` contract's own return element.
     ``mtime`` is ``None`` when a format/entry has no reliable value: each
-    format module's own ``_safe_mtime``/``_*_entry_mtime`` helper reads it
-    off a live Dissect object on real, possibly-malformed disk bytes, and
-    degrades a raise there to ``None`` for that one entry rather than
-    aborting the whole listing — this package's "report what's observed,
-    don't crash" posture, applied here the same way ``_ntfs_size``/
-    ``_apfs_size`` already apply it to a resolved entry's size."""
+    format's own ``_safe_mtime``/``_*_entry_mtime`` helper degrades a raise
+    there to ``None`` for that one entry rather than aborting the whole
+    listing (the same posture ``_ntfs_size``/``_apfs_size`` apply to
+    size)."""
 
     name: str
     is_dir: bool
@@ -137,19 +128,14 @@ def _default_content_unavailable(entry: object) -> None:
     return None
 
 
-#: The explanation for each of this SDK's own ``ContentUnavailableError``
-#: cases, raised once per failed open — shown to the user verbatim
-#: wherever that exception surfaces (the CLI's own error output, via
-#: ``ApmRepoError.safe_message``; the TUI's detail-pane inline note), so
-#: kept short rather than padded out to a full sentence. Distinct from
-#: ``Node.attrs["file_state"]`` (a bare ``FileState`` a presentation layer
-#: renders its own way, e.g. ``sdk.presentation.icons.FILE_STATE_ICON``).
-#: ``_CLOUD_ONLY_REASON`` is shared verbatim between NTFS's confirmed
-#: reparse-tag check and APFS's confirmed flag/xattr check — stated as
-#: plain fact either way, not hedged: both are proactively trusted to
-#: refuse an export on their own, not just to explain a failure that
-#: already happened. ``_ENCRYPTED_REASON`` (NTFS only) is likewise
-#: trusted on its own, since this SDK has no key material anywhere to
-#: attempt a real decryption.
+#: User-facing explanation for each ``ContentUnavailableError`` case,
+#: shown verbatim wherever it surfaces (CLI error output via
+#: ``ApmRepoError.safe_message``; the TUI's detail-pane note) — distinct
+#: from ``Node.attrs["file_state"]`` (a bare ``FileState`` a presentation
+#: layer renders its own way). ``_CLOUD_ONLY_REASON`` is shared between
+#: NTFS's reparse-tag check and APFS's flag/xattr check, both confirmed
+#: rather than heuristic. ``_ENCRYPTED_REASON`` (NTFS only) is likewise
+#: trusted on its own — this SDK has no key material to attempt
+#: decryption.
 _CLOUD_ONLY_REASON = "cloud-sync placeholder — no data at backup time"
 _ENCRYPTED_REASON = "EFS-encrypted — no key to decrypt it"

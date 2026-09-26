@@ -12,8 +12,7 @@ would key on. ``_patch_source_roots`` also clears ``EXCEPTIONS`` to
 ``{}`` — the real dict's ~20 entries name modules nothing in a narrow
 synthetic tmp tree ever resolves to, which the stale-``EXCEPTIONS``-key
 check (``main()``'s own ``stale_keys``) would otherwise flag on every
-synthetic scenario below; a test that needs one specific entry sets it
-explicitly, after calling ``_patch_source_roots``.
+synthetic scenario below.
 """
 
 from __future__ import annotations

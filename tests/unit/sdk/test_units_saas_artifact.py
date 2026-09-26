@@ -59,13 +59,9 @@ class TestLazyBuild:
 
 class TestSize:
     async def test_size_is_unknown_until_built_then_matches_built_bytes_length(self) -> None:
-        """``size`` stays a *synchronous* property on ``ContentSource``
-        and a property cannot await, so the one implementer
-        whose size genuinely isn't known without I/O reports ``None``
-        until the artifact has actually been assembled — the ``int |
-        None`` half of that contract. Once built, it reflects the
-        built bytes' length.
-        """
+        """``size`` is a synchronous property, so the one implementer
+        whose size isn't known without I/O reports ``None`` until built,
+        then the built bytes' length."""
 
         async def build() -> bytes:
             return b"hello world"
@@ -107,13 +103,10 @@ class TestRead:
         assert await artifact.read(6) == b"world"
 
     async def test_negative_offset_raises(self) -> None:
-        """``ContentSource.read``'s contract requires raising
-        ``ValueError`` for a negative ``offset``/``length``, matching
-        every sibling implementer (``DedupFile``, ``ByteRangeView``,
-        ``VirtualDiskContentSource``, ``disk_fs.py``'s
-        ``_BlockingReadContentSource``) -- without this guard, a negative
-        offset would silently fall into Python's own negative-slice
-        semantics instead of raising."""
+        """``ContentSource.read`` raises ``ValueError`` for a negative
+        offset/length, matching every sibling implementer — without this
+        guard a negative offset would silently fall into Python's own
+        negative-slice semantics instead."""
 
         async def build() -> bytes:
             return b"hello world"

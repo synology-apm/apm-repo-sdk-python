@@ -1,22 +1,14 @@
 """``Connection``: one backup source (a ``db/connection_config`` row) and
 its own cheap enumeration query, ``connections()`` — a plain SQLite read,
 never touching Pool or Composition, sorted by ``display_name`` since
-``connection_config`` has no chronological field. ``display_name``
-extraction (``_connection_display_name``) is a first-class output here, not
-an afterthought — CLI/TUI show *only* ``display_name``/``subtitle``/
-``attrs`` in the default (non-diagnostic) mode; raw ids stay internal. The
-sibling ``Workload``/``Version`` entities and their own display-name/status
-extraction (``_device_display_name``/``_saas_display_name``,
-``_version_epoch``) live in ``catalog/workload.py``/``catalog/version.py``
-instead — not catalogued here.
+``connection_config`` has no chronological field.
 
-**How a workload is linked to a connection**: ``workload_config`` carries no
-``connection_config_id`` column of its own — the only table with both
-``workload_id`` *and* ``connection_config_id`` is ``copy_target_version``,
-so that join is the actual source of truth ``_workload_ids_by_connection``/
-``_namespace_by_workload`` below use (``catalog/workload.py``'s own
-``_workload_ids_for_connection`` relies on the same join, in its
-single-connection form).
+``workload_config`` carries no ``connection_config_id`` column of its own
+— the only table with both ``workload_id`` and ``connection_config_id`` is
+``copy_target_version``, so that join is the source of truth
+``_workload_ids_by_connection``/``_namespace_by_workload`` below use
+(``catalog/workload.py``'s ``_workload_ids_for_connection`` relies on the
+same join, single-connection form).
 """
 
 from __future__ import annotations
@@ -49,12 +41,9 @@ _CONNECTION_CONFIG_COLUMNS = [Column("connection_config_id"), Column("connection
 
 
 async def connections(repo: DedupRepo) -> list[Connection]:
-    """Sorted by ``display_name`` (case-insensitive) — unlike ``versions``,
-    ``connection_config`` has no chronological field a collection order
-    could instead follow. Per-connection enrichment (workload ids,
-    namespaces, version counts) is batched across every row collected
-    below in one shot each, mirroring ``versions``'s own two-pass "collect
-    rows, then batch-resolve" shape."""
+    """Sorted by ``display_name`` (case-insensitive). Per-connection
+    enrichment (workload ids, namespaces, version counts) is batched
+    across every row in one shot each, rather than resolved per row."""
     table = await Table.create(await repo.db("connection_config"), "connection_config", _CONNECTION_CONFIG_COLUMNS)
     rows = [row async for row in table.select()]
     connection_config_ids = [ConnectionConfigId(as_int(row["connection_config_id"])) for row in rows]
@@ -93,11 +82,9 @@ async def _workload_ids_by_connection(
     repo: DedupRepo, connection_config_ids: list[ConnectionConfigId]
 ) -> dict[ConnectionConfigId, list[WorkloadId]]:
     """Batched form of ``catalog/workload.py``'s ``_workload_ids_for_connection``
-    — one ``WHERE connection_config_id IN (...)`` query for every id in
-    ``connection_config_ids``, used only by ``connections`` (which needs
-    every connection's own workload ids at once); ``workloads`` still calls
-    the single-connection version instead, since it only ever has one
-    ``Connection`` to resolve."""
+    — one ``WHERE connection_config_id IN (...)`` query for every id, used
+    only by ``connections`` (which needs every connection's workload ids
+    at once)."""
     if not connection_config_ids:
         return {}
     placeholders = sql_placeholders(len(connection_config_ids))
@@ -117,11 +104,9 @@ async def _workload_ids_by_connection(
 async def _version_counts_by_connection(
     repo: DedupRepo, connection_config_ids: list[ConnectionConfigId]
 ) -> dict[ConnectionConfigId, int]:
-    """Batched ``COUNT(*) ... GROUP BY connection_config_id`` — one
-    query for every id in ``connection_config_ids``. A
-    ``connection_config_id`` with zero versions is simply
-    absent from the returned dict (``GROUP BY`` never yields a
-    zero-count row) — callers should treat a miss as ``0``."""
+    """Batched ``COUNT(*) ... GROUP BY connection_config_id``. A
+    ``connection_config_id`` with zero versions is absent from the
+    returned dict — callers should treat a miss as ``0``."""
     if not connection_config_ids:
         return {}
     placeholders = sql_placeholders(len(connection_config_ids))
@@ -136,19 +121,12 @@ async def _version_counts_by_connection(
 
 
 async def _namespace_by_workload(repo: DedupRepo, workload_ids: list[WorkloadId]) -> dict[WorkloadId, str]:
-    """``workload_id -> namespace`` for every id in ``workload_ids``
-    that actually has one recorded — one batched query for every
-    connection's workloads at once, used by ``connections`` to build each
-    connection's own deduped-in-encounter-order namespace list without
-    re-querying ``workload_config`` per connection."""
+    """``workload_id -> namespace`` for every id in ``workload_ids`` that
+    actually has one recorded — one batched query, used by ``connections``
+    to avoid re-querying ``workload_config`` per connection."""
     if not workload_ids:
         return {}
     placeholders = sql_placeholders(len(workload_ids))
-    # _WORKLOAD_COLUMNS is shared with catalog/workload.py's own
-    # workloads()/workload_by_id() (which read every column; this reads
-    # only workload_id/workload_spec off the same rows) via
-    # catalog/workload_config.py, so the two required-column lists can
-    # never silently drift apart.
     table = await Table.create(await repo.db("workload_config"), "workload_config", _WORKLOAD_COLUMNS)
     result: dict[WorkloadId, str] = {}
     async for row in table.select(f"workload_id IN ({placeholders})", workload_ids):

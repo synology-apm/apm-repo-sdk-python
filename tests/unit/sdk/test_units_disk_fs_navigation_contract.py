@@ -1,30 +1,18 @@
 """Cross-format navigation contract for ``DiskFilesystem``: root's own
 listing never contains a self-referential/bookkeeping entry
-(``.``/``..``), run identically against ext4, XFS, Btrfs, and NTFS's
-real, committed fixtures (the four formats sharing ``tests/unit/sdk/
-test_units_disk_fs.py``'s own ``.raw.tar.gz`` + ``_FileBackedAsyncContent``
-mechanism — see that file's module docstring for where each fixture came
-from and why FAT12 isn't included here: it's hand-built byte-exact rather
-than a real filesystem image, a different construction entirely).
+(``.``/``..``), checked against ext4, XFS, Btrfs, and NTFS's real,
+committed fixtures via ``test_units_disk_fs.py``'s ``.raw.tar.gz``/
+``_FileBackedAsyncContent`` mechanism (FAT12 isn't included — it's
+hand-built, not a real filesystem image).
 
-Complements, rather than replaces, the dedicated regression tests for
-NTFS root's literal ``"."`` self-reference
-(``test_ntfs_iterdir_filters_the_roots_self_referential_dot_entry``) and
-Btrfs's ``Subvolume``-as-``.parent`` quirk
-(``test_btrfs_dot_dot_can_be_a_bare_subvolume_object_not_a_real_inode``/
-``test_btrfs_iterdir_skips_a_child_missing_is_dir_even_under_a_non_dot_name``)
-— both in ``test_units_disk_fs.py``, both against hand-built fake objects
-calling the private ``_ntfs_iterdir``/``_btrfs_iterdir`` functions
-directly, no real sample or even a real ``dissect.*`` disk image needed
-(the Btrfs one is additionally characterized against this project's own
-flat, single-subvolume fixture, proving the underlying library quirk
-itself doesn't need real multi-subvolume data to reproduce). What this
-file adds on top is the *general* shape both bugs took (a directory
-listing that includes a self-referential/bookkeeping entry), checked
-through the real, public ``DiskFilesystem.open()``/``list_dir()`` path
-against every format this project can exercise offline — so a future
-format, or a regression reachable only through that public path rather
-than the private per-format functions above, is still caught here.
+Complements that file's dedicated NTFS/Btrfs regression tests
+(``test_ntfs_iterdir_filters_the_roots_self_referential_dot_entry``,
+``test_btrfs_dot_dot_can_be_a_bare_subvolume_object_not_a_real_inode``,
+``test_btrfs_iterdir_skips_a_child_missing_is_dir_even_under_a_non_dot_name``),
+which call the private ``_ntfs_iterdir``/``_btrfs_iterdir`` functions
+directly; this file checks the same shape through the public
+``DiskFilesystem.open()``/``list_dir()`` path instead, so a future format
+or a regression reachable only through that public path is still caught.
 """
 
 from __future__ import annotations

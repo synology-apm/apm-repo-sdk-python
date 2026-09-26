@@ -1,26 +1,18 @@
 """Pure ``BrowseModel`` -> ``NodeSpec`` tree translation for
-``view/reconcile.py``, for columns 1 (catalogs) and 2 (workloads).
-Column 3 (versions) has no reconciler equivalent at all -- ``DataTable``
-can't be reconciled the way ``Tree`` is: ``add_row`` can't insert at a
-position (it's append-only) and ``add_column`` raises ``NoActiveAppError``
-with no running ``App`` -- so its own pure projections, ``version_rows``/
-``version_load_error``, hand back plain rows/an error message instead of
-a ``NodeSpec`` tree.
+``view/reconcile.py``, for columns 1 (catalogs) and 2 (workloads). Column 3
+(versions) has no reconciler equivalent -- ``DataTable`` can't be
+reconciled the way ``Tree`` is -- so its own pure projections,
+``version_rows``/``version_load_error``, hand back plain rows/an error
+message instead.
 
-Both trees' own root is a permanent, non-domain container ("Catalogs"/
-"Workloads") that never itself changes shape -- unlike ``core/unit/
-select.py``'s ``folder_tree_spec``, whose root really is a domain ``Node``, so
-there's nothing here to ``Binding``-wrap at the root: each of
-``catalog_tree_spec``/``workload_tree_spec`` returns that root's own
-*children* directly, always a plain tuple (never ``None`` -- there is no
-"not modelled" case for a permanent root, only "currently has zero
-children"), for the screen to hand straight to
-``reconcile_children(tree.root, ...)``.
+Both trees' root is a permanent, non-domain container ("Catalogs"/
+"Workloads") that never changes shape, so ``catalog_tree_spec``/
+``workload_tree_spec`` return that root's children directly, always a
+plain tuple, for the screen to hand to ``reconcile_children(tree.root, ...)``.
 
-The actual device/SaaS grouping algorithm is entirely
-``workload_grouping.py``'s ``_group_workloads`` -- this module only turns
-its result into ``NodeSpec``s and applies the tree filter, keeping
-grouping logic and widget-rendering as two separate concerns."""
+The device/SaaS grouping algorithm is ``workload_grouping.py``'s
+``_group_workloads``; this module only turns its result into ``NodeSpec``s
+and applies the tree filter."""
 
 from __future__ import annotations
 
@@ -47,35 +39,26 @@ from synology_apm_repo.sdk.units.node_ref import disambiguate_catalogs, disambig
 
 @dataclasses.dataclass(frozen=True, slots=True)
 class RepoErrorKey:
-    """Synthetic key for the one error leaf a repository whose
-    ``catalogs()`` fetch failed renders under itself -- scoped by
-    ``repo`` (not a bare sentinel string) so ``find_node``'s own
-    whole-tree walk resolves the *right* repository's own error leaf
-    when more than one is failing at once (``reconcile_children`` itself
-    only needs per-parent uniqueness, already satisfied by a bare
-    sentinel, but ``find_node`` walks the whole reconciled tree matching
-    by key alone, with no per-parent scoping, so a bare sentinel shared by
-    two failing repositories could resolve to whichever one it reaches
-    first)."""
+    """Synthetic key for the error leaf a repository whose ``catalogs()``
+    fetch failed renders under itself -- scoped by ``repo`` so
+    ``find_node``'s whole-tree walk resolves the right repository's error
+    leaf when more than one is failing at once."""
 
     repo: RepoHandle
 
 
 @dataclasses.dataclass(frozen=True, slots=True)
 class WorkloadGroupKey:
-    """Path-encoded, globally unique within column 2's whole tree (same
-    ``find_node`` reasoning as ``RepoErrorKey`` above): ``(type_hint,)``
-    for a device group directly under root, ``(platform_type,)`` for a
-    SaaS platform header, ``(platform_type, tenant_key)`` for a SaaS
-    tenant/domain node, ``(platform_type, tenant_key, type_hint)`` for a
-    SaaS sub_type group nested under one."""
+    """Path-encoded, globally unique within column 2's tree: ``(type_hint,)``
+    for a device group, ``(platform_type,)`` for a SaaS platform header,
+    ``(platform_type, tenant_key)`` for a tenant/domain node,
+    ``(platform_type, tenant_key, type_hint)`` for a nested sub_type group."""
 
     path: tuple[str, ...]
 
 
-#: Column 2's own single error leaf, replacing the whole tree -- only one
-#: catalog is ever selected at a time, so unlike ``RepoErrorKey`` there's
-#: no cross-selection collision to scope against.
+#: Column 2's single error leaf, replacing the whole tree -- only one
+#: catalog is ever selected at a time, so no cross-selection scoping needed.
 WORKLOAD_ERROR_KEY = WorkloadGroupKey(path=("__workload_error__",))
 
 CatalogTreeKey = RepoHandle | CatalogKey | RepoErrorKey
@@ -118,10 +101,10 @@ def _catalog_children_spec(
 
 
 def catalog_tree_spec(model: BrowseModel, *, scan_path: str, verbose: bool) -> tuple[NodeSpec[CatalogTreeKey], ...]:
-    """Column 1's own top-level ``NodeSpec``s, one per discovered
-    repository, in ``model.repos``' own insertion (discovery) order.
-    ``payload`` is the bare ``RepoHandle`` -- the screen resolves it back
-    to the real ``Repository`` only inside an effect, never here."""
+    """Column 1's top-level ``NodeSpec``s, one per discovered repository,
+    in ``model.repos``'s insertion order. ``payload`` is the bare
+    ``RepoHandle`` -- resolved back to the real ``Repository`` only
+    inside an effect."""
     specs: list[NodeSpec[CatalogTreeKey]] = []
     for repo, state in model.repos.items():
         label = _repo_label(state.layout, state.key_status, scan_path, verbose=verbose)
@@ -133,12 +116,9 @@ def catalog_tree_spec(model: BrowseModel, *, scan_path: str, verbose: bool) -> t
 def _workload_leaf_specs(
     model: BrowseModel, catalog: CatalogKey, group_key: WorkloadGroupKey, workloads: list[Workload]
 ) -> tuple[NodeSpec[WorkloadTreeKey], ...]:
-    """Calls ``disambiguate_workloads(..., use_type_hint=False)`` on
-    ``workloads``, which are already one sub_type group's own siblings by
-    the time this runs (``_group_workloads``' caller) — every sibling here
-    already shares one ``type_hint``, so its own hint-based disambiguation
-    would never differentiate anything at this level and would just repeat
-    what the grouping already shows; the hash fallback alone still can."""
+    """``workloads`` already share one ``type_hint`` (one sub_type group's
+    siblings), so ``use_type_hint=False``: hint-based disambiguation would
+    just repeat what the grouping already shows."""
     needle = _tree_needle(model, "workloads", group_key)
     names = disambiguate_workloads(workloads, use_type_hint=False)
     specs: list[NodeSpec[WorkloadTreeKey]] = []
@@ -204,15 +184,11 @@ def _platform_spec(
 
 
 def workload_tree_spec(model: BrowseModel, *, verbose: bool) -> tuple[NodeSpec[WorkloadTreeKey], ...]:
-    """Column 2's own top-level ``NodeSpec``s -- empty whenever there's
-    nothing to show (no catalog selected, its own workload fetch still
-    ``NotAsked``/``Loading``, or a ``Success`` of zero workloads), one
-    synthetic error leaf on ``FailureInfo``, or the real device/SaaS
-    grouping on ``Success``. ``verbose`` currently has nothing to add at this level
-    -- unlike column 1's catalog leaves, a workload leaf carries no
-    verbose-only suffix -- but is threaded through for the same reason
-    every other selector in this package accepts it: a future verbose-
-    only workload detail shouldn't need a new call-site plumbing pass."""
+    """Column 2's top-level ``NodeSpec``s -- empty when there's nothing to
+    show, one synthetic error leaf on ``FailureInfo``, or the device/SaaS
+    grouping on ``Success``. ``verbose`` has nothing to add at this level
+    yet, but is threaded through so a future verbose-only detail doesn't
+    need a new plumbing pass."""
     if model.reload_failure is not None:
         # An exception's own str() -- arbitrary text, escaped before
         # reaching this Tree label, same reasoning as
@@ -249,10 +225,8 @@ def workload_tree_spec(model: BrowseModel, *, verbose: bool) -> tuple[NodeSpec[W
 
 
 def _current_versions_state(model: BrowseModel) -> RemoteData[tuple[Version, ...]] | None:
-    """The current workload's own ``workload_versions`` entry, or ``None``
-    before a catalog/workload is even selected -- the one place
-    ``version_rows``/``version_load_error``/``version_fetch_pending`` all
-    resolve down to, each then projecting it differently."""
+    """The current workload's ``workload_versions`` entry, or ``None``
+    before a catalog/workload is selected."""
     if model.selected_catalog is None or model.selected_workload is None:
         return None
     catalog = catalog_key(model.selected_catalog.repo, model.selected_catalog.catalog)
@@ -261,14 +235,11 @@ def _current_versions_state(model: BrowseModel) -> RemoteData[tuple[Version, ...
 
 
 def version_rows(model: BrowseModel) -> tuple[tuple[int, str], ...]:
-    """The disambiguated ``(original_index, name)`` pairs for the
-    currently selected workload's own versions -- unfiltered; the screen
-    itself applies ``model.version_filter``'s own text, since that
-    filtering (substring match plus cursor-position restore) is
-    genuinely ``DataTable``-rendering-local, not a ``NodeSpec``-tree
-    concern -- column 3 renders via a plain ``DataTable``, which has no
-    reconciler counterpart. Empty whenever nothing's selected or its own
-    fetch hasn't succeeded yet."""
+    """The disambiguated ``(original_index, name)`` pairs for the selected
+    workload's versions -- unfiltered; the screen applies
+    ``model.version_filter``'s text itself, since that's
+    ``DataTable``-rendering-local, not a ``NodeSpec``-tree concern. Empty
+    when nothing's selected or its fetch hasn't succeeded yet."""
     state = _current_versions_state(model)
     if state is None:
         return ()
@@ -282,41 +253,29 @@ def version_rows(model: BrowseModel) -> tuple[tuple[int, str], ...]:
 
 
 def version_fetch_pending(model: BrowseModel) -> bool:
-    """True exactly when the current workload's own versions fetch hasn't
-    resolved even once yet (see ``remote_data.py``'s ``has_ever_resolved``).
-    ``False`` for a failed fetch too -- that's a resolution, just an
-    unsuccessful one, rendered separately via ``version_load_error``, not
-    conflated with "still loading" here. Read by ``_render_versions`` to
-    decide when its own empty-state placeholder is safe to show: showing
-    it before the fetch has ever resolved would coexist with the
-    debounced loading row ``DataTableLoadingRowSink`` already shows,
-    instead of letting the fetch's first resolution decide which one
-    actually belongs on screen."""
+    """True exactly when the current workload's versions fetch hasn't
+    resolved even once yet. ``False`` for a failed fetch too -- that's a
+    resolution, rendered separately via ``version_load_error``. Read by
+    ``_render_versions`` to decide when its empty-state placeholder is
+    safe to show, rather than coexisting with the debounced loading row."""
     state = _current_versions_state(model)
     return state is not None and not isinstance(state, FailureInfo) and not has_ever_resolved(state)
 
 
 def version_load_error(model: BrowseModel) -> str | None:
-    """The current workload's own ``catalog.versions()`` failure message,
-    if any -- column 3's own single error row (``_render_versions``), the
-    flat-``DataTable`` counterpart to a tree's synthetic error leaf
-    (``_catalog_children_spec``'s ``RepoErrorKey`` leaf,
-    ``workload_tree_spec``'s ``WORKLOAD_ERROR_KEY`` leaf). ``None``
-    whenever nothing's selected or its own fetch didn't fail."""
+    """The current workload's ``versions()`` failure message, if any --
+    column 3's single error row, the flat-``DataTable`` counterpart to a
+    tree's synthetic error leaf. ``None`` when nothing's selected or its
+    fetch didn't fail."""
     state = _current_versions_state(model)
     return state.message if isinstance(state, FailureInfo) else None
 
 
 def is_workload_current(model: BrowseModel, key: WorkloadKey) -> bool:
-    """True when ``key`` is still the currently selected workload --
-    what a ``LoadVersions`` fetch's own ``DataTableLoadingRowSink`` reads
-    live (``browse_effects.py``) before writing into column 3, so a
-    fetch for a workload the user has since navigated away from can't
-    leak a stray row onto whatever's now displayed. Same
-    ``CatalogKey``/``WorkloadKey`` derivation shape as
-    ``_current_versions_state`` above -- an independent copy, not a
-    shared call, since the two compare against different things (a
-    caller-supplied ``key`` here, a ``workload_versions`` lookup there)."""
+    """True when ``key`` is still the selected workload -- read by a
+    ``LoadVersions`` fetch's ``DataTableLoadingRowSink`` before writing
+    into column 3, so a fetch for a workload navigated away from can't
+    leak a stray row."""
     if model.selected_catalog is None or model.selected_workload is None:
         return False
     catalog = catalog_key(model.selected_catalog.repo, model.selected_catalog.catalog)

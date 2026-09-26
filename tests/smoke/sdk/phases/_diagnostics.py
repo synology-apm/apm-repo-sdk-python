@@ -76,22 +76,13 @@ async def run_for_repo(ctx: SmokeContext, ri: RepoInfo) -> None:
     async def _round_trip(
         ri: RepoInfo = ri, versions: list[tuple[CatalogId, Version]] = versions
     ) -> tuple[bool, str, str]:
-        """Tries every version with browsable catalog metadata in
-        turn -- the same "a single version's known data gap mustn't
-        doom the whole check when a sibling version's real data is
-        still there" reasoning _shared_refs.py's own
-        pick_workload_with_retry documents, needed here because
-        _browsable_versions's own filter can't tell a version with
-        real backing data from one whose catalog entry outlived it.
-
-        Each candidate carries the ``CatalogId`` of the specific
-        ``Catalog`` its own ``version`` came from -- resolved fresh
-        via ``resolve_catalog`` every time:
-        re-deriving "some catalog" from ``ri.repo.catalogs()[0]`` is
-        wrong the moment a repository holds more than one, and caching the
-        ``Catalog`` object itself (as ``ctx.data["workloads"]``
-        deliberately doesn't) would go stale the moment this domain's
-        own key round trip, above, runs against this same repository."""
+        """Tries every version with browsable catalog metadata in turn,
+        same retry reasoning as ``_shared_refs.py``'s
+        ``pick_workload_with_retry`` -- needed here because
+        ``_browsable_versions``'s own filter can't tell a version with
+        real backing data from one whose catalog entry outlived it. Each
+        candidate's ``Catalog`` is resolved fresh via ``resolve_catalog``
+        (see that function's own docstring)."""
         last_exc: BaseException | None = None
         for catalog_id, version in versions:
             provider: UnitProvider | None = None

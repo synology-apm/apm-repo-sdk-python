@@ -21,13 +21,10 @@ from .node_ref import NodeRef
 
 # For one prefix ("" for the tree root, otherwise a "/"-joined ancestor
 # path): the set of immediate subdirectory names, and a name -> full
-# file_map ``path`` mapping for immediate leaf rows. A name can legitimately
-# appear in *both* halves at once -- a real file_map row can itself also
-# be a path-prefix of a longer row (e.g. an empty-directory object
-# alongside a file nested under that same path) -- so this mirrors the
-# original per-call ``dir_names``/``leaves`` locals exactly rather than
-# collapsing them into one "name -> is_dir" mapping that would silently
-# drop one of the two nodes in that case.
+# file_map ``path`` mapping for immediate leaf rows. A name can appear in
+# both halves at once -- a row can also be a path-prefix of a longer row
+# -- so these stay separate rather than collapsing into one "name ->
+# is_dir" mapping that would drop one of the two nodes.
 _ChildIndex = dict[str, tuple[set[str], dict[str, str]]]
 
 
@@ -50,12 +47,9 @@ class FileMapTreeProvider:
 
     async def _index(self) -> _ChildIndex:
         """Every ancestor prefix of every ``file_map`` path, indexed once
-        in O(row count x average path depth) and amortized across every
-        call for this provider's lifetime — ``file_map`` accumulates
-        history across every device/VM/PC-PS/SaaS stream ever recorded,
-        not just current state, so a real repository's row count can be
-        large. ``children()`` itself is then an O(children at this one
-        level) dict lookup."""
+        and amortized across every call for this provider's lifetime.
+        ``children()`` is then an O(children at this level) dict
+        lookup."""
         if self._child_index is None:
             index: _ChildIndex = defaultdict(lambda: (set(), {}))
             for path in await self._all_paths():
@@ -80,10 +74,9 @@ class FileMapTreeProvider:
         prefix = node.attrs.get("prefix")
         if prefix is None:
             return []
-        # Re-normalized from the request's own prefix string (not assumed
-        # already-clean), since this lookup key must match exactly how
-        # _index() built its own prefix keys ("/".join of filtered,
-        # non-empty parts).
+        # Re-normalized from the request's prefix string, since this
+        # lookup key must match exactly how _index() built its own
+        # prefix keys.
         prefix_parts = [p for p in prefix.split("/") if p]
         normalized_prefix = "/".join(prefix_parts)
 

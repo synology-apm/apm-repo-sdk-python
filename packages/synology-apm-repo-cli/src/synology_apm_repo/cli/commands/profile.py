@@ -146,12 +146,8 @@ async def _store_from_fields(kind: BackendKind, fields: dict[str, str | bool]) -
     pre-persist connectivity check, via ``store_from_config`` — the same
     translation ``build_store`` applies to an already-saved profile,
     applied here before either exists."""
-    # fields is ``dict[str, str | bool]`` (verify_tls is the one bool
-    # field); client_kwargs_with_secrets only ever reads the string-typed
-    # secret fields (access_key/secret_key/credential) back out of
-    # whatever Mapping[str, str] it's handed, so filtering to the
-    # string-valued entries here is enough to satisfy its type, not a
-    # behavior change.
+    # verify_tls is the one bool field; the rest (access_key/secret_key/
+    # credential) are the string secrets client_kwargs_with_secrets reads.
     secret_source = {k: v for k, v in fields.items() if isinstance(v, str)}
     config = config_from_fields(kind, fields)
     return await store_from_config(kind, config, secret_source)
@@ -165,11 +161,9 @@ async def _verify_connectivity(state: CliState, backend: BackendKind, fields: di
     instead of raising back to the caller."""
     try:
         store = await _store_from_fields(backend, fields)
-    except Exception as exc:  # AzureStore's own client construction validates its
-        # account_url/credential shape synchronously (no network I/O) and can raise
-        # several exception types (e.g. ValueError for a malformed URL or an
-        # unresolvable account name); S3Store defers all of this to first
-        # read/listdir.
+    except Exception as exc:  # AzureStore validates account_url/credential shape
+        # synchronously and can raise (e.g. ValueError); S3Store defers this to
+        # first read/listdir.
         fail(f"connectivity check failed: {exc}", cause=exc)
     session = Session()
     meter = build_progress_meter(state)
@@ -258,9 +252,7 @@ async def list_profiles_command(ctx: typer.Context) -> None:
     profile. Never touches the keyring."""
     state: CliState = ctx.obj
     # One read either way: list_profiles_full() already returns every
-    # saved profile in full, so --verbose needs no further per-name
-    # get_profile() call each re-reading and re-parsing the same
-    # profiles.json a second (third, ...) time.
+    # saved profile in full, so --verbose needs no per-name get_profile().
     profiles = await list_profiles_full()
     if not state.verbose:
         render(
@@ -293,13 +285,8 @@ def _render_verbose_list(profiles: list[Profile]) -> None:
 
 
 def _build_report(profile: Profile) -> dict[str, object]:
-    # profile.config.display_fields is backend-specific (bucket/endpoint/
-    # region for S3, container/account_url for Azure, server/share/port/
-    # username for SMB) — reading it here instead of branching on
-    # isinstance(profile.config, ...) is what lets both renderers below
-    # stay backend-agnostic. verify_tls is S3/Azure-only (SMB has no TLS
-    # concept the way their endpoints do), so it's read via getattr and
-    # omitted rather than assumed present on every config.
+    # display_fields keeps both renderers below backend-agnostic. verify_tls
+    # is S3/Azure-only, so it's read via getattr and omitted otherwise.
     report: dict[str, object] = {"name": profile.name, "kind": profile.kind.value}
     verify_tls = getattr(profile.config, "verify_tls", None)
     if verify_tls is not None:

@@ -238,9 +238,7 @@ def _write_composition(
     actually written to disk differ from the bytes ``map_crc`` is computed
     over, and ``trailer`` is appended right after them -- together express a
     record whose on-disk chunk-map array is corrupted but parity-recoverable
-    via a real Redundancy blob appended after it. Every existing caller
-    leaves both at their defaults and gets today's exact behavior
-    unchanged."""
+    via a real Redundancy blob appended after it."""
     map_num = len(entries) // 20
     head = bytearray(_record_head_bytes(map_num=map_num, map_crc=zlib.crc32(entries) & 0xFFFFFFFF))
     if corrupt_record_head:
@@ -479,7 +477,7 @@ def _write_fs_workload(
         # the copy_meta_file/<meta_dirname> directory to actually show up
         # in a listing -- target.db above already guarantees that in
         # practice, but a dedicated marker file makes the dependency
-        # explicit rather than incidental.
+        # explicit.
         (tmp_path / "copy_meta_file" / meta_dirname / "version.db.zst").touch()
     dedup_img_path = f"{target_id}/{dedup_version_id}/dedup.img"
     if dedup_img_size is not None:
@@ -1306,26 +1304,18 @@ class _LoopCheckingStore:
 
 
 class TestVerifyWorkerLoopReuse:
-    """Regression test for the bug ``concurrency.run_in_worker_loop`` fixes:
-    a ``ProcessPoolExecutor`` worker handles many buckets over its
+    """A ``ProcessPoolExecutor`` worker handles many buckets over its
     lifetime, and its ``ObjectStore`` (built once by ``_verify_worker_init``,
     which runs once per worker process's whole lifetime, not once per task)
     is meant to survive every one of them, including a lazily-cached,
-    loop-bound client (``S3Store._get_client``, say).
+    loop-bound client (``S3Store._get_client``, say) — otherwise a second
+    bucket in the same worker gets a false-positive "unexpected error:
+    Event loop is closed" corruption finding instead of a real check. This
+    test asserts on the returned findings for that reason, not
+    ``pytest.raises``.
 
-    Every layer ``_verify_bucket_worker`` calls through
-    (``_check_one_bucket_core``/``_open_bucket_or_finding``) converts an
-    unexpected exception into a ``Finding`` rather than raising -- an
-    escaped exception would cancel every other in-flight bucket check via
-    the caller's own concurrent dispatch — so pre-fix, this bug never
-    crashed a real ``verify --level full`` run the way it crashed ``export``; it silently
-    produced a false-positive "unexpected error: Event loop is closed"
-    corruption finding for the second (and every later) bucket a worker
-    checked instead, arguably worse than a crash. This test asserts on the
-    returned findings for that reason, not ``pytest.raises``.
-
-    Exercised in-process — no real subprocess needed, since the bug is
-    about ``asyncio.run()``'s own per-call loop, not about multiprocessing
+    Exercised in-process — no real subprocess needed, since this is about
+    ``asyncio.run()``'s own per-call loop, not about multiprocessing
     itself — via ``_LoopCheckingStore``, which reproduces that hazard
     without a real network backend. Two *different* bucket keys are used
     deliberately: the same key twice would hit ``_worker_bucket_cache``'s
@@ -1350,9 +1340,7 @@ class TestVerifyWorkerLoopReuse:
         # Second bucket, same worker (same process-global state, exactly
         # like a real ProcessPoolExecutor worker handling a second item)
         # — must reuse the same loop, not open a fresh one that orphans
-        # the first bucket's cached loop reference. Before this fix, the
-        # store's own read raised "Event loop is closed", swallowed into
-        # exactly the finding asserted absent below.
+        # the first bucket's cached loop reference.
         findings_b, _ = _verify_bucket_worker((StreamId(0), BucketId(1)))
 
         for findings in (findings_a, findings_b):

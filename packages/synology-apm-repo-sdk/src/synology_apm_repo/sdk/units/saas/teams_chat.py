@@ -11,14 +11,13 @@ its Standard/Private/Shared split (keyed off the real
 ``channel_info_table.channel_type`` column) -- the same ``TreeStrategy``
 machinery Site/Calendar use for their own synthetic category level.
 Chat has no such concept and uses the bare, unwrapped flat tree
-directly. ``root()``/``children()`` delegate to whichever of the two
-``self._tree`` is uniformly, via that shared protocol, the same shape
-``SaasWorkloadProvider`` uses for every other SaaS workload -- this
-class still isn't built on that class itself, since its own discovery
-mechanism (below) doesn't fit the config-driven
-``tables``/``object_names`` model that class assumes. ``unit()`` needs
-no such delegation: everything it reads (``object_id``, ``degraded``)
-already lives on the ``Node`` ``children()`` built.
+directly. ``root()``/``children()`` delegate to whichever ``self._tree``
+applies, via the same ``TreeStrategy`` protocol ``SaasWorkloadProvider``
+uses — but this class isn't built on ``SaasWorkloadProvider`` itself,
+since its own discovery mechanism (below) doesn't fit that class's
+config-driven ``tables``/``object_names`` model. ``unit()`` needs no such
+delegation: everything it reads (``object_id``, ``degraded``) already
+lives on the ``Node`` ``children()`` built.
 
 Unlike every other SaaS provider here, Teams and Chat locate their
 service-level DBs via one shared discovery mechanism: the index entry

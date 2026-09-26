@@ -47,17 +47,12 @@ def _write_fd(fd: int, data: bytes) -> None:
 
 
 def is_zstd_frame(head: bytes) -> bool:
-    """Whether ``head`` opens with a standard ZSTD frame's magic number
-    — only the first 4 bytes are ever inspected, so ``head`` need not be
-    the full payload. The exact check ``peel`` uses internally to
-    decide whether to attempt decompression at all; exposed here so a
+    """Whether ``head`` opens with a standard ZSTD frame's magic number —
+    only the first 4 bytes are inspected, so ``head`` need not be the full
+    payload. The exact check ``peel`` uses internally; exposed here so a
     caller that only wants to know *whether* something is zstd-framed
-    before deciding how much to even read (e.g.
-    ``units/saas/services.py``'s ``inspect_object``, choosing between a
-    small head read and a full one) doesn't need its own copy of the Codec
-    Layer's magic constant — see ``ARCHITECTURE.md``'s "Cross-cutting
-    shared mechanisms" on why drifting from ``peel()``'s own convention
-    is treated as a real bug, not a style nit."""
+    before deciding how much to read (e.g. ``units/saas/services.py``'s
+    ``inspect_object``) doesn't need its own copy of the magic constant."""
     return head[:4] == ZSTD_FRAME_MAGIC
 
 
@@ -125,14 +120,10 @@ class SqliteSource:
     @classmethod
     async def from_bytes(cls, data: bytes) -> Self:
         """Materialize plain (post-``peel``) SQLite ``data`` to a private
-        temp file and open a *writable* connection to it.
-
-        Writable because the file is this instance's own scratch copy,
-        unlinked again by ``close()`` — the store's bytes are already behind
-        us by the time ``data`` exists, so the read-only invariant is upheld
-        by what this never opens, not by the mode of this connection. It is
-        also what lets ``apply_index_hint`` build a real index here instead
-        of leaving every hinted query a full table scan."""
+        temp file and open a *writable* connection to it — this instance's
+        own scratch copy, unlinked by ``close()``, which is what lets
+        ``apply_index_hint`` build a real index instead of leaving every
+        hinted query a full table scan."""
         fd, path = tempfile.mkstemp(suffix=".db")
         try:
             await asyncio.to_thread(_write_fd, fd, data)

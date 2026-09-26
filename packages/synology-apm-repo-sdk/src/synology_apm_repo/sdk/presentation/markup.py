@@ -1,52 +1,23 @@
 """``safe()`` — escape arbitrary text before it reaches a Rich-markup-parsing
-call, shared by the CLI's ``rich.console.Console.print()`` calls, the TUI's
-``Static.update()``/``Static(...)`` calls (``markup=True`` is the default
-for both), and a TUI ``Tree``/``DataTable`` label or cell value (each
-re-parses a plain ``str`` as markup too — ``Tree.process_label``/
-``DataTable``'s own ``default_cell_formatter`` both call
-``Text.from_markup``). Any genuinely dynamic text reaching one of those
-call sites (an exception's ``str()``, a real backup-derived display name,
-a user-typed path) risks breaking whichever entry point receives it
-unescaped: a TUI widget crashes outright with a markup error on an
-unmatched closing tag (``"a[/]b"``, say) or an unresolvable tag body,
-while the CLI's ``Console.print()`` sometimes instead silently swallows a
-bracketed suffix as an unclosed style span.
+call: the CLI's ``Console.print()``, the TUI's ``Static``/``Tree``/
+``DataTable`` (all default to ``markup=True``). Unescaped dynamic text (an
+exception's ``str()``, a backup-derived name, a user-typed path) can crash
+a Textual widget outright, or get silently mangled by Rich's parser.
 
-Deliberately not a bare ``rich.markup.escape()`` call — that function's
-own regex only escapes a ``[`` immediately followed by a lowercase
-letter/``#``/``/``/``@`` (a real Rich/Textual tag's own naming
-convention), leaving any *other* ``[`` (followed by an uppercase letter,
-a digit, punctuation, ...) untouched on the assumption that no real
-parser would ever treat it as a tag either. Textual's own markup
-tokenizer (``textual.markup``'s ``expect_markup``) doesn't share that
-assumption: its ``open_tag`` token matches *any* unescaped ``[``,
-regardless of what follows it, and raises ``textual.markup.MarkupError``
-once it fails to resolve the rest as a real tag body — an ordinary
-uppercase bracketed reference like ``"[MVP-5002577]"``, which
-``rich.markup.escape()`` leaves untouched, still crashes
-``Static.update()`` this way. Plain Rich (the
-CLI's own entry point) is the more lenient parser matching ``escape()``'s
-own heuristic, so escaping every ``[`` here — not just the ones that
-look like a real tag name — is strictly safe for the CLI side too: a
-bracket Rich's own parser wouldn't have treated as a tag renders
-identically whether escaped or not.
-
-Never renders as a real, unintended tag either way — the one narrow shape
-where that safety costs an exact backslash-count round trip is a
-tag-shaped bracket, whose existing backslash run gets doubled so both
-parsers still read it as the literal, escaped form (they only do so when
-the run is odd).
+Escapes every ``[``, not just tag-shaped ones (unlike
+``rich.markup.escape()``): Textual's own tokenizer treats *any* unescaped
+``[`` as an open tag and crashes ``Static.update()`` on an ordinary
+bracketed reference like ``"[MVP-5002577]"`` — safe for the CLI/Rich side
+too, since a bracket Rich wouldn't treat as a tag renders identically
+either way.
 
 A value containing a strong right-to-left character (Hebrew, Arabic, ...)
 additionally comes back wrapped in a Unicode bidi isolate (``FSI``/``PDI``,
 zero-width): placed unisolated next to a fixed-width table's own column
-borders, the terminal's own bidi reordering (Unicode UAX #9) can pull
-those neutral border/padding characters into the RTL run's reordering
-scope, desyncing the terminal's rendered layout from what Rich/Textual's
-compositor believes it drew. ``FSI`` (not ``LRI``/``RLI``) keeps the
-isolate's own internal direction auto-detected from its first strong
-character, so the wrapped text still reads in its natural order — only
-the surrounding context is shielded from it.
+borders, the terminal's own bidi reordering (Unicode UAX #9) can pull those
+neutral border characters into the RTL run, desyncing the rendered layout
+from what Rich/Textual believes it drew. ``FSI`` keeps the isolate's own
+direction auto-detected from the wrapped text's first strong character.
 """
 
 from __future__ import annotations

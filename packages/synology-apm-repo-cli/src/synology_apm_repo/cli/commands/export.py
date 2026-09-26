@@ -6,20 +6,14 @@ problem for a restore tool, not just a UX nicety, so a failure or Ctrl-C
 leaves the ``.part`` file rather than a file named ``FILE`` that looks
 complete but isn't.
 
-Progress: ``ContentSource.export_to()``'s own progress callback is
-``async (done: int, total: int) -> None``, with a *planned*-bytes total
-(the extents walk already knows how much real data there is before
-writing a single byte) — adapted via ``reading_progress_callback`` into a
-``Progress`` snapshot fed to a ``ProgressMeter``; neither the CLI nor the
-TUI computes rate/ETA itself.
+Progress: ``ContentSource.export_to()``'s callback reports a *planned*-bytes
+total, adapted via ``reading_progress_callback`` into a ``Progress``
+snapshot fed to a ``ProgressMeter``.
 
 **Ctrl-C**: the export body runs as its own ``asyncio.Task``, cancelled by
-SIGINT — the first press cancels that Task for a clean unwind, a second
-press exits immediately (``os._exit()``) since a repeated Ctrl-C means the
-user has made clear they don't want to wait for anything; see the
-``except asyncio.CancelledError`` branch below for what "cancelled"
-actually does to the partial output (``--keep-partial`` controls whether
-it's kept or deleted).
+SIGINT — first press cancels the Task for a clean unwind, second press
+exits immediately (``os._exit()``). ``--keep-partial`` controls whether
+the ``.part`` file survives a cancelled export.
 
 **Pre-existing destination**: an already-present ``FILE`` is refused,
 via ``destination_available()``, before anything is opened; ``--force``
@@ -90,24 +84,15 @@ def handle_cancelled(part_path: Path, *, keep_partial: bool) -> str:
 
 def _install_sigint_cancel(task: asyncio.Task[_T]) -> Callable[[], None]:
     """Routes SIGINT into ``task.cancel()``; returns the undo callable.
-    First Ctrl-C cancels the export Task — a normal, clean unwind into
-    the ``except`` branch in ``export``. Second Ctrl-C terminates
-    immediately instead, since the user has made clear they don't want
-    to wait for anything.
+    First Ctrl-C cancels the export Task for a clean unwind into
+    ``export``'s own ``except`` branch. Second Ctrl-C exits immediately
+    via ``os._exit()``.
 
-    ``signal.signal()``, not ``loop.add_signal_handler()``: the latter
-    delivers the handler as an ordinary loop callback, so the
-    second-press force quit would only fire once the loop next got to
-    run one — never while it's inside a long synchronous stretch,
-    exactly when "Ctrl-C twice means stop now" matters most. A
-    ``signal.signal()`` handler runs between bytecodes instead, so
-    ``os._exit(130)`` stays immediate.
-
-    ``Task.cancel()`` is the one thing still deferred to the loop, since
-    it can't run inside a signal handler: it goes through
-    ``loop.call_soon_threadsafe()``, asyncio's own thread-safe entry
-    point and the same self-pipe wakeup ``add_signal_handler()`` uses
-    internally."""
+    Uses ``signal.signal()`` rather than ``loop.add_signal_handler()`` so
+    the second-press force quit stays immediate even mid-synchronous-stretch;
+    ``task.cancel()`` itself still goes through
+    ``loop.call_soon_threadsafe()``, since it can't run inside a signal
+    handler."""
     loop = asyncio.get_running_loop()
     sigint_count = 0
 
@@ -175,14 +160,10 @@ async def export(
         )
         content = resolved.open()
         output.parent.mkdir(parents=True, exist_ok=True)
-        # ContentSource.export_to()'s Protocol return type is deliberately
-        # ``object`` (a future ContentSource implementation isn't
-        # required to return ExportResult specifically), but every real
-        # implementation today does; this is a display-only cast, not a
-        # behavioral assumption. No concurrency kwargs to forward here —
-        # export_to()'s own real parallelism (a multiprocess dispatch,
-        # unconditional whenever the repository's store supports it) isn't
-        # a CLI-facing knob.
+        # ContentSource.export_to()'s Protocol return type is ``object``,
+        # but every real implementation returns ExportResult — a
+        # display-only cast. No concurrency kwargs to forward here:
+        # export_to()'s own multiprocess dispatch isn't a CLI-facing knob.
         return cast(
             ExportResult,
             await content.export_to(part_path, sparse=sparse, progress=on_export_progress),
@@ -194,33 +175,22 @@ async def export(
         result = await task
         finalize_export(part_path, output)
     except asyncio.CancelledError:
-        # This is the first-Ctrl-C path (a second press exits immediately
-        # via os._exit() instead of reaching here). Cancellation is prompt
-        # on the single-process (fallback) path, since the read path awaits
-        # per extent/chunk; on the real, unconditional multiprocess path
-        # (each claimed bucket group's decode+write dispatched to its own
-        # process) it widens slightly instead — an already-running worker
-        # finishes its one in-flight bucket group's decode/write rather
-        # than being torn down mid-write, so this lands roughly one bucket
-        # group's own decode time after the signal, not instantly. This
-        # command manages its own Session/progress lifecycle instead of
-        # going through opened_repo (whose shared skeleton doesn't fit
-        # export's own SIGINT/Task cancellation), so it clears its own
-        # leftover progress line before each of its own exit prints,
-        # rather than getting it for free the way doctor/ls/tree/cat/key/
-        # verify do.
+        # The first-Ctrl-C path. Cancellation is prompt on the
+        # single-process path; on the multiprocess path it widens to
+        # roughly one bucket group's decode time, since an already-running
+        # worker finishes its in-flight write rather than being torn down
+        # mid-write. This command manages its own Session/progress
+        # lifecycle instead of going through opened_repo, so it clears its
+        # own leftover progress line before each exit print.
         finish_live_progress(state)
         console.print(f"[yellow]{handle_cancelled(part_path, keep_partial=keep_partial)}[/yellow]")
         return
     except ApmRepoError as exc:
         fail_from_apm_error(exc, state)
     finally:
-        # Covers the success path (this line only clears something once,
-        # even though the two branches above already called it once each
-        # for their own timing needs) and, unlike those two, also a
-        # non-ApmRepoError/CancelledError
-        # exception this function doesn't otherwise catch at all (a bug,
-        # not an expected failure).
+        # Covers the success path and any exception not caught above (a
+        # bug, not an expected failure) — a harmless no-op if one of the
+        # branches above already cleared the line.
         finish_live_progress(state)
         restore_sigint()
         await session.close()

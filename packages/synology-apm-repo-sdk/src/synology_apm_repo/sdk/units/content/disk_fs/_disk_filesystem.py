@@ -175,13 +175,10 @@ class DiskFilesystem:
     A disk image can (and typically does) contain more than one
     partition/volume (a Windows "System Reserved" boot partition
     alongside the real NTFS volume, for instance) — every one Dissect
-    can open is kept, not just the first/largest, matching what a real
-    disk-mount tool would show. A partition/volume Dissect can't open
-    (unsupported format, encrypted without a key, or genuinely not a filesystem at
-    all) is silently skipped, not reported as an error — this mirrors
-    the project's existing principle of resolving real state lazily and
-    only reporting what was actually found, not guessing at why
-    something wasn't.
+    can open is kept, not just the first/largest. A partition/volume
+    Dissect can't open (unsupported format, encrypted without a key, or
+    genuinely not a filesystem at all) is silently skipped, not reported
+    as an error.
 
     Not a ``UnitProvider`` — like ``VirtualDiskContentSource``, it is a
     disk-content helper ``DeviceProvider`` drives directly, building its

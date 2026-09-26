@@ -24,21 +24,15 @@ from ._base import _CLOUD_ONLY_REASON
 
 
 class _BlockingReadContentSource:
-    """Shared ``ContentSource`` implementation for a single already-resolved
-    guest-OS file, deliberately thin: every Dissect filesystem entry's own
-    ``.open()`` (returning a ``dissect.util.stream.RunlistStream``/
-    ``AlignedStream``) already resolves this file's own runlist/
-    fragmentation/sparse regions internally, so there is no extent
-    bookkeeping here at all, unlike
-    ``VirtualDiskContentSource``. Streamed in blocks for ``stream()``/
-    ``export_to()`` rather than materializing the whole file in memory the
-    way ``LazyArtifact`` does — a guest-OS file can be arbitrarily large,
-    unlike an assembled ``.eml``/``.ics``.
+    """Shared ``ContentSource`` for a single already-resolved guest-OS
+    file: deliberately thin, since a Dissect entry's own ``.open()``
+    already resolves runlist/fragmentation/sparse regions internally (no
+    extent bookkeeping here, unlike ``VirtualDiskContentSource``).
+    Streamed in blocks rather than materialized in memory like
+    ``LazyArtifact`` — a guest-OS file can be arbitrarily large.
 
-    Held privately by ``DissectFileContentSource`` (composition, not a base
-    class — it's not meant to expose this helper on its own public
-    surface) so a future second blocking-read source could share this
-    same forwarding logic.
+    Held privately by ``DissectFileContentSource`` (composition, not
+    inheritance) rather than exposed on its own public surface.
     """
 
     def __init__(self, size: int | None, read_blocking: Callable[[int, int], bytes]) -> None:
@@ -66,15 +60,13 @@ class _BlockingReadContentSource:
         request extending past this file's own ``size`` is clamped, never
         an error.
 
-        Unlike a chunk-map-backed ``ContentSource`` (which raises rather
-        than ever returning a silently-short result), ``read_blocking``
-        delegates to a Dissect stream's own ``.read(n)`` — ordinary
-        file-object semantics, which *can* legitimately return fewer than
-        ``n`` bytes if the guest file's real on-disk data is truncated
-        relative to what the filesystem's own metadata declared. When the
-        requested window reaches this file's declared end and the actual
-        read still comes up short, that's raised as ``DataCorruptError``
-        rather than silently handed back as a shorter file.
+        Unlike a chunk-map-backed ``ContentSource`` (which never returns a
+        silently-short result), the underlying Dissect stream's
+        ``.read(n)`` can legitimately return fewer than ``n`` bytes if the
+        guest file's real data is truncated relative to what the
+        filesystem declared. A short read at this file's declared end is
+        raised as ``DataCorruptError`` rather than silently handed back as
+        a shorter file.
 
         Raises:
             DataCorruptError: the underlying stream returned fewer bytes than
@@ -129,12 +121,10 @@ class _BlockingReadContentSource:
             return data
 
         def _read_and_write(handle: BinaryIO, offset: int, n: int) -> int:
-            # One block's read *and* write inside the same
-            # asyncio.to_thread() call below, rather than this.stream()'s
-            # own read()-then-separate-write shape (two thread-pool round
-            # trips per block for a large single-file export) -- the
-            # first block pays that extra round trip anyway (see below),
-            # every later one reuses this fused shape.
+            # Fused read+write in one asyncio.to_thread() call rather than
+            # a separate read-then-write (two thread-pool round trips per
+            # block) -- only the first block pays that extra round trip
+            # (below).
             data = _read_validated(offset, n)
             handle.write(data)
             return len(data)
@@ -161,10 +151,7 @@ class _BlockingReadContentSource:
                     # -- a first-block failure (a cloud-sync placeholder's
                     # ContentUnavailableError, or a genuinely corrupt
                     # file's DataCorruptError) then never leaves a stray,
-                    # empty .part file on disk. The extra thread-pool
-                    # round trip this costs is paid once, for this one
-                    # block only -- every later block still uses
-                    # _read_and_write's own fused shape.
+                    # empty .part file on disk.
                     data = await asyncio.to_thread(_read_validated, offset, n)
                     handle = await asyncio.to_thread(_open_dst)
                     await asyncio.to_thread(handle.write, data)
@@ -195,20 +182,16 @@ class DissectFileContentSource:
 
     def __init__(self, entry: object, size: int | None) -> None:
         self._entry = entry
-        #: Lazily opened on the first block read, then reused for every
-        #: later one — ``.open()`` re-resolves the whole file's own
-        #: runlist/fragmentation internally, work identical across every
-        #: block of the same file, so a streamed multi-block read/export
-        #: must not pay it again per block. ``_fh_lock`` (a real
-        #: ``threading.Lock``, not an
-        #: ``asyncio.Lock`` — ``asyncio.to_thread`` dispatches to a real
-        #: executor thread pool, so two genuine OS threads can race into
-        #: ``_read_blocking`` concurrently, the same reasoning
-        #: ``storage/local.py``'s own ``_fd_lock`` documents) serializes
-        #: every ``seek``/``read`` pair on this one cached handle, so a
-        #: caller issuing an overlapping ``read()``/``stream()`` on the
-        #: same instance (unusual, but not something this class can rule
-        #: out) never races another call's own ``seek``.
+        #: Lazily opened on first read, reused for every later block —
+        #: ``.open()`` re-resolves the file's runlist/fragmentation
+        #: internally, so a multi-block read/export must not pay that
+        #: cost again per block. ``_fh_lock`` is a real ``threading.Lock``
+        #: (not ``asyncio.Lock``: ``asyncio.to_thread`` dispatches to a
+        #: real executor thread pool, so two OS threads can race into
+        #: ``_read_blocking`` concurrently — same reasoning as
+        #: ``storage/local.py``'s ``_fd_lock``); it serializes every
+        #: ``seek``/``read`` pair so an overlapping ``read()``/``stream()``
+        #: call on the same instance never races another's ``seek``.
         self._fh: object | None = None
         self._fh_lock = threading.Lock()
         self._blocking = _BlockingReadContentSource(size, self._read_blocking)
@@ -221,21 +204,15 @@ class DissectFileContentSource:
                 self._fh.seek(offset)  # type: ignore[union-attr]
                 return self._fh.read(length)  # type: ignore[union-attr,no-any-return]
             except Exception as exc:
-                # A failure mid-open/seek/read leaves this stream's own
-                # position/internal state unknown -- drop the cached
-                # handle so the next call opens a fresh one instead of
-                # reusing a possibly-broken stream, the same recovery a
-                # fresh per-call open always had.
+                # A failure mid-open/seek/read leaves this stream's state
+                # unknown -- drop the cached handle so the next call opens
+                # a fresh one.
                 self._fh = None
-                # Defense-in-depth only: _apfs._apfs_content_unavailable's
-                # own proactive check (at open_file() time, before this
-                # class is even constructed) already catches every
-                # confirmed cloud-sync placeholder case ahead of this
-                # point -- this branch exists for whatever unanticipated
-                # failure still reaches here. _apfs_is_dataless is that
-                # same confirmed check, not a heuristic; any other failure (a genuinely corrupt file,
-                # an unrelated dissect.* bug) still becomes
-                # DataCorruptError, this class's existing contract.
+                # Defense-in-depth: _apfs._apfs_content_unavailable's own
+                # proactive check (at open_file() time) already catches
+                # every confirmed cloud-sync placeholder case ahead of
+                # this point; any other failure still becomes
+                # DataCorruptError.
                 if _apfs_is_dataless(self._entry):
                     raise ContentUnavailableError(_CLOUD_ONLY_REASON) from exc
                 raise DataCorruptError(

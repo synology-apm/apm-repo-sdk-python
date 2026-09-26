@@ -1,10 +1,6 @@
 """Unit tests for ``DetailPane`` — driven directly against a minimal
 fake host exposing only the surface it actually reaches into
-(``query_one``, ``app_state.verbose``), never a
-real ``UnitScreen``. Previously touched only incidentally by
-other screens' tests (``test_browser_unit_screen_gaps.py``,
-``test_browser_progress_hint.py``, ``test_browser_list_overview.py``, the
-integration pilots) with no dedicated coverage of its own."""
+(``query_one``, ``app_state.verbose``), never a real ``UnitScreen``."""
 
 from __future__ import annotations
 

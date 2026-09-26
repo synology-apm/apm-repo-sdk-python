@@ -98,7 +98,7 @@ other repository. `remote_connect` opens one fresh session
 (`ctx.data["remote_entries"]`), not one shared session looping over all of
 them: reconnecting a second source in the same session replaces the
 first's tree rather than adding to it (`BrowseScreen._reset_for_new_scan`
-clears the previous scan's repositories/tree -- confirmed empirically), so each
+clears the previous scan's repositories/tree), so each
 sample needs its own session to stay independent, the same reasoning
 `key_dialog`'s own separate session already has. It drives `ConnectDialog`
 directly from each sample's own config rather than from a

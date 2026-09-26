@@ -408,12 +408,9 @@ class TestExportTo:
     async def test_max_concurrent_reads_is_forwarded_to_every_fragment(
         self, two_fragment_disk: VirtualDiskContentSource, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """Added after a real PC/PS disk export was found running well
-        under 10 MiB/s with no way to opt into the same read
-        parallelism a VM disk_image export already has -- pins down that
-        the knob actually reaches each fragment's own ``export_to()``
-        call, not just that the whole-disk export still produces correct
-        bytes."""
+        """Pins down that the knob actually reaches each fragment's own
+        ``export_to()`` call, not just that the whole-disk export still
+        produces correct bytes."""
         from synology_apm_repo.sdk.dedup.dedup_file import ByteRangeView
 
         received: list[int | None] = []

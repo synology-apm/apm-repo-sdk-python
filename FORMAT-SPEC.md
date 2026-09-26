@@ -129,21 +129,20 @@ Once the root (`<repoRoot>`) is identified, it has this top-level shape:
     └── repo_transaction        # Vault destinations only — see §2.4
 ```
 
-> This document's own vocabulary is deliberately format-neutral (each
-> `<repoRoot>` above is "a repository," full stop) — this SDK's own
-> `synology_apm_repo.sdk` API layers a naming convention on top for its
-> own class model: the *bucket* or vault's shared folder (one shared key
-> tree — an object-storage bucket holding several sibling `<repo-id>`s,
-> or a vault) is `api.Repository`; one connection's worth of data within
-> it (one `db/connection_config` row for a vault, one `<repo-id>`'s worth
-> of data for object storage) is `api.Catalog` (the plain per-connection
-> data row itself, e.g. §2.3's display name, is `catalog.Connection`). See
-> `ARCHITECTURE.md`'s "Repository Layer" section for the full contract —
-> this document describes bytes, not that API. Note "bucket" itself is
-> overloaded below in an unrelated way: an S3/Azure storage container
-> (as just used above) versus a dedup-pool `.buk` data file addressed by
-> `bucketID` (§3.2 onward) — context always disambiguates which one a
-> given mention means, but the two are unconnected.
+> This document's vocabulary is format-neutral (`<repoRoot>` above is
+> always just "a repository"). `synology_apm_repo.sdk`'s API layers a
+> naming convention on top: the bucket-or-vault shared folder (one shared
+> key tree — an object-storage bucket holding several sibling
+> `<repo-id>`s, or a vault) is `api.Repository`; one connection's worth of
+> data within it (one `db/connection_config` row for a vault, one
+> `<repo-id>`'s worth of data for object storage) is `api.Catalog`; the
+> per-connection data row itself (e.g. §2.3's display name) is
+> `catalog.Connection`. This is the canonical statement of that mapping —
+> see `ARCHITECTURE.md`'s "Repository Layer" section for the API contract
+> built on it. Separately, "bucket" is overloaded below: an S3/Azure
+> storage container (as just used above) versus a dedup-pool `.buk` data
+> file addressed by `bucketID` (§3.2 onward) — the two are unconnected;
+> context disambiguates which one a given mention means.
 
 ### §2.2 `db/file_map`
 
@@ -193,13 +192,13 @@ candidate simply has no better display name than its own raw id.
 Files with a "current generation" tend to be replaced in place with a
 numbered variant, `<name>.<N>` — the general sequence-suffix mechanism
 described in §3.4. For `db/<name>` databases specifically (`db/file_map`
-and the rest of `db/`), the naive "take the numerically largest suffix"
-rule is **not** correct on S3/Azure destinations: unlike bucket/composition
-files, old `db/<name>.<N>` generations are not cleaned up there, and a
-generation can be uploaded before the transaction that references it is
-actually committed. Determining the correct generation instead requires two
-auxiliary directories at the repository root, `repo_transactions/` and
-`suppl_transaction_ids/`, and a two-branch rule:
+and the rest of `db/`), the numerically-largest-suffix rule does **not**
+apply on S3/Azure destinations: unlike bucket/composition files, old
+`db/<name>.<N>` generations are not cleaned up there, and a generation can
+be uploaded before the transaction referencing it is committed. The
+correct generation instead requires two auxiliary directories at the
+repository root, `repo_transactions/` and `suppl_transaction_ids/`, and a
+two-branch rule:
 
 1. **Find the latest committed transaction id.** Take the
    numerically-largest-suffixed file under `repo_transactions/`,
@@ -456,10 +455,9 @@ offset_within_subfile = global_offset & (16MiB - 1)
 A read/write that crosses a 16 MiB sub-file boundary transparently
 continues in the next `subID` file — the whole session can be treated as
 one continuous logical byte stream, physically sliced into 16 MiB pieces.
-In practice, composition metadata for a single backup version is almost
-always far smaller than 16 MiB (a chunk-map record is only 20 bytes per
-mapped run, however large the underlying content), so `subID` rarely
-advances past 0 even for a very large backed-up disk.
+In practice, one backup version's chunk-map array (§3.7's 20-byte entries)
+is almost always far smaller than 16 MiB, so `subID` rarely advances past 0
+even for a very large backed-up disk.
 
 Only the very first sub-file of a session (`subID=0`) carries a 64-byte
 composition header, magic `cMpS`: the generic shell (§3.1) plus a
@@ -745,12 +743,10 @@ address on every read. It is never random and never reused across chunks:
 every chunk address in a repository is unique by construction, so pairing
 each with the same VaultKey never repeats an IV.
 
-**Write-time ordering, and why it matters for reading**: data is always
-compressed, then encrypted, then split into buckets. Reading must undo
-this in reverse — decrypt first (AES-256-CTR, address-derived IV), then
-decompress per that chunk's own recorded compression type (§4.3). Getting
-this order backwards (attempting to decompress ciphertext, or encrypting
-before compressing) simply fails.
+**Write/read ordering**: written as compress → encrypt → split into
+buckets; read as decrypt (AES-256-CTR, address-derived IV) → decompress
+per the chunk's recorded compression type (§4.3). Reversing this order
+simply fails.
 
 **Verifying a candidate VaultKey (the fingerprint recipe)**: because a
 chunk's `.fgp` fingerprint (§4.5) is a SHA-256 of its *plaintext*, it can
@@ -768,14 +764,11 @@ derived-IV scheme) is actually correct for a given repository:
    32-byte fingerprint in the group's `.fgp` file (located via `.inf`,
    §4.5).
 
-"The decrypted bytes parse as a valid compressed stream" alone is not a
-reliable signal here: an LZ4 block carries no magic number or checksum of
-its own, so decrypting with the *wrong* key can still occasionally decode
-as a spuriously "successful" (but garbage) 4096-byte result. A ZSTD chunk
-is a much stronger signal on its own, since its frame format always starts
-with a fixed 4-byte magic (`28 B5 2F FD`, §4.3) that a wrong key is
-extremely unlikely to coincidentally reproduce — but the fingerprint
-comparison itself is the one check reliable for *either* codec.
+"The decrypted bytes parse as a valid compressed stream" alone is not
+reliable: LZ4 has no magic number or checksum, so a wrong key can still
+decode a spurious "successful" 4096-byte garbage result. ZSTD's fixed
+4-byte magic (`28 B5 2F FD`, §4.3) is a much stronger signal — but the
+fingerprint comparison is the one check reliable for either codec.
 
 ### §5.3 VaultKey custody
 
@@ -808,8 +801,8 @@ its own `userKeyID` and ignore every other row, then confirm correctness
 via §5.2's fingerprint recipe (a repository may have been through key
 rotation, or restored from a backup taken under an older key).
 
-**Offline unwrap, given a key string and a repository copy, with no online
-service involved, and what each check along the way actually proves:**
+**Offline unwrap (given a key string and a repository copy, no online
+service involved) — what each step proves:**
 
 1. Split the key string on its *last* `@` into `userKeyID` (12 ASCII
    characters, used as-is) and `base64(userKey)` (decodes to 32 raw
@@ -1192,6 +1185,8 @@ simply overwrites an earlier one's in whatever range they share.
 
 ### §7.3 Generic SaaS object addressing
 
+#### Addressing model
+
 M365 and Google Workspace workloads (Mail, Drive, Contact, Calendar, Site,
 Teams, Chat) all write one backup version as a single dedup file named
 `saas_obj`, addressed (in `db/file_map`) as
@@ -1204,7 +1199,8 @@ versions may keep appending to the same physical `saas_obj` file
 `<streamVersion>/saas_obj` is opened, continuing via the ordinary INHERIT
 mechanism (§3.8) for anything unchanged.
 
-**M365 vs. GWS: same addressing, different application-layer shape.**
+#### M365 vs. GWS: same addressing, different application-layer shape
+
 Every application below still uses this section's generic `saas_obj`/
 `object_table` addressing — only the service-DB schema and metadata JSON
 shape differ per platform:
@@ -1241,6 +1237,8 @@ shape differ per platform:
   EWS-envelope `client_metadata` shape (unsupported for `.ics` export;
   the normal Graph-API shape is what's covered here).
 
+#### `object_table` addressing
+
 **`object_table`**: a lightweight SQLite side-index — built by the
 application layer, not the dedup engine itself, and written as one more
 object inside the very `saas_obj` stream it indexes — mapping an opaque
@@ -1276,8 +1274,10 @@ not immediately.
 then read that absolute byte range out of the same `saas_obj` dedup file
 via the ordinary composition-reading chain (§3).
 
-**Offline reconstruction of `object_table` with no application-layer
-database available** (only a bare repository copy):
+#### Offline reconstruction of `object_table`
+
+With no application-layer database available (only a bare repository
+copy):
 
 1. Locate `saas_obj` in the owning repository's own top-level
    `db/file_map` (never a per-account SaaS-retention scratch area, which
@@ -1298,8 +1298,9 @@ database available** (only a bare repository copy):
    authoritative one; distinguishing which sequence is which requires
    inspecting the shape of the objects it actually maps to.
 
-**The `X-ABL-ID` MIME-tree extraction/reassembly mechanism** (used for
-Mail): a generic engine that, at capture time, blanks out a MIME part's
+#### The `X-ABL-ID` MIME-tree extraction/reassembly mechanism
+
+Used for Mail: a generic engine that, at capture time, blanks out a MIME part's
 content (keeping its headers intact) and tags it with a private
 `X-ABL-ID` header recording its position in the tree. On reassembly, it
 walks the skeleton MIME tree; for every part carrying that header, it
@@ -1311,8 +1312,9 @@ part uses another fixed id, with a random suffix appended only on a
 naming collision) — reassembly matches by this id, not by array position,
 so fragment order does not matter.
 
-**Generation resolution: `saas_version`/`saas_snapshot`.** Two more
-SQLite databases, independent of `db/copy_target_version`, live at
+#### Generation resolution: `saas_version`/`saas_snapshot`
+
+Two more SQLite databases, independent of `db/copy_target_version`, live at
 `saas/<connectionConfigId>/<streamUuid>/db/` and govern which physical
 `<streamVersion>/saas_obj` a given catalog version's content actually
 resolves to:

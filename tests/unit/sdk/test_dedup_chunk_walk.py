@@ -1155,22 +1155,17 @@ class TestExecChunksPrefetch:
 
 class _ConcurrencyTrackingStore:
     """Tracks the peak number of concurrently in-flight bucket *data*
-    reads (``"Pool/" in path`` and ``offset >= 16384`` — excludes every
-    bucket's own header-open read and every Composition-side read) by
-    parking each one on ``_peak_reached``, real time, until either
-    ``expected_peak`` is actually reached or a generous timeout elapses —
-    long enough for every other read already scheduled (its own
-    semaphore permit already acquired) to also enter and bump
-    ``active``, so ``peak`` reflects genuine overlap rather than just
-    call order. Waits on this real condition rather than a fixed count
-    of zero-duration ``asyncio.sleep(0)`` ticks, which only guarantee
-    an event-loop turn, not real wall-clock time for a sibling read's
-    own ``asyncio.to_thread()`` dispatch to resolve.
+    reads (``"Pool/" in path`` and ``offset >= 16384`` — excludes header-open
+    and Composition-side reads), parking each one on ``_peak_reached`` until
+    ``expected_peak`` is reached or a timeout elapses, so ``peak`` reflects
+    genuine overlap rather than call order (a fixed count of
+    ``asyncio.sleep(0)`` ticks only guarantees an event-loop turn, not real
+    wall-clock time for a sibling's ``asyncio.to_thread()`` dispatch to
+    resolve).
 
-    Built for ``TestExecChunksCombinedConcurrencyCeiling``'s own
-    need: prove the cross-bucket and in-bucket levels really do share one
-    ceiling instead of stacking, a permit hand-off that's easy to get
-    wrong in a way that silently double-counts."""
+    Built for ``TestExecChunksCombinedConcurrencyCeiling``: proves the
+    cross-bucket and in-bucket levels share one ceiling instead of
+    silently double-counting via stacked permits."""
 
     def __init__(self, backing: LocalFsStore, *, expected_peak: int) -> None:
         self._backing = backing

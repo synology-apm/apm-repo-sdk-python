@@ -2,26 +2,18 @@
 
 Every exception carries two optional pieces of support/forensics context:
 
-- ``ref``: which node/file the error refers to — always a plain string: a
-  store-relative path, a ``file_map`` path, or any other locator
-  meaningful to a human reading the error. Callers holding a ``NodeRef``
-  pass ``str(node_ref)``; this module deliberately does not import that
-  type, to avoid a dependency from the lowest layer (errors, used
-  everywhere) onto the highest one (units).
-- ``spec``: a pointer into ``FORMAT-SPEC.md`` (e.g. ``"FORMAT-SPEC.md: SizeStore"``)
-  explaining *why* this is an error, not just that it is one. This is a
-  support/forensics tool, not a general-purpose library — errors that name
-  the offending node and the governing spec section are worth the extra
-  keyword argument at every raise site.
+- ``ref``: which node/file the error refers to — a plain string (a
+  store-relative path, a ``file_map`` path, or similar locator). Callers
+  holding a ``NodeRef`` pass ``str(node_ref)``; this module doesn't import
+  that type, to avoid a dependency from the lowest layer onto the highest.
+- ``spec``: a pointer into ``FORMAT-SPEC.md`` (e.g. ``"FORMAT-SPEC.md:
+  SizeStore"``) explaining why this is an error, not just that it is one.
 
-Deliberately NOT named ``KeyError`` anywhere in this hierarchy — that name
-shadows the built-in and would be silently swallowed by unrelated
-``except KeyError`` blocks.
-
-Argument/programmer-error validation (a negative offset or length, an
-out-of-range index) raises stdlib ``ValueError``/``IndexError`` directly,
-never wrapped in this hierarchy — this hierarchy is reserved for on-disk
-data problems, not caller mistakes.
+No exception here is named ``KeyError`` — that would shadow the builtin
+and be silently swallowed by unrelated ``except KeyError`` blocks.
+Argument/programmer-error validation raises stdlib ``ValueError``/
+``IndexError`` directly instead of this hierarchy, which is reserved for
+on-disk data problems.
 """
 
 from __future__ import annotations
@@ -105,27 +97,20 @@ class NotFoundError(ApmRepoError):
 
 class ContentUnavailableError(ApmRepoError):
     """This node's metadata was found, but its real content is not
-    available to read — either because the guest OS itself only held a
-    placeholder for it at backup time (e.g. a cloud-sync client's
-    local-storage-optimization eviction, such as iCloud Drive or Windows
-    OneDrive Files-On-Demand), never actual data, or because the real
-    on-disk bytes exist but this SDK has no key material to make sense
-    of them (e.g. an NTFS EFS-encrypted file). Distinct from
-    ``DataCorruptError``: nothing here asserts the on-disk bytes are
-    damaged, only that this SDK could not obtain real content for them.
-    Deliberately not a ``NotFoundError`` subclass: callers that catch
-    ``NotFoundError`` to treat an optional item as absent-and-skippable
-    must not silently swallow this instead."""
+    available to read — either the guest OS only held a placeholder at
+    backup time (e.g. iCloud Drive/OneDrive Files-On-Demand eviction), or
+    the bytes exist but this SDK has no key material for them (e.g. an
+    NTFS EFS-encrypted file). Distinct from ``DataCorruptError``: nothing
+    here asserts the bytes are damaged. Not a ``NotFoundError`` subclass,
+    so callers treating that as absent-and-skippable don't swallow this
+    too."""
 
 
 class PermissionDeniedError(ApmRepoError):
-    """The referenced path / node exists but the OS or backend denied the
-    access needed to read or list it (permission bits, ACL, or an
-    unauthorized credential) — as opposed to not existing at all (see
-    ``NotFoundError``). Deliberately not a ``NotFoundError`` subclass: several call
-    sites elsewhere in this SDK catch ``NotFoundError`` to treat an optional item
-    as absent-and-skippable, and a permission failure must keep propagating
-    through those instead of being silently swallowed as "doesn't exist"."""
+    """The referenced path/node exists but the OS or backend denied the
+    access needed to read or list it — as opposed to not existing at all
+    (see ``NotFoundError``). Not a ``NotFoundError`` subclass, so callers
+    treating that as absent-and-skippable don't swallow this too."""
 
 
 class UnsupportedDataFormatError(ApmRepoError):
@@ -141,18 +126,12 @@ class ProfileNotFoundError(NotFoundError):
 
 class ProfileConfigCorruptError(DataCorruptError):
     """``profiles.json`` failed to parse, or failed schema validation (bad
-    ``schema_version``, unknown ``kind``, missing/malformed field) — the
-    same "matched the outer shape but the payload didn't survive intact"
-    contract ``DataCorruptError`` already has, applied to this config file
-    instead of an on-disk repository structure."""
+    ``schema_version``, unknown ``kind``, missing/malformed field)."""
 
 
 class ProfileSecretBackendUnavailableError(ApmRepoError):
     """No usable OS keyring backend is available to store/retrieve a
-    profile's secret fields — either the ``keyring`` package failed to
-    import (a broken/partial install; it's a required dependency, so this
-    should not happen in a well-formed environment), or it imported fine
-    but resolved no real backend (e.g. headless Linux with no Secret
-    Service/dbus). Deliberately not a ``KeyMaterialError`` subclass — that
-    hierarchy is about a dedup repository's own encryption key, an
-    unrelated "key"."""
+    profile's secret fields — either ``keyring`` failed to import, or it
+    resolved no real backend (e.g. headless Linux with no Secret
+    Service/dbus). Not a ``KeyMaterialError`` subclass — that hierarchy is
+    about a dedup repository's own encryption key, an unrelated "key"."""

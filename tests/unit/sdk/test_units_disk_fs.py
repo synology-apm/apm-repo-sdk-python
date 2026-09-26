@@ -1470,10 +1470,8 @@ class TestDissectFileContentSourceHandleReuse:
         self, tmp_path: Path
     ) -> None:
         """Regression test: the destination file (and its parent
-        directory) must not exist at all after a first-block failure --
-        this is what previously let a cloud-sync placeholder's failed
-        export leave a stray, empty ``.part`` file on disk (the ``.part``
-        file itself is ``_run_export``'s/the CLI's own naming, not
+        directory) must not exist at all after a first-block failure (the
+        ``.part`` file itself is ``_run_export``'s/the CLI's own naming, not
         something this class knows about -- proven here at the plain
         ``dst`` path it's given)."""
 

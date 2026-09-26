@@ -1,26 +1,14 @@
-"""Pure validation for ``ConnectDialog``'s own per-backend fields -- one
-function per backend tab, each translating already-read, already-
-``.strip()``ped raw widget values (never an ``Input``/``Checkbox``
-itself -- this module imports no Textual) into either a validated
-``store_from_config``-ready ``config``/``secret_source`` pair, or a
-raised :class:`ConnectValidationError`. This is deliberately *not* a
-Model in the MVU sense: nothing here is held onto across a call, and no
-secret value (an S3 secret key, an Azure credential, an SMB password)
-is ever stored anywhere by this module -- each function's own
-``secret_source`` return value is consumed immediately by
-``store_from_config`` and discarded, the same one-shot flow
-``ConnectDialog`` follows directly.
+"""Pure validation for ``ConnectDialog``'s per-backend fields -- one
+function per backend tab, translating already-``.strip()``ped raw widget
+values (this module imports no Textual) into a validated
+``store_from_config``-ready ``config``/``secret_source`` pair, or a raised
+:class:`ConnectValidationError`. No secret value is ever stored anywhere
+by this module.
 
-S3/Azure additionally expose their own config/secret builder
-(``s3_config_and_secrets``/``azure_config_and_secrets``) *without* a
-bucket/container-presence check -- shared by this module's own
-``validate_s3``/``validate_azure`` (bucket/container already confirmed
-non-empty) and ``ConnectDialog.s3_client_kwargs``/``azure_client_kwargs``'s
-own deliberately bucket-less/container-less placeholders, which
-``RemoteOptionsBrowser``'s "Browse" flow needs precisely because no
-bucket/container has been picked yet. SMB has no such builder, since no
-account-level share-listing operation exists to need a share-less
-placeholder for.
+S3/Azure additionally expose a config/secret builder without a
+bucket/container-presence check, shared by ``validate_s3``/``validate_azure``
+and by ``RemoteOptionsBrowser``'s bucket-less/container-less "Browse" flow.
+SMB has no such builder: no account-level share-listing operation needs it.
 """
 
 from __future__ import annotations

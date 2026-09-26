@@ -104,8 +104,8 @@ class TestRepoLabel:
         assert label == "apv-sample-2-encrypted · invalid key"
 
     def test_verbose_mode_appends_layout_regardless_of_key_status(self) -> None:
-        # No per-repository uuid any more -- that moved to per-catalog (see
-        # Catalog.info) -- only the layout-kind suffix is added here.
+        # A repository's own uuid lives on Catalog.info, not here -- only
+        # the layout-kind suffix is added.
         label = _repo_label(
             _layout("@ActiveProtectVault"), KeyStatus.NO_KEY_PROVIDED, "/samples/apv-sample-1", verbose=True
         )
@@ -199,16 +199,11 @@ class TestHumanizeType:
         assert _humanize_type("SOME_FUTURE_TYPE") == "SOME_FUTURE_TYPE"
 
     def test_type_labels_covers_every_real_saas_sub_type(self) -> None:
-        """``_TYPE_LABELS``' own comment already claims to mirror
-        ``units/dispatch.py``'s ``_SAAS_SUB_TYPE_CANDIDATES`` ("the
-        source of truth for which 11 tokens are real") — but nothing
-        previously checked that claim against the SDK's own real
-        dispatch table; a 12th real sub_type token could have been added
-        there and this TUI-layer table would silently keep falling back
-        to the raw wire token (``_humanize_type``'s own documented
-        behavior for an unrecognized token) instead of failing loudly.
-        Checked against ``SUPPORTED_SAAS_SUB_TYPES`` directly — the real
-        source of truth, not a second hand-maintained copy of it."""
+        """Cross-checks ``_TYPE_LABELS`` against ``SUPPORTED_SAAS_SUB_TYPES``
+        (``units/dispatch.py``'s real source of truth), not the
+        parametrize list above (a hand-maintained mirror) — an
+        unrecognized token would otherwise silently fall back to the raw
+        wire string instead of failing this test loudly."""
         assert _TYPE_LABELS.keys() >= SUPPORTED_SAAS_SUB_TYPES
 
 

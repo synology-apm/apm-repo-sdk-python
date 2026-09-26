@@ -28,13 +28,9 @@ from synology_apm_repo.sdk.errors import ApmRepoError
 
 
 class KeyDialog(ModalScreen[bool]):
-    """``ModalScreen`` truncates the App-level binding chain at itself
-    (Textual's own design: a modal's own
-    bindings take precedence over, and hide, everything below it — see
-    ``textual.screen.Screen._modal_binding_chain``) — there is
-    deliberately no ``d``/``q``/``?`` reachable while this dialog is open,
-    only the two actions it actually needs, declared directly here
-    rather than inherited from ``COMMON_BINDINGS``."""
+    """``ModalScreen`` truncates the App-level binding chain at itself, so
+    there is deliberately no ``d``/``q``/``?`` reachable while this dialog
+    is open -- only the two actions it needs, declared directly here."""
 
     DEFAULT_CSS = (
         modal_box_css("KeyDialog", width=64)
@@ -87,19 +83,10 @@ class KeyDialog(ModalScreen[bool]):
             show_error(self, "#key-status", exc)
             return
         except ExceptionGroup as exc:
-            # Repository.set_key() raises ExceptionGroup (not an
-            # ApmRepoError) only when the key itself verified fine but
-            # reopening/closing one specific already-opened sibling
-            # catalog independently failed — self._repo.key_status is
-            # already VERIFIED at this point -- that update happens
-            # *before* this exception is raised, so
-            # this is a genuinely accepted key with a partial cleanup
-            # failure alongside it, not a rejected one. Notify about the
-            # failure (so it isn't silently lost) but still proceed with
-            # the verified key below, rather than looping the user back
-            # to re-enter a key that already worked — showing an error
-            # and refusing to dismiss here would desync this dialog from
-            # a Repository that already considers the key valid.
+            # Raised only when the key itself verified fine but
+            # reopening/closing one sibling catalog independently failed
+            # -- key_status is already VERIFIED, so notify but still
+            # proceed with the verified key rather than re-prompting.
             notify_warning(self, exc)
             maybe_verification = self._repo.key_verification
             assert maybe_verification is not None  # set_key() always sets this before raising

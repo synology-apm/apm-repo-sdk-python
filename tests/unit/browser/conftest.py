@@ -15,11 +15,7 @@ from synology_apm_repo.browser.screens.connect_dialog import ConnectDialog
 @pytest.fixture(autouse=True)
 def _apply_fast_browser_debounce(fast_browser_debounce: None) -> None:
     """Auto-activates ``tests/conftest.py``'s ``fast_browser_debounce`` for
-    every test in this directory. That fixture itself lives in the shared
-    root conftest, not here, because it costs nothing for a test that
-    never asks for it by name (the same reason ``open_browser_pilot``/
-    ``wait_for_detail_content`` live there despite being browser-only);
-    only its *autouse* activation is scoped per directory."""
+    every test in this directory."""
 
 
 @pytest.fixture
@@ -28,13 +24,10 @@ def wait_for_status_containing(
 ) -> Callable[..., Awaitable[str]]:
     """``await wait_for_status_containing(pilot, dialog, needle, *,
     timeout=sdk_timeout)`` polls ``#connect-status`` until its rendered text
-    contains ``needle`` (case-insensitive), returning that final text —
-    shared by every ``ConnectDialog``-driving test under this directory.
-    Defaults to ``sdk_timeout`` since callers span both pure
-    construction-time validation and a real (faked) dispatch through
-    ``Session.discover_remote``/``list_remote_items`` — the wider ceiling
-    costs nothing once the condition is already true, same reasoning as
-    ``tests/conftest.py``'s ``wait_for_detail_content``."""
+    contains ``needle`` (case-insensitive), returning that final text.
+    Defaults to ``sdk_timeout`` since a caller may be waiting on a real
+    (faked) dispatch through ``Session.discover_remote``/``list_remote_items``,
+    not just UI state."""
 
     async def _wait(
         pilot: object,
@@ -63,16 +56,11 @@ def wait_for_status_containing(
 def activate_backend_and_settle(
     wait_until: Callable[..., Awaitable[None]], ui_timeout: float
 ) -> Callable[[ConnectDialog, str, object], Awaitable[None]]:
-    """``await activate_backend_and_settle(dialog, backend, pilot)`` drives
-    the backend ``Tabs`` strip the same way a real activation does (setting
-    ``active`` posts the same ``Tabs.TabActivated`` message
-    ``ConnectDialog.on_tabs_tab_activated`` reacts to) and waits for the
-    resulting pane swap to actually land — shared by every
-    ``ConnectDialog``-driving test under this directory. Setting
-    ``Tabs.active`` only posts ``TabActivated``; the pane swap happens
-    when ``ConnectDialog`` handles it, a later event-loop turn — waiting
-    on the pane carrying the ``active`` class beats guessing a duration
-    before touching that backend's widgets."""
+    """``await activate_backend_and_settle(dialog, backend, pilot)`` sets
+    the backend ``Tabs`` strip's ``active`` value and waits for the
+    resulting pane swap to land — setting ``active`` only posts
+    ``TabActivated``; ``ConnectDialog`` handles the swap a later
+    event-loop turn."""
 
     async def _activate(dialog: ConnectDialog, backend: str, pilot: object) -> None:
         dialog.query_one("#connect-backend-tabs", Tabs).active = backend

@@ -67,15 +67,9 @@ class FsProvider:
         if version_db_rel is None:
             raise NotFoundError(f"version {self._version.version_uid} has no version.db.zst in meta_filenames")
         raw = await self._repo.store.read(f"{meta_dir}/{version_db_rel}")
-        # asyncio.to_thread: peel() itself stays synchronous by design --
-        # it is pure bytes work, no I/O -- but this
-        # is the highest-risk peel() call site in the codebase --
-        # version.db.zst is a full filesystem backup's entire
-        # file/directory listing, potentially the largest single payload
-        # this project ever decrypts+decompresses. Left on the event loop,
-        # a multi-MB decrypt+decompress would stall every other Task for
-        # its duration -- the same responsiveness reasoning behind
-        # dedup/pool's own to_thread hops.
+        # to_thread: peel() is pure CPU work, but version.db.zst can be
+        # the largest single payload this project decrypts+decompresses --
+        # left on the event loop it would stall every other Task.
         payload, _envelopes = await asyncio.to_thread(peel, raw, vault_key=self._repo.vault_key)
         self._entry_db = await SqliteSource.from_bytes(payload)
         return self._entry_db.connection
@@ -132,10 +126,9 @@ class FsProvider:
         if dirname is None:
             return []
         conn = await self._entry_table_connection()
-        # apply_index_hint() is safe to call unconditionally here (a cheap
-        # leading-prefix check skips it when the columns are already
-        # indexed, and a read-only connection just makes CREATE INDEX
-        # raise, caught as a no-op).
+        # Safe to call unconditionally: a cheap prefix check skips it if
+        # already indexed, and a read-only connection just makes CREATE
+        # INDEX raise, caught as a no-op.
         await apply_index_hint(conn, "entry_table", ["dirname"])
         order_by = dir_first_order_by(f"file_type = {_FILE_TYPE_DIR}", "basename, rowid")
         cursor = await conn.execute(

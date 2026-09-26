@@ -13,21 +13,7 @@ test:  tests              test: close coverage gap for dedup chunkmap dump
 chore: configuration      chore: bump uv.lock via make bump-external-versions
 ```
 
-Body: describe what was actually found and verified, not just what changed.
-This project's culture (see `git log` for dozens of examples) is to cite
-real numbers — exact test counts, coverage deltas, real sample names,
-before/after benchmark measurements — rather than describe a change in the
-abstract. If something was deliberately left undone, say so and say why; a
-reader should be able to tell "not done because it doesn't matter" from "not
-done because it's genuinely unresolved" from the commit message alone — the
-commit message *is* this project's investigation/decision record.
-
-**Only claim something passed, was measured, or was verified when you
-actually ran it in this exact session.** A number written into a commit
-message that wasn't actually produced by a real run is worse than not having
-the number at all — it looks like evidence and isn't. If a full verification
-pass (ruff/mypy/pytest) wasn't possible for some reason, say that plainly
-rather than omit it.
+Body: describe what was actually verified, not just what changed.
 
 ## Committing a subset while other changes are staged
 
@@ -42,19 +28,13 @@ so you can redo it correctly.
 
 See `tests/CLAUDE.md`'s "RecordingStore / ReplayStore" section for what a
 recorded fixture proves (repository structure, never backed-up content's
-own meaning) and how to record one.
+own meaning), how to record one, and the anonymization-determinism details.
 
-What a recording captures from the real sample's catalog layer (`db/
-connection_config`, `workload_config`, `copy_target_version`, `file_map`,
-`file_meta`, and similar SQLite files) is anonymized automatically at
-recording time — deterministically, the same real value producing the
-same placeholder across runs unless it collides with a different real
-value's preferred hash slot in that particular run (in which case the
-other real values present that run can shift where it lands — see
-`tests/CLAUDE.md`'s "RecordingStore / ReplayStore" section) — the exact
-fields are registered in `scripts/anonymize_catalog_metadata.py`'s
-`SENSITIVE_FIELDS`, and no real-to-fake mapping is stored anywhere to make
-that determinism happen.
+A recording's catalog-layer data (`db/connection_config`, `workload_config`,
+`copy_target_version`, `file_map`, `file_meta`, and similar SQLite files) is
+anonymized automatically at recording time — the exact fields are
+registered in `scripts/anonymize_catalog_metadata.py`'s `SENSITIVE_FIELDS`,
+and no real-to-fake mapping is stored anywhere.
 
 **Fixture storage**: `tests/fixtures/*.json.gz` cassettes are committed
 gzip-compressed. Run this one-time local setup to get a readable `git

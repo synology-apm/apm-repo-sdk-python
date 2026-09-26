@@ -483,11 +483,9 @@ async def test_reconcile_and_restore_cursor_falls_back_to_the_parent_when_no_sib
     cursor falls back to that level's own parent node -- never all the
     way to the tree's root, and never drifting into an unrelated
     sibling *group*'s own content the way trusting Textual's raw,
-    unclamped ``cursor_line`` position alone would (a real, confirmed
-    failure mode this test was written specifically to catch: the
-    group being emptied out shifts every line below it up by one, so a
-    stale ``cursor_line`` silently starts pointing at content from the
-    next group over instead)."""
+    unclamped ``cursor_line`` position alone would: the group being
+    emptied out shifts every line below it up by one, so a stale
+    ``cursor_line`` would silently point at the next group over."""
     app = _FakeApp()
     async with app.run_test():
         tree = app.query_one(Tree)

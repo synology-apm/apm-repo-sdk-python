@@ -31,10 +31,8 @@ def _format_dump(data: bytes, base_offset: int) -> str:
         row = data[row_start : row_start + _BYTES_PER_LINE]
         offset_col = f"{base_offset + row_start:08x}"
         hex_col = " ".join(f"{b:02x}" for b in row).ljust(_BYTES_PER_LINE * 3 - 1)
-        # Raw bytes 0x5b/0x5d ('['/']') are common in real content and
-        # would otherwise be misparsed as Rich markup tags by the Static
-        # this string is rendered into — same reasoning as every other
-        # real-content interpolation in this package (sdk/presentation/markup.py).
+        # Escaped: raw 0x5b/0x5d ('['/']') would otherwise be misparsed as
+        # Rich markup tags by the Static this string renders into.
         ascii_col = safe("".join(chr(b) if 0x20 <= b < 0x7F else "." for b in row))
         lines.append(f"{offset_col}  {hex_col}  {ascii_col}")
     return "\n".join(lines)
@@ -70,26 +68,15 @@ class HexPreviewScreen(NavigableScreen):
         self._offset = 0
 
     def compose(self) -> ComposeResult:
-        # Starts empty, like every other NavigableScreen's own breadcrumb
-        # -- on_mount below fills it via _update_breadcrumb_text, so a
-        # background job's own tasks-hint suffix has real breadcrumb
-        # text to combine with instead of blanking it.
+        # Starts empty; on_mount below fills it via _update_breadcrumb_text.
         yield Static("", id="breadcrumb")
         yield Static("", id="hex-dump")
         yield Footer(show_command_palette=False)
 
-    # ``on_mount``/``action_*`` are ``async def`` here because
-    # ``ContentSource.read()`` is: Textual awaits a coroutine-returning
-    # handler to completion just like any other, legitimate as long as
-    # the call stays bounded enough to need no separate loading feedback/
-    # cancellation point. This screen reads one small window per
-    # keypress and so has never needed a worker of its own. The
-    # ``type: ignore`` is this same legitimate-async-override shape, just
-    # now also caught statically: NavigableScreen.on_mount is a real,
-    # synchronous method (registering the jobs-watch for the breadcrumb
-    # tasks-hint), so overriding it with an async one is a genuine
-    # ``Coroutine`` vs ``None`` return-type mismatch to mypy -- exactly
-    # the pattern Textual's own runtime dispatch already tolerates.
+    # async here since ContentSource.read() is, and each window read is
+    # bounded enough to need no separate worker. The type: ignore is
+    # because NavigableScreen.on_mount is synchronous, a genuine
+    # Coroutine vs None mismatch to mypy that Textual's dispatch tolerates.
     async def on_mount(self) -> None:  # type: ignore[override]
         super().on_mount()
         self._update_breadcrumb_text(f"hex preview: {safe(self._name)}")

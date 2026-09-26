@@ -52,11 +52,9 @@ def test_app_accepts_an_explicit_default_sparse() -> None:
 def test_main_configures_logging_then_preloads_then_runs(monkeypatch: pytest.MonkeyPatch) -> None:
     # main() itself is excluded from the coverage gate (it opens a real
     # terminal via .run()) -- this only proves the ordering that matters:
-    # configure_logging() first (shared mechanism, proven once in
-    # test_presentation_logging_setup.py, not here), then
-    # preload_resource_tracker() must run before .run() hands sys.stderr
-    # over to Textual's own capture, or the tracker's later fd
-    # validation crashes the first ProcessPoolExecutor built afterward.
+    # configure_logging() first, then preload_resource_tracker() before
+    # .run() hands sys.stderr to Textual's capture (see that function's
+    # own docstring for why).
     calls: list[str] = []
     monkeypatch.setattr(app_module, "configure_logging", lambda: calls.append("configure_logging"))
     monkeypatch.setattr(app_module, "preload_resource_tracker", lambda: calls.append("preload"))
@@ -140,16 +138,12 @@ async def test_action_toggle_verbose_flips_the_flag_and_css_class(monkeypatch: p
 
 
 async def test_action_toggle_verbose_notifies_every_registered_watcher() -> None:
-    """``action_toggle_verbose`` no longer reaches into ``self.screen``
-    directly at all -- any screen that cares registers its own
+    """``action_toggle_verbose`` never reaches into ``self.screen``
+    directly -- any screen that cares registers its own
     ``self.watch(self.app, "verbose", ...)`` (see ``BrowseScreen``/
     ``UnitScreen``'s own ``on_mount``), and every registered watch fires
     on toggle regardless of whether that screen is currently on top of
-    the screen stack -- the actual bug this mechanism replaced the old
-    ``getattr(self.screen, "refresh_for_verbose_mode", None)`` hook to
-    fix: the old hook only ever reached whichever screen happened to be
-    current at the moment ``d`` was pressed, silently missing a covered
-    one."""
+    the screen stack."""
 
     class _FakeScreen(Screen[None]):
         def __init__(self) -> None:
@@ -217,15 +211,11 @@ class _BlockingContentSource:
 
 
 async def test_on_unmount_cancels_and_drains_every_outstanding_job(tmp_path: Path) -> None:
-    """Cancelling alone isn't enough: a cancelled worker only stops at
-    its next ``await``, and ``session.close()`` runs right after, so
-    teardown has to wait the worker out before closing what it's still
-    reading through. Proven end-to-end with a real, group-cancelled
-    export worker (see ``app.py``'s own ``on_unmount``) rather than a
-    fake ``Worker`` stand-in, since cancellation now goes through
-    ``workers.cancel_group`` by name, not a stored reference -- if
-    ``on_unmount`` didn't actually cancel/drain it, exiting
-    ``run_test()``'s context below would hang instead of returning."""
+    """``on_unmount`` must wait a cancelled export worker out, not just
+    cancel it, before ``session.close()`` closes what it's still reading
+    through. Proven with a real, group-cancelled export worker: if
+    ``on_unmount`` didn't drain it, exiting ``run_test()``'s context below
+    would hang instead of returning."""
     unit = RestorableUnit(
         ref=NodeRef("repo", ("item",)),
         name="item.bin",

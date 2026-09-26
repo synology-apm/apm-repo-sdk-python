@@ -71,10 +71,9 @@ async def test_recording_aclose_is_a_no_op_over_a_backing_store_with_nothing_to_
 
 
 async def test_recording_aclose_forwards_to_an_asynccloseable_backing_store() -> None:
-    # The real regression this guards: Session.close()'s own isinstance(
-    # store, AsyncCloseable) check used to find no aclose() at all on a
-    # RecordingStore wrapping a real S3Store/AzureStore, silently skipping
-    # its real aiohttp connector's own close.
+    # Regression guard: Session.close()'s own isinstance(store, AsyncCloseable)
+    # check must find aclose() on a RecordingStore wrapping a real
+    # S3Store/AzureStore, so its real aiohttp connector actually gets closed.
     fake = _FakeCloseableStore()
     await RecordingStore(fake).aclose()
     assert fake.closed is True

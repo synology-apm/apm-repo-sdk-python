@@ -81,12 +81,8 @@ def parse_chunk_map_record(data: bytes) -> ChunkMapEntry:
     """Decode one 20-byte ``ChunkMapRecord`` from the start of ``data``
     (``data`` may be longer; only the first 20 bytes are consulted).
 
-    A Mapping record's embedded ``ChunkAddress`` is not itself
-    range-checked here — an out-of-range field either surfaces naturally
-    downstream (``IndexError``/``NotFoundError``) or is the job of
-    ``units/verify_reachable.py``'s dedicated, verify-only checks; skipping
-    it here matters at scale, since this runs once per real chunk in an
-    export.
+    A Mapping record's embedded ``ChunkAddress`` isn't range-checked here
+    either — see ``ChunkAddress``'s own docstring.
 
     Raises:
         FormatError: ``data`` is shorter than 20 bytes.

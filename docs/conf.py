@@ -68,6 +68,11 @@ nitpick_ignore = [
     # units.saas.tree_strategy path CategorizedGroupTree.__init__'s own
     # `inner: TreeStrategy` parameter is documented under.
     ("py:class", "synology_apm_repo.sdk.units.saas.tree_strategy._base.TreeStrategy"),
+    # Same shape as the asyncio.Semaphore case above: ProcessPoolExecutor's
+    # own __module__ is the private concurrent.futures.process, but
+    # docs.python.org's inventory indexes it under the public
+    # concurrent.futures.ProcessPoolExecutor path instead.
+    ("py:class", "concurrent.futures.process.ProcessPoolExecutor"),
 ]
 
 html_theme = "furo"

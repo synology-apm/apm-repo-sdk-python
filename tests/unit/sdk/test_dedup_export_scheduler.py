@@ -4,11 +4,8 @@ repositories required.
 
 ``_naive_export_to`` below is this file's own correctness oracle: a
 deliberately independent, unmerged, one-chunk-at-a-time walk that never
-groups ``DATA`` chunks by bucket — production ``export_to()`` has no
-naive path of its own to compare against (it exists only as an
-independent correctness oracle in the test suite, never in production),
-so this file keeps one purely for the
-cross-check.
+groups ``DATA`` chunks by bucket, kept purely for the cross-check since
+production ``export_to()`` has no naive path of its own.
 
 No ``verify_map_crc`` coverage here — chunk-map CRC validation is
 ``verify``'s job specifically, not export's; see the

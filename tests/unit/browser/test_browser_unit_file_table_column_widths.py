@@ -5,17 +5,7 @@
 mounted ``FileTable`` widget rather than through the full ``UnitScreen``/
 ``Store``/provider stack, since none of this logic depends on any of that.
 Column width is driven purely by available screen space, never by row
-content. Regression coverage for three bugs real code review caught in
-this exact mechanism: ``_flexible_widths``'s own running budget/weight
-pool not accounting for an earlier column's own floor overrun (an
-overrun could otherwise push the total past the table's own available
-width -- ``TestFlexibleWidths`` exercises that arithmetic directly, with
-no ``App``/``Pilot`` needed), ``render()``'s append-vs-rebuild check
-being vacuously true for a folder's own first-ever page (routing it
-through the append path, which never establishes a flexible column's
-width in the first place), and an empty-to-empty folder-kind switch
-never calling ``render()`` at all (leaving the new spec's flexible
-columns undistributed since only ``render()`` used to size them)."""
+content."""
 
 from __future__ import annotations
 
@@ -193,17 +183,11 @@ class TestFirstPopulationAndEmptyToEmptySwitch:
     async def test_a_folders_first_ever_page_is_correctly_distributed_not_just_appended(
         self, view_and_table: Any
     ) -> None:
-        """Regression test: ``FileTableView._nodes`` starts at ``[]``, so
+        """Regression guard: ``FileTableView._nodes`` starts at ``[]``, so
         the append check's own prefix match (``new_nodes[:0] == []``) is
         vacuously true the first time any folder gets real rows --
         without the ``old_nodes`` truthiness guard, that first page would
-        route through the append path instead of the rebuild path. Now a
-        plain sanity check rather than proof the guard is width-load-
-        bearing: ``configure_column_widths`` already establishes the
-        correct share-based width against zero rows before this render()
-        call, so a misrouted first page wouldn't actually leave the
-        column unsized -- the guard is still worth keeping as a cheap,
-        general invariant."""
+        route through the append path instead of the rebuild path."""
         view, table, _pilot = view_and_table
         view.configure_columns(("Name", "Size"))
         view.configure_column_widths((FlexibleColumnWidth(), FixedColumnWidth(10)))

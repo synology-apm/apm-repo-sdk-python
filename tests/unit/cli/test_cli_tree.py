@@ -303,11 +303,9 @@ def test_tree_command_at_catalog_level_lists_workloads(monkeypatch: pytest.Monke
 
 
 # -- _root_catalog_entries --------------------------------------------------
-# The true bare-root case: no wrapping "/"-named TreeEntry (that used to
-# print as literal "//" and leak a fake object into --json) -- a bare
-# list of catalog entries instead, matching _catalog_tree's own
-# "catalog"/"workload" cases in always showing themselves regardless of
-# --depth.
+# The true bare-root case: a bare list of catalog entries, no wrapping
+# "/"-named TreeEntry, matching _catalog_tree's own "catalog"/"workload"
+# cases in always showing themselves regardless of --depth.
 
 
 async def test_root_catalog_entries_depth_zero_lists_catalogs_with_no_children() -> None:

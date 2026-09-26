@@ -1,17 +1,12 @@
 """``SavedProfileManager``: ``ConnectDialog``'s saved-connection-profile
-CRUD (list/load/save/delete), split out for the same reason
-``goto_walker.py``'s ``GotoChainWalker`` is split out of ``UnitScreen``:
-held privately, reaching back into the screen that owns it only through
-the small public surface it exposes for this
-(``validated_store_for``, ``refresh_profile_lists``, the ``naming_profile``
-reactive, ``post_message``, plus Textual's own ``query_one``).
+CRUD (list/load/save/delete), held privately and reaching back into the
+dialog only through its small public surface (``validated_store_for``,
+``refresh_profile_lists``, the ``naming_profile`` reactive, ``query_one``).
 
-Also owns the S3/Azure/SMB backend vocabulary (``_ProfileBackend``) —
-nothing outside profile persistence and ``ConnectDialog``'s own backend
-dispatch needs it. The per-backend field table itself is owned by
-``sdk.profiles`` (``ProfileFieldSpec``/``form_fields_for``), not this
-module: it's shared, identically, by the CLI and TUI, so keeping it in
-the SDK avoids each surface maintaining its own copy.
+Also owns the S3/Azure/SMB backend vocabulary (``_ProfileBackend``). The
+per-backend field table itself is owned by ``sdk.profiles``
+(``ProfileFieldSpec``/``form_fields_for``), shared identically by the CLI
+and TUI.
 """
 
 from __future__ import annotations

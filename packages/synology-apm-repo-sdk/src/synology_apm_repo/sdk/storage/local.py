@@ -124,16 +124,10 @@ class LocalFsStore:
             raise NotFoundError("is a directory, not a file", ref=path) from exc
         except PermissionError as exc:
             # On Windows, os.open() on a directory raises PermissionError
-            # directly instead of succeeding (POSIX instead lets os.open()
-            # succeed and fails on the read below, caught by the except
-            # IsADirectoryError case below) -- os.path.isdir() disambiguates
-            # the two on every platform. Deliberately os.path.isdir(), not
-            # Path.is_dir(): the latter re-raises PermissionError from its
-            # own internal stat() on an unsearchable parent (EACCES), which
-            # would let a raw PermissionError escape here uncaught; plain
-            # os.path.isdir() treats any stat failure as "not a directory"
-            # instead, which is the right fallback given os.open() already
-            # told us this path isn't accessible.
+            # directly (POSIX instead fails on the read below). Deliberately
+            # os.path.isdir(), not Path.is_dir(): the latter can re-raise
+            # PermissionError from its own stat(), which would escape here
+            # uncaught.
             if os.path.isdir(p):
                 raise NotFoundError("is a directory, not a file", ref=path) from exc
             raise PermissionDeniedError("permission denied", ref=path) from exc

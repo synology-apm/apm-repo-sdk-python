@@ -1,21 +1,13 @@
 """JSON persistence for a profile's non-secret fields.
 
-Plain, synchronous file I/O — the same shape as ``LocalFsStore``'s own
-syscalls, which is why the async boundary for this whole package lives
-one layer up, in ``profiles/__init__.py``'s facade (wrapping calls here in
-``asyncio.to_thread()``), not in this module itself.
+Plain, synchronous file I/O — the async boundary for this whole package
+lives one layer up, in ``profiles/__init__.py``'s facade.
 
-One file, ``profiles.json``, under a per-user config directory shared by the
-CLI and TUI alike: ``$XDG_CONFIG_HOME/synology-apm-repo`` (falling back
-to ``~/.config/synology-apm-repo``) on every platform, not a
-platform-native config directory — the three-distribution family name, not
-this SDK distribution's own name, since both other distributions read/write
-the exact same file. XDG-everywhere rather than a per-OS-native location
-(``~/Library/Application Support/...`` on macOS, ``%APPDATA%`` on Windows),
-down to "non-empty and absolute" being the only accepted override of the
-default: this project's audience already runs other XDG-convention CLI
-tooling and expects one predictable config location, not a platform-specific
-one.
+One file, ``profiles.json``, under a per-user config directory shared by
+the CLI and TUI: ``$XDG_CONFIG_HOME/synology-apm-repo`` (falling back to
+``~/.config/synology-apm-repo``) on every platform, not a platform-native
+location — the three-distribution family name, not this SDK distribution's
+own name, since both other distributions read/write the same file.
 """
 
 from __future__ import annotations
