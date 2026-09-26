@@ -13,13 +13,9 @@ from synology_apm_repo.browser.strings import EXPORT_CANCEL_LABEL, EXPORT_START_
 
 @dataclasses.dataclass(frozen=True, slots=True)
 class ExportButtonSpec:
-    """``ExportScreen``'s own start/cancel button and progress-bar-active
-    state, as a pure function of its own job -- ``variant`` is a plain
-    ``str``, not Textual's own ``ButtonVariant`` literal, since ``core/``
-    must stay import-free of Textual.
-    ``Button.variant`` is itself a bare ``reactive`` with no narrower
-    static type of its own, so the screen assigns this field directly,
-    with no cast needed at that boundary."""
+    """``ExportScreen``'s start/cancel button and progress-bar-active state,
+    as a pure function of its job. ``variant`` is a plain ``str``, not
+    Textual's ``ButtonVariant`` literal, since ``core/`` stays Textual-free."""
 
     label: str
     variant: str
@@ -27,13 +23,9 @@ class ExportButtonSpec:
 
 
 def export_button_spec(job: Job | FinishedJob | None) -> ExportButtonSpec:
-    """``ExportScreen``'s single source of truth for its button/progress-bar
-    state — any live ``Job`` (running, cancelling, or still queued) shows
-    Cancel/warning, but the bar itself is only active once actually
-    running: a still-``QUEUED`` job has no progress to show yet, so an
-    indeterminate spinning bar behind its "queued" status text would be
-    misleading. Anything else (nothing running yet, or a job that just
-    finished) shows Export/primary with the bar inactive."""
+    """Any live ``Job`` shows Cancel/warning; the progress bar is active
+    only once actually running (a ``QUEUED`` job has no progress yet).
+    Anything else shows Export/primary with the bar inactive."""
     if isinstance(job, Job):
         return ExportButtonSpec(
             label=EXPORT_CANCEL_LABEL, variant="warning", progress_active=job.status is not JobStatus.QUEUED

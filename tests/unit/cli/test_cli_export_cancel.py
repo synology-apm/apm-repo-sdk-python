@@ -1,11 +1,9 @@
 """Unit tests for ``synology_apm_repo.cli.commands.export``'s
 Ctrl-C/``--keep-partial`` handling — covers what's safely unit-testable:
 ``handle_cancelled()``'s pure logic, and the CLI's overall behavior when
-an ``asyncio.CancelledError`` is raised — never the literal ``os._exit()``
-force-quit branch itself, which would terminate the test runner if
-actually invoked; that branch is two lines of trivially-reviewable code,
-verified by inspection rather than by execution, a deliberate and
-documented limit, not an oversight.
+an ``asyncio.CancelledError`` is raised. The literal ``os._exit()``
+force-quit branch is out of scope here — see
+``test_first_sigint_cancels_the_task_and_can_be_restored`` for why.
 """
 
 from __future__ import annotations

@@ -1,19 +1,14 @@
 """``DetailPane``: owns ``UnitScreen``'s ``#detail``/``#detail-scroll``
 widgets — which node they're currently showing (``_render_if_current``
-compares against this to discard a late-arriving preview/overview render
-for a node the user has since navigated away from), and the
-header/preview/List-overview text rendered into them. Held by
-``UnitScreen`` as a private collaborator,
-reaching back into it only through the small surface every ``Screen``
-already exposes for this (``query_one``, ``app_state``) — the same
-convention ``GotoChainWalker`` establishes for a ``UnitScreen``
-collaborator.
+discards a late-arriving render for a node the user has since navigated
+away from), and the header/preview/List-overview text rendered into
+them. Held by ``UnitScreen`` as a private collaborator, reaching back
+into it only through ``query_one``/``app_state``.
 
-The ``@work``-decorated preview/List-overview *loading* stays on
-``UnitScreen`` itself: Textual's ``@work`` requires a ``DOMNode`` ``self``
-(a ``Widget``/``Screen``/``App``), which this plain collaborator isn't.
-This class owns only the rendering that runs once bytes are already in
-hand, called from those workers.
+The ``@work``-decorated preview/List-overview loading stays on
+``UnitScreen`` itself, since Textual's ``@work`` requires a ``DOMNode``
+``self``, which this plain collaborator isn't — this class owns only the
+rendering that runs once bytes are already in hand.
 """
 
 from __future__ import annotations
@@ -41,36 +36,28 @@ class DetailPane:
     def __init__(self, screen: UnitScreen) -> None:
         self._screen = screen
         # Which node this pane is currently showing — set synchronously by
-        # show() before its preview worker even starts, so a late-arriving
-        # preview for a node the user has since navigated away from can be
-        # told apart from a genuinely current one.
+        # show() before its preview worker starts, so a late-arriving
+        # preview from a node the user navigated away from can be told
+        # apart from a current one.
         self._node: Node | None = None
 
     @property
     def node(self) -> Node | None:
         """Whichever node this pane is currently showing -- ``None``
-        before anything has ever been selected. Read by
-        ``UnitScreen._selected_node()`` as its own fallback when neither
-        the folder tree nor the file table currently has focus (e.g. the
-        user scrolled/clicked into ``#detail-scroll``, itself focusable),
-        since this is the last real selection that produced whatever
-        content is currently on screen either way."""
+        before anything has been selected. Read by
+        ``UnitScreen._selected_node()`` as its fallback when neither the
+        tree nor the file table has focus."""
         return self._node
 
     def header_text(self, node: Node) -> str:
-        # node.name/attrs values are real backup content (mail subjects,
-        # filenames, ...) — must be escaped before reaching Static, same
-        # reasoning as sdk/presentation/markup.py's docstring. node.ref is a
-        # NodeRef string, which by construction (its own percent-
-        # encoding) never contains ``[``/``]``, so it's left unescaped as a
-        # matter of not hiding what's actually copyable from this screen.
+        # node.name/attrs are real backup content — must be escaped before
+        # reaching Static. node.ref is a NodeRef string (percent-encoded,
+        # so never contains []) and is left unescaped.
         if is_content_only_preview(node):
-            # Mail/calendar-event/contact/Teams-chat previews already
-            # state their own identity, so a generic Name/kind/size/
-            # modified header would just repeat it -- dropped entirely
-            # here. Verbose mode still gets ref/attrs (the internal-
-            # identifier exposure it exists for), just without the now-
-            # redundant header lines above them.
+            # Mail/calendar/contact/Teams-chat previews already state
+            # their own identity, so a generic header would repeat it.
+            # Verbose mode still gets ref/attrs, just without the
+            # redundant header lines.
             if not self._screen.app_state.verbose:
                 return ""
             lines = [f"ref: {node.ref}"]
@@ -82,21 +69,16 @@ class DetailPane:
             size_line = f"size: {format_bytes(node.size)}"
             if node_file_state(node) is FileState.CLOUD_ONLY:
                 # A cloud-sync placeholder has no real data resident
-                # locally — node.size is still the guest OS's own
-                # declared/logical size, not what's actually on this
-                # backup's disk. An EFS-encrypted file (FileState.
-                # ENCRYPTED) has no equivalent caveat here: its real
-                # bytes genuinely are on disk, just undecryptable.
+                # locally — node.size is the guest OS's declared size, not
+                # what's on disk. An EFS-encrypted file has no such
+                # caveat: its bytes are on disk, just undecryptable.
                 size_line += " (0 Byte on disk)"
             lines.append(size_line)
         modified = node_modified_time(node)
         if modified is not None:
-            # Shown even outside verbose mode, like size/kind above --
-            # redundant with the file table's own Modified column when a
-            # leaf row was selected from there, but the header stays the
-            # single source of truth for "everything known about the
-            # currently-shown node" even when the file table isn't in
-            # view (a goto-ref landing straight on a leaf).
+            # Shown outside verbose mode too — the header stays the single
+            # source of truth for the current node even when the file
+            # table isn't in view (e.g. a goto-ref landing on a leaf).
             lines.append(f"modified: {format_timestamp(modified)}")
         if self._screen.app_state.verbose:
             lines.append(f"ref: {node.ref}")
@@ -110,33 +92,25 @@ class DetailPane:
 
     def clear(self) -> None:
         """Resets to the empty pre-selection state -- called when the
-        screen's own root/provider is torn down (a refresh, a
-        verbose-mode toggle) so a node from the just-closed provider
-        generation can never resurface via ``UnitScreen._selected_node()``'s
-        own fallback to this pane once nothing has been selected again."""
+        screen's root/provider is torn down so a node from the closed
+        provider generation can't resurface via ``_selected_node()``'s
+        fallback."""
         self._node = None
         self._static().update("")
 
     def set_wide(self, wide: bool) -> None:
-        """Toggles the ``wide-preview`` CSS class (``theme.tcss``) that
-        lets a List overview's own table size to its real content width
-        and pan horizontally, instead of getting force-wrapped to the
-        pane's width the way ordinary preview text should be. Reset
-        (``wide=False``) on every other selection so a later, ordinary
-        preview doesn't inherit an oversized/pannable pane from a
-        previous List overview."""
+        """Toggles the ``wide-preview`` CSS class so a List overview's
+        table sizes to its real content width and pans horizontally,
+        instead of wrapping. Reset on every other selection so a later
+        preview doesn't inherit an oversized pane."""
         self._static().set_class(wide, "wide-preview")
         self._screen.query_one("#detail-scroll", VerticalScroll).set_class(wide, "wide-preview")
 
     def _append_after_header(self, node: Node, body: str, *, separator: str = "") -> None:
-        """Shared by ``append_preview``/``append_preview_error``/
-        ``append_list_overview_error``/``show_loading``: combines
-        ``body`` with whatever header
-        ``show(node)`` already put in place -- an empty header (a
-        content-only node outside verbose mode -- see ``header_text``)
-        means ``body`` *is* the pane's whole text, with no separator/
-        blank line above it dividing it from a header that isn't
-        there."""
+        """Shared by every ``append_*``/``show_loading`` method: combines
+        ``body`` with whatever header ``show(node)`` put in place — an
+        empty header means ``body`` is the pane's whole text, no
+        separator above it."""
 
         def render(header: str) -> str:
             if not header:
@@ -152,10 +126,9 @@ class DetailPane:
         if not rows:
             self._render_if_current(node, lambda header: f"{header}\n\n(no items)")
             return
-        # Pre-rendered to plain text, not a live Rich renderable: a
-        # Console(record=True) also writes straight to the real stdout on
-        # every .print(), which would corrupt this running Textual app's
-        # own terminal control.
+        # Pre-rendered to plain text: Console(record=True) also writes to
+        # the real stdout on every .print(), which would corrupt this
+        # running Textual app's own terminal.
         self._render_if_current(node, lambda header: render_overview_table(header, rows, truncated=truncated))
 
     def append_list_overview_error(self, node: Node, message: str) -> None:
@@ -166,39 +139,31 @@ class DetailPane:
 
     def append_preview_note(self, node: Node, message: object) -> None:
         """Same shape as ``append_preview_error``, styled as an
-        informational hint instead of a failure -- for a case
-        ``_load_preview`` already expects and fully explains (a
-        cloud-sync placeholder, an EFS-encrypted file), not a genuine
-        rendering failure."""
+        informational hint instead of a failure (a cloud-sync
+        placeholder, an EFS-encrypted file), not a genuine rendering
+        failure."""
         self._append_after_header(node, f"[dim]note:[/dim] {safe(message)}")
 
     def show_loading(self, node: Node, frame: str) -> None:
-        """``DetailPaneLoadingSink``'s ``show`` -- appends an animated
-        cue below whatever ``show(node)`` already put in place, discarded
-        (via ``_render_if_current``'s own staleness guard) the same way a
-        real preview/overview would be if the user has since selected a
-        different node."""
+        """``DetailPaneLoadingSink``'s ``show`` -- appends an animated cue
+        below the current header, discarded by ``_render_if_current``'s
+        staleness guard the same as a real preview would be."""
         self._append_after_header(node, f"({frame} loading)")
 
     def clear_loading(self, node: Node) -> None:
         self._render_if_current(node, lambda header: header)
 
     def current_text(self) -> str:
-        """The pane's own current plain-text rendering — lets
-        ``DetailPaneLoadingSink`` tell "nothing has written here since I
-        last showed the loading cue" apart from "a real preview/overview
-        already landed," the same way ``progress_hint.py``'s
-        ``StaticTextSink`` does for its own ``Static``. Never used to
-        strip/re-parse content back into a new render — only compared for
-        equality against a value this class itself already computed."""
+        """The pane's current plain-text rendering -- lets
+        ``DetailPaneLoadingSink`` tell "nothing written since the loading
+        cue" from "a real preview already landed," compared only for
+        equality, never re-parsed."""
         static = self._static_if_present()
         return str(static.render()) if static is not None else ""
 
     def _render_if_current(self, node: Node, render: Callable[[str], str]) -> None:
-        """Staleness guard (discard for a node the user has since navigated
-        away from) shared by every ``append_*`` method above — each
-        supplies only how to turn this node's already-computed header into
-        its own final text."""
+        """Staleness guard shared by every ``append_*`` method -- discards
+        a render for a node the user has since navigated away from."""
         if node is not self._node:
             return  # the user has since selected a different node — discard
         static = self._static_if_present()
@@ -210,14 +175,11 @@ class DetailPane:
         return self._screen.query_one("#detail", Static)
 
     def _static_if_present(self) -> Static | None:
-        """Tolerates the screen already being gone -- same rationale as
-        ``widgets/progress_hint.py``'s ``StaticTextSink._static()``: a
-        background worker's own result (or ``DebouncedProgress.stop()``'s
-        ``hide()``) can still be arriving after its host screen has already
-        been torn down. Only ``current_text()``/``_render_if_current()`` use
-        this -- ``show()``/``clear()``/``set_wide()`` all run synchronously
-        while the screen is guaranteed present, so they keep using
-        ``_static()`` unguarded."""
+        """Tolerates the screen already being gone: a background worker's
+        result can still arrive after its host screen is torn down. Only
+        ``current_text``/``_render_if_current`` need this --
+        ``show``/``clear``/``set_wide`` run synchronously while the
+        screen is guaranteed present."""
         with contextlib.suppress(NoMatches):
             return self._screen.query_one("#detail", Static)
         return None
@@ -225,22 +187,15 @@ class DetailPane:
 
 class DetailPaneLoadingSink:
     """Adapts ``DetailPane.show_loading``/``clear_loading`` to
-    ``_LoadingSink``'s ``show(frame)``/``hide()`` shape for one node --
-    ``DebouncedProgress`` calls those with just the current frame, but
-    ``DetailPane``'s own staleness guard (``_render_if_current``) needs
-    the node a given fetch was for, which this sink closes over at
-    construction instead of threading through every call.
+    ``_LoadingSink``'s ``show(frame)``/``hide()`` shape, closing over the
+    node a given fetch was for since ``DebouncedProgress`` only passes
+    the frame.
 
-    Delegates the actual show/hide bookkeeping to
-    ``widgets/progress_hint.py``'s ``_ConditionalResetSink``: ``hide()``
-    only clears back to a bare header when the pane still shows exactly
-    what the last loading frame wrote, since ``_load_preview``'s/
-    ``_load_list_overview``'s own ``append_preview``/
-    ``append_list_overview``/``append_list_overview_error`` calls, once a
-    slow-enough fetch resolves, can already have rendered the real
-    preview/overview by the time ``hide()`` runs -- clearing
-    unconditionally there would clobber that result right after showing
-    it."""
+    Delegates to ``widgets/progress_hint.py``'s ``_ConditionalResetSink``:
+    ``hide()`` only clears back to a bare header when the pane still
+    shows exactly what the last loading frame wrote, since a slow fetch
+    can have already rendered the real result by the time ``hide()``
+    runs."""
 
     def __init__(self, pane: DetailPane, node: Node) -> None:
         self._core = _ConditionalResetSink(

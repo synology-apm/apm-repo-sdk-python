@@ -92,8 +92,7 @@ def _write_bucket(
     compressed with ZSTD by default, optionally AES-256-CTR encrypted
     exactly like a real vault-encrypted bucket.
 
-    ``compress_types`` (default ``None``: every chunk is ``ZSTD``, the
-    original behavior this helper has always had) lets a caller mix
+    ``compress_types`` (default ``None``: every chunk is ``ZSTD``) lets a caller mix
     ``CompressType.NONE``/``LZ4``/``ZSTD`` per chunk within one bucket —
     for tests of ``decompress_many``'s batching, which groups by compress
     type across a whole merged run and needs a real bucket exercising
@@ -816,11 +815,9 @@ class TestLruEviction:
 
 
 async def test_concurrent_bucket_opens_for_the_same_key_only_open_the_file_once(tmp_path: Path) -> None:
-    """``_buckets`` is an ``AsyncKeyedCache`` now, so this is a real,
-    measured consequence of that migration, not just a cache-hit test:
-    two concurrent misses on the *same* bucket must not both pay for
+    """Two concurrent misses on the *same* bucket must not both pay for
     opening it — the second joins the first's in-flight open instead of
-    issuing its own."""
+    issuing its own (``_buckets`` is an ``AsyncKeyedCache``)."""
     for bucket_id in range(3):
         _write_bucket(tmp_path / "Pool" / "5" / f"{bucket_id}.buk", _PLAINTEXTS, stream_id=5, bucket_id=bucket_id)
     store = LocalFsStore(tmp_path)
@@ -1502,8 +1499,7 @@ class TestSizeStoreParityRepair:
     async def test_an_unrecoverable_corruption_still_raises(self, tmp_path: Path) -> None:
         """Two non-adjacent corrupted bytes (more than one parity-
         repairable window) — the repair attempt fails its own final CRC
-        re-check, so the original ``DataCorruptError`` still propagates,
-        exactly as it did before this self-repair path existed."""
+        re-check, so the original ``DataCorruptError`` still propagates."""
         path = tmp_path / "Pool" / "5" / "0.buk"
         entries = [(CompressType.ZSTD.value, 100 + i) for i in range(400)]  # tight_len = 750: windows 0,1,2
         _write_bucket_with_real_size_store_redundancy(path, entries, corrupt_byte_idx=None)

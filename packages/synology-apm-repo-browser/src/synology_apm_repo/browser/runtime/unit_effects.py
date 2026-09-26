@@ -1,25 +1,20 @@
 """``UnitEffects``: the one place a ``UnitCmd`` actually does anything --
-fetches a root/provider, fetches a page of children, closes a
-discarded provider, or shows a toast. Constructed once per
-``UnitScreen`` instance (unlike ``AppEffects``, which is app-wide), and
-handed to that screen's own ``Store`` as its ``perform`` callback.
+fetches a root/provider, fetches a page of children, closes a discarded
+provider, or shows a toast. Constructed once per ``UnitScreen`` instance
+(unlike ``AppEffects``, which is app-wide), handed to that screen's
+``Store`` as its ``perform`` callback.
 
-Takes a plain ``Widget`` plus three narrow callables (``repo``,
-``file_table``, ``unit_tree``) rather than the real ``UnitScreen``/
-``ApmRepoBrowserApp`` types -- ``runtime/`` must never import from
-``screens/`` (the package's own one-directional ``core`` -> ``runtime`` ->
-``view`` -> ``screens`` layering), and importing either concrete class
-here would be circular (``unit_screen.py`` is what constructs this
-class).
+Takes a plain ``Widget`` plus narrow callables rather than the real
+``UnitScreen``/``ApmRepoBrowserApp`` types, per this package's
+``core``->``runtime``->``view``->``screens`` import layering (see
+``browser/README.md``); importing either concrete class here would also
+be circular.
 
-Provider close is hosted on the *App*, never the screen: ``Widget.
-_on_unmount`` cancels every worker on a node once that node unmounts,
-regardless of its own group, so a close worker hosted on the screen
-could be cancelled out from under itself the instant the screen
-unmounts, mid-close -- exactly the leaked-connection failure mode
-closing a provider exists to prevent. ``ApmRepoBrowserApp.on_unmount``
-drains (never cancels) ``UNIT_PROVIDER_CLOSE_GROUP`` before closing the
-session.
+Provider close is hosted on the App, never the screen: a screen-hosted
+close worker would be cancelled mid-close the instant the screen
+unmounts, exactly the leak closing a provider exists to prevent.
+``ApmRepoBrowserApp.on_unmount`` drains (never cancels)
+``UNIT_PROVIDER_CLOSE_GROUP`` before closing the session.
 """
 
 from __future__ import annotations
@@ -83,31 +78,18 @@ class UnitEffects:
     def perform(self, cmd: UnitCmd) -> None:
         match cmd:
             case LoadRoot():
-                # No explicit sink -- this is the one call site in this
-                # package relying on run_worker_with_progress's default
-                # breadcrumb sink, which needs self._screen to actually be
-                # a NavigableScreen at runtime even though it's typed here
-                # as a bare Widget (the runtime -> screens layering ban
-                # forbids proving that statically). True for every real
-                # UnitScreen; not something the type system can check.
+                # No explicit sink -- relies on run_worker_with_progress's
+                # default breadcrumb sink, which needs self._screen to be a
+                # NavigableScreen at runtime (true for every real
+                # UnitScreen, not something the type system can check here).
                 _worker: Worker[None] = run_worker_with_progress(self._screen, functools.partial(self._load_root, cmd))
             case LoadChildren():
-                # Anchored on whichever surface is actually about to show
-                # this fetch's own result: the file table when the node
-                # being expanded is the currently-selected folder (the
-                # common case -- select a folder, wait for its own contents
-                # to populate the table) -- but *not* every LoadChildren is for that
-                # folder. Expanding a sibling node via `space`/its own
-                # disclosure triangle dispatches ChildrenRequested without
-                # ever touching model.selected at all -- Textual's
-                # NodeExpanded fires for any node whose disclosure state
-                # changes, independently of NodeSelected (which only fires
-                # on Enter/click and is what actually drives
-                # model.selected), so anchoring unconditionally on the file
-                # table would show the spinner inside an unrelated folder's
-                # own listing while the node actually being expanded shows
-                # no feedback at all. Falls back to the expanding tree node
-                # itself in that case.
+                # Anchored on the file table only when the node being
+                # expanded is the currently-selected folder -- expanding a
+                # sibling node's disclosure triangle doesn't touch
+                # model.selected, so anchoring unconditionally on the file
+                # table would show the spinner in an unrelated listing.
+                # Falls back to the expanding tree node itself in that case.
                 sink: _LoadingSink
 
                 def _is_selected() -> bool:
@@ -136,11 +118,9 @@ class UnitEffects:
         repo = self._repo()
         assert repo is not None
         if cmd.invalidate:
-            # A real re-scan, not just re-querying already-cached
-            # directory listings: a Session holds one DirCache per open
-            # repository for its whole lifetime, and only an explicit
-            # invalidate() forces it to re-scan rather than serve the
-            # same stale listing forever.
+            # A Session holds one DirCache per open repository for its
+            # whole lifetime; only an explicit invalidate() forces a
+            # real re-scan rather than serving the same stale listing.
             await repo.invalidate_directory_cache()
         try:
             provider = await self._catalog.provider(self._version, force_raw=cmd.force_raw)
@@ -157,9 +137,8 @@ class UnitEffects:
         try:
             children = await provider.children(cmd.node, offset=cmd.offset, limit=cmd.limit)
         except Exception as exc:
-            # Broader than ApmRepoError on purpose: a provider can also
-            # surface an unexpected failure from a third-party parser it
-            # depends on that isn't an ApmRepoError at all.
+            # Broader than ApmRepoError: a provider can surface a raw
+            # third-party parser failure too.
             self._dispatch_failure(cmd, str(exc))
             return
         self._dispatch_success(cmd, children)

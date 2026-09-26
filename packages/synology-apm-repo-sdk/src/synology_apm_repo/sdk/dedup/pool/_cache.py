@@ -21,33 +21,30 @@ class BucketReaderCache:
     """Export's bucket-major path and ``verify``'s Bucket-and-key stage
     each build one instead of going through ``Pool``'s own bounded
     ``_buckets``, so a sweep touching every bucket once doesn't evict
-    genuinely-hot interactive entries from that shared cache. Reads/writes
-    never cross over with ``Pool``'s own cache — the two stay fully
-    independent.
+    genuinely-hot interactive entries. Reads/writes never cross over
+    with ``Pool``'s own cache.
 
-    ``maxsize`` (``None``, the default: unbounded) is bounded by however
+    ``maxsize`` (``None``, default: unbounded) is bounded by however
     many distinct buckets one sweep actually touches unless the caller
-    passes a smaller cap — see each construction site's own reasoning for
-    why it picked the value it did. Built on ``AsyncKeyedCache`` like every
-    other cache in this SDK, with ``fetch`` supplied *per call* (typically
-    ``Pool.open_bucket_uncached``) since this class is constructed at
-    layers with no ``Pool`` reference of their own.
+    passes a smaller cap. Built on ``AsyncKeyedCache`` with ``fetch``
+    supplied per call (typically ``Pool.open_bucket_uncached``), since
+    this class is constructed at layers with no ``Pool`` reference of
+    their own.
 
     One instance is shared across every fragment of a
     ``VirtualDiskContentSource`` export, so a bucket one fragment opens
     stays open for the next; a standalone ``export_to`` call or a
-    ``verify`` run instead each get their own separate instance.
+    ``verify`` run each gets its own separate instance.
 
     Note:
         Deliberately does not also cache decoded chunk plaintext across
         calls — same-call repeats are already deduplicated by
-        ``exec_chunks`` itself, and unconditionally remembering every
-        decoded chunk would cost memory roughly equal to the whole
-        export's unique DATA content for little cross-call reuse against
-        real VM-image exports. Chunk decode stays scoped to one
-        bucket-group call, which is also what lets ``decompress_many``
-        hand back zero-copy ``memoryview`` values instead of an
-        independent ``bytes`` copy per chunk.
+        ``exec_chunks`` itself, and remembering every decoded chunk
+        would cost memory roughly equal to the whole export's unique
+        DATA content for little cross-call reuse. Chunk decode stays
+        scoped to one bucket-group call, which is also what lets
+        ``decompress_many`` hand back zero-copy ``memoryview`` values
+        instead of an independent ``bytes`` copy per chunk.
     """
 
     maxsize: int | None = None

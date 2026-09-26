@@ -29,7 +29,6 @@ here. The rest are dev/internal-only and don't appear there:
 | [`scripts/check_version_consistency.py`](scripts/check_version_consistency.py) | Checks the three packages' `project.version` fields and their cross-package dependency pins stay in lockstep. Run by `make test`, not invoked directly in normal workflow. | consult when a version bump or dependency pin edit isn't caught by `make test` |
 | [`scripts/check_sdk_import_boundary.py`](scripts/check_sdk_import_boundary.py) | Verifies the CLI/browser packages import only the SDK's documented public surface. Run by `make test`, not invoked directly in normal workflow. | consult when a new SDK-facing import isn't caught by `make test` |
 | [`.github/CLAUDE.md`](.github/CLAUDE.md) | GitHub Actions conventions: action-pin verification, what `make github-act-simulation` covers (build/test jobs, not deploy/publish), the PyPI trusted-publishing setup `release.yml` needs. | required when touching `.github/workflows/` |
-| `git log` | The investigation/decision history — "why does this code look like this." Root causes and verification steps live in commit messages, not a separate doc — see `CONTRIBUTING.md`'s commit convention. | consult when relevant |
 | `docs/` | Sphinx build of `synology-apm-repo-sdk`'s API reference from its own Google-style docstrings (`make -C docs html`). See the SDK README's "Docstring Conventions" before adding an SDK module or docstring. | required when adding an SDK module |
 
 New details belong in the closest document, not here — implementation
@@ -73,72 +72,49 @@ against a real sample first.
 
 ### Pythonic conventions
 
-- **Every model/data class is `@dataclass(frozen=True)`** — `Connection`,
-  `Workload`, `Version`, `RepoLayout`, `Node`, `RestorableUnit`, `Extent`,
-  and so on. If you're writing a plain `@dataclass` without `frozen=True`,
-  check whether it should be one of these instead.
-- **Computed/derived attributes are exposed via `@property`.**
-- **Import the SDK's public surface from the top-level package**
-  (`from synology_apm_repo.sdk import Session, ...`), not a submodule path.
-  **Known exception**: the CLI and TUI packages themselves import
-  exclusively via submodule paths everywhere (e.g.
-  `from synology_apm_repo.sdk.api import Repository`) — that's their own
-  convention, not the pattern to follow for anything new.
-- **`__all__` marks a genuine aggregation point** — a module that gathers
-  names imported from elsewhere into one surface (`sdk/__init__.py`,
-  `sdk/api/__init__.py`, `sdk/storage/__init__.py`, `sdk/profiles/__init__.py`
-  today), which is also the one case mypy's `no_implicit_reexport` actually
-  requires it for. A module's own locally-defined names are already its
-  public surface without one; a lone imported name meant to pass through
-  a module that doesn't otherwise aggregate anything uses the narrower
-  `from x import Y as Y` redundant-alias idiom instead (`api/repository.py`'s
-  `Finding`/`VerifyLevel`), not a module-wide `__all__` of one entry.
-- **Don't add a wrapper whose only job is to route through a convention with
-  no actual transformation happening.**
-- **`raw.get(key) or default`** for nested-JSON fields — e.g.
-  `catalog/workload.py`'s `workload_spec` nested fields, and
-  `units/content/saas_calendar.py`/`saas_contact.py`'s `client_metadata` —
-  a key can be *present* with a JSON `null` or empty string, a case
-  `.get(key, default)`'s default only covers when the key is missing
-  outright. Follow the same pattern for new nested-JSON field access in
-  this class of data.
+Every model/data class is `@dataclass(frozen=True)` — `Connection`,
+`Workload`, `Version`, `RepoLayout`, `Node`, `RestorableUnit`, `Extent`,
+and so on; a plain `@dataclass` without `frozen=True` is usually one of
+these instead. Computed/derived attributes are exposed via `@property`.
+
+Import the SDK's public surface from the top-level package
+(`from synology_apm_repo.sdk import Session, ...`), never a submodule
+path — except the CLI and TUI packages themselves, which import
+exclusively via submodule paths (e.g. `from synology_apm_repo.sdk.api
+import Repository`) as their own established convention, not a pattern
+to extend elsewhere. `__all__` marks a genuine aggregation point — a
+module that gathers names imported from elsewhere into one surface
+(`sdk/__init__.py`, `sdk/api/__init__.py`, `sdk/storage/__init__.py`,
+`sdk/profiles/__init__.py` today, also the one case mypy's
+`no_implicit_reexport` requires it for); a module's own locally-defined
+names are already public without one, and a lone pass-through name in a
+module that doesn't otherwise aggregate anything uses the narrower `from
+x import Y as Y` idiom instead (`api/repository.py`'s
+`Finding`/`VerifyLevel`).
+
+Don't add a wrapper whose only job is to route through a convention with
+no actual transformation happening.
+
+`raw.get(key) or default` for nested-JSON fields (e.g.
+`catalog/workload.py`'s `workload_spec`, `units/content/saas_calendar.py`/
+`saas_contact.py`'s `client_metadata`): a key can be present with a JSON
+`null` or empty string, a case `.get(key, default)`'s default alone
+doesn't cover.
 
 ### Docstring/comment discipline
 
-A docstring is a contract, not a walkthrough: state what goes in, what comes
-out, and the invariant(s) a caller must not violate. How the function gets
-there step by step is already stated by the code a few lines below —
-repeating it in the docstring risks the two copies drifting apart. One
-concern per docstring: a function with several unrelated contracts gets one
-short paragraph per contract at most, and reasoning that's really about one
-specific branch belongs as a comment at that branch, not stacked into the
-header above the signature.
+A docstring or comment states a contract — what a reader needs before
+touching the code — not a walkthrough of how it gets there, its history,
+a rejected alternative, or a race/lifecycle explanation the code's own
+structure already shows. Keep it short: one concern per docstring, no
+pasted examples, no inline verification citations (state the one number
+that matters, not how it was produced). When the same fact matters at
+several call sites, state it once at each, trimmed to what that site
+needs — never a shared essay one has to chase through another docstring.
 
-State a docstring's contract in prose; a pasted code example only gives a
-second copy of the mechanism a chance to drift from the real implementation.
-Skip inline verification citations ("confirmed against sample X," "measured
-Z% faster") — that belongs in the commit message that established it; a
-constant whose magnitude needs justifying gets the one number that matters,
-not the investigation that produced it. A module docstring orients rather than
-catalogues: state what's in the file and the one or two facts worth knowing
-before touching it — not a restatement of what its classes' and functions'
-docstrings, one level down, already say.
-
-If a docstring keeps growing, that's a signal to restructure — split it,
-push detail into an inline comment at the line it explains, cut a citation
-— not to compress the same content harder.
-
-Describe what the code does now, not its history — how it used to work or
-how a bug was found and fixed belongs in the commit message for the change.
-When the same rationale applies at more than one call site, state it
-directly at each one, trimmed to the single fact that site needs — a reader
-looking at any one docstring/comment should get the reason without having
-to chase it through another docstring or comment elsewhere.
-
-SDK docstrings — the only ones built into API docs — are Google-style
-(Napoleon), document the public surface only, and must pass a nitpick build
-(`make -C docs html O=-n`) before trusting a new cross-reference; see the
-SDK README's "Docstring Conventions" for the full rules.
+SDK docstrings are Google-style (Napoleon), document the public surface
+only, and must pass `make -C docs html O=-n`'s nitpick build; see the SDK
+README's "Docstring Conventions" for the full rules.
 
 ### Presentation: users see backups, not a dedup repository
 
@@ -152,8 +128,6 @@ display.
 When a claim is checkable against real data, check it. When something wasn't
 fully verified or a fix only covers part of the problem, say so explicitly —
 in commit messages and in anything reported back about a task's completion.
-See `CONTRIBUTING.md`'s Commit Convention for how this applies specifically
-to a commit message's body.
 
 ---
 
@@ -185,6 +159,4 @@ See [`tests/CLAUDE.md`](tests/CLAUDE.md).
 
 See [`CONTRIBUTING.md`](CONTRIBUTING.md) — [`README.md`](README.md)'s
 Documentation Index lists what it covers.
-
-*For detailed change history, see `git log`.*
 

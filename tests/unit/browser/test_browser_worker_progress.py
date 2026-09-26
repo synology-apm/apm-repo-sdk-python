@@ -82,13 +82,9 @@ async def test_work_uses_the_given_sink_and_hides_it_once_the_worker_finishes(
         release = asyncio.Event()
 
         # A real asyncio.sleep() here would race the debounce delay's own
-        # timer against a second, independent one -- both are real
-        # wall-clock timers on the same event loop, so under scheduling
-        # pressure they can fire back-to-back with no gap between them,
-        # letting "Loading" flash and revert between two polls without
-        # wait_until ever observing it. Gating the worker's own completion
-        # on an Event this test controls keeps "Loading" shown indefinitely
-        # until released, removing the race instead of trying to outrun it.
+        # timer, risking "Loading" flashing and reverting between two
+        # wait_until polls. Gating completion on an Event this test
+        # controls keeps "Loading" shown until released instead.
         @work(sink=lambda self: StaticTextSink(self, "#status", base=lambda: "base"), delay=_SHORT_DELAY)
         async def _slow(self: App[None]) -> None:
             await release.wait()

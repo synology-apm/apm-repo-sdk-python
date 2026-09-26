@@ -73,13 +73,10 @@ a mechanism this tool reinvents.
 - **Per-sample, not per-type-globally**: `device`/`fs`/`saas` each
   exercise one representative workload per `(sample, workload type)` (or
   `(sample, sub_type)` for `saas`) pair found, not just one globally --
-  the point of running against several differently-shaped samples is that
-  the *same* workload type behaves differently per sample (encrypted vs
-  not, object-store vs local, metadata-only vs healthy); collapsing to one
-  global example per type would hide most of that. This extends to the
-  skip decisions too: a domain lacking its workload type in one sample is
-  a skip recorded for *that sample*, not a once-per-run aggregate decided
-  from every sample's data up front.
+  the same workload type behaves differently per sample (encrypted vs
+  not, object-store vs local, metadata-only vs healthy). Skip decisions
+  follow the same rule: a domain lacking its workload type in one sample is
+  a skip recorded for *that sample*, not a once-per-run aggregate.
 - **`degrade_on`**: deliberately narrow -- only true data-gap errors
   (`NotFoundError`/`DataCorruptError`/`ChunkCompactedError`/`UnsupportedDataFormatError`).
   `KeyRequiredError`/`KeyMismatchError` are never caught this way: a repository lacking a

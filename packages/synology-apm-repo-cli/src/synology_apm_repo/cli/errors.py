@@ -39,18 +39,12 @@ def fail(message: object, *, cause: BaseException | None = None) -> NoReturn:
 
 
 def friendly_message(exc: ApmRepoError, *, verbose: bool = False) -> str:
-    """Rephrases ``Repository._require_key_verified()``'s own two
-    messages — worded for an SDK caller who'd call ``set_key()``
-    directly — into CLI language (``--key``, or the ``key`` subcommand),
-    never the internal method name. ``KeyRequiredError``/``KeyMismatchError``
-    carrying their own ``ref`` (a specific file, not the whole-repository
-    browsing gate) skip this rephrasing and fall through to the general
-    case below like any other ``ApmRepoError``.
-
-    Every other ``ApmRepoError`` renders ``exc.safe_message`` by default
-    (``ref``/``spec`` stripped — ARCHITECTURE.md's Presentation section:
-    the technical reason is reserved for diagnostic mode) or the full
-    ``str(exc)`` under ``--verbose``."""
+    """Rephrases ``Repository._require_key_verified()``'s messages into CLI
+    language (``--key``, or the ``key`` subcommand) — only when ``ref`` is
+    unset (the whole-repository gate, not a specific file); a
+    ``KeyRequiredError``/``KeyMismatchError`` with its own ``ref`` falls
+    through to the general case. Every other ``ApmRepoError`` renders
+    ``exc.safe_message`` by default, or ``str(exc)`` under ``--verbose``."""
     if isinstance(exc, (KeyRequiredError, KeyMismatchError)) and exc.ref is None:
         if isinstance(exc, KeyRequiredError):
             return "this repository is encrypted — pass --key, or verify one with `synology-apm-repo-cli key`"
@@ -59,13 +53,10 @@ def friendly_message(exc: ApmRepoError, *, verbose: bool = False) -> str:
 
 
 def fail_unexpected(exc: Exception) -> NoReturn:
-    """Last-resort handler for an exception no command's own error
-    handling caught and translated — a bug, not an expected
-    ``ApmRepoError`` — wired in at ``asyncio_support.py``'s
-    ``typer_async``, the one chokepoint every command callback passes
-    through. Prints the exception, its full traceback (dim, so a bug
-    report has something to paste), and a pointer to file one, then
-    exits 1 — never a bare, unexplained Python traceback."""
+    """Last-resort handler for an exception no command's own error handling
+    caught — a bug, not an expected ``ApmRepoError``. Prints the exception,
+    its full traceback (dim, so a bug report has something to paste), and a
+    pointer to file one, then exits 1."""
     err_console.print(f"[red]internal error:[/red] {exc.__class__.__name__}: {safe(str(exc))}")
     err_console.print("".join(traceback.format_exception(exc)), style="dim", highlight=False)
     err_console.print(f"[dim]this looks like a bug — please file it at {_ISSUE_TRACKER_URL}[/dim]")

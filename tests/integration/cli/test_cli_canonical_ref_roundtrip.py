@@ -60,7 +60,7 @@ def _no_disk_fs_sibling(monkeypatch: pytest.MonkeyPatch) -> None:
     """The tree-to-export round trip below recurses via ``tree
     --depth``, which eagerly expands every non-leaf child within that
     depth, including units/device.py's own additive "(filesystem)"
-    sibling — needing real pytsk3 reads this fixture predates. This
+    sibling — needing real pytsk3 reads this fixture doesn't cover. This
     file is about the canonical-ref round-trip contract, not
     units/content/disk_fs/ — see tests/unit/sdk/test_units_disk_fs.py for that
     feature's own tests."""

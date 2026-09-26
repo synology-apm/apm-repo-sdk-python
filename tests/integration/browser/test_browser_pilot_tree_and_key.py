@@ -220,14 +220,13 @@ def test_filtering_preserves_a_surviving_folders_own_widget_and_its_loaded_messa
 ) -> None:
     """The keyed reconciler (``view/reconcile.py``'s ``reconcile_children``)
     keeps a still-matching child's own ``TreeNode`` object across a
-    filter re-render instead of destroying and recreating it -- unlike
-    the pre-reconciler ``id(TreeNode)``-keyed bookkeeping this replaced
-    (see ``tests/unit/browser/test_browser_unit_screen_gaps.py``'s own
-    sibling test for the synthetic-data version of this same proof), so
-    a folder already expanded and loaded before a ``/`` filter keystroke
-    stays expanded with its own already-fetched messages, without any
-    re-fetch through the provider -- proven here against real recorded
-    Mail data end to end, not just a fake provider."""
+    filter re-render instead of destroying and recreating it (see
+    ``tests/unit/browser/test_browser_unit_screen_gaps.py``'s own sibling
+    test for the synthetic-data version of this same proof), so a folder
+    already expanded and loaded before a ``/`` filter keystroke stays
+    expanded with its own already-fetched messages, without any re-fetch
+    through the provider -- proven here against real recorded Mail data
+    end to end, not just a fake provider."""
 
     async def scenario() -> tuple[bool, bool, int]:
         await _patch_local_store(monkeypatch, record_target)

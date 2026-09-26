@@ -1,34 +1,20 @@
 """Redundancy blob sizing and self-repair (FORMAT-SPEC.md: ChunkCrcStore).
 
-Every Composition record and every ``.buk`` bucket carries a trailing
-Redundancy blob, written unconditionally on every flush: a ``2*coverage``
--byte ring-buffer XOR parity (windows ping-ponged across two halves — every
-even-indexed ``coverage``-byte window XORs into ``parity[0:coverage]``,
-every odd-indexed window into ``parity[coverage:2*coverage]``) plus a
-*rolling* (cumulative, not independent-per-window) CRC32 checkpoint after
-each window (``StepCrc``).
+Every Composition record and ``.buk`` bucket carries a trailing Redundancy
+blob: a ``2*coverage``-byte ring-buffer XOR parity (even-indexed windows
+into ``parity[0:coverage]``, odd-indexed into ``parity[coverage:2*coverage]``)
+plus a *rolling* CRC32 checkpoint after each window (``StepCrc``). Because
+the checkpoint is rolling, not independent per window, this mechanism can
+locate and repair at most one corrupted region, bounded to two consecutive
+coverage-windows — a "single-disk-failure RAID" limit, not N-way parity.
 
-This module owns both halves of that blob's story:
-
-- ``redundancy_size`` — the size formula, load-bearing for every reader
-  (needed to compute a bucket's/composition record's total on-disk size
-  independently of trusting the file's own declared length — see
-  ``expected_bucket_size`` and ``composition.py``'s ``record_total_length``).
-- ``parse_redundancy_blob``/``attempt_repair`` — the actual self-repair
-  algorithm. Production servers write this blob but never read it back
-  (ordinary reads only ever validate the plain CRC the blob's own
-  ``data`` argument below is checked against — see this SDK's own
-  ``verify_chunk_map_crc``/``parse_size_store`` callers); this SDK is the
-  first real consumer of it, since it can do so entirely in-memory and
-  never needs to write a repaired copy back to the source repository.
-  ``repair_via_trailer`` wraps it with the "fetch the trailer, then
-  attempt_repair" shape every call site otherwise duplicated.
-
-Because ``StepCrc`` is *rolling*, not independent per window, this
-mechanism can locate and repair **at most one corrupted region, bounded to
-two consecutive coverage-windows** — a "single-disk-failure RAID" limit,
-not N-way independent parity (FORMAT-SPEC.md: ChunkCrcStore). See
-``attempt_repair`` for how it confirms a repair before returning it.
+``redundancy_size`` computes the blob's on-disk length, needed to size a
+bucket/record independently of its own declared length (see
+``expected_bucket_size``, ``composition.py``'s ``record_total_length``).
+``parse_redundancy_blob``/``attempt_repair`` do the actual repair — see
+``attempt_repair`` for how it confirms one before returning it —
+and ``repair_via_trailer`` wraps the "fetch the trailer, then repair" shape
+every call site otherwise duplicated.
 """
 
 from __future__ import annotations
@@ -234,17 +220,13 @@ async def repair_via_trailer(
     fetch_trailer: Callable[[], Awaitable[bytes]],
 ) -> bytes | None:
     """Shared orchestration behind every Redundancy-blob self-repair call
-    site (``dedup/pool/_bucket_reader.py``'s SizeStore repair,
-    ``dedup/verify_checks.py``'s map-CRC repair): fetch the trailer via
-    ``fetch_trailer`` — already resolved to that record's/bucket's own
-    trailer offset, however that offset needs computing at each call site
-    — and hand it to ``attempt_repair``.
+    site: fetch the trailer via ``fetch_trailer`` — already resolved to
+    that record's/bucket's own trailer offset — and hand it to
+    ``attempt_repair``.
 
-    ``attempt_repair`` runs on a real OS thread (``asyncio.to_thread``), the
-    same responsiveness rationale as ``dedup/pool/_bucket_reader.py``'s
-    ``_read_run``: the map-CRC repair path can see an array up to several
-    MB, and its rolling CRC32 scan plus reconstruction must not stall every
-    other concurrent Task for that duration.
+    ``attempt_repair`` runs on a real OS thread (``asyncio.to_thread``): the
+    map-CRC repair path can see an array up to several MB, and its rolling
+    CRC32 scan plus reconstruction must not stall other concurrent Tasks.
 
     Returns:
         ``attempt_repair``'s own result, or ``None`` if ``fetch_trailer``

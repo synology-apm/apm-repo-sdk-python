@@ -50,11 +50,8 @@ _thread_local = threading.local()
 
 def _zstd_decompressor() -> zstandard.ZstdDecompressor:
     """One ``ZstdDecompressor`` per OS thread, reused for that thread's whole
-    lifetime rather than rebuilt on every call — construction cost is on the
-    same order as decompressing one 4096-byte chunk. Thread-local, not one
-    shared instance: decode can run on several real OS threads at once, and
-    a ``ZstdDecompressor`` holds a live decode context that can't be shared
-    across threads.
+    lifetime — a ``ZstdDecompressor`` holds a live decode context that
+    can't be shared across the several real OS threads decode may run on.
     """
     dctx = getattr(_thread_local, "zstd_decompressor", None)
     if dctx is None:
@@ -88,15 +85,8 @@ def decompress(ctype: CompressType, data: bytes | memoryview) -> bytes:
         case CompressType.LZ4:
             plain = lz4.block.decompress(data, uncompressed_size=FIXED_CHUNK_LENGTH)
         case CompressType.ZSTD:
-            # Not the one-shot decompress(data, max_output_size=...): that API
-            # silently ignores max_output_size for any frame that declares its
-            # own decompressed content size in its header (the common case,
-            # since that's ZstdCompressor()'s default), so a corrupt or hostile
-            # chunk claiming a huge declared size would decompress in full
-            # before the length check below ever gets a chance to catch it.
-            # Reading one bounded slice through the streaming reader instead
-            # enforces the cap unconditionally, independent of the frame's own
-            # claim.
+            # Bounded streaming read, not the one-shot decompress(...): see
+            # decompress_zstd_stream for why the one-shot API isn't safe here.
             with _zstd_decompressor().stream_reader(io.BytesIO(data)) as reader:
                 plain = reader.read(FIXED_CHUNK_LENGTH + 1)
         case _:  # pragma: no cover - CompressType is exhaustive above
@@ -207,25 +197,18 @@ def decompress_zstd_stream(data: bytes, *, max_output_size: int | None = None) -
     fixed-4096-byte chunk.
 
     ``max_output_size``, when given, bounds how much the decompressor
-    produces before giving up (``zstandard.ZstdError``) — for callers
-    decompressing content of an *unconfirmed* type, a cap turns "this
-    wasn't really zstd-framed" into a fast failure instead of decompressing
-    a corrupt or hostile oversized frame in full. Omit it (the default,
-    genuinely unbounded) for a source already known to be a real, trusted
-    db snapshot.
+    produces before giving up (``zstandard.ZstdError``) — for content of an
+    *unconfirmed* type, a cap turns "this wasn't really zstd-framed" into a
+    fast failure instead of decompressing a hostile oversized frame in
+    full. Omit it for a source already known to be a trusted db snapshot.
 
-    Always reads through the streaming reader, counting bytes as they
-    come out, rather than ever calling ``zstandard``'s one-shot
-    ``ZstdDecompressor.decompress(data, max_output_size=N)``: that API
-    only enforces ``max_output_size`` when the frame does *not* declare
-    its own decompressed content size in its header: a frame that does
-    (the common case — every frame this project's own encoders and test
-    fixtures produce, since that's ``ZstdCompressor()``'s default) is
-    decompressed in full regardless, silently ignoring the cap. Reading
-    incrementally and checking the running total ourselves enforces
-    ``max_output_size`` unconditionally, independent of whatever the
-    frame's header claims — the frame's own declared size is never
-    trusted either way.
+    Always reads incrementally through the streaming reader, checking the
+    running total ourselves, rather than ``zstandard``'s one-shot
+    ``ZstdDecompressor.decompress(data, max_output_size=N)``: that API only
+    enforces the cap when the frame does *not* declare its own decompressed
+    size in its header — a frame that does (the common case) is decompressed
+    in full regardless, silently ignoring it. The frame's own declared size
+    is never trusted either way.
     """
     decompressor = zstandard.ZstdDecompressor()
     with decompressor.stream_reader(io.BytesIO(data)) as reader:

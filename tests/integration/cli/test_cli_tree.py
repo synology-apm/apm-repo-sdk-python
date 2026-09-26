@@ -52,9 +52,8 @@ def _replay(patch_profile_store: Callable[[str, ModuleType], None], monkeypatch:
     # tree's own --depth recursion eagerly expands every non-leaf child
     # it finds within that depth, including units/device.py's own
     # additive "(filesystem)" sibling node next to the VM disk image —
-    # which needs real pytsk3 reads this fixture was never recorded
-    # against (predating that feature). This file is about tree's own
-    # CLI wiring, not units/content/disk_fs/ — see
+    # which needs real pytsk3 reads this fixture doesn't cover. This file
+    # is about tree's own CLI wiring, not units/content/disk_fs/ — see
     # tests/unit/sdk/test_units_disk_fs.py for that feature's own tests.
     monkeypatch.setattr(device_module, "disk_fs_available", lambda: False)
 

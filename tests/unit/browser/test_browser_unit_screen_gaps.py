@@ -1078,12 +1078,12 @@ async def test_export_selected_with_a_real_leaf_pushes_the_export_screen(wait_un
 async def test_export_selected_shows_the_loading_indicator_while_the_fetch_is_in_flight(
     wait_until: Any, sdk_timeout: float
 ) -> None:
-    """``action_export_selected`` now dispatches through ``@work``, which
+    """``action_export_selected`` dispatches through ``@work``, which
     wraps the worker's body in ``DebouncedProgress`` by default and
-    renders it to the breadcrumb unless a ``sink`` is given, rather than
-    awaiting ``provider.unit()`` inline -- proves the breadcrumb actually shows the
-    loading indicator while that fetch is genuinely still in flight, not
-    just that the eventual screen push still happens. A held-open
+    renders it to the breadcrumb unless a ``sink`` is given -- proves the
+    breadcrumb actually shows the loading indicator while that fetch is
+    genuinely still in flight, not just that the eventual screen push
+    still happens. A held-open
     ``asyncio.Event`` (rather than a fixed ``pilot.pause``) keeps the fetch
     reliably still running when the breadcrumb is checked.
 
@@ -1436,10 +1436,7 @@ async def test_filtering_a_level_preserves_a_surviving_childs_own_widget_and_doe
 ) -> None:
     """The keyed reconciler (``view/reconcile.py``'s ``reconcile_children``)
     keeps a surviving child's own ``TreeNode`` object across a filter
-    re-render instead of destroying and recreating it -- unlike the old
-    ``id(TreeNode)``-keyed scheme (which tore down and forgot every node
-    at a filtered level on every keystroke, needing its own purge/replay
-    dance to cope with the resulting re-fetches). ``children_calls``
+    re-render instead of destroying and recreating it. ``children_calls``
     proves this directly: the folder's real ``children()`` call happens
     exactly once, not once per filter keystroke or per re-selection,
     since its already-loaded subtree is never destroyed at all -- proven

@@ -5,19 +5,11 @@ store instead of receiving one directly — an already-open ``S3Store``/
 event loop and can't cross a process boundary at all.
 
 ``describe_store()`` is the one place this module reaches into another
-``storage/`` class's private fields (``_bucket``/``_client_kwargs``/...) —
-an accepted, deliberately narrow exception to those classes' own
-encapsulation, the same way ``dedup/chunk_walk.py`` is the one module
-allowed to reach into ``DedupFile._extents()`` for its own narrow,
-single purpose rather than that field becoming generally public: every
-field read here is read *only* to describe how to rebuild an equivalent
-store, never touched for any other purpose,
-and the reason a free function does this instead of each store class
-exposing a public ``describe()`` method is that ``ObjectStore`` itself
-stays a narrow four-method Protocol (``read``/``size``/``exists``/
-``listdir``) — a test fake, or a future backend, should never be required
-to also implement multiprocess-support machinery just to satisfy that
-Protocol.
+``storage/`` class's private fields, read only to describe how to rebuild
+an equivalent store. A free function rather than a method on each store
+class, so ``ObjectStore`` itself stays a narrow four-method Protocol that a
+test fake or future backend never has to implement multiprocess support
+just to satisfy.
 """
 
 from __future__ import annotations
@@ -71,17 +63,15 @@ StoreDescriptor = LocalFsStoreDescriptor | S3StoreDescriptor | AzureStoreDescrip
 def describe_store(store: ObjectStore) -> StoreDescriptor | None:
     """``store`` reduced to a picklable recipe for rebuilding an
     equivalent one elsewhere, or ``None`` when that's not possible —
-    always a graceful "can't", never a raised error, since every caller
-    treats ``None`` as "fall back to today's single-process path" rather
-    than a failure:
+    always a graceful "can't", never a raised error; every caller treats
+    ``None`` as "fall back to today's single-process path":
 
-    - A ``TracingStore``/``RecordingStore`` wrapper (``storage/recording.py``)
-      or any other/unrecognized ``ObjectStore`` implementation — this
-      module only knows the four real backends by name, deliberately, not
-      an oversight.
+    - A ``TracingStore``/``RecordingStore`` wrapper or any other/unrecognized
+      ``ObjectStore`` implementation — this module only knows the four real
+      backends by name.
     - An ``S3Store``/``AzureStore`` built from an already-live, injected
-      ``client=`` (tests, or a caller-supplied pre-entered client) — there
-      is no picklable recipe for a client that already exists.
+      ``client=`` — there is no picklable recipe for a client that already
+      exists.
     """
     if isinstance(store, LocalFsStore):
         return LocalFsStoreDescriptor(root=str(store.root))
@@ -109,13 +99,9 @@ def describe_store(store: ObjectStore) -> StoreDescriptor | None:
 
 def rebuild_store(descriptor: StoreDescriptor) -> ObjectStore:
     """The worker-process-side counterpart to ``describe_store()`` — every
-    real backend's constructor is synchronous and does no I/O (confirmed
-    for all four: ``LocalFsStore.__init__``'s ``os.open``/``Path.is_dir()``,
-    ``S3Store``/``SmbStore``'s constructors likewise do no I/O, and
-    ``AzureStore``'s ``BlobServiceClient(...)`` call is plain
-    client-object configuration), so this is always safe to call from a
-    ``ProcessPoolExecutor``'s synchronous ``initializer=``, not just from
-    inside a worker's own event loop.
+    real backend's constructor is synchronous and does no I/O, so this is
+    always safe to call from a ``ProcessPoolExecutor``'s synchronous
+    ``initializer=``, not just from inside a worker's own event loop.
     """
     if isinstance(descriptor, LocalFsStoreDescriptor):
         return LocalFsStore(descriptor.root)

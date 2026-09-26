@@ -128,24 +128,17 @@ class CliRunner:
     def sandboxed_env(self, home_dir: Path) -> dict[str, str]:
         """``env_overrides`` for a ``profile add/list/show/remove`` round
         trip -- points every config-file lookup at a per-run temp
-        directory instead of the developer's real ``~/.config``, so this
-        tool never touches (or clobbers) their real saved profiles.
+        directory instead of the developer's real ``~/.config``.
 
         ``PYTHON_KEYRING_BACKEND=keyring.backends.null.Keyring`` keeps
-        ``profile add``'s secret storage off the real OS keychain the
-        same way ``tests/unit/conftest.py``'s own ``fake_keyring``
-        fixture does in-process (an in-memory fake there; an env-var
-        override here, since a fresh subprocess can't be monkeypatched
-        directly) -- not just for isolation, but because the real
-        backend can block indefinitely on a GUI authorization prompt in
-        a headless context. ``null.Keyring`` no-ops
-        every operation rather than ``fail.Keyring`` erroring outright
-        (which ``profiles/secrets.py``'s own ``_require_keyring()``
-        explicitly rejects) -- accepted as "usable" and silently
-        discards the secret, which this phase never needs back (``get_
-        profile()``/``list_profiles()`` never touch the keyring at all,
-        so a ``list``/``show``-shaped caller structurally cannot leak a
-        secret regardless)."""
+        ``profile add``'s secret storage off the real OS keychain (an
+        env-var override, since a fresh subprocess can't be monkeypatched
+        the way ``tests/unit/conftest.py``'s ``fake_keyring`` does
+        in-process) -- the real backend can otherwise block indefinitely
+        on a GUI authorization prompt in a headless context. ``null.
+        Keyring`` (accepted by ``profiles/secrets.py``'s
+        ``_require_keyring()``, unlike ``fail.Keyring``) silently
+        discards the secret, which this phase never reads back."""
         return {
             "HOME": str(home_dir),
             "XDG_CONFIG_HOME": str(home_dir / ".config"),

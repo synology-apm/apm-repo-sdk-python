@@ -62,14 +62,11 @@ def _root(
     no_input: bool = typer.Option(False, "--no-input", help=NO_INPUT_HELP),
     version: bool = typer.Option(False, "--version", callback=_version_callback, is_eager=True, help=VERSION_HELP),
 ) -> None:
-    """Not decorative: Typer/Click collapses a ``Typer()`` app with exactly
-    one registered command into "no subcommand name needed" mode, which
-    would make ``synology-apm-repo-cli doctor X`` ambiguous with a future second
-    command. A root callback keeps every subcommand explicit from day
-    one, and is also where the ``--verbose``/``--json``/``--progress``/
-    ``--trace``/``--quiet``/``--no-input`` global flags live, so
-    every subcommand reads them via ``ctx.obj`` instead of redeclaring them.
-    ``--version`` is eager and exits before any of this runs."""
+    """Root callback: keeps every subcommand explicit rather than Typer's
+    single-command collapse, and is where the global ``--verbose``/
+    ``--json``/``--progress``/``--trace``/``--quiet``/``--no-input`` flags
+    live — every subcommand reads them via ``ctx.obj``. ``--version`` is
+    eager and exits before any of this runs."""
     ctx.obj = CliState(
         verbose=verbose,
         json=json_output,
@@ -92,13 +89,9 @@ app.add_typer(profile_cmd.app, name="profile")
 
 
 def main() -> None:  # pragma: no cover - real sys.argv/sys.exit; every test drives ``app`` via CliRunner instead
-    # Stop dependency logging from reaching the terminal -- shared with the
-    # TUI's own call site (browser/app.py::main()), since both must behave
-    # identically here; configure_logging() silences it by default, or
-    # redirects it to a file via the SYNOLOGY_APM_REPO_LOG env var for
-    # debugging a backend. Less severe here than in the TUI: a dependency's
-    # warning does not corrupt a rendered screen, but it does interleave
-    # with this tool's own output for no reason the user can act on.
+    # Silences dependency logging by default, or redirects it to a file via
+    # SYNOLOGY_APM_REPO_LOG — shared with the TUI's own call site
+    # (browser/app.py::main()).
     configure_logging()
     app()
 

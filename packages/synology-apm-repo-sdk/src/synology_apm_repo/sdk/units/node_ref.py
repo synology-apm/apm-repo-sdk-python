@@ -176,31 +176,23 @@ class NodeRef:
         return cls(repo_path, tuple(names))
 
     def child(self, *extra: str) -> NodeRef:
-        """Extends *this* ref's own segments by ``extra`` — for a provider
-        appending one or more segments to an already-resolved node's own
-        ref (a diagnostic leaf, a synthetic partition/entry node, ...),
-        not the version root (``canonical_ref_for`` covers that case) —
-        every call site uses this instead of hand-rolling
-        ``NodeRef(node.ref.repo_path, (*node.ref.segments, "x"))``."""
+        """Extends this ref's segments by ``extra`` — for a provider
+        appending segments to an already-resolved node's ref (a
+        diagnostic leaf, synthetic entry, ...), not the version root
+        (``canonical_ref_for`` covers that)."""
         return NodeRef(self.repo_path, (*self.segments, *extra))
 
 
 def canonical_ref_for(repo: DedupRepo, version: Version, extra: Sequence[str] = ()) -> NodeRef:
-    """``NodeRef.canonical`` for ``version``, within ``repo`` — the
-    ``(repo.layout.repo_root, catalog_id, workload_id, version_uid)``
-    prefix every provider's own ``ref_for``/``_ref`` method shares; only
-    ``extra`` differs per call site.
+    """``NodeRef.canonical`` for ``version``, within ``repo``.
 
-    ``catalog_id`` (``identifiers.resolve_catalog_id``'s shared formula)
-    is ``repo.layout.repo_id`` when set — object storage's own repo-id,
-    unique per bucket by construction — falling back to
-    ``version.connection_config_id`` otherwise: always correct for a
-    vault (whose ``connection_config_id`` is already unique *within* it,
-    and whose ``RepoLayout.repo_id`` is always ``None``), and also
-    correct for the one object-storage edge case with no derivable
-    repo-id (see ``storage.layout``'s ``_data_dir_ancestor``) — that case
-    only arises when this ``DedupRepo`` is the sole catalog reachable
-    from here anyway, so nothing else could collide with it."""
+    ``catalog_id`` (``identifiers.resolve_catalog_id``) is
+    ``repo.layout.repo_id`` when set (object storage's own repo-id,
+    unique per bucket), falling back to ``version.connection_config_id``
+    otherwise — correct for a vault (whose ``connection_config_id`` is
+    already unique within it) and for the one object-storage edge case
+    with no derivable repo-id, since that case only arises when this
+    ``DedupRepo`` is the sole catalog reachable from here."""
     catalog_id = resolve_catalog_id(repo.layout.repo_id, version.connection_config_id)
     return NodeRef.canonical(
         repo.layout.repo_root,
@@ -281,25 +273,19 @@ def disambiguate(names_and_ids: Sequence[tuple[str, str]], *, hints: Sequence[st
 
 
 def disambiguate_catalogs(catalogs: Sequence[_HasCatalogIdentity]) -> list[str]:
-    """Disambiguated display names for ``catalogs``, in the same order —
-    the ``catalog_pairs()`` + ``disambiguate()`` sequence the CLI's own
-    catalog-listing helpers and the browser's own catalog-tree selector
-    each built independently before this helper existed. Zipping the
-    result back against ``catalogs`` (or any other parallel sequence) is
-    left to the caller — consumers zip against different shapes (live
-    domain objects, index pairs)."""
+    """Disambiguated display names for ``catalogs``, in the same order.
+    Zipping the result back against ``catalogs`` (or any other parallel
+    sequence) is left to the caller."""
     return disambiguate(catalog_pairs(catalogs))
 
 
 def disambiguate_workloads(workloads: Sequence[Workload], *, use_type_hint: bool = True) -> list[str]:
-    """Same idea as ``disambiguate_catalogs``, for ``Workload``, folding in
-    ``workload_pairs()``'s own ``type_hint`` disambiguation hint by
-    default. ``use_type_hint=False`` skips it — for a caller whose own
-    ``workloads`` are already grouped by ``type_hint`` before reaching
-    here (the browser's own per-sub_type leaf list): every sibling there
-    already shares one ``type_hint``, so the hint could never actually
-    differentiate any of them, and showing it again in the display name
-    would just repeat what the grouping already conveys."""
+    """Same idea as ``disambiguate_catalogs``, for ``Workload``, folding
+    in ``workload_pairs()``'s ``type_hint`` disambiguation hint by
+    default. ``use_type_hint=False`` skips it — for a caller whose
+    ``workloads`` are already grouped by ``type_hint`` (the browser's
+    per-sub_type leaf list), where showing it again would just repeat
+    what the grouping already conveys."""
     pairs, hints = workload_pairs(workloads)
     return disambiguate(pairs, hints=hints if use_type_hint else None)
 
@@ -318,15 +304,11 @@ def match_display_name(
 ) -> _T | None:
     """Match ``target`` against the *displayed* form of ``pairs``
     (``(display_name, stable_id)``) after running the collision suffix
-    through ``disambiguate`` — the same transform the CLI/TUI apply before
-    showing these names, so a name copied straight out of a breadcrumb
-    resolves back exactly, suffix included when one collided.
+    through ``disambiguate`` — the same transform the CLI/TUI apply, so a
+    name copied straight out of a breadcrumb resolves back exactly.
 
     ``hints`` must match whatever the display side passed to its own
-    ``disambiguate`` call for these same ``pairs`` — workload resolution
-    passes each workload's own ``type_hint`` here for exactly that reason,
-    so a ref showing ``"Alice Example <...> · MAIL"`` resolves back to the
-    Mail workload, not just any workload with that name."""
+    ``disambiguate`` call for these same ``pairs``."""
     for name, obj in zip(disambiguate(pairs, hints=hints), objects, strict=True):
         if name == target:
             return obj
@@ -341,13 +323,8 @@ def ambiguous_matches(
 ) -> list[str]:
     """The disambiguated names among ``pairs`` whose *pre-suffix* display
     name equals ``target``. Meant to be called only after
-    ``match_display_name`` already returned ``None`` for the same
+    ``match_display_name`` returned ``None`` for the same
     ``target``/``pairs``/``hints`` — under that precondition, a
-    non-empty result means ``target`` collided at this level and needed
-    a suffix (real ambiguity), while an empty result means ``target``
-    genuinely doesn't exist here at all. Called on its own, outside that
-    precondition, it's a plain filter with no such guarantee: a
-    ``target`` that matches exactly one row's raw name comes back as a
-    one-element list even though ``match_display_name`` would have
-    already resolved it cleanly."""
+    non-empty result means ``target`` collided at this level (real
+    ambiguity); empty means it doesn't exist here at all."""
     return [name for (raw, _id), name in zip(pairs, disambiguate(pairs, hints=hints), strict=True) if raw == target]

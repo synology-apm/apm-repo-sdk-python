@@ -68,13 +68,9 @@ async def open_sqlite(
     through it, so ``check_same_thread`` is unnecessary.
     """
     wal_path = path + _WAL_SUFFIX
-    # The upfront WAL-size check only ever gates the fast path below, and
-    # that path is itself restricted to LocalFsStore — so for any other
-    # store this check's result could never change what happens next.
-    # Skipping it saves a real network round trip per db open on S3/Azure
-    # (the loop below still checks -wal/-shm individually to decide
-    # whether to copy each sidecar into the materialized copy — that part
-    # applies regardless of store).
+    # The WAL-size check only gates the fast path, which is itself
+    # restricted to LocalFsStore — skipping it for any other store saves a
+    # real network round trip per db open on S3/Azure.
     if transform is None and isinstance(store, LocalFsStore):
         needs_materialize = await store.exists(wal_path) and await store.size(wal_path) > 0
         if not needs_materialize:
@@ -100,12 +96,9 @@ async def open_sqlite(
             if await store.exists(side_path):
                 await _materialize(side_path, base_name + suffix)
 
-        # Concurrent: each of these is its own network round trip on a
-        # remote store. return_exceptions=True (not a bare gather(), not a
-        # TaskGroup) waits for every task to finish before touching dest_dir
-        # again, so a failing task can't race tmp.cleanup() below against a
-        # sibling still writing -- and keeps the raised exception in its own
-        # type, unlike TaskGroup's ExceptionGroup wrapping.
+        # return_exceptions=True: waits for every task to finish before
+        # tmp.cleanup() below, so a failing task can't race a sibling still
+        # writing, and keeps the raised exception in its own type.
         results = await asyncio.gather(
             _materialize(path, base_name),
             *(_materialize_sidecar_if_present(suffix) for suffix in (_WAL_SUFFIX, _SHM_SUFFIX)),
@@ -115,14 +108,10 @@ async def open_sqlite(
             if isinstance(result, BaseException):
                 raise result
 
-        # Read-*write*, unlike the fast path above: this is our own private
-        # copy in a temp directory this function created and will delete, so
-        # nothing here can reach the store's bytes. Writable is what lets
-        # apply_index_hint() actually build an index instead of silently
-        # doing nothing and leaving every later query a full table scan.
-        # ``rw`` rather than plain (``rwc``): a path SQLite cannot resolve must
-        # still fail here, not open as a brand-new empty database whose
-        # missing tables only surface later as a DataCorruptError.
+        # Read-*write*: our own private copy, which is what lets
+        # apply_index_hint() build an index. ``rw`` not ``rwc``: a path
+        # SQLite can't resolve must fail here, not open as a new empty
+        # database whose missing tables surface later as DataCorruptError.
         conn = await aiosqlite.connect(f"file:{dest_dir / base_name}?mode=rw", uri=True)
     except Exception:
         tmp.cleanup()
@@ -147,21 +136,14 @@ async def _index_leading_columns(conn: aiosqlite.Connection, table: str) -> list
 async def apply_index_hint(conn: aiosqlite.Connection, table: str, columns: Sequence[str]) -> None:
     """A pure declaration of intent — "queries against ``table`` will
     filter/sort by ``columns``" — never a command this is guaranteed to
-    fulfil; callers never need to check whether it actually did anything.
-    Safe to call even when ``columns`` is already known to be indexed
-    (e.g. a schema-defined index or a PRIMARY KEY): the leading-prefix
-    check below makes that case a cheap no-op, so callers apply this
-    uniformly rather than reasoning per call site about whether it's
-    needed.
+    fulfil. Safe to call even when ``columns`` is already indexed: the
+    leading-prefix check below makes that a cheap no-op.
 
-    Checks whether an existing index already covers ``columns`` as a
-    leading prefix; skips if so. Otherwise attempts ``CREATE INDEX IF NOT
-    EXISTS`` and lets a genuinely read-only connection's own answer settle
-    whether that's even possible: SQLite raises ``OperationalError:
-    attempt to write a readonly database`` synchronously and safely
-    against a ``mode=ro`` connection, caught here and treated as "the
-    hint quietly did nothing" — the caller's own query afterward just
-    costs a full scan. Any other error still propagates.
+    Skips if an existing index already covers ``columns`` as a leading
+    prefix. Otherwise attempts ``CREATE INDEX IF NOT EXISTS`` and lets a
+    read-only connection's own ``OperationalError`` settle whether that's
+    even possible — caught here as "the hint quietly did nothing," any
+    other error still propagates.
     """
     existing = await _index_leading_columns(conn, table)
     wanted = list(columns)

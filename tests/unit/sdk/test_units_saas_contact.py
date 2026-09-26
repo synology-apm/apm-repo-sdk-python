@@ -176,9 +176,8 @@ def _build_m365_contact_db(
 ) -> bytes:
     """``contacts``: (contact_id, first_name, last_name, parent_folder_id, meta_object_id).
     ``emails`` (contact_id -> primary_email), when given, populates the
-    real ``primary_email`` column -- every existing call site omits it,
-    leaving that column empty (falsy) exactly as it was before this
-    column existed."""
+    real ``primary_email`` column — every existing call site omits it,
+    leaving that column empty."""
     with tempfile.TemporaryDirectory() as td:
         path = Path(td) / "contact.db"
         conn = sqlite3.connect(path)

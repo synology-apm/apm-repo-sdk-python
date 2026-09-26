@@ -21,42 +21,26 @@ if TYPE_CHECKING:
 
 class RecursiveGroupFlatTree:
     """M365 Mail's real folder hierarchy: ``mail_folder_table`` is a
-    real, named, self-referencing table (``folder_id``/``folder_name``/
-    ``parent_folder_id``, rooted at a synthetic anchor id exactly like
-    ``RecursiveTree``'s own ``root_id`` convention) whose rows are
-    *always* folders — unlike ``RecursiveTree``/``NamedGroupRecursiveTree``'s
-    own mixed tables, no ``is_folder()`` check is needed. Its leaves live
-    in a separate, flat, non-recursive table keyed by its own group-fk
-    column — a message never nests and never has children of its own.
-    "Group" here means what it means for ``NamedGroupFlatTree``/
-    ``NamedGroupRecursiveTree`` (a real definitions table with its own
-    display-name column), just recursive rather than flat, and with one
-    id-space serving as both this table's own recursion key and the leaf
-    table's own foreign key.
+    real, self-referencing table (``folder_id``/``folder_name``/
+    ``parent_folder_id``, rooted at a synthetic anchor id like
+    ``RecursiveTree``'s ``root_id``) whose rows are always folders, so no
+    ``is_folder()`` check is needed. Leaves (messages) live in a
+    separate, flat, non-recursive table keyed by its own group-fk
+    column, sharing one id-space with the folder table's own recursion
+    key.
 
     Every key is a growing-prefix chain, one real folder id per level
-    (e.g. ``("inbox",)``, ``("inbox", "haha")``), not a bare id the way
-    ``RecursiveTree`` keys Drive: Mail stays a plain ``SaasWorkloadProvider``
-    (not ``RecursiveTreeSaasProvider``), so ``units/resolve.py``'s generic
-    ref-descent needs every non-leaf child's key to be a genuine prefix of
-    any deeper target's key. A leaf's key extends its own containing
-    folder's key by one more segment (its own leaf id).
+    (e.g. ``("inbox",)``, ``("inbox", "haha")``), not a bare id: Mail
+    stays a plain ``SaasWorkloadProvider`` (not
+    ``RecursiveTreeSaasProvider``), so ``units/resolve.py``'s generic
+    ref-descent needs every non-leaf child's key to be a genuine prefix
+    of any deeper target's key.
 
-    ``children_of()`` for one folder lists its real subfolders — always,
-    even with zero backed-up messages, the entire point of this class —
-    before that folder's own leaves. See ``children_of()`` itself for how
-    each half is fetched and windowed.
-
-    A genuine leaf's own key naturally returns ``[]`` from
-    ``children_of()`` with no explicit key-shape guard (unlike every
-    sibling class in this package): a leaf's own id never appears as any
-    row's ``parent_folder_id`` in either table. A ``NULL``
-    ``leaf_group_column`` value is a documented non-concern the same way:
-    it never matches ``WHERE ... = ?``, and real M365 rows always
-    populate it.
-
-    ``contact_folder_table`` has this exact same shape and could reuse
-    this class later — out of scope for now, ``contact.py`` is untouched."""
+    ``children_of()`` lists a folder's real subfolders before its own
+    leaves, even with zero backed-up messages. A leaf's own key returns
+    ``[]`` with no explicit guard: a leaf's id never appears as a
+    ``parent_folder_id``, and a ``NULL`` ``leaf_group_column`` never
+    matches ``WHERE ... = ?``."""
 
     def __init__(
         self,

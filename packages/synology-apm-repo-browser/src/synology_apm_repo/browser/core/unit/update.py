@@ -1,14 +1,10 @@
-"""``update(model, msg) -> (model, cmds)`` for ``UnitScreen``'s own
-store -- pure, synchronous, exhaustive (``case _: assert_never(msg)``,
-so a new unhandled ``UnitMsg`` case is a mypy error, not a silent
-no-op).
+"""``update(model, msg) -> (model, cmds)`` for ``UnitScreen``'s store --
+pure, synchronous, exhaustive (``case _: assert_never(msg)``).
 
-Every fetch-result case checks its own ``epoch``/``request`` against
-the model's current ones *before* touching anything else, and drops
-silently (returning the model unchanged) on a mismatch -- a worker
-already past its last ``await`` when cancelled still runs to completion
-and still tries to publish. ``Slot``/``RequestId`` extend this same check
-to per-node staleness alongside the coarser per-provider ``Epoch``."""
+Every fetch-result case checks its ``epoch``/``request`` against the
+model's current ones before touching anything else, and drops silently
+on a mismatch -- a worker already past its last ``await`` when cancelled
+still runs to completion and tries to publish."""
 
 from __future__ import annotations
 
@@ -215,26 +211,12 @@ def update(model: UnitModel, msg: UnitMsg) -> tuple[UnitModel, tuple[UnitCmd, ..
             return new_model, (Notify(message=message, severity="warning"),)
 
         case ChainStepResolved(ref=ref, children=children):
-            # Always the full, exhaustive sibling list (find_path_with_
-            # children's own contract) -- unconditionally replaces whatever
-            # was there, whether nothing yet or only a partial page from
-            # ordinary browsing. Not epoch/request-gated: a goto walk only
-            # ever runs against the provider that's currently live (see
-            # GotoChainWalker's own caller), so there is no "current
-            # generation" this could be stale against the way a
-            # long-running background fetch could.
-            #
-            # Also clears `ref`'s own children slot from `inflight` (if
-            # occupied): an ordinary ChildrenLoaded/MoreChildrenLoaded (or
-            # their *Failed siblings) for the same `ref`, still in flight
-            # from browsing before this walk step resolved it, would
-            # otherwise land afterwards and pass its own is_stale() check
-            # unchanged -- corrupting this already-exhaustive list by
-            # appending a stale page onto it or replacing it outright.
-            # `pending` is cleared alongside it for the same `ref`, so that
-            # still-in-flight fetch's own eventual (stale) result isn't the
-            # only thing that can ever unblock a future re-expand/load-more
-            # of this now-exhaustively-resolved node.
+            # Always the full, exhaustive sibling list -- unconditionally
+            # replaces whatever was there. Not epoch/request-gated: a goto
+            # walk only runs against the currently-live provider. Also
+            # clears `ref`'s children slot from `inflight`/`pending`, so an
+            # ordinary fetch still in flight from before this walk step
+            # can't land afterwards and corrupt this exhaustive list.
             level = LoadedLevel(children=children, exhausted=True)
             slot = children_slot(ref)
             inflight = (

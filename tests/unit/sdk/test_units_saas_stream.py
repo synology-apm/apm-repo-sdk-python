@@ -639,10 +639,9 @@ class TestForwardResolution:
 
 class TestLastOpenResolution:
     """``SaasStream.last_open_resolution``/``SaasStreamCache.
-    last_open_resolution`` — a synchronous, zero-I/O readback of what the
-    most recent successful ``open_saas_obj`` call actually resolved to,
-    for a caller (``verify_reachable``'s own label enrichment) that wants
-    it without changing ``open_saas_obj``'s own return type."""
+    last_open_resolution`` — a synchronous, zero-I/O readback of the most
+    recent successful ``open_saas_obj`` call's resolution, used by
+    ``verify_reachable``'s label enrichment."""
 
     async def test_returns_none_before_any_open_call(self, repo: DedupRepo) -> None:
         async with SaasStream(repo, _CCID, _STREAM_UUID) as stream:
@@ -692,12 +691,10 @@ class TestResourceManagement:
 
 
 class TestBoundedEviction:
-    """SaasStreamCache's own bounded LRU — eviction must actually close
-    the evicted stream's connections, not just drop the reference (the
-    fd/thread-exhaustion regression this bound exists to prevent). Faked
-    ``SaasStream``
-    construction: proving the cache mechanics needs no real
-    repository/sqlite I/O at all."""
+    """SaasStreamCache's own bounded LRU — eviction must close the
+    evicted stream's connections, not just drop the reference, or
+    descriptors/threads leak. Uses a faked ``SaasStream``: cache
+    mechanics need no real repository/sqlite I/O."""
 
     @staticmethod
     def _install_fake_stream(monkeypatch: pytest.MonkeyPatch) -> list[tuple[int, str]]:
@@ -752,9 +749,8 @@ class TestBoundedEviction:
         assert sorted(closed) == [(1, "a"), (2, "b")]
 
     async def test_default_maxsize_is_bounded_not_unbounded(self, repo: DedupRepo) -> None:
-        # Regression guard for the fd-exhaustion bug itself: the default
-        # constructor call (as _ReachabilityWalker uses it) must not go
-        # back to being unbounded.
+        # The default constructor call (as _ReachabilityWalker uses it)
+        # must stay bounded, not unbounded.
         cache = SaasStreamCache(repo)
         assert cache._maxsize == stream_mod._DEFAULT_STREAM_CACHE_SIZE
 
@@ -864,13 +860,9 @@ class TestEvictionDefersForAnInUseStream:
     async def test_a_just_inserted_key_is_protected_even_while_its_own_eviction_is_still_closing(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """Regression test: ``_in_use`` must be set *before* ``_stream_for``
-        ever runs, not after it returns -- ``_stream_for`` itself can
-        ``await`` (closing a *different*, evicted sibling) between
-        inserting this call's own new key and handing the stream back, and
-        a concurrent call for yet another key racing through its own
-        eviction loop during that window would otherwise see this call's
-        own just-inserted key as not-yet-in-use and evict it."""
+        """``_in_use`` must be set before ``_stream_for`` runs, not after
+        it returns, or a concurrent eviction can race a still-mid-insert
+        key and evict it out from under this call."""
         closed: list[tuple[int, str]] = []
         c_close_started = asyncio.Event()
         release_c_close = asyncio.Event()
@@ -901,18 +893,16 @@ class TestEvictionDefersForAnInUseStream:
         )
 
         # Task A: opens A -- cache is at capacity (1), so this evicts
-        # (3, "c"), whose own close() blocks, holding task A inside
-        # _stream_for's own eviction-await with (1, "a") already inserted
-        # into self._streams but not yet returned to open_saas_obj.
+        # (3, "c"), whose close() blocks with (1, "a") already inserted
+        # but not yet returned.
         task_a = asyncio.create_task(cache.open_saas_obj(version_a))
         try:
             await c_close_started.wait()
             assert (1, "a") in cache._streams  # inserted before the blocking close
 
-            # Task B: opens a different key concurrently, while task A is
-            # still stuck inside its own eviction-await above. (1, "a")
-            # must already be protected by _in_use at this point, or this
-            # eviction loop would treat it as a free victim.
+            # Task B: opens a different key concurrently while task A is
+            # still blocked in eviction. (1, "a") must already be
+            # protected, or this eviction loop would treat it as free.
             await cache.open_saas_obj(version_b)
             assert (1, "a") in cache._streams  # never evicted out from under task A
             assert (3, "c") not in closed  # task A's own close() hasn't finished yet
@@ -931,11 +921,8 @@ class TestCloseRacingAnInFlightOpen:
     async def test_close_running_concurrently_does_not_mask_the_callers_own_result(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """``open_saas_obj()``'s own ``finally`` block must tolerate its
-        key already being gone when a concurrent ``close()`` clears
-        ``_in_use`` first — not raise ``KeyError`` there and silently
-        replace this call's real return value with an unrelated
-        exception."""
+        """Must not raise ``KeyError`` there and silently replace this
+        call's real return value with an unrelated exception."""
         entered = asyncio.Event()
         release = asyncio.Event()
         completed: list[str] = []

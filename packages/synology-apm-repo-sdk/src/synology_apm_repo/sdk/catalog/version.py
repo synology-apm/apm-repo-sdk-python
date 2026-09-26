@@ -1,18 +1,12 @@
 """``Version``: one ``db/copy_target_version`` row (+ ``_meta`` when
 present), its own meta-availability checks, and ``open_target_db()`` — the
 one place this layer does real decrypt work (shared by the Unit Layer's
-Device and FS providers). Display/status extraction
-(``_version_epoch``/``_version_display_name``) is a first-class output here
-too: CLI/TUI show only ``display_name``/``subtitle``/``attrs`` in the
-default (non-diagnostic) mode, so this can't be an afterthought bolted on
-later.
+Device and FS providers).
 
-**Encrypted connections**: ``version_spec`` itself is AES-256-CTR
-ciphertext (whole-string, standard base64) whenever the connection has a
-vault key, decrypted with the same DEK as chunk-pool/``aHlT`` encryption
-before parsing — see ``parse_version_spec``, also used by
-``units.saas.object_name_index``. Not documented in ``docs/`` at all
-(neither this column's schema nor its encryption).
+``version_spec`` is AES-256-CTR ciphertext (whole-string, standard base64)
+whenever the connection has a vault key, decrypted with the same DEK as
+chunk-pool/``aHlT`` encryption before parsing — see ``parse_version_spec``,
+also used by ``units.saas.object_name_index``.
 """
 
 from __future__ import annotations
@@ -86,22 +80,13 @@ _VERSION_COLUMNS = [
 
 
 #: ``version_spec.status.status`` values that mean "this version has real,
-#: landed data worth listing" — present and uniform across every
-#: ``target_type`` (VM/PC/PS/FS/GW/M365 all carry the same field).
-#: ``CANCELED`` still belongs here: a canceled backup job can
-#: have transferred and landed real data before it was stopped, so it's
-#: kept alongside a normally-finished one rather than hidden — opening it
-#: degrades per-item like any other version if a given file/object never
-#: made it into the landed data. Every other value (``BACKING_UP``/
-#: ``FAILED``/``PAUSED``/``DELETING``/``DELETE_FAILED``/``CLONING``/
-#: ``CMS_PROCESSING``/``NONE``) means nothing ever landed for this version
-#: — not worth listing at all. A version whose status can't even be
-#: determined (undecryptable/unparseable ``version_spec``, or no
-#: ``status.status`` key present) is filtered out right alongside those,
-#: not kept — unlike ``_version_display_name``'s own "degrade, don't
-#: hide" default for the same field, an unconfirmed-landed version is
-#: excluded from the list entirely rather than shown and left to fail (or
-#: silently under-deliver) once opened.
+#: landed data worth listing" (uniform across VM/PC/PS/FS/GW/M365).
+#: ``CANCELED`` still belongs here: a canceled backup job can have
+#: transferred and landed real data before it stopped. Every other value
+#: (``BACKING_UP``/``FAILED``/``PAUSED``/``DELETING``/``DELETE_FAILED``/
+#: ``CLONING``/``CMS_PROCESSING``/``NONE``), and an undecryptable or
+#: unparseable status, means nothing worth listing — excluded rather than
+#: shown and left to fail once opened.
 _BROWSABLE_VERSION_STATUSES = frozenset({"COMPLETED", "PARTIAL", "CANCELED"})
 
 
@@ -109,13 +94,9 @@ def resolve_meta_filename(meta: VersionMeta, name: str, *, ref: str | None = Non
     """Confirm ``name`` (e.g. ``"target.db"``) is one of this version's own
     ``meta_filenames`` — the ``copy_meta_file/<dir>`` directory's
     authoritative, write-time-recorded file list (FORMAT-SPEC.md:
-    version-meta-mapping) — and return it unchanged.
-
-    **Never a directory scan** — unlike the dedup layer's own
-    per-generation files (``.buk``, ``db/<name>``, ...; see
-    ``storage/seqid.py``'s ``resolve_seq_file``), files under
-    ``copy_meta_file`` are written once by the backup agent and never
-    rewritten by the dedup layer.
+    version-meta-mapping) — and return it unchanged. Never a directory
+    scan: unlike the dedup layer's own per-generation files, files under
+    ``copy_meta_file`` are written once and never rewritten.
 
     Raises:
         NotFoundError: ``name`` was never registered for this version.
@@ -131,11 +112,8 @@ def resolve_meta_filename(meta: VersionMeta, name: str, *, ref: str | None = Non
 
 def resolve_copy_meta_dir(version: Version, repo_root: str) -> str:
     """The ``copy_meta_file/<dir>`` this VM/FS ``version``'s own meta
-    artifacts (``target.db``, ``version.db.zst``) live under, derived
-    from ``copy_target_version_meta.target_meta_path`` joined onto
-    ``repo_root`` (empty when a store is rooted directly at the vault
-    dir, non-empty when the repository was discovered from a parent directory
-    — ``Session.discover``).
+    artifacts (``target.db``, ``version.db.zst``) live under, derived from
+    ``copy_target_version_meta.target_meta_path`` joined onto ``repo_root``.
 
     Raises:
         NotFoundError: ``version`` has no ``copy_target_version_meta`` row at
@@ -153,16 +131,14 @@ def resolve_copy_meta_dir(version: Version, repo_root: str) -> str:
 
 async def open_target_db(repo: DedupRepo, version: Version, meta_dir: str) -> SqliteSource:
     """Resolve and open ``<meta_dir>/target.db`` into an opened
-    ``SqliteSource`` — the identical sequence ``units.device`` and
-    ``units.fs`` each need before going on to interpret ``target.db``'s
-    own tables their own way. May be ``aHlT``-enveloped and have a real
-    ``-wal``/``-shm`` sidecar (FORMAT-SPEC.md: copy_meta_file-layout); ``SqliteSource.
-    from_enveloped_store`` handles both. A different addressing scheme
-    than ``DedupRepo.db``'s own ``db/<name>`` auto-detection (name-alias
-    resolution plus generation-selection for ``OBJECT_STORE``):
-    ``copy_meta_file`` entries are written once by the backup agent and
-    never rotated, so this resolves the physical filename directly
-    against the version's own recorded ``meta_filenames`` instead.
+    ``SqliteSource`` — the sequence ``units.device`` and ``units.fs`` each
+    need before interpreting ``target.db``'s own tables. May be
+    ``aHlT``-enveloped with a real ``-wal``/``-shm`` sidecar (FORMAT-SPEC.md:
+    copy_meta_file-layout); ``SqliteSource.from_enveloped_store`` handles
+    both. Resolves the physical filename against the version's own
+    ``meta_filenames`` rather than ``DedupRepo.db``'s generation-selection
+    auto-detection, since ``copy_meta_file`` entries are written once and
+    never rotated.
 
     ``rebuild_target.db`` (§6.4) is never read through this function.
     """
@@ -175,22 +151,14 @@ async def open_target_db(repo: DedupRepo, version: Version, meta_dir: str) -> Sq
 async def versions(repo: DedupRepo, workload: Workload, *, include_deleted: bool = False) -> list[Version]:
     """Newest-first by real backup time (``_version_epoch``, the same
     field/fallback ``_version_display_name`` uses, so sort order and
-    displayed timestamp always agree). ``table.select()`` carries no
-    ``ORDER BY`` of its own — row order is an implementation detail, not a
-    chronological guarantee — so sorting happens here. A version whose
-    timestamp can't be resolved sorts last, ties broken by ``version_id``
-    descending (the best available recency proxy once the real timestamp
-    is unusable)."""
-    # Hinted on what the WHERE below actually filters by: the schema's own
-    # index is on version_uid, which this query never mentions, so without an
-    # index here every call is a full scan of a table carrying version_spec
-    # blobs, paid once per workload.
-    #
-    # Only takes effect where the connection is onto a materialized copy (a
-    # remote store, or a local one with a live -wal). A plain local repository
-    # takes open_sqlite's fast path onto the real file, immutable and
-    # read-only, where apply_index_hint is documented to do nothing -- that
-    # case still scans.
+    displayed timestamp always agree). Sorted here since ``table.select()``
+    carries no ``ORDER BY`` of its own. A version whose timestamp can't be
+    resolved sorts last, ties broken by ``version_id`` descending."""
+    # index_hints matters only against a materialized copy (remote, or
+    # local with a live -wal); a plain local repository's fast path scans
+    # regardless. Without it, every call here full-scans a table carrying
+    # version_spec blobs, since the query never mentions the schema's own
+    # version_uid index.
     table = await Table.create(
         await repo.db("copy_target_version"),
         "copy_target_version",
@@ -198,11 +166,9 @@ async def versions(repo: DedupRepo, workload: Workload, *, include_deleted: bool
         index_hints=[["workload_id", "deleted"]],
     )
     where = "workload_id = ?" if include_deleted else "workload_id = ? AND deleted = 0"
-    # Two passes: the first collects every row that survives the
-    # browsable-status filter, the second batch-resolves their
-    # copy_target_version_meta rows in one query — mirrors
-    # catalog/connection.py's own _namespace_by_workload()'s
-    # WHERE ... IN (...) batching.
+    # Two passes: collect every row surviving the browsable-status
+    # filter, then batch-resolve their copy_target_version_meta rows in
+    # one query.
     rows: list[tuple[dict[str, object], str, ParsedVersionStatus | None]] = []
     async for row in table.select(where, (workload.workload_id,)):
         version_uid = as_str(row["version_uid"])
@@ -244,12 +210,10 @@ async def versions(repo: DedupRepo, workload: Workload, *, include_deleted: bool
 
 def _as_epoch_seconds(value: object) -> int | None:
     """Narrow one of ``version_spec.status``'s ``start_time``/``end_time``
-    values to a usable epoch — real data has these as **strings**
-    (protobuf-JSON's own int64-as-string convention,
-    e.g. ``"1786024626"``), and ``"0"``/``0`` is the proto's own "not
-    set" sentinel for both fields, not a real 1970 timestamp, so both
-    parse failure and the zero sentinel return ``None`` — never ``0``
-    itself, which would format as 1970."""
+    values to a usable epoch — real data has these as protobuf-JSON
+    int64-as-strings (e.g. ``"1786024626"``), where ``"0"``/``0`` is the
+    proto's "not set" sentinel, not a real 1970 timestamp. Both parse
+    failure and the zero sentinel return ``None``, never ``0`` itself."""
     if isinstance(value, bool):
         return None
     if isinstance(value, int):
@@ -266,12 +230,9 @@ def _as_epoch_seconds(value: object) -> int | None:
 @dataclasses.dataclass(frozen=True)
 class ParsedVersionStatus:
     """``version_spec.status``, narrowed to exactly the fields
-    ``_version_epoch``/``_version_display_name``/the browsable-status filter
-    (``_BROWSABLE_VERSION_STATUSES``) read — a type-checked replacement for
-    passing a raw ``dict[str, Any]`` around, so mypy enforces "call
-    ``_parse_version_status`` first" as a real requirement instead of a
-    documented-only convention. Field names match
-    ``version_spec.status``'s own JSON keys."""
+    ``_version_epoch``/``_version_display_name``/the browsable-status
+    filter read. Field names match ``version_spec.status``'s own JSON
+    keys."""
 
     status: object = None
     start_time: object = None
@@ -280,16 +241,11 @@ class ParsedVersionStatus:
 
 def parse_version_spec(version_spec_raw: str, version_uid: str, vault_key: bytes | None) -> object | None:
     """Decrypt (whenever ``vault_key`` is given) and JSON-parse one
-    ``copy_target_version.version_spec`` column value — the shared
-    decrypt-then-parse step this module's own status filter and
-    ``units.saas.object_name_index``'s connector-recorded index both need.
-
-    Decrypts unconditionally whenever ``vault_key`` is given, never by
-    probing the raw column first (§5.1: encryption is a per-connection
-    state, not per-row).
-
-    Returns ``None`` on any failure — undecryptable or unparseable —
-    never raises; each caller applies its own conservative default."""
+    ``copy_target_version.version_spec`` column value — decrypts
+    unconditionally whenever ``vault_key`` is given, never by probing the
+    raw column first (§5.1: encryption is a per-connection state, not
+    per-row). Returns ``None`` on any failure rather than raising; each
+    caller applies its own conservative default."""
     try:
         raw = (
             decrypt_version_spec(version_spec_raw, version_uid, vault_key)
@@ -305,13 +261,9 @@ def parse_version_spec(version_spec_raw: str, version_uid: str, vault_key: bytes
 def _parse_version_status(
     version_spec_raw: str, version_uid: str, vault_key: bytes | None
 ) -> ParsedVersionStatus | None:
-    """``parse_version_spec``'s result, narrowed to its ``status`` object —
-    the one decrypt+parse this module needs per row, shared by the status
-    filter (``_BROWSABLE_VERSION_STATUSES``) and ``_version_display_name``.
-
-    ``None`` on any failure (undecryptable, unparseable, or no ``status``
-    present) — each caller picks its own conservative default for that
-    case."""
+    """``parse_version_spec``'s result, narrowed to its ``status`` object,
+    shared by the status filter and ``_version_display_name``. ``None`` on
+    any failure or no ``status`` present."""
     spec = parse_version_spec(version_spec_raw, version_uid, vault_key)
     raw_status = spec.get("status") if isinstance(spec, dict) else None
     if not isinstance(raw_status, dict):
@@ -325,12 +277,9 @@ def _parse_version_status(
 
 def _version_epoch(status: ParsedVersionStatus | None) -> int | None:
     """Real backup time: ``status.start_time``, falling back to
-    ``end_time`` only when ``start_time`` itself is absent/zero — both are
-    unix-epoch seconds from the *source* backup job. ``None`` when
-    ``status`` is ``None`` or neither field yields a usable epoch (see
-    ``_as_epoch_seconds``). Shared by ``_version_display_name`` and
-    ``versions`` so both use the same rule rather than risking two copies
-    drifting apart."""
+    ``end_time`` only when ``start_time`` is absent/zero — both are
+    unix-epoch seconds from the source backup job. ``None`` when
+    ``status`` is ``None`` or neither field yields a usable epoch."""
     if status is None:
         return None
     epoch = _as_epoch_seconds(status.start_time)
@@ -340,34 +289,23 @@ def _version_epoch(status: ParsedVersionStatus | None) -> int | None:
 
 
 def _version_display_name(status: ParsedVersionStatus | None, version_uid: str) -> str:
-    """Formats ``_version_epoch``'s real backup time for display.
-
-    Degrades to the raw ``version_uid`` on any failure (undecryptable,
-    unparseable, or no usable timestamp) — deliberately *not* a crtime
-    fallback: ``version_spec`` is expected to always be present and
-    parseable, so this path is a rare degrade for corrupt data, not a
-    normal branch to design a second timestamp source around.
-    """
+    """Formats ``_version_epoch``'s real backup time for display, degrading
+    to the raw ``version_uid`` on any failure (undecryptable, unparseable,
+    or no usable timestamp)."""
     epoch = _version_epoch(status)
     if epoch is None:
         return version_uid
     try:
         return format_timestamp(datetime.fromtimestamp(epoch, UTC))
     except (OverflowError, OSError, ValueError):
-        # _as_epoch_seconds narrows a protobuf-JSON string to int with no
-        # range check of its own -- an out-of-datetime-range value is
-        # exactly the kind of corrupt data this function already degrades
-        # on, not something to add a new exception type for.
         return version_uid
 
 
 async def _version_metas_for(repo: DedupRepo, version_uids: list[str]) -> dict[str, VersionMeta]:
     """Batched ``copy_target_version_meta`` lookup — one ``WHERE
-    version_uid IN (...)`` query for every uid in ``version_uids``,
-    mirroring ``catalog/connection.py``'s own ``_namespace_by_workload``'s
-    batching shape. A ``version_uid`` with no matching row (or no
-    ``copy_target_version_meta`` table at all) is simply absent from
-    the returned dict."""
+    version_uid IN (...)`` query. A ``version_uid`` with no matching row
+    (or no ``copy_target_version_meta`` table at all) is absent from the
+    returned dict."""
     if not version_uids:
         return {}
     try:

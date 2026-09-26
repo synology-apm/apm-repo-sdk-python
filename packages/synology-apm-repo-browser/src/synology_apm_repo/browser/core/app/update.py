@@ -41,34 +41,25 @@ _T = TypeVar("_T")
 
 
 def _without(mapping: Mapping[JobId, _T], job_id: JobId) -> dict[JobId, _T]:
-    """``mapping`` with ``job_id`` dropped — the one dict-filter shape
-    every ``jobs``/``queued_requests`` removal below needs."""
+    """``mapping`` with ``job_id`` dropped."""
     return {k: v for k, v in mapping.items() if k != job_id}
 
 
 def _record_finished(model: AppModel, job_id: JobId, label: str, outcome: JobOutcome) -> AppModel:
-    """Appends a ``FinishedJob`` for ``job_id`` to ``model.recent``
-    (capped) — the one piece ``ExportFinished`` and a ``QUEUED``
-    ``CancelJobRequested`` both need identically. Each caller still
-    handles its own ``jobs``/``queued_requests`` removal on top of this,
-    since that genuinely differs between the two (a promotion check for
-    one, a ``queued_requests`` cleanup for the other)."""
+    """Appends a ``FinishedJob`` for ``job_id`` to ``model.recent`` (capped)."""
     finished = FinishedJob(id=job_id, label=label, outcome=outcome)
     return dataclasses.replace(model, recent=_cap_recent((*model.recent, finished)))
 
 
 def _notify_outcome(outcome: JobOutcome) -> Notify:
-    """The toast for a finished job's own outcome — identical in shape
-    for ``ExportFinished`` and a ``QUEUED`` ``CancelJobRequested``."""
+    """The toast for a finished job's outcome."""
     return Notify(message=outcome.notify_message, severity=outcome.notify_severity, title=EXPORT_NOTIFY_TITLE)
 
 
 def _promote_next_queued(model: AppModel) -> tuple[AppModel, RunExport | None]:
-    """Promotes the earliest still-``QUEUED`` job (``model.jobs`` preserves
-    insertion order, so the first match is FIFO) to ``RUNNING`` and returns
-    the ``RunExport`` to start it — called once the one job slot frees up,
-    from either ``ExportFinished`` or ``VerifyFullFinished``. Returns
-    ``model`` unchanged and ``None`` when nothing is queued."""
+    """Promotes the earliest still-``QUEUED`` job (FIFO, via ``model.jobs``'s
+    insertion order) to ``RUNNING`` and returns the ``RunExport`` to start
+    it. Returns ``model`` unchanged and ``None`` when nothing is queued."""
     for job_id, job in model.jobs.items():
         if job.status is JobStatus.QUEUED:
             request = model.queued_requests[job_id]

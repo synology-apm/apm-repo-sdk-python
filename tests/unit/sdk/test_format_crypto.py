@@ -66,15 +66,10 @@ class TestDecryptChunk:
             decrypt_chunk(b"short", _addr(1, 1, 1), b"\x00" * 16)
 
     def test_accepts_a_memoryview_ciphertext_without_copying_first(self) -> None:
-        # A caller slicing chunk ciphertext straight out of a merged
-        # run's I/O buffer can pass a memoryview through unchanged --
-        # Cipher.decryptor().update() reads it via the buffer protocol
-        # with no copy needed -- unlike compression.py's
-        # CompressType.NONE passthrough, there's no identity-preserving
-        # fast path here (Cipher.decryptor().update() always allocates a
-        # fresh output), so the real thing worth pinning is that a
-        # memoryview slice decrypts to the exact same plaintext bytes
-        # as the equivalent bytes object would.
+        # Cipher.decryptor().update() reads a memoryview via the buffer
+        # protocol with no copy needed, but always allocates a fresh
+        # output -- pins that a memoryview slice decrypts to the same
+        # plaintext a bytes object would.
         key = os.urandom(AES_KEY_SIZE)
         addr = _addr(132, 330, 18)
         plaintext = os.urandom(4096)

@@ -127,16 +127,12 @@ def _layout(repo_root: str = "") -> RepoLayout:
 
 
 def _repository_layout(repo_root: str = "") -> RepositoryLayout:
-    """The ``RepositoryLayout``-level counterpart to ``_layout()`` above —
-    what ``api.Repository.__init__`` itself now takes (a single opened
-    bucket/vault, not one already-opened ``DedupRepo``). Every test
-    here uses ``RepoKind.VAULT``, matching ``_layout()``'s own default:
-    ``catalog_repo_layouts()`` always resolves a ``VAULT``
-    ``RepositoryLayout`` to exactly one derived ``RepoLayout`` (a vault's
-    own catalogs come from querying ``db/connection_config`` after
-    opening, not a separate directory per catalog), so a single-catalog
-    fake (``_FakeDedupRepo``) is always the right shape regardless of
-    which of the two layout types a given test builds by hand."""
+    """The ``RepositoryLayout``-level counterpart to ``_layout()`` — what
+    ``api.Repository.__init__`` takes (a single opened bucket/vault, not
+    one already-opened ``DedupRepo``). Every test here uses
+    ``RepoKind.VAULT``, which ``catalog_repo_layouts()`` always resolves
+    to exactly one derived ``RepoLayout``, so a single-catalog fake
+    (``_FakeDedupRepo``) is always the right shape."""
     return RepositoryLayout(kind=RepoKind.VAULT, repo_root=repo_root)
 
 
@@ -149,29 +145,18 @@ def _repo_with_fake_dedup(
     encrypted: bool | None = None,
     layout: RepositoryLayout | None = None,
 ) -> api.Repository:
-    """Construct an ``api.Repository`` backed by ``fake`` — the new-model
-    replacement for directly constructing ``api.Repository(_as_dedup_repo(fake), ...)``,
-    now that ``Repository`` opens its own ``DedupRepo``(s) lazily via
-    ``DedupRepo.open()`` rather than taking one ready-made. Monkeypatches
-    ``DedupRepo.open`` to hand back ``fake`` regardless of which derived
-    ``RepoLayout`` it's called with — fine for every test here, which only
-    ever has one single-catalog vault layout to open (every test here
-    builds a ``VAULT`` layout, which always resolves to exactly one
-    ``RepoLayout``). Construction itself never
-    opens anything (only ``Session``'s own ``_confirm_real()`` or an
-    explicit ``catalogs()``/``_open_catalogs.resolve()`` call does) — a
-    test that only checks ``key_status``/``is_encrypted`` right after
-    construction doesn't need this helper at all, a bare ``api.Repository(
-    _as_object_store(_FakeStore()), _repository_layout(), ...)`` is enough.
-
-    Also fakes ``api_repository.connections`` to return ``[]`` by default:
-    ``_open_catalog_resources`` resolves it eagerly alongside ``dedup_repo``
-    and caches it for this ``DedupRepo``'s whole lifetime, so any test
-    forcing a catalog open -- even just via ``_open_catalogs.resolve(0)``,
-    not ``catalogs()`` itself -- needs it faked too. A test that cares
-    about a specific connection list overrides this with its own
-    ``monkeypatch.setattr(api_repository, "connections", ...)`` call
-    afterward."""
+    """Construct an ``api.Repository`` backed by ``fake``. Monkeypatches
+    ``DedupRepo.open`` to return ``fake`` regardless of which derived
+    ``RepoLayout`` it's called with, and fakes ``api_repository.connections``
+    to return ``[]`` by default (override via ``monkeypatch.setattr(
+    api_repository, "connections", ...)`` for a specific list — any test
+    forcing a catalog open, even just via ``_open_catalogs.resolve(0)``,
+    needs it faked too). Construction alone opens nothing — only
+    ``Session._confirm_real()`` or an explicit ``catalogs()``/
+    ``_open_catalogs.resolve()`` call does; a test checking only
+    ``key_status``/``is_encrypted`` right after construction doesn't need
+    this helper, a bare ``api.Repository(_as_object_store(_FakeStore()),
+    _repository_layout(), ...)`` is enough."""
     monkeypatch.setattr(DedupRepo, "open", _async_open(lambda *a, **k: fake))
     monkeypatch.setattr(api_repository, "connections", _async_returning([]))
     return api.Repository(

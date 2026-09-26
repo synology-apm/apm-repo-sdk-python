@@ -1,24 +1,16 @@
 """``synology-apm-repo-cli dump bucket|composition|chunkmap <path>`` — raw format-level
 inspection of one physical file.
 
-Each subcommand takes a bare path to one physical file — not a ``NodeRef``
-— because these commands exist to answer "what does this specific byte
-layout actually say" for one ``.buk`` or composition sub-file, a question
-a ``NodeRef`` (which routes through catalog/dispatch) would get in the way
-of, not help with. The actual parsing lives in ``sdk.diagnostics``, built
-on the same Codec/Dedup Layer parsers the real read path uses — this
-module is presentation only.
+Each subcommand takes a bare path to one physical file, not a ``NodeRef`` —
+these commands answer "what does this specific byte layout say" for one
+``.buk`` or composition sub-file, never routing through catalog/dispatch.
+The actual parsing lives in ``sdk.diagnostics``; this module is
+presentation only.
 
-Without ``--profile``, ``path`` is a literal local filesystem path, as
-always. With ``--profile``, it's a store-relative sub-path instead — the
-same interpretation shift ``ls``/``tree``/``cat``/``export`` already give
-their own ref argument — since a ``.buk``/composition file's byte layout
-is identical whether it lives on local disk, S3, Azure, or SMB
-(FORMAT-SPEC.md: sequence-id-suffix/composition-splitting); this command
-never needed the ``NodeRef``/Catalog machinery locally and doesn't need it
-remotely either. A ``.<N>`` sequence-id suffix (FORMAT-SPEC.md:
-sequence-id-suffix) is never resolved from a logical name in either
-case — type the exact on-disk filename, local or remote.
+Without ``--profile``, ``path`` is a local filesystem path; with it, a
+store-relative sub-path instead — a ``.<N>`` sequence-id suffix
+(FORMAT-SPEC.md: sequence-id-suffix) is never resolved from a logical name
+in either case, so type the exact on-disk filename.
 """
 
 from __future__ import annotations
@@ -93,15 +85,13 @@ def _badge(ok: bool, fail_word: str = "FAIL") -> str:
 @contextlib.asynccontextmanager
 async def _resolved_store(path: str, profile: str | None, *, state: CliState) -> AsyncIterator[tuple[ObjectStore, str]]:
     """Resolve ``path``/``profile`` into an ``(ObjectStore, rel)`` pair,
-    mirroring ``repo_session.py``'s ``opened_repo`` — but store-level, not
-    repository-level, since this command family never opens a ``Session``: an
-    ``ApmRepoError`` raised while resolving the store itself (a missing
-    local directory, an unknown profile name) gets the same clean
-    ``fail()`` exit ``unwrap()`` gives one raised while reading through
-    it, rather than an internal-error traceback. The local case has
-    nothing to close; the ``--profile`` case closes its own ``ObjectStore``
-    here, since — unlike every other ``--profile`` command — there's no
-    ``Session`` to do it for us."""
+    mirroring ``repo_session.py``'s ``opened_repo`` at the store level
+    rather than the repository level, since this command family never
+    opens a ``Session``. An ``ApmRepoError`` raised while resolving the
+    store gets the same clean ``fail()`` exit as one raised while reading
+    through it. The ``--profile`` case closes its own ``ObjectStore``
+    here — unlike every other ``--profile`` command, there's no ``Session``
+    to do it for us."""
     store: ObjectStore | None = None
     try:
         if profile is None:
@@ -127,17 +117,13 @@ async def _run_dump(
     render_human: Callable[[_ResultT], None],
 ) -> None:
     """The shape ``bucket``/``composition``/``chunkmap`` each repeat:
-    resolve the store, run one ``sdk.diagnostics`` call via ``fetch``
-    (which owns its own ``unwrap()`` and any command-specific exception
-    translation), stamp the result with the original ``path`` argument
-    (not the store-relative ``rel`` ``_resolved_store`` actually read
-    from), then dispatch through ``paging.render()`` — ``build_json``
-    returns the payload rather than printing it directly, which is what
-    lets this share ``render()`` with every other command despite
-    ``composition()``'s own ``--json`` shape being a hand-built dict, not
-    a plain ``dataclasses.asdict()``: ``render()``'s own ``json`` parameter
-    already accepts any payload, so the two shapes need no special-casing
-    here."""
+    resolve the store, run one ``sdk.diagnostics`` call via ``fetch``,
+    stamp the result with the original ``path`` argument (not the
+    store-relative ``rel`` actually read from), then dispatch through
+    ``paging.render()`` — ``build_json`` returns the payload rather than
+    printing it, so ``composition()``'s own hand-built ``--json`` dict and
+    the other two commands' plain ``dataclasses.asdict()`` both fit
+    ``render()``'s ``json`` parameter without special-casing."""
     async with _resolved_store(path, profile, state=state) as (store, rel):
         result = await fetch(store, rel)
     # mypy can't confirm dataclasses.replace() keeps _ResultT's concrete

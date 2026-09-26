@@ -37,11 +37,7 @@ class ChunkAddress(NamedTuple):
     downstream (an over-capacity ``chunk_idx`` raises ``IndexError``; a
     bogus ``bucket_id`` resolves to a missing path and raises
     ``NotFoundError``) or is the job of ``units/verify_reachable.py``'s
-    dedicated checks (chunk-map ``mapCrc``, per-chunk fingerprint), which
-    are already verify-only and never run on the ordinary read/export
-    path. This matters at scale: ``advance`` runs once per real chunk in
-    an export — millions of times for a large disk — reconstructing a
-    value that is, by construction, already correct.
+    dedicated, verify-only checks.
 
     Same deliberate ``NamedTuple``-not-``@dataclass(frozen=True)`` exception
     as ``SizeStoreEntry`` — see there for the reasoning.
@@ -71,13 +67,9 @@ class ChunkAddress(NamedTuple):
 
     def advance(self, k: int) -> ChunkAddress:
         """Advance by ``k`` chunks, carrying into ``bucket_id`` when
-        ``chunk_idx`` would reach ``BUCKET_MAX_CHUNK_NUM`` (8192).
-        This is the semantics needed to expand a ``ChunkMapKind.MAPPING``
-        chunk-map entry's ``map_num * (1 + repeat)`` run of chunks starting
-        from this address; it must never be approximated as "add k to the
-        raw 64-bit integer", which would misplace the carry at the packed
-        field's 16-bit boundary instead of the bucket's real 8192-chunk
-        capacity.
+        ``chunk_idx`` would reach ``BUCKET_MAX_CHUNK_NUM`` (8192) — never
+        approximate this as "add k to the raw 64-bit integer", which would
+        carry at the packed field's 16-bit boundary instead.
         """
         if k < 0:
             raise ValueError(f"advance() does not support negative k ({k})")

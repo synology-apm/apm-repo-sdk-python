@@ -496,17 +496,16 @@ class TestTree:
 
 
 class TestVmTargetDbMissingPropagatesRaw:
-    """A VM version whose ``target.db`` isn't actually readable now
-    surfaces as a plain, uncaught ``NotFoundError`` from
-    ``DeviceProvider.children()`` — no diagnostic-node fallback any more.
-    ``api.repository``'s ``Repository.versions()`` filters out every case
-    knowable ahead of time (no meta row; ``target.db`` not among
-    ``meta_filenames``; the ``copy_meta_file/<dir>`` since removed from
-    the store — ``catalog/version.py``'s ``vm_meta_available()``/
-    ``copy_meta_dir_exists()``) before a version ever reaches a real
-    ``DeviceProvider`` — covered directly here anyway, since a caller can
-    still construct a ``DeviceProvider`` from an arbitrary ``Version``
-    bypassing that filter (as every test in this file does)."""
+    """A VM version whose ``target.db`` isn't actually readable surfaces
+    as a plain, uncaught ``NotFoundError`` from ``DeviceProvider.children()``.
+    ``Repository.versions()`` filters out every case knowable ahead of time
+    (no meta row; ``target.db`` not among ``meta_filenames``; the
+    ``copy_meta_file/<dir>`` removed from the store — see
+    ``catalog/version.py``'s ``vm_meta_available()``/``copy_meta_dir_exists()``)
+    before a version ever reaches a real ``DeviceProvider`` — covered
+    directly here anyway, since a caller can still construct one from an
+    arbitrary ``Version`` bypassing that filter, as every test in this
+    file does."""
 
     async def test_no_meta_row_at_all_raises_not_found(self, tmp_path: Path) -> None:
         store, layout = _write_repo_info_and_vault_key_db(tmp_path)
@@ -1049,9 +1048,9 @@ class TestPcPsFallback:
     async def test_disk_with_non_numeric_disk_index_sorts_after_numeric_disks(self, tmp_path: Path) -> None:
         """Regression test: a real (non-singleton) disk whose ``S(...)``
         capture isn't numeric must sort after every well-formed numeric
-        disk, not before "Disk 0" — its own ``int()`` ``ValueError``
-        fallback used to keep the numeric-disk bucket, placing it ahead
-        of every real disk via a ``-1`` placeholder instead of after them."""
+        disk, not before "Disk 0" — the ``int()`` ``ValueError`` fallback's
+        own sort key must rank it after every numeric disk, not ahead of
+        them."""
         store, layout = _write_repo_info_and_vault_key_db(tmp_path)
         path_disk0 = "PC-uid/ActiveBackup_2026-01-01/D(AAAA)S(0).img"
         path_disk1 = "PC-uid/ActiveBackup_2026-01-01/D(BBBB)S(1).img"

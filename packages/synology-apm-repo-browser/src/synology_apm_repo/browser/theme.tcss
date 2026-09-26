@@ -83,6 +83,10 @@ Screen {
     padding: 0 1;
 }
 
+#detail-scroll:focus {
+    border: solid $accent;
+}
+
 #detail {
     width: 100%;
     height: auto;

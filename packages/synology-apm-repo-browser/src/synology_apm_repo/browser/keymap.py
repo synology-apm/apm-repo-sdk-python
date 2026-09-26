@@ -1,20 +1,6 @@
 """Shared key bindings — centralized here so every screen offers the same
 muscle-memory, and so the whole keymap is a single place to check against
-rather than re-derived per screen.
-
-Several handlers/actions across this package (lifecycle handlers like
-``UnitScreen.on_unmount``, actions like
-``HexPreviewScreen.action_page_forward``) are declared ``async def``
-purely so they can ``await`` an SDK call directly, in place, rather than
-dispatching to a ``@work`` method — legitimate only for a call bounded
-enough that no separate loading feedback/cancellation point is needed
-(see ``browser/README.md``'s Screen and Worker Conventions). This is
-legal because Textual dispatches both
-through ``textual._callback.invoke()``, which does ``result =
-callback(...)`` then ``if isawaitable(result): result = await result`` —
-so a coroutine function is awaited to completion rather than left as an
-un-awaited coroutine, exactly like any other handler.
-"""
+rather than re-derived per screen."""
 
 from __future__ import annotations
 

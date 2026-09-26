@@ -1,13 +1,10 @@
 """``synology-apm-repo-cli key <repo> --key <str>`` — verify a key string against a
 repository. ``gcm_ok`` alone is the whole answer to "is this key
-correct" — a successful AES-256-GCM authentication tag is already
-cryptographic proof of the key for every chunk in the repository, not a
-probabilistic check — there is no separate, deeper check this command
-runs. A caller who additionally
-wants every chunk *read* verified against its stored fingerprint should
-reach for ``verify --level full`` or ``DedupRepo.open(...,
-verify_fingerprint=True)`` directly — a data-integrity property of
-reads, not of this key.
+correct": a successful AES-256-GCM authentication tag is cryptographic
+proof of the key for every chunk, not a probabilistic check. To also
+verify every chunk *read* against its stored fingerprint, use ``verify
+--level full`` or ``DedupRepo.open(..., verify_fingerprint=True)``
+directly.
 """
 
 from __future__ import annotations
@@ -67,15 +64,10 @@ async def key(
         try:
             verification = await repository.set_key(key_string)
         except ExceptionGroup as exc:
-            # Repository.set_key() raises this only when the key itself
-            # verified fine but reopening/closing one specific
-            # already-opened sibling catalog independently failed --
-            # set_key() records key_status from verification.ok before
-            # raising this ExceptionGroup, so repository.key_status is
-            # already VERIFIED/INVALID by the time this is caught, and
-            # this is a genuinely accepted key with a partial cleanup
-            # failure alongside it, not a rejected one. Warn rather than fail --
-            # same posture as the TUI's own KeyDialog._verify.
+            # Raised only when the key itself verified fine but reopening
+            # one sibling catalog independently failed — a genuinely
+            # accepted key with a partial cleanup failure, not a rejected
+            # one. Warn rather than fail, same as the TUI's KeyDialog._verify.
             err_console.print(f"[yellow]warning: {exc}[/yellow]")
             maybe_verification = repository.key_verification
             assert maybe_verification is not None  # set_key() always sets this before raising

@@ -66,11 +66,7 @@ _MAX_VISITS = 200
 # recording.py) forward aclose() to whatever they wrap, so Session.close()
 # always reaches a real S3Store/AzureStore's own aclose() -- regardless of
 # whether trace= is passed (every smoke tool here always does) -- and
-# closes its aiohttp connector correctly. Without that forwarding,
-# Session.close()'s isinstance(store, AsyncCloseable) check would find no
-# aclose() on the wrapper at all (@runtime_checkable only looks at method
-# presence), and the real connector would never be closed. See git log for
-# the investigation that found and fixed the gap.
+# closes its aiohttp connector correctly.
 
 
 @dataclass
@@ -127,9 +123,7 @@ class RepoInfo:
     structurally cannot see a sibling ``@ActiveProtectKey`` two levels
     up, even with ``storage/layout.py``'s narrowed-root key-tree fix
     (which only helps a *remote* narrowed rescan sharing the same,
-    already-broad ``store`` instance). See the project's plan file for
-    the proper fix (a Repository/Catalog hierarchy rename) this
-    sidesteps for now."""
+    already-broad ``store`` instance)."""
 
     @property
     def broad_repo_ref(self) -> str:
@@ -241,49 +235,30 @@ async def pick_workload_with_retry(
     *,
     prefer: Callable[[Node], bool] | None = None,
 ) -> tuple[tuple[RepoInfo, Workload, Version, UnitProvider, Node] | None, bool]:
-    """Try every ``(workload, version)`` pair in ``entries`` -- not just
-    the first with a non-empty version list -- giving up only once every
-    combination's own ``provider()``/``find_leaf()`` has failed or found
-    nothing. Mirrors ``_first_working_ref``'s own retry, for the identical
-    "a sibling version might still work" reason its docstring gives: a
-    single version's known data gap (a metadata-only fragment, an
-    unsupported format, ...) must not doom the whole group when another
-    version might still work.
+    """Try every ``(workload, version)`` pair in ``entries``, not just the
+    first with a non-empty version list, since a single version's known
+    data gap must not doom the whole group when a sibling version might
+    still work.
 
-    Each entry carries the ``CatalogId`` of the specific ``Catalog`` its
-    ``workload``/``versions`` came from -- this must be resolved back to a
-    live ``Catalog`` fresh, every time, rather than re-deriving "some
-    catalog" from ``ri.repo.catalogs()[0]`` (wrong the moment a repository
-    holds more than one ``Catalog``) or caching the ``Catalog`` object
-    itself (stale the moment any ``set_key()`` call touches the same
-    repository later in the same run).
+    Each entry carries the ``CatalogId`` its ``workload``/``versions``
+    came from, resolved back to a live ``Catalog`` fresh every time via
+    ``resolve_catalog`` (see that function's own docstring for why).
 
-    ``Catalog.versions()`` itself never pre-filters by resolvability --
-    so this doesn't re-filter by ``version.meta is not None`` on top of
-    that, which would silently exclude *every* GW/M365 version (SaaS
-    versions carry no ``VersionMeta`` at all) and second-guess PC/PS's
-    own, different resolution check.
+    ``Catalog.versions()`` never pre-filters by resolvability, so this
+    doesn't re-filter by ``version.meta is not None`` either -- that would
+    silently exclude every GW/M365 version, which carries no
+    ``VersionMeta`` at all.
 
-    Returns ``(result, any_truncated)``. ``result`` carries the winning
-    candidate's already-fetched ``provider``/``leaf`` alongside it, so the
-    caller's own ``ctx.call`` records that real work instead of repeating
-    it -- a candidate's own data-gap failure is swallowed here exactly
-    like ``_first_working_ref``'s, invisible to the per-domain report the
-    same way a rejected sibling already is there. ``any_truncated`` is
-    ``True`` if ``find_leaf``'s own search bound cut short at least one
-    tried candidate, reported even when ``result`` isn't ``None``, and
-    worth surfacing to the caller's report either way, distinct from every
-    candidate's tree genuinely, fully walked and found empty.
+    Returns ``(result, any_truncated)``: ``result`` carries the winning
+    candidate's already-fetched ``provider``/``leaf`` so the caller's own
+    ``ctx.call`` records that work instead of repeating it; ``any_truncated``
+    is ``True`` if ``find_leaf``'s search bound cut short at least one
+    tried candidate, even when a match was still found.
 
-    Closes every rejected candidate's own provider immediately (device/PC-
-    PS's own ``target.db`` SqliteSource, most notably), same "whoever
-    builds one outside ``Repository.provider()``'s own tracking owns
-    closing it" contract as ``tests/CLAUDE.md``'s "Closing a provider
-    built directly against a repository" -- this walk can try many
-    candidates before finding a winner (or none at all), and leaving a
-    rejected one open until ``Repository.close()`` eventually gets to it
-    isn't good enough for a search that can touch many candidates in one
-    repository's own turn."""
+    Closes every rejected candidate's own provider immediately, per
+    ``tests/CLAUDE.md``'s "Closing a provider built directly against a
+    repository" -- a search that tries many candidates can't wait for
+    ``Repository.close()`` to eventually reach each one."""
     any_truncated = False
     for ri, catalog_id, workload, versions in entries:
         for version in versions:
@@ -422,44 +397,26 @@ async def list_representative_refs(
 ) -> tuple[list[RepresentativeRef], list[str]]:
     """One representative, real leaf per ``(sample, workload type)`` pair
     -- ``cli/__main__.py`` and ``browser/__main__.py``'s entire bootstrap
-    step. Flattened across every workload type in one pass rather than
-    split by domain the way ``sdk/``'s phases are: neither ``cli/`` nor
-    ``browser/`` smoke needs per-type-specific leaf kinds (a disk image
-    vs. a plain file) the way ``sdk/``'s device/fs domains do, just *some*
-    meaningful leaf to exercise a command/screen against. A repository that
-    isn't readable (unkeyed/wrong-keyed) is skipped, same as ``sdk/``'s
-    own bootstrap.
-
-    Processes one sample entry's repositories at a time -- discover,
-    resolve this entry's own leaf groups, then close every one of its
-    repositories via ``session.close_repo()`` before moving to the next --
-    same shape and rationale as ``sdk/__main__.py``'s own
-    ``_process_entry``: no repository's own caches or its workloads'
-    unpaginated ``Catalog.versions()`` result need to stay resident past
-    its own turn. Differs from that function only in what it keeps around
-    meanwhile: one picked leaf per group, discarding the rest immediately,
-    rather than every version list for later per-domain checks (see
-    ``_process_entry``'s own docstring).
+    step. Flattened across every workload type in one pass (unlike
+    ``sdk/``'s per-domain phases), since neither needs per-type-specific
+    leaf kinds, just *some* meaningful leaf to exercise a command/screen
+    against. A repository that isn't readable (unkeyed/wrong-keyed) is
+    skipped, same as ``sdk/``'s own bootstrap. Processes and closes one
+    sample entry's repositories at a time, same shape as
+    ``sdk/__main__.py``'s ``_process_entry``, keeping only one picked leaf
+    per group rather than every version list.
 
     ``exclude_unreopenable_by_cli``, when set, also skips any
     ``RemoteStorageSample``-derived repository: the real CLI has no
-    raw-credential flag, only ``--profile <name>`` for a saved profile, so
-    a direct-credential sample can't be reopened by a fresh subprocess at
-    all. ``cli/__main__.py`` sets this; ``sdk/``'s own bootstrap (which
+    raw-credential flag, only ``--profile <name>`` for a saved profile.
+    ``cli/__main__.py`` sets this; ``sdk/``'s own bootstrap (which
     doesn't call this function) and ``browser/__main__.py`` (which drives
     ``ConnectDialog`` directly, profile or direct alike) don't.
 
-    Returns ``(refs, skip_reasons)`` -- ``skip_reasons`` is one line per
-    ``(sample, workload type)`` this bootstrap couldn't pick a ref for
-    (printed live as it happens, same as before), handed back so a caller
-    that has its own ``SmokeContext`` by the time this returns can record
-    each one as a real ``ctx.skip(...)`` -- this function runs *before*
-    either ``cli/``'s or ``browser/``'s own ``SmokeContext`` exists, so it
-    can't record them itself, and a bare ``print()`` alone would leave
-    real, cli/browser-specific coverage gaps invisible in ``index.md``,
-    visible only in whatever terminal happened to run the tool.
-    ``skip_reasons``' order reflects entry/repo processing order, not
-    skip kind -- nothing downstream branches on it, only its contents.
+    Returns ``(refs, skip_reasons)`` -- one skip-reason line per
+    ``(sample, workload type)`` this bootstrap couldn't pick a ref for, so
+    a caller with its own ``SmokeContext`` (which doesn't exist yet at
+    this point) can record each as a real ``ctx.skip(...)``.
     """
     kinds = leaf_kinds if leaf_kinds is not None else frozenset(UnitKind)
     refs: list[RepresentativeRef] = []
@@ -520,22 +477,11 @@ async def resolve_catalog(repo: Repository, catalog_id: CatalogId) -> Catalog:
     changed out from under this run, worth a loud failure rather than a
     silent skip.
 
-    Deliberately the real ``Repository.catalog_by_id()``, not a fresh
-    ``repo.catalogs()`` listing filtered down to one match: that method
-    already skips opening every sibling it can rule out by ``repo_id``
-    alone, and exists precisely for "re-fetching one already-known
-    catalog after ``set_key()``." ``Repository.set_key()`` closes and
-    replaces every already-opened ``DedupRepo`` -- documented to make a
-    stale ``Catalog`` a caller already holds fail cleanly on its next use
-    rather than silently keep serving the old key's data -- which
-    silently turns a ``Catalog`` reference cached here from an earlier
-    point in a run stale the moment ``catalog.py``'s own wrong-key/restore
-    round trip (or any other ``set_key()`` call) runs against the same
-    repository later in the same process -- a stale reference's own next use
-    doesn't raise cleanly the way that's documented to happen; it surfaces
-    several layers down as a raw ``aiosqlite`` "no active connection"
-    error instead. Grouping helpers in this module key on ``CatalogId``
-    rather than a ``Catalog`` object for exactly this reason."""
+    Grouping helpers in this module key on ``CatalogId`` rather than a
+    cached ``Catalog`` object, since ``Repository.set_key()`` closes and
+    replaces every already-opened ``DedupRepo`` -- a ``Catalog`` cached
+    from earlier in the run would surface a raw ``aiosqlite`` "no active
+    connection" error on its next use instead of raising cleanly."""
     catalog = await repo.catalog_by_id(catalog_id)
     if catalog is None:
         raise LookupError(f"catalog {catalog_id!r} no longer present on {repo!r}")
@@ -549,20 +495,17 @@ async def _first_working_ref(
     kinds: frozenset[UnitKind],
 ) -> RepresentativeRef | None:
     """Tries every ``(workload, version)`` pair in turn, since a single
-    version's known data gap (a metadata-only fragment, an unsupported
-    format, ...) shouldn't doom the whole group when a sibling version
-    might still work -- the same retry shape ``pick_workload_with_retry``
-    gives ``sdk/``'s own device/fs/saas domains.
+    version's known data gap shouldn't doom the whole group when a sibling
+    version might still work -- the same retry shape
+    ``pick_workload_with_retry`` gives ``sdk/``'s own device/fs/saas
+    domains.
 
-    Each entry carries the ``CatalogId`` of the specific ``Catalog`` its
-    ``workload``/``versions`` actually came from -- a repository can hold more
-    than one ``Catalog``, and the same ``type_hint`` can appear in more
-    than one of them (a real, non-empty workload in one, an empty one of
-    the same type in another); ``Catalog.provider()`` doesn't validate
-    that a ``Version`` belongs to it, so re-deriving "some catalog" from
-    ``ri.repo.catalogs()[0]`` here instead of resolving this entry's own
-    ``catalog_id`` (see ``resolve_catalog``) would silently build a
-    provider against the wrong catalog for any entry beyond the first.
+    Each entry carries the ``CatalogId`` its ``workload``/``versions``
+    came from, resolved back to a live ``Catalog`` via ``resolve_catalog``
+    rather than re-derived from ``ri.repo.catalogs()[0]`` -- a repository
+    can hold more than one ``Catalog`` with the same ``type_hint``, and
+    ``Catalog.provider()`` doesn't validate that a ``Version`` belongs to
+    it.
 
     Closes every rejected candidate's own provider immediately, same as
     ``pick_workload_with_retry``. Unlike that function, the *winning*

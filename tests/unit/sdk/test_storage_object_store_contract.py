@@ -1,21 +1,15 @@
 """Cross-backend ``ObjectStore`` contract tests: the same test bodies, run
-against ``LocalFsStore``, ``S3Store`` (backed by an in-memory fake client,
-``_FakeS3Client`` below — no real or emulated network server, the same
-house style ``test_storage_s3.py``'s own copy of this class uses),
-``AzureStore`` (backed by a
-mocked async ``BlobServiceClient`` — deliberately chosen over
-requiring a live Azurite instance), and ``SmbStore`` (backed by a mocked
-``smbclient`` module — deliberately chosen over spinning up a real SMB
-server, the same trade-off ``AzureStore``'s own fake already makes here).
-Four backends behaving differently
+against ``LocalFsStore``, ``S3Store`` (``_FakeS3Client`` below), ``AzureStore``
+(a mocked async ``BlobServiceClient``), and ``SmbStore`` (a mocked
+``smbclient`` module) — each backed by an in-memory fake rather than a live
+server or emulator. Four backends behaving differently
 here would be a bug, not an expected difference — **with one disclosed
 exception**: ``listdir`` on an absent "directory". Object storage has
 no directory entities to check for (a prefix with zero matches and one
 that was "never created" are the same observable state), so
 ``S3Store``/``AzureStore`` return ``[]`` there while ``LocalFsStore``/
 ``SmbStore`` (real filesystems, which *do* have directory entities) raise
-``NotFoundError`` — a deliberate difference in each backend's own
-contract, and it is tested explicitly as a
+``NotFoundError`` — tested explicitly as a
 *difference*, not folded into the shared parametrized cases below.
 
 Backend-specific internals that aren't part of the generic ``ObjectStore``

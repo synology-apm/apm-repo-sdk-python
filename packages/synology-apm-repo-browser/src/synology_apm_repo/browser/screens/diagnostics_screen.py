@@ -1,19 +1,16 @@
 """``DiagnosticsScreen``: ``Repository.verify``'s ``Finding`` list —
 diagnostic-mode content, reachable from anywhere via ``v``.
 
-FULL stays screen-local (hosted on ``self``, cancelled the instant this
-screen unmounts) rather than joining ``AppModel.jobs`` the way export
-does — a FULL check's own usage pattern is "start it, wait, see the
-result" (the same blocking-foreground shape ``synology-apm-repo-cli
-verify --level full`` already has), not something a user needs to keep
-running while browsing elsewhere. It still needs to never overlap an
-export's own ``ProcessPoolExecutor``, though: ``action_run_full`` refuses
-to start while one is running (``AppModel.export_occupied``), and sets
-``AppModel.verify_full_running`` for its own duration so a `StartExport`
-in the other direction queues instead of racing it — see
+FULL stays screen-local (cancelled the instant this screen unmounts)
+rather than joining ``AppModel.jobs`` the way export does, matching
+``synology-apm-repo-cli verify --level full``'s own blocking-foreground
+shape. It must never overlap an export's own ``ProcessPoolExecutor``:
+``action_run_full`` refuses to start while one is running
+(``AppModel.export_occupied``), and sets ``AppModel.verify_full_running``
+for its duration so a `StartExport` queues instead of racing it — see
 ``core/app/update.py``'s ``VerifyFullStarted``/``VerifyFullFinished``
-handling. QUICK never touches any of this: it doesn't use a process pool,
-so it's re-run fresh on every mount exactly as before.
+handling. QUICK doesn't use a process pool, so it re-runs fresh on every
+mount.
 """
 
 from __future__ import annotations
@@ -59,22 +56,16 @@ class DiagnosticsScreen(NavigableScreen):
     def __init__(self) -> None:
         super().__init__()
         #: The most recent tick from a running FULL check's own
-        #: ``ProgressMeter`` — only ever set while ``level is
-        #: VerifyLevel.FULL``; QUICK never touches it. Read by
-        #: ``_verify_status_text``, the debounced spinner's own ``base()``.
+        #: ``ProgressMeter`` -- only set while ``level is VerifyLevel.FULL``.
+        #: Read by ``_verify_status_text``.
         self._verify_progress: Progress | None = None
         #: True for the whole duration of either level's own ``_run``
-        #: worker on this screen instance -- QUICK included. ``_run``'s
-        #: own ``@work`` has no ``group``/``exclusive`` of its own, so
-        #: without this, pressing ``f`` while the QUICK check from
-        #: ``on_mount`` is still running would start a second, genuinely
-        #: concurrent worker racing the first one's writes into
+        #: worker -- guards against a second concurrent worker (``_run``'s
+        #: ``@work`` has no group/exclusive of its own) racing writes into
         #: ``#diag-status``/``#diag-table``.
         self._verify_running = False
-        #: The most recent ``verify()`` result and the level it ran at —
-        #: kept so ``refresh_for_verbose_mode`` can re-render the same
-        #: findings (showing/hiding each instance's own ``ref``) without
-        #: re-running the check itself.
+        #: The most recent ``verify()`` result and level, so
+        #: ``refresh_for_verbose_mode`` can re-render without re-running.
         self._last_findings: list[Finding] | None = None
         self._last_level: VerifyLevel | None = None
 
@@ -86,10 +77,8 @@ class DiagnosticsScreen(NavigableScreen):
     def on_mount(self) -> None:
         table = self.query_one("#diag-table", DataTable)
         table.add_columns(*DIAGNOSTICS_COLUMNS)
-        # init=False: this screen's on_mount already runs a fresh QUICK
-        # check unconditionally below, so the watch only needs to fire on
-        # a genuine later toggle, not the initial subscribe -- same
-        # reasoning as UnitScreen's/BrowseScreen's own identical call.
+        # init=False: on_mount already runs a fresh QUICK check
+        # unconditionally, so the watch only needs to fire on a later toggle.
         self.watch(self.app, "verbose", self.refresh_for_verbose_mode, init=False)
         self._verify_running = True
         self._run(VerifyLevel.QUICK)
@@ -103,46 +92,31 @@ class DiagnosticsScreen(NavigableScreen):
             self._show_findings(self._last_findings, self._last_level)
 
     def action_run_full(self) -> None:
-        # Checked before the cross-screen model checks below, not
-        # combined with them: this one guards against QUICK (from
-        # on_mount) or an earlier FULL still running on *this* screen
-        # instance, a narrower and separate hazard from the
-        # cross-screen/cross-kind ones the model-level checks cover.
+        # Guards against QUICK (from on_mount) or an earlier FULL still
+        # running on *this* screen instance -- narrower than the
+        # cross-screen checks below.
         if self._verify_running:
             show_error(self, "#diag-status", DIAGNOSTICS_QUICK_STILL_RUNNING_WARNING)
             return
         model = self.app_state.store.model
-        # Checked separately, not one combined `or`, so the message
-        # actually names what's blocking -- "an export is running" would
-        # be flatly wrong when the real blocker is another already-
-        # running FULL check (this screen or another DiagnosticsScreen
-        # instance), and vice versa.
+        # Checked separately so the error message names the actual blocker.
         if model.verify_full_running:
             show_error(self, "#diag-status", DIAGNOSTICS_FULL_ALREADY_RUNNING_WARNING)
             return
         if model.export_occupied:
             show_error(self, "#diag-status", DIAGNOSTICS_EXPORT_BUSY_WARNING)
             return
-        # Set/dispatched here, synchronously, immediately after every
-        # check above passes -- not from inside _run's own worker body.
-        # _run is a @work-decorated worker: calling it only *schedules*
-        # the coroutine, so the actual repo.verify() call (and any
-        # dispatch inside it) doesn't run until a later event-loop turn.
-        # Setting either flag there instead would leave a window where
-        # two action_run_full calls in quick succession -- a fast
-        # double-`f`, or two different DiagnosticsScreen instances --
-        # could both pass the guards above before either one's flag-set
-        # actually lands, exactly the race these flags exist to prevent.
-        # Checking and flag-setting must happen in the same synchronous
-        # stretch of code, with no ``await`` in between.
+        # Set synchronously here, not inside _run's own worker body: _run
+        # is @work-decorated, so calling it only schedules the coroutine
+        # -- setting the flag inside would leave a window for a fast
+        # double-`f` (or two screen instances) to both pass the guards
+        # above first.
         self._verify_running = True
         self.app_state.store.dispatch(VerifyFullStarted())
         self._run(VerifyLevel.FULL)
 
-    # The sink's base text depends on level: DIAGNOSTICS_FULL_RUNNING_STATUS's
-    # own "this may take a while" warning is what a still-running full
-    # check shows past the 300ms debounce, rather than a separate eager,
-    # undebounced write of its own outside this worker.
+    # The sink's base text differs by level -- FULL's own
+    # DIAGNOSTICS_FULL_RUNNING_STATUS warning shows past the 300ms debounce.
     @work(sink=lambda self, level: StaticTextSink(self, "#diag-status", base=lambda: self._verify_status_text(level)))
     async def _run(self, level: VerifyLevel) -> None:
         repo = self.app_state.current_repo
@@ -159,12 +133,9 @@ class DiagnosticsScreen(NavigableScreen):
             show_error(self, "#diag-status", str(exc))
             return
         finally:
-            # Always fires -- success, cancelled (Esc pops this screen),
-            # or errored -- so neither flag ever gets stuck True:
-            # _verify_running (for either level, so a next QUICK-on-
-            # remount or FULL-on-f can actually run) and, FULL only,
-            # AppModel.verify_full_running (so a queued export can
-            # always eventually start).
+            # Always fires, so neither flag gets stuck True: _verify_running
+            # (so a next QUICK/FULL can run) and, FULL only,
+            # AppModel.verify_full_running (so a queued export can start).
             self._verify_running = False
             if level is VerifyLevel.FULL:
                 self.app_state.store.dispatch(VerifyFullFinished())
@@ -185,20 +156,12 @@ class DiagnosticsScreen(NavigableScreen):
 
     def _show_findings(self, findings: list[Finding], level: VerifyLevel) -> None:
         """Renders ``findings`` grouped/sorted the same way the CLI's own
-        ``verify`` command does (via ``group_findings``/``sort_key`` —
-        ``findings`` is expected already sorted, see ``_run``) instead of
-        one flat, ungrouped row per ``Finding``: a header row per group
-        (stage/symptom populated, path blank, detail = template + count)
-        followed by one indented instance row per member (path/
-        variable_parts, ``ref`` appended only in verbose mode) —
-        the ``DataTable``-shaped equivalent of that command's own
-        ``"[symptom] stage: template (count)"`` header plus per-instance
-        lines. Every content-derived value (path, template, variable_parts,
-        ref) is escaped via ``safe()`` before reaching a cell, matching
-        every other cell-producing site in this package; stage/symptom are
-        fixed vocabulary, left unescaped, the same split the CLI's own
-        ``_render_human`` documents.
-        """
+        ``verify`` command does (``group_findings``/``sort_key`` —
+        ``findings`` expected already sorted): a header row per group
+        (detail = template + count) followed by an indented row per
+        instance (``ref`` appended only in verbose mode). Every
+        content-derived value is escaped via ``safe()`` before reaching a
+        cell; stage/symptom are fixed vocabulary, left unescaped."""
         table = self.query_one("#diag-table", DataTable)
         table.clear()
         groups = group_findings(findings)
@@ -216,9 +179,8 @@ class DiagnosticsScreen(NavigableScreen):
         if problems:
             status.update(f"[red]{len(problems)} finding(s)[/red] in {group_count} at level={level.value}")
         elif findings:
-            # Not a problem left unresolved -- every finding here already
-            # passed self-repair (Symptom.REPAIRED_VIA_PARITY), just still
-            # shown as "clean" rather than hidden.
+            # Every finding here already passed self-repair
+            # (Symptom.REPAIRED_VIA_PARITY), just still shown as "clean".
             status.update(
                 f"[green]clean[/green] ({len(findings)} self-repaired via parity) in {group_count} "
                 f"at level={level.value}"

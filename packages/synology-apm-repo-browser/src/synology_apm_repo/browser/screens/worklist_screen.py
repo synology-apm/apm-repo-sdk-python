@@ -27,39 +27,21 @@ from synology_apm_repo.browser.widgets.filter_debounce import Debouncer
 
 
 class WorklistScreen(ModalScreen[None]):
-    """A centered dialog box (same treatment as ``KeyDialog``/
-    ``ExportScreen``), not a full-viewport screen — ``ModalScreen``
-    truncates the App-level binding chain at itself, so only the bindings
-    declared here are reachable while this dialog is open. Keeps
-    ``COMMON_BINDINGS`` (``q``/``d``/``?``), matching a working screen
-    with ongoing state shown as a dialog, not a one-shot form like
-    ``KeyDialog``/``ConnectDialog`` (which skip it) — but including the
-    ``Binding`` alone isn't enough on a modal: Textual's own action
-    dispatch runs the method on whichever node's own ``BINDINGS`` the key
-    was actually found on, never bubbling further once the chain is
-    truncated here — without ``action_quit_app``/``action_toggle_verbose``/
-    ``action_show_help`` below, each delegating explicitly to the App's
-    own real implementation, ``q``/``d``/``?`` would be silently
-    swallowed while this dialog is open despite the ``Binding`` being
-    present. ``j``/``k`` are re-declared directly (forwarding to the
-    ``DataTable``'s own cursor actions via
-    ``_shared.forward_to_focused``, shared with ``NavigableScreen``'s own
-    identical need) since this class doesn't inherit ``NavigableScreen``
-    — plain arrow keys keep working regardless, via ``DataTable``'s own
-    built-in bindings. None of ``BINDINGS``' own ``show`` flags matter
-    visually here, unlike a real ``NavigableScreen`` -- this dialog has
-    no ``Footer`` at all, matching every other modal in this package; the
-    *actual* visible key hint is ``WORKLIST_HINT``, its own plain string in
-    ``#status-bar``."""
+    """A centered dialog box, not a full-viewport screen -- ``ModalScreen``
+    truncates the App-level binding chain here, so ``q``/``d``/``?``
+    need explicit ``action_quit_app``/``action_toggle_verbose``/
+    ``action_show_help`` delegates below, or Textual would silently
+    swallow them despite ``COMMON_BINDINGS`` being inherited. ``j``/``k``
+    are re-declared directly (forwarding to the ``DataTable``'s cursor
+    actions) since this class doesn't inherit ``NavigableScreen``. No
+    ``Footer``, matching every other modal here; ``WORKLIST_HINT`` in
+    ``#status-bar`` is the visible key hint instead."""
 
     DEFAULT_CSS = (
         modal_box_css("WorklistScreen", width=100)
         + """
-    /* Overrides modal_box_css's own fixed 100-cell width: a 7-column
-    DataTable (Name/Size/Progress/Speed/ETA/Elapsed/Status) needs real
-    room to breathe, especially Name for a long unit filename -- a
-    percentage of the actual terminal width scales far better here than
-    any single fixed cell count would. */
+    /* Overrides modal_box_css's fixed 100-cell width: the 7-column
+    DataTable needs room that scales with terminal width. */
     WorklistScreen > Vertical {
         width: 92%;
         height: auto;
@@ -78,10 +60,8 @@ class WorklistScreen(ModalScreen[None]):
 
     def __init__(self) -> None:
         super().__init__()
-        # Armed in on_mount, once this screen actually has a real event
-        # loop to arm a timer on -- Debouncer arms its timer via
-        # screen.set_timer, which needs the App's event loop already
-        # running.
+        # Armed in on_mount, once this screen has a real event loop --
+        # Debouncer arms its timer via screen.set_timer.
         self._refresh_debounce: Debouncer | None = None
 
     def compose(self) -> ComposeResult:
@@ -95,17 +75,10 @@ class WorklistScreen(ModalScreen[None]):
         table.cursor_type = "row"
         self._refresh_debounce = Debouncer(self, self._refresh)
         self._refresh()  # immediate first paint -- see the watch below's own init=False
-        # Replaces a fixed 0.5s poll (plus the snapshot-diff it needed
-        # purely to skip repainting when nothing had changed between
-        # ticks): this only fires on a genuine jobs mutation
-        # (App.mutate_reactive, from start/update/finish/cancel), the
-        # same mechanism NavigableScreen's own breadcrumb tasks-hint
-        # watch uses, so the diff is no longer needed -- every firing
-        # already represents a real change. Still debounced rather than
-        # calling _refresh directly: ProgressMeter's own default 0.1s
-        # throttle can push jobs updates faster than the fixed-column
-        # DataTable rebuild below is worth redoing, well past what the
-        # old 0.5s poll ever allowed through.
+        # Fires only on a genuine jobs mutation (App.mutate_reactive), so
+        # every firing is a real change. Still debounced since
+        # ProgressMeter's 0.1s throttle can push updates faster than the
+        # DataTable rebuild is worth redoing.
         self.watch(self.app, "jobs", self._refresh_debounce.trigger, init=False)
 
     def _refresh(self) -> None:
@@ -130,19 +103,12 @@ class WorklistScreen(ModalScreen[None]):
                 job.status,
                 key=str(job.id),
             )
-        # No Footer on this screen (matching every other modal in this
-        # package), so #status-bar is the only place a key hint can show
-        # at all -- WORKLIST_HINT covers the non-empty case, the same
-        # role ExportScreen's own permanent #status-bar ("b: continue in
-        # background...") already plays there.
         self.query_one("#status-bar", Static).update(WORKLIST_EMPTY_STATUS if not jobs else WORKLIST_HINT)
 
     def action_dismiss_worklist(self) -> None:
         self.app.pop_screen()
 
-    # -- COMMON_BINDINGS delegates -- see the class docstring for why
-    # the Binding alone (inherited into this screen's own BINDINGS) isn't
-    # enough on a modal; each of these must exist here too.
+    # -- COMMON_BINDINGS delegates -- see the class docstring.
     def action_quit_app(self) -> None:
         delegate_common_action(self, "quit_app")
 
@@ -169,8 +135,7 @@ class WorklistScreen(ModalScreen[None]):
         app = cast(ApmRepoBrowserApp, self.app)
         if JobId(job_id) in app.jobs:
             app.store.dispatch(CancelJobRequested(job_id=JobId(job_id)))
-            # update()'s own CancelJobRequested handler applies synchronously
-            # (before dispatch() returns), so this reflects the new
+            # update() applies synchronously, so this reflects the new
             # status/removal immediately rather than waiting for the
-            # debounced watch above to pick it up.
+            # debounced watch above.
             self._refresh()

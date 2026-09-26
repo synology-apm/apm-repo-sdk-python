@@ -1,10 +1,7 @@
 """``typer_async`` — the one place every CLI command's ``asyncio.run()``
-boilerplate lives, instead of each command module defining its own
-``async def _run(): ...; asyncio.run(_run())`` wrapper; Typer itself has
-no native async support (it inspects a command's signature to build the
-CLI, then calls it as a plain sync function), so every ``async def``
-command callback still needs a synchronous entry point. It's also the
-one chokepoint every command callback passes through.
+boilerplate lives. Typer calls each callback as a plain sync function, so
+every ``async def`` command needs a synchronous entry point; this is also
+the one chokepoint every command callback passes through.
 """
 
 from __future__ import annotations
@@ -24,18 +21,11 @@ _T = TypeVar("_T")
 
 def typer_async(func: Callable[_P, Coroutine[Any, Any, _T]]) -> Callable[_P, _T]:
     """Wraps an ``async def`` Typer command callback so Typer can register
-    and call it like any other command. ``functools.wraps`` preserves the
-    original function's signature (via ``__wrapped__``), which is what
-    Typer actually inspects to build ``--options``/arguments — the
-    wrapper itself only ever needs ``*args``/``**kwargs``.
-
-    An exception that reaches here without becoming a ``typer.Exit``
-    (every expected failure already does, via ``fail()``/``unwrap()``) is
-    treated as a bug and handed to ``fail_unexpected`` instead of reaching
-    the terminal as a raw traceback. ``KeyboardInterrupt``/
-    ``asyncio.CancelledError`` aren't ``Exception`` subclasses, so Ctrl-C
-    handling (``export.py``'s own two-press cancel, or the plain default
-    for every other command) is unaffected by this."""
+    and call it like a plain sync function. Any exception that escapes
+    without becoming a ``typer.Exit`` is treated as a bug and handed to
+    ``fail_unexpected``; ``KeyboardInterrupt``/``asyncio.CancelledError``
+    aren't ``Exception`` subclasses, so Ctrl-C handling elsewhere is
+    unaffected."""
 
     @functools.wraps(func)
     def wrapper(*args: _P.args, **kwargs: _P.kwargs) -> _T:

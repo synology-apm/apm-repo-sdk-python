@@ -1,30 +1,19 @@
-"""``AzureStore`` — a real, executable ``ObjectStore`` implementation for
-Azure Blob Storage, matching the ``s3`` module's scope, structure, and
-contract exactly (same four methods, same EOF/NotFoundError semantics, same
-lazy-import pattern) — this one only differs where the Azure SDK's own
-shapes force a difference. ``list_containers`` mirrors that module's
-``list_buckets()``.
+"""``AzureStore`` — an ``ObjectStore`` implementation for Azure Blob
+Storage, matching ``S3Store``'s scope, structure, and contract (same four
+methods, same EOF/``NotFoundError`` semantics, same lazy-import pattern).
+``list_containers`` mirrors that module's ``list_buckets()``.
 
-The one genuine shape difference from ``S3Store``: Azure's hierarchical
-listing (``azure.storage.blob.ContainerClient.walk_blobs``) already
-returns one unified sequence of ``BlobProperties``/``BlobPrefix`` entries,
-so there's no separate paginated "common prefixes" collection to merge in
-the way S3's ``CommonPrefixes``/``Contents`` split requires; the SDK's own
-``ItemPaged``/``AsyncItemPaged`` iterator handles continuation-token
-pagination internally too.
+Unlike S3, Azure's hierarchical listing
+(``azure.storage.blob.ContainerClient.walk_blobs``) already returns one
+unified sequence of entries, so there's no separate "common prefixes"
+collection to merge in.
 
-**Why ``azure.storage.blob.aio``**: this is network I/O, and — like
-``S3Store`` — this module sits on ``aiohttp``, where many outstanding
-round-trips genuinely overlap on one thread; that's a real gain over a
-thread-pool wrapper around a synchronous client. Its client owns an
-``aiohttp`` session that must be closed, hence ``AzureStore.aclose``, which
-``Session.close()`` calls.
-
-Every client this module builds goes through ``_with_default_timeouts``,
-which trims azure-core's batch-job-tuned defaults down to values an
-interactive caller — the TUI's connect dialog, in particular — can
-actually wait through when an endpoint is unreachable (see the
-module-level constants below for the exact values).
+This module sits on ``aiohttp`` (via ``azure.storage.blob.aio``), the same
+as ``S3Store`` — its client owns a session that must be closed, hence
+``AzureStore.aclose``. Every client built here goes through
+``_with_default_timeouts``, which trims azure-core's batch-job-tuned
+defaults to values an interactive caller can wait through (see the
+module-level constants below).
 """
 
 from __future__ import annotations
@@ -41,26 +30,19 @@ _RANGE_NOT_SATISFIABLE = 416
 _NOT_FOUND = 404
 
 # azure-core's own defaults (300s connect, 300s read, plus a handful of
-# retries) are tuned for long-running batch jobs, not an interactive "is
-# this endpoint even reachable" probe. These apply to every client this
-# module builds unless the caller already passed the same keyword
-# explicitly, in which case the caller's value wins.
+# retries) are tuned for a batch job, not an interactive reachability probe.
+# These apply unless the caller already passed the same keyword explicitly.
 _DEFAULT_CONNECTION_TIMEOUT = 5
 _DEFAULT_READ_TIMEOUT = 15
 _DEFAULT_RETRY_TOTAL = 1
 
-# Unlike storage/s3.py's own _DEFAULT_MAX_POOL_CONNECTIONS override,
-# nothing needs overriding here:
-# azure.core.pipeline.transport._aiohttp.AioHttpTransport.open() builds a
-# plain aiohttp.ClientSession() with no connector= override at all, so it
-# inherits aiohttp.TCPConnector's own default of limit=100 (global) /
-# limit_per_host=0 (unlimited, bounded only by that 100) -- already well
-# above _DEFAULT_MAX_POOL_CONNECTIONS's 32. Every sub-client this module
-# hands out (via get_blob_client()) shares that one parent
-# transport/session rather than opening its own, which is why read()'s
-# CancelledError handler has to force-close that one shared transport on
-# cancellation (no per-connection handle exists to close instead) rather
-# than just the connection the cancelled read was using.
+# No pool-size override needed here (unlike storage/s3.py's
+# _DEFAULT_MAX_POOL_CONNECTIONS): azure-core's transport builds a plain
+# aiohttp.ClientSession() with no connector override, inheriting aiohttp's
+# own default limit=100 — already above S3Store's 32. Every sub-client this
+# module hands out shares that one parent transport/session, which is why
+# read()'s CancelledError handler force-closes the whole transport rather
+# than just its own connection (see that handler).
 
 
 def _account_name_from_url(account_url: str) -> str | None:
@@ -136,13 +118,10 @@ async def _force_close_transport(service_client: Any) -> None:
 
 
 def _import_blob_service_client() -> Any:
-    """Lazy ``from azure.storage.blob.aio import BlobServiceClient``:
-    ``azure-storage-blob`` is always installed (a required dependency) but
-    pulls in a substantial import graph, and ``storage/__init__.py`` imports
-    this module unconditionally, so a module-level import would make every
-    caller of ``storage`` pay that cost even if it never touches
-    ``AzureStore``. Shared by every constructor/free function here that
-    needs it, so the choice of what to import lives in one place."""
+    """Lazy ``from azure.storage.blob.aio import BlobServiceClient`` —
+    ``storage/__init__.py`` imports this module unconditionally, so a
+    module-level import would make every caller pay its import cost even
+    when it never touches ``AzureStore``."""
     from azure.storage.blob.aio import BlobServiceClient
 
     return BlobServiceClient
@@ -214,18 +193,11 @@ class AzureStore:
                 raise NotFoundError("no such blob", ref=blob_name) from exc
             raise
         except asyncio.CancelledError:
-            # Uses the same approach as S3Store.read() for this identical
-            # hazard: Azure's async SDK gives no per-connection handle to
-            # close on cancellation, so a read large enough to split into
-            # multiple ranged GETs can leave sibling asyncio Tasks running
-            # against this store's connection pool after this coroutine is
-            # cancelled — not reachable via ``downloader``/``blob_client``
-            # at all. The only reliably-reachable handle is the top-level
-            # client's transport (``self._service_client``); closing it is
-            # blunt (every connection in the pool goes, not just this
-            # read's), but ``AioHttpTransport.open()`` lazily rebuilds a
-            # fresh session on the next request, so the store stays usable
-            # immediately afterward.
+            # Azure's async SDK gives no per-connection handle to close on
+            # cancellation, only the shared parent transport (see the
+            # module-level pool-size comment) — blunt, but
+            # AioHttpTransport.open() lazily rebuilds a fresh session on the
+            # next request, so the store stays usable immediately after.
             await _force_close_transport(self._service_client)
             raise
 

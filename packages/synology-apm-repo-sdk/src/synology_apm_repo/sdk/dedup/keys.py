@@ -2,18 +2,15 @@
 resolving the wrapped VaultKey from whichever of the two on-disk
 locations this repository's layout uses.
 
-**"Is this key correct" is answered by ``KeyMaterial.verify`` alone,
-via AES-256-GCM's own authentication tag — never by also decrypting a
-real chunk.** GCM tag success is already cryptographic proof the
-``(userKeyID, userKey)`` pair correctly unwraps the *stored*
-wrapped-VaultKey record (FORMAT-SPEC.md: vaultkey-custody); given the repository-wide
-invariant that the DEK (``vaultKey``) itself never changes
-after first initialization (also vaultkey-custody), that same VaultKey is, by
-construction, the one used for every real chunk this repository has —
-not merely "probably" so. Per-chunk fingerprint verification (decrypting
-a real chunk and comparing its SHA-256 against its stored ``.fgp``) is a
-separate, data-integrity concern this module has no part in — see
-``Pool.read_chunk``'s own ``verify_fingerprint`` option for that.
+**"Is this key correct" is answered by ``KeyMaterial.verify`` alone, via
+AES-256-GCM's own authentication tag — never by also decrypting a real
+chunk.** GCM tag success already proves the ``(userKeyID, userKey)``
+pair correctly unwraps the stored wrapped-VaultKey record
+(FORMAT-SPEC.md: vaultkey-custody); since the DEK (``vaultKey``) never
+changes after first initialization, that same VaultKey is the one used
+for every real chunk. Per-chunk fingerprint verification is a separate
+concern this module has no part in — see ``Pool.read_chunk``'s
+``verify_fingerprint`` option.
 """
 
 from __future__ import annotations
@@ -39,16 +36,14 @@ async def _vault_db_row(
     store: ObjectStore, db_path: str, query: str, params: tuple[object, ...] = ()
 ) -> sqlite3.Row | None:
     """Run ``query`` against the vault's own ``db/vault_encryption_key``
-    and return its first row (``None`` if it has none) — the one place
+    and return its first row (``None`` if none) — the one place
     ``aiosqlite.Error`` gets wrapped into ``DataCorruptError``, shared by
     ``KeyMaterial._wrapped_vault_key_from_db`` and
-    ``_probe_encrypted_from_vault_db`` below, which differ only in which
-    query they run against this same file. A half-written vault can have
-    ``db_path`` present (the caller's own ``exists()`` check passing) but
-    truncated/garbage — reported as a recognized ``ApmRepoError`` rather
-    than letting a raw sqlite3 exception escape, so callers up the stack
-    (``Session.discover()``'s own "skip, don't abort" contract) can tell
-    this apart from every other ``BaseException``.
+    ``_probe_encrypted_from_vault_db`` below. A half-written vault can
+    have ``db_path`` present but truncated/garbage — reported as a
+    recognized ``ApmRepoError`` rather than a raw sqlite3 exception, so
+    callers up the stack (``Session.discover()``'s "skip, don't abort"
+    contract) can tell the two apart.
     """
     try:
         async with await SqliteSource.from_raw_store(store, db_path) as source:
@@ -188,27 +183,18 @@ async def probe_encrypted(store: ObjectStore, layout: RepoLayout) -> bool | None
     reading its own encryption-key record directly — VAULT layout reads
     ``db/vault_encryption_key``'s latest row, OBJECT_STORE layout reads
     the key-dir marker under ``<key_root>/userKey/``. No bucket file
-    opened, no Pool scan, no key required — the repository's own
-    encryption-key record is trusted as the single source of truth here,
-    the same way ``KeyMaterial.resolve_vault_key`` trusts it to find
-    one *specific* candidate key's wrapped VaultKey, just reading the
-    record's latest entry instead of looking one up by id.
+    opened, no Pool scan, no key required.
 
     VAULT layout: ``db/vault_encryption_key`` is an append-only
-    key-rotation log, never updated in place. Its last-inserted row's
-    ``user_key_uuid`` is the currently-active key, ``"NoEncryption"`` iff
-    this vault has never been encrypted (Encryption↔NoEncryption cannot
-    toggle after first initialization — the DEK/``vaultKey`` itself never
-    changes once set, per FORMAT-SPEC.md: vaultkey-custody).
+    key-rotation log; its last-inserted row's ``user_key_uuid`` is the
+    active key, ``"NoEncryption"`` iff never encrypted (this cannot
+    toggle after first initialization — FORMAT-SPEC.md:
+    vaultkey-custody). OBJECT_STORE layout: the equivalent record lives
+    as individual objects named by ``userKeyID`` under
+    ``<key_root>/userKey/``, with the same ``"NoEncryption"`` sentinel.
 
-    OBJECT_STORE layout: the equivalent record lives as individual
-    objects named by ``userKeyID`` under ``<key_root>/userKey/`` rather
-    than db rows, with the same ``"NoEncryption"`` sentinel written at
-    bucket-creation time for an unencrypted bucket.
-
-    Returns ``None`` only if the record itself is entirely absent —
-    should not happen for a properly initialized repository — as distinct from
-    a confirmed-unencrypted repository (``False``).
+    Returns ``None`` only if the record itself is entirely absent — as
+    distinct from a confirmed-unencrypted repository (``False``).
     """
     if layout.kind is RepoKind.VAULT:
         return await _probe_encrypted_from_vault_db(store, layout)
@@ -234,11 +220,9 @@ async def _probe_encrypted_from_key_dir(store: ObjectStore, layout: RepoLayout) 
         names = await store.listdir(join_path(layout.key_root, "userKey"))
     except NotFoundError:
         return None
-    # An encrypted object-store bucket can carry an extra ``init@<userKeyID>``
-    # object alongside the real ``<userKeyID>`` one (different, smaller
-    # content than the wrapped key itself) — its purpose isn't confirmed,
-    # so its prefix is stripped before comparing rather than risking it
-    # read as a second, unaccounted-for "real key" entry.
+    # An encrypted object-store bucket can carry an extra init@<userKeyID>
+    # object alongside the real one — strip that prefix before comparing
+    # rather than counting it as a second real-key entry.
     real_names = {name.removeprefix("init@") for name in names}
     if not real_names:
         return None

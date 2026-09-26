@@ -39,13 +39,7 @@ from synology_apm_repo.sdk.storage.s3 import S3Store
 @asynccontextmanager
 async def _open_connect_dialog() -> AsyncIterator[tuple[ApmRepoBrowserApp, Pilot[None], ConnectDialog]]:
     """Mounts a fresh app, waits for the auto-opened ``ConnectDialog``
-    to appear, and yields ``(app, pilot, dialog)`` — the boilerplate every
-    ``scenario()`` closure below starts with, replacing a hand-rolled
-    ``app = ApmRepoBrowserApp()`` + ``async with app.run_test(...) as
-    pilot:`` + pause + isinstance-assert block. Still an ``async with
-    app.run_test(...)`` underneath — nothing changes about ``app``'s own
-    lifecycle, this just factors out the mount-and-wait every caller did
-    identically."""
+    to appear, and yields ``(app, pilot, dialog)``."""
     app = ApmRepoBrowserApp()
     async with app.run_test(size=(140, 45)) as pilot:
         await pilot.pause()
@@ -160,14 +154,10 @@ class TestRemoteFields:
         activate_backend_and_settle: Any,
         wait_for_status_containing: Any,
     ) -> None:
-        """An endpoint that never responds must surface a clear timeout error
-        within the dialog's own network timeout, not hang indefinitely — the
-        ``list_remote_items()`` fake here never returns, standing in for an
-        unreachable endpoint whose SDK-level connect/read timeouts
-        (``storage/s3.py``/``storage/azure.py``) didn't fire for some reason;
-        the dialog's own ``asyncio.wait_for`` wrapper is the backstop under
-        test. The dialog's network timeout is monkeypatched down so this test
-        doesn't itself take ``_NETWORK_TIMEOUT_SECONDS`` real seconds to run."""
+        """An endpoint that never responds must surface a clear timeout error,
+        not hang indefinitely — the dialog's own ``asyncio.wait_for`` wrapper
+        is the backstop under test. ``_NETWORK_TIMEOUT_SECONDS`` is
+        monkeypatched down so this test doesn't take real seconds to run."""
         monkeypatch.setattr(remote_browser_module, "_NETWORK_TIMEOUT_SECONDS", 0.05)
 
         async def fake_list(kind: BackendKind, **kwargs: object) -> list[str]:
@@ -192,14 +182,11 @@ class TestRemoteFields:
     def test_connect_dialog_azure_unresolvable_account_url_shows_inline_error_instead_of_crashing(
         self, wait_until: Any, activate_backend_and_settle: Any, wait_for_status_containing: Any
     ) -> None:
-        """Unlike ``S3Store``'s fully-lazy constructor, ``AzureStore(...)``
-        (``BlobServiceClient(...)``) validates its account_url/credential shape
-        synchronously and can raise ``ValueError`` for an account URL with no
-        path and no recognizable ``.blob.core.<...>`` subdomain — the account
-        name is genuinely unresolvable. ``_submit()`` must catch this the same
-        way it catches every other construction-time failure and show it
-        inline, not let it propagate out of the button-press handler and crash
-        the whole app."""
+        """Unlike ``S3Store``'s lazy constructor, ``AzureStore(...)``
+        validates its account_url/credential shape synchronously and can
+        raise ``ValueError`` for an unresolvable account URL — ``_submit()``
+        must catch this like every other construction-time failure and show
+        it inline, not crash the app."""
 
         async def scenario() -> tuple[bool, str]:
             async with _open_connect_dialog() as (app, pilot, dialog):

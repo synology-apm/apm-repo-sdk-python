@@ -52,14 +52,9 @@ async def _node_entry(node: Node, provider: UnitProvider, depth: int, *, show_re
     # Deliberately serial, not gathered, unlike _workload_entries/
     # _root_catalog_entries above: every UnitProvider.children()
     # implementation bottoms out on one shared local aiosqlite connection
-    # or an in-memory index, never per-child network I/O, so a synthetic
-    # benchmark modeling that single-worker-thread constraint showed zero
-    # wall-clock improvement from gathering here (concurrent variants were
-    # marginally *slower*, from scheduling overhead alone) while using
-    # 3500-4700x more peak memory at a few thousand entries -- a real
-    # regression at the item-tree scale --depth exists to bound, for no
-    # measured benefit. Re-measure before revisiting, don't assume either
-    # way.
+    # or an in-memory index, never per-child network I/O, so gathering
+    # here measured zero wall-clock gain while using 3500-4700x more peak
+    # memory at the item-tree scale --depth exists to bound.
     children: list[TreeEntry] = []
     if not node.is_leaf and depth > 0:
         children = [
@@ -82,9 +77,7 @@ def _entry_to_json(entry: TreeEntry) -> dict[str, object]:
     """``entry``'s fields as a ``--json`` payload, omitting ``kind``/``ref``/
     ``file_state``/``diagnostic`` when they carry their catalog/workload/
     version-level default rather than a real item-tree value — the same
-    omit-when-inapplicable convention ``ls --json``'s own ``_row()`` uses,
-    so the two commands' ``--json`` output can't disagree on the same
-    ``Node``'s shape."""
+    omit-when-inapplicable convention as ``ls --json``'s ``_row()``."""
     payload: dict[str, object] = {"name": entry.name, "is_leaf": entry.is_leaf}
     if entry.kind:
         payload["kind"] = entry.kind
@@ -137,17 +130,15 @@ async def _workload_entries(catalog: Catalog, *, with_versions: bool) -> list[Tr
 
 async def _catalog_tree(frame: Frame, depth: int) -> TreeEntry:
     """The catalog-level tree for a REF that landed at "catalog" or
-    "workload" — neither level is a ``Node``, so this builds its own
-    small tree rather than going through ``browse``'s ``Node``-shaped
-    walker. Starts wherever ``frame`` landed: pointing REF at a catalog
-    shows that catalog's own workloads/versions, not the whole repository
-    from the top again. Every level's names run through the same
-    collision-suffix ``disambiguate`` scheme ``ls``/``walk()`` use.
+    "workload" — neither level is a ``Node``, so this builds its own small
+    tree rather than going through ``browse``'s ``Node``-shaped walker.
+    Starts wherever ``frame`` landed: pointing REF at a catalog shows that
+    catalog's own workloads/versions, not the whole repository again.
 
     The true bare-root case (``frame.level == "root"``) is handled
-    separately by ``_root_catalog_entries`` — it has no real node/catalog/
-    workload of its own to name an entry after, so unlike this function's
-    two cases it returns a bare list, not a single wrapping ``TreeEntry``."""
+    separately by ``_root_catalog_entries``, which returns a bare list
+    rather than a single wrapping ``TreeEntry`` — it has no node/catalog/
+    workload of its own to name an entry after."""
     match frame.level:
         case "workload":
             assert frame.catalog is not None and frame.workload is not None
@@ -162,13 +153,11 @@ async def _catalog_tree(frame: Frame, depth: int) -> TreeEntry:
 
 
 async def _root_catalog_entries(repo: Repository, depth: int) -> list[TreeEntry]:
-    """The catalog-level entries at a repository's true root, as a bare list --
-    not wrapped in a synthetic ``"/"``-named ``TreeEntry``. The top-level
-    list itself is always shown (matching ``ls``'s own behavior at the
-    same level, and this function's sibling ``_catalog_tree``'s
-    "catalog"/"workload" cases, which likewise always show themselves
-    regardless of ``--depth``) — ``depth`` only gates how many further
-    levels (workloads, then versions) come with them."""
+    """The catalog-level entries at a repository's true root, as a bare
+    list — not wrapped in a synthetic ``"/"``-named ``TreeEntry``. Always
+    shown regardless of ``--depth`` (matching ``ls``); ``depth`` only
+    gates how many further levels (workloads, then versions) come with
+    them."""
     named = await named_catalogs(repo)
     if depth < 1:
         return [TreeEntry(name=name, is_leaf=False) for name, _catalog in named]
@@ -202,17 +191,10 @@ async def _result_for_frame(
                     diagnostic=fields.diagnostic,
                 )
             if frame.node == frame.provider.root():
-                # frame.node is the provider's own un-consumed root -- a
-                # placeholder label (e.g. device.py's "Devices"/"Disks",
-                # fs.py's "/") the user never typed and walk_human_ref
-                # never matched against a real segment, so (like the
-                # bare-root case above) it must not print as if it were
-                # an ordinary, addressable child. root() is documented
-                # pure/no-I/O on every provider, so calling it again here
-                # to compare is free. Peel one level: the root's own
-                # children become the top-level list (always shown, same
-                # depth budget _node_entry would give them one level
-                # down), instead of a fake heading wrapping them.
+                # frame.node is the provider's own un-consumed placeholder
+                # root (e.g. device.py's "Devices"/"Disks") — peel one
+                # level so its children become the top-level list instead
+                # of a fake heading wrapping them.
                 children = await frame.provider.children(frame.node)
                 return [
                     await _node_entry(child, frame.provider, depth, show_ref=show_ref, fs_path=fs_path)

@@ -96,15 +96,9 @@ class TestRateSmoothing:
         assert meter.rate == 0.0  # no divide-by-zero, no crash
 
     async def test_rate_stays_stable_despite_a_burst_of_near_zero_dt_calls(self) -> None:
-        """The failure mode this algorithm exists to prevent: a plain
-        per-call EWMA blends *every* call's instantaneous rate at a
-        fixed weight, regardless of how little real time that call
-        represents — a burst of near-zero-``dt`` calls (a run of
-        already-cached/fast chunks) each computes a huge ``delta/dt``
-        spike, and enough of them in a row drags the smoothed rate
-        almost entirely up to the spike value. A real moving average
-        over a time window must not move at all in response to a burst
-        that spans a negligible fraction of that window."""
+        """A burst of near-zero-``dt`` calls (a run of already-cached/fast
+        chunks) must not move the rate, since it spans a negligible
+        fraction of the averaging window."""
         clock = _FakeClock()
         meter = ProgressMeter(now=clock)
         await meter.update(_progress(0))

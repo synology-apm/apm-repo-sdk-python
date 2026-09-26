@@ -1,19 +1,14 @@
 """``ResourceTable``: the one place a live, closable SDK object (a
 ``Repository``, a ``UnitProvider``) is actually held, addressed
-everywhere else by an opaque ``RepoHandle``/``ProviderHandle`` (see
-``core/keys.py``) rather than by the object itself.
-
-This split exists because a frozen ``core.*`` model can't hold either
-type directly: both own an ``aiosqlite`` connection whose background
-thread is non-daemon, so an unclosed one leaks threads across repeated
-version visits. A handle is a plain, comparable, hashable value a model
-*can* hold; only this module ever dereferences one into the real object.
+everywhere else by an opaque ``RepoHandle``/``ProviderHandle`` rather
+than by the object itself -- a frozen ``core.*`` model can't hold either
+directly, since both own a non-daemon-thread ``aiosqlite`` connection.
 
 Repository disposal always goes through ``Session.close_repo()`` — never
 a bare ``Repository.close()``, which leaves an S3/Azure/SMB connector
 referenced by the ``Session`` for the rest of the process.
 ``tests/unit/browser/test_browser_repository_disposal_convention.py``
-enforces this structurally across the whole package, not just here.
+enforces this structurally across the whole package.
 """
 
 from __future__ import annotations
@@ -24,9 +19,8 @@ from synology_apm_repo.sdk.units.base import ClosableUnitProvider, UnitProvider
 
 
 class ResourceTable:
-    """One instance per running app (constructed alongside the single
-    ``Session``), not per screen — a repository opened by
-    ``ConnectDialog`` outlives the screen that opened it."""
+    """One instance per running app, not per screen — a repository opened
+    by ``ConnectDialog`` outlives the screen that opened it."""
 
     def __init__(self, session: Session) -> None:
         self._session = session
@@ -60,23 +54,17 @@ class ResourceTable:
 
     async def release_repo(self, handle: RepoHandle) -> None:
         """Pops ``handle`` and closes it via ``Session.close_repo()`` —
-        popped *before* the ``await``, so a concurrent duplicate release
-        of the same handle sees it already gone and does nothing, rather
-        than both racing to close the same repository."""
+        popped before the ``await``, so a concurrent duplicate release
+        sees it already gone."""
         repo = self._repos.pop(handle, None)
         if repo is not None:
             await self._session.close_repo(repo)
 
     async def release_provider(self, handle: ProviderHandle) -> None:
-        """Pops ``handle`` and closes it if it's a
-        ``ClosableUnitProvider`` — same pop-before-``await`` guard as
-        ``release_repo``. Waiting out whatever workers were still
-        reading through this provider is the caller's own
-        responsibility (a screen's own ``on_unmount`` drains its
-        still-running workers before this release runs), not this
-        method's — a provider close and the fetch of this screen's
-        *next* provider never share a connection, so nothing here needs
-        to know about that ordering."""
+        """Pops ``handle`` and closes it if it's a ``ClosableUnitProvider``
+        — same pop-before-``await`` guard as ``release_repo``. Draining
+        workers still reading through this provider is the caller's
+        responsibility, not this method's."""
         provider = self._providers.pop(handle, None)
         if provider is not None and isinstance(provider, ClosableUnitProvider):
             await provider.close()

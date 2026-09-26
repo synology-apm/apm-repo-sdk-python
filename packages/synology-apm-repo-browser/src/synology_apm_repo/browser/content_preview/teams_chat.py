@@ -7,9 +7,7 @@ from __future__ import annotations
 import dataclasses
 from html.parser import HTMLParser
 
-from synology_apm_repo.sdk.presentation.format import format_bytes
-
-from ._common import _BLOCK_TAGS, _collapse_blank_lines, _drop_trailing_unterminated_tag
+from ._common import _BLOCK_TAGS, _collapse_blank_lines, _drop_trailing_unterminated_tag, _truncation_placeholder
 
 _NO_MESSAGES_LABEL = "(no messages)"
 _SYSTEM_EVENT_FALLBACK_LABEL = "(system event)"
@@ -270,7 +268,7 @@ def render_teams_chat_preview(data: bytes, *, max_chars: int = 4000) -> str:
         return _NO_MESSAGES_LABEL
     text, dropped_older = _join_keeping_the_newest(blocks, max_chars)
     if dropped_label is not None:
-        placeholder = f"[{dropped_label}, ≥{format_bytes(len(data) - len(trimmed))}, not shown in preview]"
+        placeholder = _truncation_placeholder(dropped_label, len(data) - len(trimmed))
         text = f"{text}\n\n{placeholder}"
     if dropped_older:
         text = f"{_OLDER_MESSAGES_TRUNCATED_NOTE}{text}"

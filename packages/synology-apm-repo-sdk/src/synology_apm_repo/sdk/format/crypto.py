@@ -94,15 +94,11 @@ def decrypt_chunk(vault_key: bytes, addr: ChunkAddress, ciphertext: bytes | memo
     always allocates its own fresh plaintext output either way.
 
     **One ``Cipher`` per call, deliberately.** Each chunk's counter starts
-    from its own independently derived ``chunk_iv``, not from where
-    the previous chunk's ``update()`` left the running counter, so
-    streaming many chunks through one decryptor would silently produce
-    wrong plaintext after the first. Batching the ``Cipher`` construction
-    itself is not a win with AES-NI either: chunk ciphertext lengths vary
-    (compressed sizes, not a fixed 4096), so building a batch's counter
-    blocks needs a Python-level loop whose own overhead dwarfs whatever
-    construction cost it would save. The ``algorithms.AES`` key-schedule
-    half *is* safe to reuse across chunks — see ``_aes_algorithm``.
+    from its own independently derived ``chunk_iv``, not from where the
+    previous chunk's ``update()`` left the running counter, so streaming
+    many chunks through one decryptor would silently produce wrong
+    plaintext after the first. The ``algorithms.AES`` key-schedule half
+    *is* safe to reuse across chunks — see ``_aes_algorithm``.
     """
     if len(vault_key) != AES_KEY_SIZE:
         raise KeyMaterialError(f"vault_key must be {AES_KEY_SIZE} bytes, got {len(vault_key)}", spec=_SPEC_CHUNK)

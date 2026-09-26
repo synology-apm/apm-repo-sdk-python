@@ -1,29 +1,20 @@
 """``BrowseEffects``: the one place a ``BrowseCmd`` actually does
-anything -- fetches a repository's own catalogs, a catalog's own
-workloads, a workload's own versions, closes discarded repositories,
-sets the app-wide "current repository", prompts for a key, or shows a
-toast. Constructed once (there is exactly one ``BrowseScreen``, the
-app's own root screen), and handed to its ``Store`` as its ``perform``
-callback.
+anything -- fetches catalogs/workloads/versions, closes discarded
+repositories, sets the current repository, prompts for a key, or shows a
+toast. Constructed once (there is exactly one ``BrowseScreen``), handed
+to its ``Store`` as its ``perform`` callback.
 
-Takes a plain ``Widget`` plus narrow callables (``catalog_tree``,
-``workload_tree``, ``set_current_repo``) rather than the real
-``BrowseScreen``/``ApmRepoBrowserApp`` types: ``runtime/`` must never
-import from ``screens/`` (``core`` -> ``runtime`` -> ``view`` ->
-``screens``, one-directional), and importing either concrete class here
-would be circular (``browse_screen.py`` constructs this class, and
-``app.py`` imports ``browse_screen.py``).
+Takes a plain ``Widget`` plus narrow callables rather than the real
+``BrowseScreen``/``ApmRepoBrowserApp`` types, per this package's
+``core``->``runtime``->``view``->``screens`` import layering (see
+``browser/README.md``); importing either concrete class here would also
+be circular.
 
-Repository close is hosted on the *App*, never the screen -- same
-posture as ``UnitEffects``'s own ``CloseProvider`` handler, even though
-this screen never actually unmounts in practice (it's the app's own root
-screen, pushed once, never popped): a rescan's own ``CloseRepos`` can be
-dispatched at any point while this screen is very much still alive and
-already displaying a fresh scan's results, so the close still needs a
-host that outlives the individual dispatch that triggered it.
-``ApmRepoBrowserApp.on_unmount`` drains (never cancels)
-``BROWSE_REPO_CLOSE_GROUP`` before closing the session, the same as it
-already does for ``UNIT_PROVIDER_CLOSE_GROUP``.
+Repository close is hosted on the App, never the screen, so a rescan's
+``CloseRepos`` always has a host that outlives the dispatch even though
+this root screen never actually unmounts. ``ApmRepoBrowserApp.on_unmount``
+drains (never cancels) ``BROWSE_REPO_CLOSE_GROUP`` before closing the
+session.
 """
 
 from __future__ import annotations
@@ -80,11 +71,8 @@ BROWSE_REPO_CLOSE_GROUP = "browse-repo-close"
 
 
 def _load_versions_key(cmd: LoadVersions) -> WorkloadKey:
-    """The one place ``LoadVersions``'s own ``WorkloadKey`` is derived --
-    both ``perform()``'s ``is_current`` predicate and ``_load_versions()``
-    itself need it from the same ``cmd``, so a shared derivation is the
-    single source of truth rather than two independent copies drifting
-    apart."""
+    """Shared by ``perform()``'s ``is_current`` predicate and
+    ``_load_versions()`` so both derive the same ``WorkloadKey``."""
     return workload_key(catalog_key(cmd.repo, cmd.catalog), cmd.workload)
 
 
@@ -118,13 +106,10 @@ class BrowseEffects:
                     app, functools.partial(self._close_repos, repos), group=BROWSE_REPO_CLOSE_GROUP, name="close-repos"
                 )
             case SetCurrentRepo(repo=repo):
-                # `repo` stays a handle all the way through -- the screen
-                # itself dereferences it, at the point of use, through
-                # ResourceTable, the sole owner of the live object.
-                self._set_current_repo(repo)
+                self._set_current_repo(repo)  # stays a handle; the screen dereferences via ResourceTable
             case LoadCatalogsFor():
-                # Anchored on the repo node itself: expanding it is what
-                # populates its own children, in the same tree.
+                # Anchored on the repo node: expanding it populates its
+                # own children, in the same tree.
                 catalog_tree = self._catalog_tree()
                 repo_node = find_node(catalog_tree.root, cmd.repo) or catalog_tree.root
                 _worker = run_worker_with_progress(
@@ -133,11 +118,9 @@ class BrowseEffects:
                     sink=TreeNodeLoadingSink(repo_node),
                 )
             case LoadWorkloads():
-                # Anchored on column 2's own permanent "Workloads" tree
-                # root -- this fetch populates that whole column, not a
-                # child of whatever column-1 node was clicked to trigger
-                # it, so the breadcrumb-two-columns-away default would
-                # be the wrong place.
+                # Anchored on column 2's permanent "Workloads" tree root,
+                # since this fetch populates that whole column, not a
+                # child of the column-1 node clicked to trigger it.
                 _worker = run_worker_with_progress(
                     self._screen,
                     functools.partial(self._load_workloads, cmd),
@@ -146,14 +129,10 @@ class BrowseEffects:
             case PromptForKey():
                 self._prompt_for_key(cmd)
             case ReloadCatalogsAfterKeyVerified():
-                # Anchored on the specific catalog the user just unlocked
-                # via KeyDialog, not the whole repository -- every sibling
-                # catalog is refetched too (same reasoning as
-                # _reload_catalogs_after_key_verified below), but this one
-                # is what the user's attention is actually on.
-                # Falls back to the repo node itself if the catalog's own
-                # node can't be found (e.g. a rescan mid-flight), and to
-                # the tree's root if even that's gone.
+                # Anchored on the catalog the user just unlocked, not the
+                # whole repository, even though every sibling is refetched
+                # too. Falls back to the repo node, then the tree root, if
+                # the catalog's node can't be found.
                 catalog_tree = self._catalog_tree()
                 target_node = (
                     find_node(catalog_tree.root, CatalogKey(repo=cmd.repo, catalog_id=cmd.catalog_id))
@@ -166,10 +145,8 @@ class BrowseEffects:
                     sink=TreeNodeLoadingSink(target_node),
                 )
             case LoadVersions():
-                # Anchored on column 3's own table: no per-node equivalent
-                # of TreeNodeLoadingSink exists for a flat DataTable, so
-                # this appends a trailing "<frame> Loading" row instead of
-                # the screen-wide breadcrumb.
+                # Column 3 is a flat DataTable with no per-node loading sink,
+                # so this appends a trailing loading row instead.
                 dispatched_key = _load_versions_key(cmd)
                 _worker = run_worker_with_progress(
                     self._screen,
@@ -186,10 +163,7 @@ class BrowseEffects:
 
     async def _close_repos(self, repos: tuple[RepoHandle, ...]) -> None:
         """Releases every discarded repository concurrently, in one
-        worker -- a rescan closing several repos at once has no
-        ordering dependency between them, so gathering avoids spawning
-        one ``Worker`` per handle for closes that could all run at
-        once."""
+        worker -- no ordering dependency between them."""
         await asyncio.gather(*(self._resources.release_repo(handle) for handle in repos))
 
     async def _load_catalogs_for(self, cmd: LoadCatalogsFor) -> None:
@@ -199,13 +173,9 @@ class BrowseEffects:
         try:
             catalogs = await repo.catalogs()
         except Exception as exc:
-            # Broader than ApmRepoError on purpose: a repository can also
-            # surface an unexpected failure from a third-party parser/driver
-            # it depends on that isn't an ApmRepoError at all. Load-bearing
-            # now that BrowseScreen.on_tree_node_expanded's is_pending_or_done guard
-            # blocks re-dispatch while this slot stays Loading -- an
-            # exception this doesn't catch would leave it stuck Loading
-            # forever, with no way to retry short of a full reconnect.
+            # Broader than ApmRepoError: a repository can surface a raw
+            # third-party failure too. Load-bearing: an uncaught exception
+            # would leave this slot stuck Loading forever.
             self._store.dispatch(
                 CatalogsLoadFailed(epoch=cmd.epoch, request=cmd.request, repo=cmd.repo, message=str(exc))
             )
@@ -224,10 +194,8 @@ class BrowseEffects:
             self._store.dispatch(WorkloadsLoadFailed(catalog=key, real_catalog=cmd.catalog, info=info))
             return
         except Exception as exc:
-            # Broader than ApmRepoError on purpose, same reasoning as
-            # _load_catalogs_for above -- load-bearing here too, since
-            # CatalogSelected's is_pending_or_done guard would otherwise
-            # leave this slot stuck Loading forever.
+            # Broader than ApmRepoError, load-bearing here too -- same
+            # reasoning as _load_catalogs_for above.
             self._store.dispatch(
                 WorkloadsLoadFailed(catalog=key, real_catalog=cmd.catalog, info=FailureInfo(message=str(exc)))
             )
@@ -243,11 +211,8 @@ class BrowseEffects:
         catalog_id = cmd.catalog.catalog_id
 
         def on_dismiss(verified: bool | None) -> None:
-            # Read live and dispatched unconditionally -- key_status can
-            # change even on a failed verify attempt (NO_KEY_PROVIDED ->
-            # INVALID) or stay the same on a bare cancel, so both
-            # repository and catalog labels need refreshing on every
-            # KeyDialog dismissal regardless of verified's own value.
+            # Dispatched unconditionally: key_status can change even on a
+            # failed verify attempt, so labels need refreshing regardless.
             self._store.dispatch(RepoKeyStatusRefreshed(repo=cmd.repo, key_status=repo.key_status))
             if verified:
                 self._store.dispatch(KeyVerified(repo=cmd.repo, catalog_id=catalog_id))
@@ -255,32 +220,18 @@ class BrowseEffects:
         self._screen.app.push_screen(KeyDialog(repo), on_dismiss)
 
     async def _reload_catalogs_after_key_verified(self, cmd: ReloadCatalogsAfterKeyVerified) -> None:
-        """``Repository.set_key()`` (just run, successfully, by the
-        ``KeyDialog`` this resumes from) closes and replaces every
-        already-opened ``DedupRepo`` this repository holds -- not just
-        the one ``catalog_id`` names, since ``RepoKind.OBJECT_STORE``
-        eagerly opens every sibling catalog up front -- so every sibling
-        catalog under this repository, not just the one that triggered
-        ``KeyDialog``, needs its own fresh ``Catalog`` re-resolved via
-        ``repo.catalog_by_id()``.
-        Fetched concurrently (``asyncio.gather``), not one at a time --
-        each sibling is an independent round-trip, and ``OBJECT_STORE``'s
-        own eager-open-every-sibling posture means this can be more than
-        a couple of catalogs; there's no ordering dependency between
-        them; only the tuple order of the *result* (matching
-        ``sibling_ids``' own order, so a caller-facing catalog list stays
-        stable) needs to survive the fan-out. Dispatches
-        ``CatalogsRefreshed`` (every sibling's own fresh entry, with a
-        sibling whose own re-fetch failed keeping its stale entry in
-        place at its own position rather than dropping out of the list
-        entirely) followed by ``CatalogSelected`` for the one that
-        actually triggered this reload -- reusing the ordinary selection path's own
-        cache-check/``LoadWorkloads`` dispatch rather than duplicating
-        it, which is safe here because a key-required catalog's own
-        ``catalog_workloads`` entry is always a ``FailureInfo`` (never a
-        cached ``Success``, since ``workloads()`` could never have
-        succeeded before the key was verified) -- so the reselect always
-        misses the skip-refetch cache and genuinely re-fetches."""
+        """``Repository.set_key()`` closes and replaces every already-opened
+        ``DedupRepo`` this repository holds, not just the one ``catalog_id``
+        names (``RepoKind.OBJECT_STORE`` eagerly opens every sibling up
+        front), so every sibling catalog is re-resolved via
+        ``repo.catalog_by_id()``, concurrently since there's no ordering
+        dependency between them. Dispatches ``CatalogsRefreshed`` (a
+        sibling whose re-fetch failed keeps its stale entry rather than
+        dropping out) then ``CatalogSelected`` for the one that triggered
+        this reload, reusing the ordinary selection path's cache-check --
+        safe since a key-required catalog's entry is always a
+        ``FailureInfo``, never a cached ``Success``, so the reselect
+        always misses the cache and genuinely re-fetches."""
         repo = self._resources.repo(cmd.repo)
         if repo is None:  # pragma: no cover - defensive; a handle only exists while its own repository is live
             return
@@ -304,10 +255,8 @@ class BrowseEffects:
                 if not isinstance(result, ApmRepoError):
                     raise result  # pragma: no cover - defensive; catalog_by_id only ever raises ApmRepoError
                 if sibling_id != cmd.catalog_id:
-                    # Best-effort for a sibling -- its own stale entry
-                    # (when this repo's catalogs were ever fetched at
-                    # all) stays in the list at its own position rather
-                    # than dropping out of it.
+                    # Best-effort for a sibling: its stale entry stays in
+                    # the list rather than dropping out.
                     stale = old_by_id.get(sibling_id)
                     if stale is not None:
                         fresh_catalogs.append(stale)
@@ -336,10 +285,8 @@ class BrowseEffects:
         try:
             versions = await cmd.catalog.versions(cmd.workload)
         except Exception as exc:
-            # Broader than ApmRepoError on purpose, same reasoning as
-            # _load_catalogs_for above -- load-bearing here too, since
-            # WorkloadSelected's is_pending_or_done guard would otherwise
-            # leave this slot stuck Loading forever.
+            # Broader than ApmRepoError, load-bearing here too -- same
+            # reasoning as _load_catalogs_for above.
             self._store.dispatch(VersionsLoadFailed(workload=key, message=str(exc)))
             return
         self._store.dispatch(VersionsLoaded(workload=key, versions=tuple(versions)))

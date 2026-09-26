@@ -161,8 +161,7 @@ async def test_action_go_back_with_a_repo_open_closes_it_and_reopens_connect(
     """Esc's fallback on ``BrowseScreen``'s root -- nothing else to close
     (no filter/goto box open) -- closes whatever's currently connected,
     the same real close ``_reset_for_new_scan`` already does for a
-    rescan, and reopens ``ConnectDialog`` (the ``c``/app-startup flow),
-    rather than the old no-op."""
+    rescan, and reopens ``ConnectDialog`` (the ``c``/app-startup flow)."""
     app = _FakeApp()
     async with app.run_test() as pilot:
         await pilot.pause()
@@ -193,9 +192,8 @@ async def test_action_go_back_with_a_repo_open_closes_it_and_reopens_connect(
 
 async def test_action_go_back_with_nothing_open_still_reopens_connect(monkeypatch: pytest.MonkeyPatch) -> None:
     """The same fallback with nothing currently connected -- the close
-    step is a no-op (nothing in ``model.repos``), but Connect still
-    reopens, matching the unconditional "always reopen" behavior rather
-    than only doing so when there was something to close."""
+    step is a no-op (nothing in ``model.repos``), but Connect always
+    reopens regardless."""
     app = _FakeApp()
     async with app.run_test() as pilot:
         await pilot.pause()

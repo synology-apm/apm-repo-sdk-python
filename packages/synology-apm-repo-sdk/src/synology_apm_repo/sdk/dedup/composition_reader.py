@@ -41,11 +41,8 @@ from ..storage.seqid import resolve_seq_path
 class CompositionReader:
     """Read access to one ``(stream_id, session_id)``'s composition
     sub-files. Does **not** validate the ``subID=0`` header automatically
-    on every access (that would cost a read for a check that virtually
-    never fails and whose only failure mode — an addressing-constant
-    mismatch — would already surface as consistently wrong data); call
-    ``verify_header`` explicitly when that specific, stricter, opt-in
-    check is wanted.
+    (a failure there would already surface as consistently wrong data) —
+    call ``verify_header`` explicitly for that stricter, opt-in check.
     """
 
     def __init__(
@@ -278,28 +275,16 @@ class CompositionRecord:
 
     async def seed_pages_from_array(self, array_raw: bytes) -> None:
         """Pre-populate every page of this record's cache from
-        ``array_raw`` — chunk-map array bytes a caller
-        (``verify_checks.check_map_and_attr_crc``) already confirmed
-        correct via Redundancy-blob parity repair — instead of leaving
-        ``_get_page`` to cold-fetch (and so re-derive from the
-        still-corrupted on-disk copy) as ``entries()`` walks forward.
+        ``array_raw`` — chunk-map array bytes already confirmed correct
+        via redundancy-blob parity repair — instead of leaving
+        ``_get_page`` to cold-fetch the still-corrupted on-disk copy.
         ``array_raw`` must be exactly ``map_num * CHUNK_MAP_RECORD_LENGTH``
-        bytes.
-
-        A page already resolved by an earlier ``entries()``/``_locate()``/
-        ``extent()`` call — e.g. ``units/device_pcps.py``'s own
-        ``open_disk()``, which calls ``extent()`` (cold-fetching page 0 and
-        the last page straight off disk) while assembling a PC/PS disk's
-        fragments, *before* this repaired record is ever seeded — is
-        force-refreshed here too, not left with its stale content (see the
-        loop below for how).
+        bytes. Force-refreshes any page already resolved by an earlier
+        call, not just cold ones.
 
         Raises:
-            ValueError: ``array_raw``'s length doesn't match this record's
-                own ``map_num`` — e.g. a concurrent writer changed the
-                record between two independent reads of it, so the repair
-                this is seeding from was computed against a differently
-                shaped record than the one being seeded here.
+            ValueError: ``array_raw``'s length doesn't match this
+                record's own ``map_num``.
         """
         expected_len = self.map_num * CHUNK_MAP_RECORD_LENGTH
         if len(array_raw) != expected_len:
@@ -313,13 +298,9 @@ class CompositionRecord:
             return array_raw[start_entry * CHUNK_MAP_RECORD_LENGTH : (start_entry + count) * CHUNK_MAP_RECORD_LENGTH]
 
         for page_idx in range(self._page_count):  # ascending order keeps _contiguous_scanned advancing correctly
-            # invalidate() first (a no-op for a page never fetched) so an
-            # already-warm page from a prior cold read is force-refreshed
-            # too: AsyncKeyedCache.resolve() is a no-op for an
-            # already-settled key, so skipping this invalidate would leave
-            # a pre-repair page's stale content in place. _resolve_page's
-            # own unconditional _page_end_offsets write handles the same
-            # force-refresh for the boundary index.
+            # invalidate() first: AsyncKeyedCache.resolve() is a no-op for
+            # an already-settled key, so skipping this would leave a
+            # pre-repair page's stale content in place.
             self._pages.invalidate(page_idx)
             await self._resolve_page(page_idx, _page_from_array)
 
@@ -329,14 +310,14 @@ class CompositionRecord:
         entry's ``end_offset``. Cheap regardless of ``map_num`` (two page
         reads, first and last, never a full scan).
 
-        Needed by PC/PS's per-region disk fragments (``units/content/pcps_disk.py``):
-        each fragment's registered ``file_meta.file_size`` is the *whole
-        disk's* total capacity, identical across every sibling fragment,
-        never that one fragment's own real length — asking its own
+        Needed by PC/PS's per-region disk fragments
+        (``units/content/pcps_disk.py``): each fragment's registered
+        ``file_meta.file_size`` is the whole disk's total capacity,
+        identical across every sibling fragment — asking its own
         composition record directly is the only way to learn a
-        fragment's actual coverage (FORMAT-SPEC.md: pcps-fragments has the full
-        story). VM's model doesn't need this: one composition record
-        already covers the whole disk.
+        fragment's actual coverage (FORMAT-SPEC.md: pcps-fragments). VM's
+        model doesn't need this: one composition record already covers
+        the whole disk.
         """
         if self.map_num == 0:
             return (0, 0)

@@ -12,15 +12,9 @@
   above (machine-consumable; the command's actual result still goes to
   stdout, untouched by any of this).
 
-Every rendering mode is built from the *same* ``ProgressMeter`` instance —
-CLI and TUI both build on ``ProgressMeter``, so ETA/rate math is never
-reimplemented twice. ``build_progress_meter`` is the one entry point every
-CLI command should call, never ``ProgressMeter()`` directly.
-
-``finish_live_progress`` is the other entry point every command with
-progress-bearing work must call, exactly once, right before it prints its
-own first real report line, to clear any live progress line still
-sitting on the terminal row it would otherwise print over.
+``build_progress_meter`` is the one entry point every CLI command should
+call, never ``ProgressMeter()`` directly — CLI and TUI both build on it, so
+ETA/rate math is never reimplemented twice.
 """
 
 from __future__ import annotations
@@ -54,26 +48,18 @@ def build_progress_meter(state: CliState) -> ProgressMeter:
     if state.progress is ProgressMode.NEVER:
         return ProgressMeter(callback=None)
 
-    # Built once here, not per-render: a fresh Console(stderr=True)
-    # re-probes terminal capabilities on every call, and on_update()
-    # below runs up to 10x/second for the whole span of a long
-    # export/discover. None when --json is on: NDJSON rendering never
-    # touches a Console at all (see _render_ndjson).
+    # Built once, not per-render — a fresh Console() re-probes terminal
+    # capabilities each time, and on_update() can run up to 10x/second.
+    # None when --json is on: NDJSON rendering never touches a Console.
     err_console = None if state.json else Console(stderr=True)
 
-    # This meter's own plain-text throttle clock (see _render_plain_line) —
-    # a one-element list rather than a plain float so on_update's closure
-    # can update it without a `nonlocal` declaration threaded through
-    # _render too. Scoped to this one build_progress_meter() call, unlike
-    # a module-level dict keyed by id(meter): CPython can reuse a garbage
-    # collected meter's id() for an unrelated later one, which would
-    # inherit a stale throttle timestamp from it.
+    # Plain-text throttle clock, scoped to this call — never keyed by
+    # id(meter) in a module-level dict, since CPython can reuse a
+    # garbage-collected meter's id() for an unrelated later one.
     last_plain_emit = [0.0]
 
-    # ``async def`` purely to satisfy ProgressMeter's awaitable callback
-    # type — the rendering below is synchronous console output, with
-    # nothing to await. Reads ``meter`` from the enclosing scope via late
-    # binding, resolved at call time even though it's assigned below.
+    # async def only to satisfy ProgressMeter's callback type; nothing
+    # here actually awaits.
     async def on_update(p: Progress) -> None:
         _render(state, err_console, meter, p, last_plain_emit)
 
@@ -84,17 +70,10 @@ def build_progress_meter(state: CliState) -> ProgressMeter:
 def finish_live_progress(state: CliState) -> None:
     """Clear any live progress line still sitting on stderr, once a
     command's progress-bearing work is done and it's about to print its
-    own final report. ``_render_live_line``'s own bare ``\\r`` (no
-    trailing newline, so the *next* live update can overwrite it in
-    place) is otherwise never cleared once nothing renders another
-    progress frame — a shorter final-report line sharing that same
-    terminal row then leaves the old line's tail dangling behind it.
-
-    A no-op in every mode that never renders a live line to begin with
-    (``--json``, ``--progress never``, or a non-terminal stderr without
-    ``--progress always``) — and harmless even when a live line genuinely
-    was never shown, so every caller can call this unconditionally rather
-    than tracking whether one actually appeared."""
+    own final report — ``_render_live_line``'s bare ``\\r`` otherwise
+    leaves the old line's tail dangling behind a shorter report line
+    sharing the same row. A no-op in every mode that never renders a live
+    line, so every caller can call this unconditionally."""
     if state.json or state.progress is ProgressMode.NEVER:
         return
     console = Console(stderr=True)
@@ -129,13 +108,9 @@ def _render_ndjson(meter: ProgressMeter, p: Progress) -> None:
 
 
 def _render_live_line(console: Console, meter: ProgressMeter, p: Progress) -> None:
-    # Clear-to-end-of-line (\x1b[2K) before writing: without it, a line
-    # shorter than the previous one leaves stale trailing characters from
-    # the longer line behind — the classic "live progress bar" artifact.
-    # No trailing newline (end="\r") so the next update overwrites this
-    # same terminal row; whoever's still watching by the time the whole
-    # command finishes sees the last progress line stay on screen mixed
-    # with the command's real stdout output.
+    # Clear-to-end-of-line (\x1b[2K) so a shorter line doesn't leave stale
+    # trailing characters behind. No trailing newline (end="\r") so the
+    # next update overwrites this same terminal row.
     console.print("\x1b[2K" + _format_line(meter, p), end="\r", style="dim", highlight=False)
 
 
@@ -167,14 +142,7 @@ def _format_line(meter: ProgressMeter, p: Progress) -> str:
     else:
         found = p.found if p.found is not None else p.done
         parts.append(f"│ found {found} {p.unit}")
-        # meter.rate is computed from p.done regardless of determinate --
-        # every current real caller of this branch (Session.discover())
-        # leaves done at its default and so never shows a rate here, but
-        # a future indeterminate caller that also reports a real done=
-        # (a running count of work completed so far, alongside found=
-        # for the total still being discovered) gets an honest rate for
-        # free, same as the determinate branch above -- just never an
-        # ETA, since there's no total yet to divide the remainder by.
+        # No ETA here — there's no total yet to divide the remainder by.
         rate = meter.rate
         if rate > 0:
             parts.append(f"│ {_format_rate(rate, p.unit)}")

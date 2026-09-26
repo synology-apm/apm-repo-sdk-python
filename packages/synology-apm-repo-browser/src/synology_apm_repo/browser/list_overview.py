@@ -49,44 +49,25 @@ def overview_columns(rows: list[dict[str, object]]) -> list[str]:
 
 
 def overview_console_width(columns: list[str]) -> int:
-    """A cell's own content is already bounded by ``OVERVIEW_CELL_MAX_CHARS``
-    (``truncate_cell``), but a column *header* (a real SharePoint field
-    name) isn't — so each column's own worst case is whichever of the
-    two is actually larger. ``+ 4`` covers the table's own outer border.
-
-    ``columns`` can genuinely be empty even when ``rows`` (the caller's own
-    fetched items) isn't -- a real List item's JSON body can itself be
-    ``{}``, or ``visible_site_fields`` can filter every one of its keys away
-    -- so ``max(..., default=0)`` avoids ``max()``'s own "arg is an empty
-    sequence" ``ValueError`` for that real case, rather than crashing this
-    preview."""
+    """Each column's width is the larger of ``OVERVIEW_CELL_MAX_CHARS`` and
+    its header length; ``+ 4`` covers the table's outer border. ``columns``
+    can be empty (a real List item's JSON body can be ``{}``), so
+    ``max(..., default=0)`` avoids ``max()``'s empty-sequence ``ValueError``."""
     per_column = max(((max(OVERVIEW_CELL_MAX_CHARS, len(c)) + _OVERVIEW_COLUMN_OVERHEAD) for c in columns), default=0)
     return len(columns) * per_column + 4
 
 
 def render_overview_table(header: str, rows: list[dict[str, object]], *, truncated: bool) -> str:
-    """Pre-renders ``header`` plus a Rich table of ``rows`` to plain text via
-    an in-memory, file-redirected Console — not handed back as a live
-    Rich renderable, since a plain ``Console(record=True)`` *also* writes
-    straight to the real stdout on every ``.print()``, which would
-    corrupt a running Textual app's own terminal control, and every other
-    preview ``UnitScreen`` shows is already a plain string.
+    """Pre-renders ``header`` plus a Rich table of ``rows`` to a plain string
+    via an in-memory, file-redirected Console — a plain ``Console(record=True)``
+    would also write to the real stdout, corrupting the running TUI.
 
-    Laid out at each column's own natural content width, not the
-    pane's visible width: a real SharePoint List row easily has 10+
-    visible columns even after ``visible_site_fields`` filtering, and
-    handing Rich a Console narrower than that many columns need makes it
-    *compress* — truncating column headers, then (worse) the detail
-    pane's own line-wrapping hard-wraps the resulting already-fixed-width
-    box-drawing rows mid-cell, visibly misaligning the table.
-    ``overview_console_width`` instead sizes the Console comfortably larger
-    than any column could possibly need, so Rich never compresses
-    anything; the caller's own ``wide-preview`` CSS class is what lets the
-    detail pane show the result at its real width and pan right instead
-    of wrapping it back down.
+    Sized to each column's natural width via ``overview_console_width``,
+    wide enough that Rich never compresses/truncates headers; the caller's
+    ``wide-preview`` CSS class lets the detail pane pan right instead of
+    wrapping the result back down.
 
-    ``rows`` must be non-empty — the caller shows a plain "(no items)"
-    message itself rather than calling this for that case."""
+    ``rows`` must be non-empty — the caller shows "(no items)" itself."""
     columns = overview_columns(rows)
     title = f"showing first {len(rows)} items" if truncated else f"{len(rows)} {pluralize(len(rows), 'item')}"
     table = RichTable(title=title, title_justify="left")
@@ -95,15 +76,9 @@ def render_overview_table(header: str, rows: list[dict[str, object]], *, truncat
     for row in rows:
         table.add_row(*(safe(truncate_cell(row.get(column))) for column in columns))
     buffer = io.StringIO()
-    # force_terminal=False, not Console()'s own "auto" default: an ambient
-    # FORCE_COLOR in the launching shell (Console.is_terminal returns
-    # true for it before ever calling isatty()) would otherwise
-    # make Rich emit real ANSI escapes into this buffer even though it's
-    # never a real terminal, corrupting the plain string this function
-    # promises -- the box-drawing rows would carry a different number of
-    # embedded escape codes per line depending on each cell's own styling,
-    # so a caller measuring "is every row the same width" would see
-    # different raw lengths despite identical visible width.
+    # force_terminal=False, not Console's "auto" default: an ambient
+    # FORCE_COLOR would otherwise make Rich emit real ANSI escapes into
+    # this buffer, corrupting the plain string this function promises.
     console = Console(file=buffer, width=overview_console_width(columns), force_terminal=False)
     console.print(header)
     console.print()

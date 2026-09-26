@@ -250,18 +250,12 @@ def client_kwargs_with_secrets(
     """``config.client_kwargs``, overlaid with whichever of
     ``secret_fields_for(kind)``'s fields ``secrets`` actually carries a
     truthy value for — the shared shape behind every "resolve one
-    profile's config plus its secrets into constructor kwargs" call site
-    (``profiles.build_store``, ``cli/commands/profile.py::_store_from_fields``,
-    ``browser/screens/connect_dialog.py``'s ``s3_client_kwargs``/
-    ``azure_client_kwargs`` — SMB has no bucket-less/container-less
-    "Browse" counterpart calling this directly, only ``smb_config_and_secrets``
-    feeding ``store_from_config`` straight from ``_build_smb_store``).
+    profile's config plus its secrets into constructor kwargs" call site.
     ``secrets`` may be a superset of what applies here (a not-yet-saved
     connection form carries every backend's fields at once) — only the
     keys ``secret_fields_for`` names for ``config``'s own kind are ever
     read from it; a present-but-falsy value (an empty string from an
-    untouched form field) is treated the same as absent, matching every
-    prior hand-rolled version of this check."""
+    untouched form field) is treated the same as absent."""
     kind = _KIND_BY_CONFIG_TYPE[type(config)]
     kwargs = dict(config.client_kwargs)
     for field_name in secret_fields_for(kind):

@@ -4,18 +4,15 @@ node in it — shared by ``Repository.resolve`` (which only needs the final
 ancestor chain and each ancestor's own children, to repopulate a ``Tree``
 widget).
 
-For a provider whose ``extra_segments`` grow by exactly one new segment per
+For a provider whose ``extra_segments`` grow by exactly one segment per
 tree level (true for every provider except Drive/Team Drive, which key
-every node by a single, depth-independent id instead), a target's ``extra_segments``
-is a real, checkable prefix relationship: a child is only worth
-descending into when its own ref is a prefix of the target's.
-``find_node``/``find_path_with_children`` use exactly that to visit only the
-nodes on the real path to the target, never a non-matching sibling's
-subtree — unlike a plain depth-first search, whose cost is the size of
-the whole tree regardless of where the target sits. A provider that
-can't support this prefix relationship instead implements
-``SupportsDirectRefLookup``, checked here via ``isinstance`` before falling
-back to the descent.
+nodes by a depth-independent id instead), a target's ``extra_segments``
+is a checkable prefix relationship: a child is only worth descending
+into when its ref is a prefix of the target's. ``find_node``/
+``find_path_with_children`` use exactly that to visit only the nodes on
+the real path to the target. A provider that can't support this instead
+implements ``SupportsDirectRefLookup``, checked via ``isinstance`` before
+falling back to descent.
 """
 
 from __future__ import annotations
@@ -28,10 +25,9 @@ from .node_ref import NodeRef
 _PAGE_SIZE = 500
 """Matches the TUI's own children-pagination page size
 (``browser/core/unit/update.py``'s ``CHILDREN_PAGE_SIZE``) — large
-enough that a real tree level almost always resolves in one page, small
-enough that a single pathologically wide level doesn't force one huge
-fetch before a match found early in it can short-circuit (``find_node``'s
-case)."""
+enough that a real tree level usually resolves in one page, small enough
+that a wide level doesn't force one huge fetch before an early match can
+short-circuit."""
 
 
 def _is_strict_prefix(shorter: tuple[str, ...], longer: tuple[str, ...]) -> bool:
@@ -40,11 +36,9 @@ def _is_strict_prefix(shorter: tuple[str, ...], longer: tuple[str, ...]) -> bool
 
 async def _iter_pages(provider: UnitProvider, node: Node) -> AsyncIterator[list[Node]]:
     """Yields ``node``'s children one ``_PAGE_SIZE`` page at a time,
-    stopping once a short page proves there's no next one — the fetch/
-    stop-condition bookkeeping shared by ``_children_matching``'s/
-    ``_all_children``'s otherwise-identical pagination loops. A consumer
-    that ``return``s out of its ``async for`` early (``_children_matching``'s
-    exact-match short-circuit) simply never requests the next page."""
+    stopping once a short page proves there's no next one. A consumer
+    that ``return``s out of its ``async for`` early simply never
+    requests the next page."""
     offset = 0
     while True:
         page = await provider.children(node, offset=offset, limit=_PAGE_SIZE)
@@ -60,23 +54,17 @@ async def _children_matching(
     """Fetches ``node``'s children, paginated, returning ``(exact,
     children, candidates)``.
 
-    ``exact`` is the one child (if any) whose own ``extra_segments`` equals
+    ``exact`` is the one child (if any) whose ``extra_segments`` equals
     ``target_extra`` — unambiguous, so paginating stops the instant it's
-    found (even when ``need_full_list`` is set, later pages are simply
-    appended to ``children`` without further searching).
+    found.
 
-    ``candidates`` is every *non-leaf* child whose ``extra_segments`` is a
-    genuine, strictly shorter prefix of ``target_extra`` — normally at
-    most one (a well-formed provider's siblings never share this
-    relationship), but a disk-image node's own "(filesystem)" sibling is
-    a real exception: its ref extends the image's own ref for addressing
-    continuity despite being a tree *sibling*, not a descendant, of it
-    (the image node itself is always a leaf and so is never a candidate;
-    see ``units.device``). The caller tries each candidate in turn rather
-    than assume the first one found is correct. Collecting every
-    candidate means every page must still be fetched when no exact match
-    turns up at this level — unlike the exact-match case, a later page
-    could hold another (or the only) valid candidate.
+    ``candidates`` is every non-leaf child whose ``extra_segments`` is a
+    strictly shorter prefix of ``target_extra`` — normally at most one,
+    but a disk-image node's "(filesystem)" sibling is a real exception:
+    its ref extends the image's own ref despite being a tree sibling, not
+    a descendant. The caller tries each candidate in turn. Collecting
+    every candidate means every page is still fetched when no exact match
+    turns up at this level.
 
     ``children`` (every child fetched so far) is populated only when
     ``need_full_list`` is set — ``find_path_with_children``'s requirement,
@@ -125,11 +113,9 @@ async def _descend(
     if node.is_leaf:
         return None
     exact, children, candidates = await _children_matching(provider, node, target_extra, need_full_list=need_full_list)
-    # An exact match is unambiguous — try only it. Otherwise try each
-    # non-leaf prefix candidate in turn (normally just one -- a
-    # disk-image node's own "(filesystem)" sibling is the real exception),
-    # moving on rather than giving up when an earlier one's own subtree
-    # turns out not to actually contain the target.
+    # An exact match is unambiguous -- try only it. Otherwise try each
+    # non-leaf prefix candidate in turn, moving on rather than giving up
+    # if an earlier one's subtree doesn't actually contain the target.
     for child in [exact] if exact is not None else candidates:
         deeper = await _descend(provider, child, target, need_full_list=need_full_list)
         if deeper is not None:

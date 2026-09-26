@@ -236,9 +236,7 @@ def _write_composition(
     actually written to disk differ from the bytes ``map_crc`` is computed
     over, and ``trailer`` is appended right after them -- together express a
     record whose on-disk chunk-map array is corrupted but parity-recoverable
-    via a real Redundancy blob appended after it. Every existing caller
-    leaves both at their defaults and gets today's exact behavior
-    unchanged."""
+    via a real Redundancy blob appended after it."""
     map_num = len(entries) // 20
     head = bytearray(_record_head_bytes(map_num=map_num, map_crc=zlib.crc32(entries) & 0xFFFFFFFF))
     if corrupt_record_head:
@@ -458,7 +456,7 @@ def _write_fs_workload(
         # the copy_meta_file/<meta_dirname> directory to actually show up
         # in a listing -- target.db above already guarantees that in
         # practice, but a dedicated marker file makes the dependency
-        # explicit rather than incidental.
+        # explicit.
         (tmp_path / "copy_meta_file" / meta_dirname / "version.db.zst").touch()
     dedup_img_path = f"{target_id}/{dedup_version_id}/dedup.img"
     if dedup_img_size is not None:
@@ -1616,8 +1614,7 @@ class TestSaasSupersededGeneration:
 
 
 class TestSaasCachingAcrossWalkerRun:
-    """The correctness/performance defect this whole redesign guards
-    against: ``_saas_extents`` must resolve through the walker's own
+    """``_saas_extents`` must resolve through the walker's own
     run-scoped ``SaasStreamCache``, not a fresh ``SaasStream`` per
     ``discover_version()`` call — otherwise every per-stream cache
     forward-resolution builds gets rebuilt from scratch on every catalog

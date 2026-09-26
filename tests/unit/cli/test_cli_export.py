@@ -24,10 +24,9 @@ class _RecordingBucketBackedSource:
     """Matches ``ContentSource`` and declares
     ``supports_concurrent_export = True`` — the ``DedupFile``/
     ``ByteRangeView`` shape a real bucket-backed export uses. Records
-    ``sparse`` only; there's no concurrency kwargs to record anymore —
-    ``export_to()``'s own parallelism (an unconditional multiprocess
-    dispatch whenever the repository's store supports it) isn't a
-    CLI-facing knob, so the CLI has no flag left that forwards one."""
+    ``sparse`` only — ``export_to()``'s own parallelism (an unconditional
+    multiprocess dispatch whenever the repository's store supports it)
+    isn't a CLI-facing knob, so there's no concurrency kwarg to record."""
 
     size = 4096
     supports_concurrent_export = True

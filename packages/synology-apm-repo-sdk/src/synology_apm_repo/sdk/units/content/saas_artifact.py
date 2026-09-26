@@ -1,19 +1,15 @@
-"""``LazyArtifact``: the ``ContentSource`` implementation shared by
-every application-layer artifact this project builds (Calendar's
-``.ics``, Mail's ``.eml``, Contact's CSV) — each cheap to construct a
-*node* for, expensive to actually assemble, and once assembled just a
-small, fully in-memory blob of bytes. ``CalendarProvider``/
-``MailProvider``/``ContactProvider`` each supply only the one thing
-that's actually different: the ``build`` callback itself.
+"""``LazyArtifact``: the shared ``ContentSource`` implementation for
+in-memory application-layer artifacts (Calendar's ``.ics``, Mail's
+``.eml``, Contact's CSV) — cheap to construct a node for, expensive to
+assemble, then a small in-memory blob; each provider supplies only its
+own ``build`` callback. Teams chat/channel content
+(``saas_teams_chat.py``) is the one exception to "small": its
+``render_channel_html`` holds an entire rendered history in memory as
+one string.
 
-Teams chat/channel content is the one known exception to "small":
-``render_channel_html`` (``saas_teams_chat.py``) holds an entire
-rendered channel/chat history in memory as one string.
-
-``parse_meta_json`` is a second, smaller shared piece those same
-``build`` callbacks (and ``units/saas/site.py``'s own item-``_assemble``,
-one layer up) each need: every one of them starts by parsing a fetched
-META object's raw bytes as JSON before touching its fields.
+``parse_meta_json`` is a shared JSON-parsing helper every ``build``
+callback (and ``units/saas/site.py``'s own item assembly) uses before
+touching a fetched META object's fields.
 """
 
 from __future__ import annotations
@@ -31,18 +27,13 @@ from ...errors import DataCorruptError
 def parse_meta_json(meta_bytes: bytes, label: str, *, ref: str | None = None) -> dict[str, Any]:
     """Parses ``meta_bytes`` as JSON, raising
     ``DataCorruptError(f"{label} did not parse as JSON: ...", ref=ref)``
-    instead of letting a bare ``json.JSONDecodeError`` propagate — the
-    identical try/except every META-object JSON parse in this project
-    needs (Mail, Contact, Calendar, SharePoint Site). ``label`` is the
-    caller's own already-formatted "<item kind> <id!r> META"-shaped
-    prefix, so each keeps its own established wording/ordering rather
-    than this function imposing one.
+    instead of a bare ``json.JSONDecodeError`` — the shared parse used by
+    Mail, Contact, Calendar, and SharePoint Site. ``label`` is the
+    caller's own pre-formatted "<item kind> <id!r> META" prefix.
 
-    Returns ``dict[str, Any]`` — real META JSON is always an object at
-    the top level, but individual field values are still ``Any``: every
-    caller immediately narrows them with its own ``.get()``/``isinstance``
-    checks (the data is untrusted on-disk content, never assumed-shaped),
-    the same way it already would against a bare ``json.loads()`` result.
+    Returns ``dict[str, Any]``: field values stay ``Any`` since every
+    caller narrows them with its own ``.get()``/``isinstance`` checks
+    against untrusted on-disk content.
     """
     try:
         return cast("dict[str, Any]", json.loads(meta_bytes))
@@ -93,11 +84,9 @@ class LazyArtifact:
         return data[offset : offset + length]
 
     async def stream(self, block: int = DEFAULT_STREAM_BLOCK) -> AsyncIterator[tuple[int, bytes]]:
-        # NOT stream_via_read() (dedup/dedup_file.py): that helper reads
-        # via self.size, which stays None here until _ensure_built() has
-        # actually run -- a real, legitimate difference from every other
-        # ContentSource implementer, not an oversight. Slices the
-        # already-materialized buffer directly instead.
+        # Not stream_via_read() (dedup/dedup_file.py): that reads via
+        # self.size, which stays None until _ensure_built() runs. Slices
+        # the already-materialized buffer directly instead.
         data = await self._ensure_built()
         pos = 0
         while pos < len(data):

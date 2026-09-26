@@ -256,29 +256,18 @@ def test_tasks_hint_stays_in_sync_across_browse_and_unit_screens_replayed(
     ui_timeout: float,
 ) -> None:
     """A background job started on ``BrowseScreen`` must show in
-    ``UnitScreen``'s own breadcrumb immediately once pushed
-    (``NavigableScreen._update_breadcrumb_text`` -- called synchronously
-    from each screen's own ``on_mount`` -- always re-reads
-    ``app.jobs`` fresh rather than waiting for that job's own next
-    progress tick, a real gap since the job started before this
-    ``UnitScreen`` instance ever existed), keep tracking live progress
-    while ``UnitScreen`` stays on top (every dispatch that changes
-    ``app.store.model.jobs`` re-fires every screen's own
-    ``NavigableScreen.on_mount``-registered ``jobs`` watch regardless of
-    stack position -- ``_render_breadcrumb``'s own covered-screen guard
-    just skips the actual widget write for one still mounted
-    underneath, e.g. ``BrowseScreen`` here, not a correctness gap since
-    it re-reads the real, current job count fresh the moment it becomes
-    visible again instead), and still be correct back on ``BrowseScreen``
-    after Esc pops back to it
-    (``on_screen_resume`` re-renders it at exactly that moment). The job
-    itself is synthetic (a fake unit/content source,
-    never the real fixture data this file otherwise replays) — only its
-    effect on the hint's own job *count* is under test here (per-job
-    detail like a label/percent lives in ``WorklistScreen``'s own dialog
-    now, not this hint); real export-progress timing isn't covered here
-    at all -- a replayed fixture returns instantly, with no wall-clock
-    window for it to be observable in."""
+    ``UnitScreen``'s breadcrumb immediately once pushed
+    (``NavigableScreen._update_breadcrumb_text`` re-reads ``app.jobs``
+    fresh on ``on_mount``), keep tracking while ``UnitScreen`` stays on
+    top (every ``app.store.model.jobs`` dispatch re-fires every screen's
+    own ``jobs`` watch regardless of stack position; ``_render_breadcrumb``'s
+    covered-screen guard only skips the widget write for a screen
+    underneath, not the re-read), and stay correct back on
+    ``BrowseScreen`` after Esc (``on_screen_resume`` re-renders it). The
+    job is synthetic — only the hint's job *count* is under test here
+    (per-job detail lives in ``WorklistScreen``'s own dialog; real
+    export-progress timing needs wall-clock time a replayed fixture can't
+    provide)."""
     monkeypatch.setattr(
         connect_dialog_module.ConnectDialog,
         "_build_local_store",

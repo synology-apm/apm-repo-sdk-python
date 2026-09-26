@@ -32,14 +32,9 @@ _MAX_RECENT = 20
 
 
 class JobStatus(enum.StrEnum):
-    """A background job's own lifecycle. ``QUEUED`` (waiting for the one
-    job slot ``AppModel.export_occupied`` tracks to free up) is the
-    only status that ever moves back to ``RUNNING``; once ``RUNNING``,
-    a job only ever moves on to ``CANCELLING`` (the export screen's
-    Esc/cancel button, or ``WorklistScreen``'s ``x``), never back. A
-    ``StrEnum`` so status bar/worklist text built from it (e.g.
-    ``f"{label} ({job.status})"``) keeps reading as the plain
-    "running"/"queued"/"cancelling" text it always has."""
+    """A background job's lifecycle: ``QUEUED`` -> ``RUNNING`` ->
+    ``CANCELLING``, never back. A ``StrEnum`` so status bar/worklist text
+    built from it reads as the plain "running"/"queued"/"cancelling" text."""
 
     RUNNING = "running"
     QUEUED = "queued"
@@ -48,20 +43,16 @@ class JobStatus(enum.StrEnum):
 
 @dataclasses.dataclass(frozen=True, slots=True)
 class Job:
-    """One backgroundable job's own live record, while it's still in
-    ``AppModel.jobs``. A ``QUEUED`` job carries only its own
-    label/group; the request it'll actually run once promoted lives in
-    ``AppModel.queued_requests``, keyed by the same ``id``.
+    """One backgroundable job's live record, while still in
+    ``AppModel.jobs``. A ``QUEUED`` job carries only its label/group; the
+    request it'll run once promoted lives in ``AppModel.queued_requests``,
+    keyed by the same ``id``.
 
     ``size_text``/``rate_text``/``eta_text``/``elapsed_text`` (e.g.
     ``"4.2 GiB"``/``"187 MiB/s"``/``"00:08"``/``"00:42"``) arrive
-    already formatted from whichever effect is driving the job
-    (``runtime/app_effects.py``'s own ``ProgressMeter``, for an export)
-    — rate/ETA tracking is inherently stateful (it needs to remember
-    *when* the previous tick was), which has no place in a frozen
-    model; only the text it produces does. Each is left at its default
-    ``""`` until the first progress tick arrives (e.g. while still
-    ``QUEUED``)."""
+    pre-formatted from whichever effect drives the job (rate/ETA tracking
+    is inherently stateful, which has no place in a frozen model). Each
+    stays ``""`` until the first progress tick arrives."""
 
     id: JobId
     label: str
@@ -76,11 +67,8 @@ class Job:
 
     @property
     def percent(self) -> int | None:
-        """Whole-percent completion, or ``None`` when ``total`` isn't
-        known yet — the same guard ``WorklistScreen`` needs before
-        dividing by it. A ``total`` of ``0`` (an empty unit) is complete
-        by definition, not unknown, so it's checked ahead of the
-        division below."""
+        """Whole-percent completion, or ``None`` when ``total`` isn't known
+        yet. A ``total`` of ``0`` is complete by definition, not unknown."""
         if self.total is None:
             return None
         if self.total == 0:
@@ -90,13 +78,10 @@ class Job:
 
 @dataclasses.dataclass(frozen=True, slots=True)
 class JobOutcome:
-    """A finished job's own terminal result. Two separate texts, not
-    one: ``notify_message`` is the plain string passed to ``self.notify()``
-    (the app-wide toast); ``status_text`` is the richer, markup-styled text
-    ``ExportScreen`` renders into its own in-modal status line (e.g.
-    ``"[green]done[/green] — 4.2 GiB written, ..."``) — always more
-    detailed than the toast, and specific to whichever screen owns this
-    job, so it's never appropriate as the toast text itself."""
+    """A finished job's terminal result. Two texts: ``notify_message`` is
+    the plain app-wide toast string; ``status_text`` is the richer,
+    markup-styled text a screen renders into its own status line (e.g.
+    ``"[green]done[/green] — 4.2 GiB written, ..."``)."""
 
     notify_message: str
     notify_severity: Literal["information", "warning", "error"]
@@ -148,11 +133,7 @@ class AppModel:
 
     @property
     def export_occupied(self) -> bool:
-        """Whether some export already holds the one job slot — checked
-        both before starting a new export (``update.py``'s ``StartExport``)
-        and before starting a verify FULL check (``DiagnosticsScreen``'s
-        ``action_run_full``), so the same predicate isn't written out
-        twice."""
+        """Whether some export already holds the one job slot."""
         return any(job.status in (JobStatus.RUNNING, JobStatus.CANCELLING) for job in self.jobs.values())
 
 

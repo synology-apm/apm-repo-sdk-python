@@ -165,9 +165,7 @@ async def test_disk_image_is_a_file_table_row_and_its_sibling_is_a_top_level_fol
         assert fs_tree_node.data.payload.name == "disk-1.img (filesystem)"
         assert fs_tree_node.data.payload.is_leaf is False
         assert fs_tree_node.allow_expand is True
-        # Its own real name, not a relabeled "Filesystem" wrapper -- that
-        # relabeling existed only for the nesting this refactor removed.
-        assert str(fs_tree_node.label) == "disk-1.img (filesystem)"
+        assert str(fs_tree_node.label) == "disk-1.img (filesystem)"  # its own real name, never relabeled
 
         # The disk-image leaf itself shows up as an ordinary file-table
         # row under root instead.

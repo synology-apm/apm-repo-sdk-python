@@ -1,28 +1,12 @@
-"""``AsyncKeyedCache`` — the one memoizing-cache shape this SDK keeps
-reinventing by hand.
+"""``AsyncKeyedCache``: a ``key -> value`` memoizing cache — check a dict,
+``await`` a fetch on miss, store the result, optionally evict the oldest
+entry once over a cap — shared by every cache in this SDK
+(``dedup.pool``'s bucket/chunk caches, ``storage.dircache.DirCache``,
+``dedup.composition_reader``'s page cache, and others) so each only has
+to get its own fetch function right.
 
-``Pool._buckets``/``._chunks`` (bounded LRU, locked, session-wide shared),
-``dedup.pool.BucketReaderCache`` (unbounded by default, private to one
-bulk sweep so it doesn't evict ``Pool``'s own shared cache),
-``storage.dircache.DirCache`` (unbounded, session-wide shared),
-``dedup.composition_reader.CompositionRecord``'s page cache (bounded LRU,
-scoped to one record), and ``units.verify_reachable._ReachabilityWalker
-._composition_records`` (bounded LRU, one run's worth of shared records)
-are all the exact same operation —
-check a dict, ``await`` a fetch on miss, store the result, optionally
-evict the oldest entry once over a cap — each written independently with
-its own, slightly different correctness properties (some lock, some
-don't; some accept "two callers miss the same key at once and both pay
-for a redundant fetch" as a deliberately-accepted race, some don't even
-consider it). This module factors that one operation out once, with one
-well-tested concurrency contract, so every caller only has to get *its
-own* fetch function right.
-
-Deliberately at the SDK package root, not inside ``storage/`` or
-``dedup/``: it has zero dependencies beyond the stdlib, and both of those
-packages need to depend on it (``storage.dircache.DirCache`, several
-places under ``dedup/``) — the same reason ``errors.py``/``identifiers.py``
-live here instead of under a specific layer.
+At the SDK package root, not under ``storage/``/``dedup/``: both packages
+depend on it, and it has zero dependencies beyond the stdlib.
 """
 
 from __future__ import annotations
@@ -79,32 +63,22 @@ class AsyncKeyedCache(Mapping[K, V], Generic[K, V]):
         return self._store[key]
 
     def known_keys(self) -> list[K]:
-        """Every key with either a settled value or a fetch in flight
-        right now, deduplicated — for a caller (e.g. ``Repository.close()``)
-        that needs to account for everything ever asked for, not just what
-        ``.keys()`` (the ``Mapping`` interface, settled entries only) can
-        see. Doesn't trigger a fetch, doesn't block; a key not yet asked
-        for by the time this is taken is still invisible to it."""
+        """Every key with either a settled value or a fetch in flight right
+        now, deduplicated — unlike ``.keys()``, includes in-flight fetches.
+        Doesn't trigger a fetch, doesn't block."""
         return list({*self._store.keys(), *self._inflight.keys()})
 
     # -- the actual cache operation ------------------------------------------
 
     def put(self, key: K, value: V) -> None:
-        """Insert ``key`` -> ``value`` directly, no fetch involved — for a
-        caller that already has a value in hand (e.g. decoded as a
-        byproduct of a batched fetch elsewhere) and wants it remembered
-        here too, without paying for the ``Future``/in-flight-dedup
-        machinery ``resolve()`` needs to await a real fetch on miss. Safe
-        with no lock, the same reason ``invalidate()`` needs none: plain
-        sync code can't be preempted mid-call on asyncio's single-threaded
-        event loop. Overwrites an existing entry for ``key`` rather than
-        leaving it — fine for every current caller, where the same key
-        always maps to the same value."""
+        """Insert ``key`` -> ``value`` directly, no fetch involved, for a
+        caller that already has a value in hand. Overwrites an existing
+        entry for ``key``."""
         self._store_and_evict(key, value)
 
     def _store_and_evict(self, key: K, value: V) -> None:
         """The maxsize-eviction bookkeeping shared by ``resolve()``'s own
-        write-back and ``put()`` — one home for it instead of two copies."""
+        write-back and ``put()``."""
         self._store[key] = value
         self._store.move_to_end(key)
         if self.maxsize is not None:
@@ -113,43 +87,23 @@ class AsyncKeyedCache(Mapping[K, V], Generic[K, V]):
 
     async def resolve(self, key: K, fetch: Callable[[K], Awaitable[V]] | None = None) -> V:
         """Return the cached value for ``key``, fetching and storing it
-        first if this is a miss.
-
-        ``fetch`` overrides whatever was bound at construction for this
-        one call. Passing neither is a caller bug: raises ``TypeError``
-        immediately, same as Python would for any other missing required
-        argument.
+        first if this is a miss. ``fetch`` overrides whatever was bound at
+        construction for this one call; passing neither raises
+        ``TypeError``.
 
         In-flight de-duplication: if another caller is already fetching
         this exact ``key``, this call awaits that caller's own in-progress
-        fetch instead of starting a second, redundant one — both callers
-        get the same value (or exception) for the cost of one fetch. The
-        first caller to miss (the "owner") is the only one that actually
-        calls ``fetch``; later callers become waiters, never seeing their
-        own ``fetch`` argument even if one was given.
+        fetch instead of starting a second one — both get the same value
+        (or exception).
         """
-        # fetch overrides the bound one for this call only — needed by a
-        # cache built at a layer that doesn't yet know how to fetch a miss
-        # (dedup.pool.BucketReaderCache is constructed at the units layer,
-        # which has no Pool reference; only the later resolver does).
         effective_fetch = fetch if fetch is not None else self._fetch
         if effective_fetch is None:
             raise TypeError(f"resolve({key!r}): no fetch function bound at construction or passed here")
 
-        # Locking and in-flight dedup are unconditional, with no
-        # per-instance escape hatch: both are cheap when uncontended, and
-        # every consumer either genuinely needs them (real concurrent,
-        # unrelated callers racing one key) or is never contended in
-        # practice (a private, one-sweep cache with disjoint keys per
-        # task) — no case where paying for one path costs more than
-        # maintaining two.
         async with self._lock:
-            # ``key in self._store``, not ``self._store.get(key) is not None``:
-            # a fetch is free to legitimately resolve to ``None`` (a "checked,
-            # found nothing" outcome some callers cache on purpose, e.g.
-            # dedup.repository.DedupRepo's encryption-probe and
-            # file_meta-table caches) — that must still count as a cache
-            # hit, not silently re-fetch forever.
+            # A fetch may legitimately resolve to None (a cached
+            # "checked, found nothing"), so presence is checked by key
+            # membership, not truthiness.
             if key in self._store:
                 self._store.move_to_end(key)
                 return self._store[key]
@@ -157,11 +111,6 @@ class AsyncKeyedCache(Mapping[K, V], Generic[K, V]):
             if future is None:
                 future = asyncio.get_running_loop().create_future()
                 self._inflight[key] = future
-                # Captured now, under the lock, so a concurrent
-                # invalidate() can't land between this read and the
-                # fetch starting -- it either happens before (this owner
-                # sees the bumped generation, below) or after (caught by
-                # the write-back check).
                 epoch = self._generation.setdefault(key, 0)
                 is_owner = True
             else:
@@ -181,15 +130,10 @@ class AsyncKeyedCache(Mapping[K, V], Generic[K, V]):
             raise
 
         async with self._lock:
-            # A concurrent invalidate() targeting this exact key while
-            # this fetch was in flight already bumped _generation past
-            # what this owner captured above -- that invalidation must
-            # win: writing this now-stale value to _store would silently
-            # undo it, defeating the very call that asked for a fresh
-            # fetch next time. The in-flight future is still resolved
-            # with it below, though: every waiter asked before the
-            # invalidation, so handing them the answer that was already
-            # committed to fetching is still the right value for *them*.
+            # A concurrent invalidate() on this key already bumped
+            # _generation past what this owner captured — that
+            # invalidation wins, so the stale fetch result is not written
+            # back (though waiters already in flight still get it).
             if self._generation.get(key, 0) == epoch:
                 self._store_and_evict(key, value)
             del self._inflight[key]
@@ -198,12 +142,10 @@ class AsyncKeyedCache(Mapping[K, V], Generic[K, V]):
         return value
 
     def invalidate(self, key: K | None = None) -> None:
-        """Drop ``key`` (or every cached entry, if ``key`` is ``None``).
-
-        Also discards the result of any fetch already in flight for the
-        affected key(s): without this, a ``resolve()`` that started
-        before this call could still land its now-stale result in the
-        cache afterward, silently undoing the invalidation.
+        """Drop ``key`` (or every cached entry, if ``key`` is ``None``),
+        including the result of any fetch already in flight for it — a
+        ``resolve()`` started before this call must not land a stale
+        result afterward.
         """
         if key is None:
             self._store.clear()
@@ -214,26 +156,12 @@ class AsyncKeyedCache(Mapping[K, V], Generic[K, V]):
             self._generation[key] = self._generation.get(key, 0) + 1
 
     async def settle_all(self) -> tuple[dict[K, V], list[Exception]]:
-        """Resolve every key ``known_keys()`` reports right now — settled
-        or still fetching — for a caller that needs the whole cache
-        quiesced before it does something that depends on nothing still
-        being in flight (``Repository.close()``/``set_key()`` both drain
-        this way before touching every open ``DedupRepo``, since a
-        ``dict(self._store)``/``.values()`` snapshot only sees entries
-        already settled: a fetch started by a concurrent caller — racing
-        ``close()``/``set_key()`` itself — would otherwise stay invisible
-        to either method's own cleanup, and (for ``set_key()`` specifically)
-        go on to land in the cache after the fact, permanently pinned to
-        whatever key was active when it started. A key nobody has asked
-        for yet at the moment ``known_keys()`` is taken is an unavoidably
-        narrower, residual race neither method can retroactively account
-        for — it's racing the drain itself, not something already in
-        flight when the drain began.
-
-        Returns the values that resolved successfully, keyed the same as
-        ``known_keys()``, plus the exceptions raised by every key that
-        didn't — a caller with nothing further to do for a failed key
-        (``set_key()``'s own drain) can simply discard the second element.
+        """Resolve every key ``known_keys()`` reports right now — settled or
+        still fetching — so a caller can quiesce the cache before doing
+        something that depends on nothing still being in flight (e.g.
+        before closing underlying resources). Returns the values that
+        resolved successfully, keyed the same as ``known_keys()``, plus the
+        exceptions raised by every key that didn't.
         """
         settled: dict[K, V] = {}
         errors: list[Exception] = []

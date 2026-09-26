@@ -1,12 +1,9 @@
 """``Workload``: one ``db/workload_config`` row, with its own display-name/
-subtitle extraction (``_device_display_name``/``_saas_display_name``) as a
-first-class output, not an afterthought: CLI/TUI show only
-``display_name``/``subtitle``/``attrs`` in the default (non-diagnostic)
-mode, so this can't be bolted on later.
+subtitle extraction (``_device_display_name``/``_saas_display_name``).
 
-``workloads()``'s own per-connection lookup, ``_workload_ids_for_connection``,
+``workloads()``'s per-connection lookup, ``_workload_ids_for_connection``,
 relies on the same ``copy_target_version`` join ``catalog/connection.py``
-documents in its batched form.
+uses in its batched form.
 """
 
 from __future__ import annotations
@@ -25,12 +22,9 @@ from .workload_config import _WORKLOAD_COLUMNS
 
 class TargetType(enum.StrEnum):
     """The six real ``Workload.workload_type``/``Version.target_type``
-    values (``db/workload_config``/``db/copy_target_version`` on-disk
-    strings) — device workloads (VM/PC/PS/FS) vs. SaaS connector kinds
-    (GW/M365). A ``str`` subclass: every existing site comparing one
-    against a plain ``"VM"``/``"GW"`` literal, or collecting it alongside
-    the still-``str``-typed ``workload_type``/``target_type`` fields,
-    keeps working unchanged."""
+    values — device workloads (VM/PC/PS/FS) vs. SaaS connector kinds
+    (GW/M365). A ``str`` subclass, so existing sites comparing against a
+    plain ``"VM"``/``"GW"`` literal keep working unchanged."""
 
     VM = "VM"
     PC = "PC"
@@ -61,9 +55,9 @@ class Workload:
     def type_hint(self) -> str:
         """A short, human-meaningful classification for disambiguation —
         ``sub_type`` where present, else the top-level ``workload_type``.
-        **Deliberately not ``subtitle``** — that field carries
-        workload-specific *detail* (an OS name, a host IP), not a *type*
-        classification. Feeds ``disambiguate``'s ``hints`` parameter."""
+        Not ``subtitle``, which carries workload-specific detail (an OS
+        name, a host IP), not a type classification. Feeds
+        ``disambiguate``'s ``hints`` parameter."""
         return self.sub_type or self.workload_type
 
     def _spec_str(self, key: str) -> str | None:
@@ -73,28 +67,23 @@ class Workload:
 
     @property
     def tenant_id(self) -> str | None:
-        """The real M365 (Microsoft 365) tenant GUID —
-        ``workload_spec.spec.tenant_id``. **Not the same thing as**
-        ``workload_spec``'s own top-level ``namespace`` field, a
-        backup-server-internal bookkeeping UUID that can differ across
-        workloads sharing this same ``tenant_id``. ``None`` for non-M365
-        workloads — GW's tenant-equivalent is ``domain``, a different
-        field, never this one."""
+        """The real M365 tenant GUID — ``workload_spec.spec.tenant_id``,
+        not the same as ``workload_spec``'s own ``namespace`` field (a
+        backup-server-internal bookkeeping UUID). ``None`` for non-M365
+        workloads; GW's tenant-equivalent is ``domain`` instead."""
         return self._spec_str("tenant_id")
 
     @property
     def domain(self) -> str | None:
-        """The real GWS (Google Workspace) domain —
-        ``workload_spec.spec.domain``, already a plain human-readable
-        domain string — unlike M365's ``tenant_id``, which is only ever a
-        GUID (no field anywhere in ``workload_spec`` carries a plain
-        M365 tenant *domain* string). ``None`` for non-GW workloads."""
+        """The real GWS domain — ``workload_spec.spec.domain``, a plain
+        human-readable string, unlike M365's GUID-only ``tenant_id``.
+        ``None`` for non-GW workloads."""
         return self._spec_str("domain")
 
 
 async def _workload_ids_for_connection(repo: DedupRepo, connection_config_id: ConnectionConfigId) -> list[WorkloadId]:
     """Workloads for one connection — the single-connection form of the
-    ``copy_target_version`` join ``catalog/connection.py`` documents."""
+    ``copy_target_version`` join ``catalog/connection.py`` uses."""
     conn = await repo.db("copy_target_version")
     cursor = await conn.execute(
         "SELECT DISTINCT workload_id FROM copy_target_version WHERE connection_config_id = ?",
@@ -119,12 +108,9 @@ async def workloads(repo: DedupRepo, connection: Connection) -> list[Workload]:
 
 async def workload_by_id(repo: DedupRepo, workload_id: WorkloadId) -> Workload | None:
     """A single ``Workload`` by its own ``workload_config`` primary key —
-    a direct ``WHERE workload_id = ?`` lookup, not a ``connections()`` +
-    ``workloads(connection)`` scan followed by a linear match: unlike
-    ``Connection``, no field of a ``Workload`` (see ``_workload_from_row``)
-    depends on which connection it belongs to, so there is nothing a full
-    catalog walk would supply that this direct lookup doesn't already
-    have. ``None`` if ``workload_id`` doesn't resolve to any row."""
+    a direct ``WHERE workload_id = ?`` lookup rather than scanning every
+    connection's workloads, since no ``Workload`` field depends on which
+    connection it belongs to. ``None`` if ``workload_id`` doesn't resolve."""
     table = await Table.create(await repo.db("workload_config"), "workload_config", _WORKLOAD_COLUMNS)
     row = await table.select_one("workload_id = ?", (workload_id,))
     return _workload_from_row(row) if row is not None else None

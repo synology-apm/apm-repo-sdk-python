@@ -9,11 +9,9 @@ Four rules, implemented here rather than left to each caller to reinvent:
    image only needs the chunks a planning pass found, not its full
    logical size).
 2. Rate is a windowed average over the last ``rate_window_seconds`` of
-   real elapsed time, not a cumulative average (mis-predicts ETA right
-   after a rate change) and not a per-call EWMA (a burst of
-   near-zero-``dt`` calls would drag a constant-α blend up to a spike
-   value). ETA is suppressed until enough time/progress has accumulated
-   (a warm-up window), and reported quantized so it doesn't jitter.
+   real elapsed time. ETA is suppressed until enough time/progress has
+   accumulated (a warm-up window), and reported quantized so it doesn't
+   jitter.
 3. New rate *samples* are taken no more often than
    ``rate_sample_interval``, decoupling how often the windowed average is
    recomputed from how often ``ProgressMeter.update`` is called — this is

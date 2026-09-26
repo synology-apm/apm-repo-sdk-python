@@ -30,10 +30,8 @@ def display_ref(node: Node, fs_path: str) -> str:
 
 async def named_catalogs(repo: Repository) -> list[tuple[str, Catalog]]:
     """Every catalog in ``repo``, each paired with its own disambiguated
-    display name — the "fetch, disambiguate, zip with the objects those
-    names were built from" sequence ``ls``'s own root case and ``tree``'s
-    own root-catalog-entries case each repeated independently before this
-    helper existed."""
+    display name — shared by ``ls``'s root case and ``tree``'s
+    root-catalog-entries case."""
     catalogs = await repo.catalogs()
     return list(zip(disambiguate_catalogs(catalogs), catalogs, strict=True))
 
@@ -65,10 +63,9 @@ class NodeFields:
 
 def node_fields(node: Node, *, show_ref: bool, fs_path: str) -> NodeFields:
     """``kind``/``ref``/``file_state``/``diagnostic`` for one resolved
-    item-tree ``Node`` — the field set ``ls``'s own row-builder and
-    ``tree``'s own entry-builders each derived independently before this
-    helper existed, which is what let their ``--json`` output disagree on
-    the same node's fields."""
+    item-tree ``Node`` — shared by ``ls``'s row-builder and ``tree``'s
+    entry-builders, so their ``--json`` output can't disagree on the same
+    node's fields."""
     return NodeFields(
         kind=node_kind_label(node),
         ref=display_ref(node, fs_path) if show_ref else None,

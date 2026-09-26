@@ -129,16 +129,12 @@ def _layout(repo_root: str = "") -> RepoLayout:
 
 
 def _repository_layout(repo_root: str = "") -> RepositoryLayout:
-    """The ``RepositoryLayout``-level counterpart to ``_layout()`` above —
-    what ``api.Repository.__init__`` itself now takes (a single opened
-    bucket/vault, not one already-opened ``DedupRepo``). Every test
-    here uses ``RepoKind.VAULT``, matching ``_layout()``'s own default:
-    ``catalog_repo_layouts()`` always resolves a ``VAULT``
-    ``RepositoryLayout`` to exactly one derived ``RepoLayout`` (a vault's
-    own catalogs come from querying ``db/connection_config`` after
-    opening, not a separate directory per catalog), so a single-catalog
-    fake (``_FakeDedupRepo``) is always the right shape regardless of
-    which of the two layout types a given test builds by hand."""
+    """The ``RepositoryLayout``-level counterpart to ``_layout()`` — what
+    ``api.Repository.__init__`` takes (a single opened bucket/vault, not
+    one already-opened ``DedupRepo``). Every test here uses
+    ``RepoKind.VAULT``, which ``catalog_repo_layouts()`` always resolves
+    to exactly one derived ``RepoLayout``, so a single-catalog fake
+    (``_FakeDedupRepo``) is always the right shape."""
     return RepositoryLayout(kind=RepoKind.VAULT, repo_root=repo_root)
 
 
@@ -151,20 +147,14 @@ def _repo_with_fake_dedup(
     encrypted: bool | None = None,
     layout: RepositoryLayout | None = None,
 ) -> api.Repository:
-    """Construct an ``api.Repository`` backed by ``fake`` — the new-model
-    replacement for directly constructing ``api.Repository(_as_dedup_repo(fake), ...)``,
-    now that ``Repository`` opens its own ``DedupRepo``(s) lazily via
-    ``DedupRepo.open()`` rather than taking one ready-made. Monkeypatches
-    ``DedupRepo.open`` to hand back ``fake`` regardless of which derived
-    ``RepoLayout`` it's called with — fine for every test here, which only
-    ever has one single-catalog vault layout to open (every test here
-    builds a ``VAULT`` layout, which always resolves to exactly one
-    ``RepoLayout``). Construction itself never
-    opens anything (only ``Session``'s own ``_confirm_real()`` or an
-    explicit ``catalogs()``/``_open_catalogs.resolve()`` call does) — a
-    test that only checks ``key_status``/``is_encrypted`` right after
-    construction doesn't need this helper at all, a bare ``api.Repository(
-    _as_object_store(_FakeStore()), _repository_layout(), ...)`` is enough."""
+    """Construct an ``api.Repository`` backed by ``fake``. Monkeypatches
+    ``DedupRepo.open`` to return ``fake`` regardless of which derived
+    ``RepoLayout`` it's called with. Construction alone opens nothing —
+    only ``Session._confirm_real()`` or an explicit ``catalogs()``/
+    ``_open_catalogs.resolve()`` call does; a test checking only
+    ``key_status``/``is_encrypted`` right after construction doesn't need
+    this helper, a bare ``api.Repository(_as_object_store(_FakeStore()),
+    _repository_layout(), ...)`` is enough."""
     monkeypatch.setattr(DedupRepo, "open", _async_open(lambda *a, **k: fake))
     return api.Repository(
         _as_object_store(_FakeStore()),
@@ -280,7 +270,7 @@ async def test_session_discover_yields_one_repository_per_layout(monkeypatch: py
     assert session._repos == repos
 
 
-async def test_session_discover_no_longer_confirms_a_vault_via_a_real_open(monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_session_discover_yields_a_vault_whose_catalog_fails_to_open(monkeypatch: pytest.MonkeyPatch) -> None:
     """``Repository._confirm_real()`` trusts ``iter_repository_layouts``'s
     own marker check for ``VAULT`` — a vault whose one catalog
     would fail to open is still yielded by ``discover()``/``open()``, the
@@ -373,17 +363,10 @@ async def test_session_discover_reports_progress_with_found_count(monkeypatch: p
 async def test_session_discover_cancellation_aborts_the_scan_partway(monkeypatch: pytest.MonkeyPatch) -> None:
     """Cancellation propagates as ``asyncio.CancelledError`` at the next
     ``await`` — a cancelled scan stops partway instead of draining every
-    layout.
-
-    Synchronizes on "a" actually reaching ``seen`` (set from inside
-    ``drain()`` itself), not on ``iter_layouts`` having merely been asked
-    for its *next* layout: ``_discover_from_store`` races "look for the
-    next layout" against "finish opening an already-found one" via
-    ``asyncio.wait(..., FIRST_COMPLETED)``, specifically so a hang discovering layout "b" can
-    never block yielding an already-opened "a" — which means "iter_layouts
-    reached its second yield point" and "repository a was delivered to the
-    consumer" have no guaranteed order relative to each other.
-    """
+    layout. Synchronizes on "a" reaching ``seen`` (set inside ``drain()``),
+    not on ``iter_layouts`` merely being asked for its next layout —
+    ``_discover_from_store``'s internal ``FIRST_COMPLETED`` race gives no
+    guaranteed order between finding "b" and delivering "a"."""
     monkeypatch.setattr(api_session, "LocalFsStore", lambda path: _FakeStore())
     monkeypatch.setattr(DedupRepo, "open", _async_open(lambda store, layout, keys, **kwargs: _FakeDedupRepo(layout)))
 
@@ -431,14 +414,10 @@ async def test_session_discover_resolves_key_verification_when_key_given(monkeyp
 async def test_session_discover_resolves_encrypted_status_eagerly_when_no_key_given(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """The point of this whole mechanism: key_status must already be
-    NOT_ENCRYPTED right out of discover(), with zero key ever given —
-    never the ambiguous NO_KEY_PROVIDED a confirmed-unencrypted repository used
-    to get stuck reporting. ``_probe_encrypted``
-    (the free function ``_open_repository`` calls before a ``Repository``
-    ever opens a ``DedupRepo``) is faked directly here, rather than via
-    ``DedupRepo.open``/``_FakeDedupRepo`` -- it now runs *before* any
-    catalog is opened at all."""
+    """``key_status`` must already be ``NOT_ENCRYPTED`` right out of
+    ``discover()``, with zero key given. ``_probe_encrypted`` (called by
+    ``_open_repository`` before any ``DedupRepo`` opens) is faked directly
+    here rather than via ``DedupRepo.open``/``_FakeDedupRepo``."""
     monkeypatch.setattr(api_session, "LocalFsStore", lambda path: _FakeStore())
     monkeypatch.setattr(
         api_session, "iter_repository_layouts", _async_iter_repository_layouts([_repository_layout("a")])
@@ -803,14 +782,11 @@ async def test_session_close_repo_is_idempotent(monkeypatch: pytest.MonkeyPatch)
 async def test_session_close_repo_treats_two_traced_discovers_of_one_backing_store_as_shared(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """``_discover_from_store`` wraps ``store`` in a **new** ``TracingStore``
-    on every call when ``trace=`` is given -- two separate
-    ``discover_remote()`` calls against the same backing store (the shape
-    ``discover_remote``'s own ``root=`` parameter exists to support: scanning
-    one bucket's several sibling repositories via separate calls) must still
-    be recognized as sharing one backing connector, not two independent
-    ones, or ``close_repo()`` would ``aclose()`` the shared connector out
-    from under whichever group is closed second."""
+    """``_discover_from_store`` wraps ``store`` in a new ``TracingStore`` on
+    every call when ``trace=`` is given — two separate ``discover_remote()``
+    calls against the same backing store must still be recognized as
+    sharing one backing connector, or ``close_repo()`` would ``aclose()``
+    it out from under whichever group closes second."""
 
     monkeypatch.setattr(
         api_session, "iter_repository_layouts", _async_iter_repository_layouts([_repository_layout("a")])
@@ -838,20 +814,14 @@ async def test_session_close_repo_keeps_store_tracked_when_cancelled_mid_aclose(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """A cancellation arriving while ``aclose_if_possible`` is still
-    in-flight (the TUI quitting while ``BrowseScreen._close_repos``'s own
-    fire-and-forget worker is mid-close, say) must not orphan the store --
-    neither tracked nor closed. ``close_repo()`` only removes a store from
-    ``self._stores`` once its own aclose attempt has actually returned or
-    raised, never before it starts, so a still-in-flight one stays
-    trackable for ``Session.close()`` to pick up later instead."""
+    in-flight must not orphan the store — neither tracked nor closed.
+    ``close_repo()`` only removes a store from ``self._stores`` once its
+    own aclose attempt has returned or raised, so a still-in-flight one
+    stays trackable for ``Session.close()`` to pick up later."""
 
     class _FakeStoreThatHangsOnFirstAclose(_FakeStore):
-        """Hangs only on its first ``aclose()`` -- standing in for a real
-        connector whose close the *first* caller's cancellation interrupts
-        mid-flight; a second, later caller (``Session.close()`` here)
-        retrying the same close must still succeed normally, the same way
-        a real backend's ``aclose()`` isn't itself left half-broken just
-        because a previous attempt was cancelled before it returned."""
+        """Hangs only on its first ``aclose()``; a second caller retrying
+        the same close must still succeed normally."""
 
         def __init__(self) -> None:
             self.closed = False
@@ -890,19 +860,12 @@ async def test_session_close_repo_keeps_store_tracked_when_cancelled_mid_aclose(
 async def test_session_discover_cancellation_also_cancels_still_pending_open_tasks(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Distinct from the scan-cancellation test above: there, every step of
-    ``_open_repository`` always completes instantly, so ``pending_open`` is
-    empty by the time cancellation lands and the ``finally`` block's own
-    pending-task cancel/await loops never actually run. Here the key/
-    encryption probe for the one found layout is made to hang, so
-    ``pending_open`` still holds its in-flight task when cancellation
-    lands, exercising that cleanup for real. The probe (not
-    ``DedupRepo.open()``) is what's made to hang: ``Repository.
-    _confirm_real()`` trusts the marker check ``iter_repository_layouts``
-    already performed rather than opening a real ``DedupRepo`` for
-    ``VAULT`` to double-check it, so the probe is
-    the one remaining per-layout step ``_open_repository`` still awaits
-    before ``_confirm_real()``."""
+    """Unlike the scan-cancellation test above (where every step completes
+    instantly, so ``pending_open`` is empty by the time cancellation
+    lands), this hangs the encryption probe for the one found layout so
+    ``pending_open`` still holds an in-flight task when cancellation
+    lands, exercising the ``finally`` block's cancel/await cleanup for
+    real."""
     monkeypatch.setattr(api_session, "LocalFsStore", lambda path: _FakeStore())
     monkeypatch.setattr(
         api_session, "iter_repository_layouts", _async_iter_repository_layouts([_repository_layout("a")])

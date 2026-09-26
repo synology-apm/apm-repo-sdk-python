@@ -32,21 +32,15 @@ def _decode_content_transfer_encoding(part: Message, raw: bytes) -> None:
 
 def build_eml(skel_bytes: bytes, fragments_by_id: dict[str, bytes]) -> bytes:
     """Reassembles one ``.eml`` from a skeleton's raw bytes and its
-    fragments, keyed by ``fragment_id`` (FORMAT-SPEC.md: saas-addressing's ``X-ABL-ID``
-    engine — matching is by header **value**, never array/tree order).
-    A part with no ``X-ABL-ID`` is left untouched; an unmatched
-    ``fragments_by_id`` entry is simply unused, not an error — the
-    skeleton is the sole authority on which parts were ever extracted.
-    A ``message/rfc822`` attachment is one opaque fragment, never
-    recursively re-expanded.
-
-    Its spliced bytes for such a part won't show through
-    ``part.get_payload(decode=True)``: the ``email`` stdlib always
-    re-nests a ``message/rfc822`` body into a sub-``Message`` on parse,
-    which routes that part to its multipart early-exit (``None``)
-    regardless of how the bytes got there — compare
-    ``part.get_payload()[0].as_bytes()`` against the original fragment
-    instead."""
+    fragments, keyed by ``fragment_id`` (FORMAT-SPEC.md: saas-addressing's
+    ``X-ABL-ID`` engine; matched by header **value**, never order). A part
+    with no ``X-ABL-ID`` is left untouched; an unmatched fragment is simply
+    unused — the skeleton is the sole authority on which parts were ever
+    extracted. A ``message/rfc822`` attachment is one opaque fragment,
+    never recursively re-expanded; verify its spliced bytes via
+    ``part.get_payload()[0].as_bytes()``, not ``get_payload(decode=True)``
+    (``None`` there — the ``email`` stdlib always re-nests such a body
+    into a sub-``Message`` on parse)."""
     msg = message_from_bytes(skel_bytes, policy=policy.compat32)
     for part in msg.walk():
         abl_id = part.get("X-ABL-ID")

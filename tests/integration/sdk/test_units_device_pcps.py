@@ -40,12 +40,12 @@ _PS_SAMPLE_2_WORKLOAD_ID = 16
 async def test_replayed_ps_sample_1_unresolvable_version_is_listed_and_opens_to_a_diagnostic(
     record_target: Callable[[str], Awaitable[ObjectStore]],
 ) -> None:
-    """``Catalog.versions()`` is the raw catalog read now — this version
-    (whose registered fids are all absent from ``file_meta``'s current
-    generation) is no longer excluded from the list; opening it still
-    degrades gracefully to an empty, diagnostic-only disk list rather
-    than raising, the same as it already did for any version reached
-    through an unfiltered path (``verify_reachable()``'s own walk)."""
+    """``Catalog.versions()`` is the raw catalog read — a version whose
+    registered fids are all absent from ``file_meta``'s current generation
+    still appears in the list; opening it degrades gracefully to an empty,
+    diagnostic-only disk list rather than raising, same as any version
+    reached through an unfiltered path (``verify_reachable()``'s own
+    walk)."""
     store = await record_target("device_pcps_ps_sample_1.json.gz")
     async with Session() as session:
         [repo] = await session.open_remote(store)

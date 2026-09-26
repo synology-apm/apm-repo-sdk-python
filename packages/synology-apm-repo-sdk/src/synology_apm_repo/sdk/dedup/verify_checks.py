@@ -64,11 +64,10 @@ class Symptom(enum.Enum):
     REPAIRED_VIA_PARITY = "RepairedViaParity"
     """A CRC mismatch that this SDK's own Redundancy-blob self-repair
     (``format.redundancy.attempt_repair``) was able to reconstruct and
-    byte-for-byte confirm correct. Not a problem left unresolved, but still reported (not
-    silently dropped) since repeated repairs against the same bucket
-    group over time is itself a signal of failing underlying storage,
-    even though the check the caller actually cared about (is this data
-    readable) passed."""
+    byte-for-byte confirm correct. Still reported, not silently dropped —
+    repeated repairs against the same bucket group over time is itself a
+    signal of failing underlying storage, even though the check the
+    caller actually cared about (is this data readable) passed."""
 
 
 class VerifyLevel(enum.Enum):
@@ -178,15 +177,11 @@ async def check_record_head(
 async def verify_chunk_map_crc_threaded(map_array_bytes: bytes, expected_crc: int) -> None:
     """``format.composition.verify_chunk_map_crc``, with the thread-hop
     decision folded in — ``map_array_bytes`` can be a multi-hundred-MB
-    chunk-map array, so this keeps
-    that rare case's ``zlib.crc32`` pass off the event loop the same way
-    every other large-payload synchronous computation in this codebase
-    does (``catalog/version.py::open_target_db``, ``units/fs.py``'s own
-    ``peel()`` call). ``should_thread_chunk_map_crc`` skips the hop for
-    the common small-array case, where the hop itself would cost more
-    than the ``crc32`` pass it's saving. Shared by this module's own
-    ``check_map_and_attr_crc`` and ``diagnostics.py``'s
-    ``_verify_map_crc`` — same check, two orchestrators.
+    array, so this keeps the rare large case's ``zlib.crc32`` pass off
+    the event loop. ``should_thread_chunk_map_crc`` skips the hop for the
+    common small-array case, where the hop would cost more than the
+    ``crc32`` pass it saves. Shared by ``check_map_and_attr_crc`` and
+    ``diagnostics.py``'s ``_verify_map_crc``.
 
     Raises:
         DataCorruptError: ``map_array_bytes`` doesn't match ``expected_crc``.
@@ -202,18 +197,17 @@ async def _attempt_map_crc_repair(
 ) -> bytes | None:
     """On a ``map_crc`` mismatch, lazily fetch the record's trailing
     Redundancy blob (FORMAT-SPEC.md: ChunkCrcStore/RecordHead — stored
-    *after* the attribute blob, at
-    ``map_array_off + map_array_len + attr_leng``, coverage 8192) and
-    attempt in-memory self-repair (``format.redundancy.repair_via_trailer``).
+    after the attribute blob, at ``map_array_off + map_array_len +
+    attr_leng``, coverage 8192) and attempt in-memory self-repair
+    (``format.redundancy.repair_via_trailer``).
 
-    Never read on the healthy path — this is only called once
-    ``verify_chunk_map_crc_threaded`` has already raised, so the extra
-    read only ever happens on an already-broken record.
+    Never read on the healthy path — only called once
+    ``verify_chunk_map_crc_threaded`` has already raised.
 
-    Returns the repaired array bytes on a confirmed-correct reconstruction,
-    or ``None`` if the trailer can't be fetched/parsed or the
-    reconstruction still doesn't validate — either way, the caller falls
-    back to reporting the original mismatch unchanged.
+    Returns the repaired array bytes on a confirmed-correct
+    reconstruction, or ``None`` if the trailer can't be fetched/parsed or
+    the reconstruction still doesn't validate — either way, the caller
+    falls back to reporting the original mismatch unchanged.
     """
     trailer_len = redundancy_size(map_array_len, REDUNDANCY_COVERAGE_COMPOSITION)
     trailer_off = map_array_off + map_array_len + attr_leng
@@ -230,30 +224,23 @@ async def check_map_and_attr_crc(
 ) -> tuple[list[Finding], bytes | None]:
     """Full ``mapCrc`` over the whole chunk-map array plus (when present)
     ``attrCrc`` over the trailing JSON attribute blob — one merged read
-    for both regions, since they're contiguous.
+    for both, since they're contiguous.
 
-    A ``map_crc`` mismatch is not immediately reported as a problem: this
-    first tries the record's own Redundancy-blob self-repair
-    (``_attempt_map_crc_repair``), since every current-format record
-    carries one (``RecordHead.has_redundancy``, checked by
-    ``parse_record_head`` itself). A confirmed-correct repair is reported
-    as ``Symptom.REPAIRED_VIA_PARITY`` (see that symptom for why a
-    successful repair still gets reported) rather than dropped silently.
+    A ``map_crc`` mismatch first tries the record's own Redundancy-blob
+    self-repair (``_attempt_map_crc_repair``), since every current-format
+    record carries one. A confirmed-correct repair is reported as
+    ``Symptom.REPAIRED_VIA_PARITY`` rather than dropped silently.
 
-    Nothing is checked when ``record_head.map_num == 0`` — an empty
-    chunk-map array has nothing to CRC.
+    Nothing is checked when ``record_head.map_num == 0``.
 
     Returns:
         ``(findings, repaired_array)``. ``repaired_array`` is the
-        confirmed-correct chunk-map array bytes exactly when a ``map_crc``
-        mismatch was just repaired via parity, ``None`` otherwise (no
-        mismatch, or one that couldn't be repaired). A caller with its own
-        *separate* re-read of this same array — ``units/verify_reachable.py``'s
-        ``plan_chunks_windowed`` walk goes through a different
-        ``CompositionReader``/``CompositionRecord`` that never sees this
-        repair on its own — must feed a non-``None`` result into
-        ``CompositionRecord.seed_pages_from_array`` itself, or it re-derives
-        entries from the still-corrupted on-disk bytes.
+        confirmed-correct chunk-map array bytes exactly when a
+        ``map_crc`` mismatch was just repaired via parity, ``None``
+        otherwise. A caller with its own separate re-read of this same
+        array must feed a non-``None`` result into
+        ``CompositionRecord.seed_pages_from_array`` itself, or it
+        re-derives entries from the still-corrupted on-disk bytes.
     """
     if record_head.map_num == 0:
         return [], None
@@ -261,9 +248,6 @@ async def check_map_and_attr_crc(
     map_array_off = chunk_map_array_offset(comp_offset)
     map_array_len = record_head.map_num * CHUNK_MAP_RECORD_LENGTH
     try:
-        # One merged read for the chunk-map array plus the JSON attribute
-        # blob immediately following it -- they're contiguous, so this
-        # saves a second round-trip over reading each separately.
         combined_raw = await reader.read_at(map_array_off, map_array_len + record_head.attr_leng)
     except (NotFoundError, FormatError) as exc:
         return [Finding(Stage.COMPOSITION, Symptom.DATA_MISSING, path, str(exc))], None
@@ -295,29 +279,22 @@ async def check_map_and_attr_crc(
 
 async def check_bucket_structure(store: ObjectStore, reader: BucketReader) -> list[Finding]:
     """Everything about this bucket that doesn't depend on which chunk(s)
-    a caller actually cares about: ``expected_bucket_size`` against the
-    real on-disk size, and the ChunkCrcStore trailer's own
-    ``crcOfChunkCrc`` self-consistency (via
-    ``BucketReader.ensure_chunk_crc_store``, which also warms the cache
-    ``check_chunk_ciphertext_crc`` below reuses — one trailer read shared
-    by both, not two). Header/SizeStore CRC are already unconditionally
-    checked by ``BucketReader.open`` itself; the one further thing owned
-    here is turning a successful SizeStore self-repair
-    (``reader.sizestore_repaired``) into its own
-    ``Symptom.REPAIRED_VIA_PARITY`` finding, since ``open()`` itself has no
-    ``Finding``-returning contract — the same visibility
-    ``check_map_and_attr_crc`` already gives the composition-layer map-CRC
-    repair.
+    a caller cares about: ``expected_bucket_size`` against the real
+    on-disk size, and the ChunkCrcStore trailer's own self-consistency
+    (via ``BucketReader.ensure_chunk_crc_store``, which also warms the
+    cache ``check_chunk_ciphertext_crc`` below reuses). Header/SizeStore
+    CRC are already checked by ``BucketReader.open`` itself; this adds a
+    ``Symptom.REPAIRED_VIA_PARITY`` finding when ``open()``'s own
+    SizeStore self-repair succeeded, since ``open()`` has no
+    ``Finding``-returning contract of its own.
 
     A legacy uncompressed-layout bucket has neither an
-    ``expected_bucket_size`` formula nor a ChunkCrcStore trailer that
-    applies to it — both are skipped, not treated as findings.
+    ``expected_bucket_size`` formula nor a ChunkCrcStore trailer — both
+    are skipped, not treated as findings.
 
-    Takes a bare ``store``, not a full ``DedupRepo`` — the only thing
-    this function ever needed from one — so a caller with just an
-    ``ObjectStore`` in hand (a multiprocess worker rebuilding its own repository
-    state via ``dedup.pool_descriptor``, which has no ``DedupRepo`` at
-    all) can call this directly.
+    Takes a bare ``store``, not a full ``DedupRepo``, so a caller with
+    just an ``ObjectStore`` in hand (a multiprocess worker rebuilding its
+    own state via ``dedup.pool_descriptor``) can call this directly.
     """
     findings: list[Finding] = []
     if not reader.header.is_compressed:
@@ -330,9 +307,8 @@ async def check_bucket_structure(store: ObjectStore, reader: BucketReader) -> li
         )
     expected = expected_bucket_size(reader.header, reader.entries)
     # reader.known_file_size is already the actual on-disk size when
-    # SizeStore repair fetched it moments earlier, in this same open() ->
-    # check_bucket_structure sequence -- reuse it instead of a second
-    # store.size() round-trip on the same path.
+    # SizeStore repair fetched it moments earlier — reuse it instead of a
+    # second store.size() round-trip.
     actual = reader.known_file_size if reader.known_file_size is not None else await store.size(reader.path)
     if actual != expected:
         findings.append(
@@ -372,13 +348,11 @@ async def check_raw_chunk_ciphertext_crc(
     reader: BucketReader, chunk_idx: int, raw: bytes | memoryview
 ) -> Finding | None:
     """``check_chunk_ciphertext_crc``'s counterpart for a caller that
-    already has ``chunk_idx``'s stored bytes in hand — e.g. from a batched
-    ``read_raw_chunks`` call — instead of fetching them itself, the same
-    split ``verify_raw_chunk_ciphertext_crc`` already has from
-    ``verify_chunk_ciphertext_crc``. Same three-way exception mapping as
-    the singular form above; kept as its own function rather than folded
-    into ``check_chunk_ciphertext_crcs`` below (its only caller) so that
-    caller's own batched-fetch-then-check-each shape stays readable."""
+    already has ``chunk_idx``'s stored bytes in hand (e.g. from a batched
+    ``read_raw_chunks`` call). Same exception mapping as the singular
+    form above; kept separate from ``check_chunk_ciphertext_crcs`` below
+    (its only caller) so that caller's batched-fetch-then-check shape
+    stays readable."""
     try:
         await reader.verify_raw_chunk_ciphertext_crc(chunk_idx, raw)
     except NotFoundError as exc:
@@ -394,22 +368,14 @@ async def check_chunk_ciphertext_crcs(reader: BucketReader, chunk_indices: Seque
     """Batched ``check_chunk_ciphertext_crc``: every one of
     ``chunk_indices``'s stored bytes is fetched via
     ``reader.read_raw_chunks`` — one merged ``store.read()`` per
-    contiguous run instead of one per chunk — before checking each against its own ``ChunkCrcStore``
-    entry via ``check_raw_chunk_ciphertext_crc``. Reports each chunk that
-    fails on its own, the same granularity looping
-    ``check_chunk_ciphertext_crc`` would.
+    contiguous run instead of one per chunk — before checking each
+    against its own ``ChunkCrcStore`` entry.
 
-    ``read_raw_chunks`` reads its own runs one after another with no
-    per-run isolation: a later run's failure raises past every earlier
-    run's already-fetched bytes, discarding them along with it. Since
-    those bytes were never actually checked, silently swallowing that
-    failure here would mean a real ciphertext CRC mismatch sitting in an
-    earlier, otherwise-successful run could go unreported — so any
-    failure at all from the batched read falls back to one
-    ``check_chunk_ciphertext_crc`` call per chunk instead, which has no
-    such cross-run coupling. Reserved for the failure path only; the
-    common case (a single run, or every run succeeding) never pays for
-    it.
+    ``read_raw_chunks`` has no per-run isolation: a later run's failure
+    discards every earlier run's already-fetched (but never checked)
+    bytes. So any failure at all from the batched read falls back to one
+    ``check_chunk_ciphertext_crc`` call per chunk instead — reserved for
+    the failure path only; the common case never pays for it.
     """
     try:
         raw_by_chunk = await reader.read_raw_chunks(list(chunk_indices))

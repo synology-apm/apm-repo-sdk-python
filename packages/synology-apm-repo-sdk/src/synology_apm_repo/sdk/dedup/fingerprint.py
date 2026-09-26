@@ -1,32 +1,26 @@
-"""Fingerprint lookup: locates the stored SHA-256 digest for one
-chunk in its group's ``.inf``/``.fgp`` files. Used by ``verify`` and by
-``Pool.read_chunk`` when ``verify_fingerprint`` is enabled.
+"""Fingerprint lookup: locates the stored SHA-256 digest for one chunk in
+its group's ``.inf``/``.fgp`` files. Used by ``verify`` and by
+``Pool.read_chunk`` when ``verify_fingerprint`` is enabled. Correctly
+handles a chunk whose fingerprint straddles a ``.fgp`` 4 MiB segment
+boundary, across plaintext and encrypted, vault- and object-store-backed
+repositories.
 
-Correctly handles a chunk whose fingerprint straddles a ``.fgp`` 4 MiB
-segment boundary, across both plaintext and encrypted, vault- and
-object-store-backed repositories.
-
-**Group path indirection**: ``.inf``/``.fgp`` are
-shared by an entire 1024-bucket *group*, keyed by the group's *starting*
-bucket id (``bucket_id & ~1023``), not any individual bucket's own id —
-the same 10-bit layering scheme as ``.buk`` paths, just applied to the
-group id instead. ``.fgp`` is additionally split into 4 MiB segments
-(``<prefix>_<segIdx>.fgp``) since a full group's fingerprint data
-(1024 buckets * up to 8192 chunks * 32 bytes) would otherwise be a single
+**Group path indirection**: ``.inf``/``.fgp`` are shared by an entire
+1024-bucket *group*, keyed by the group's starting bucket id
+(``bucket_id & ~1023``) — the same 10-bit layering scheme as ``.buk``
+paths. ``.fgp`` is further split into 4 MiB segments
+(``<prefix>_<segIdx>.fgp``) since a full group's fingerprint data (1024
+buckets * up to 8192 chunks * 32 bytes) would otherwise be one
 multi-hundred-MB file.
 
-**``AllocationTableCache``**: ``fingerprint()``/``fingerprints()`` already
-resolve a bucket's own ``.inf`` header + allocation-table entry once per
-*call* regardless of how many chunks that call checks — but every one of
-up to ``GROUP_BUCKET_NUM`` (1024) distinct *buckets* sharing one group
-still pays for the same header validation and entry lookup again, once
-per bucket, since nothing persists that resolution across separate calls,
-even though the underlying bytes are identical for every bucket in the
-group. An optional ``AllocationTableCache`` (kept by ``Pool``, so every
-caller reading fingerprints through one — browsing, export, and both
-``verify`` orchestrators alike — shares it automatically) resolves the
-whole group's allocation table once, the first time any of its buckets is
-touched, and answers every later bucket in that same group from memory.
+**``AllocationTableCache``**: ``fingerprint()``/``fingerprints()``
+resolve a bucket's ``.inf`` header/allocation entry once per call, but
+every one of up to ``GROUP_BUCKET_NUM`` (1024) buckets sharing a group
+still re-resolves identical bytes, once per bucket, across separate
+calls. An optional ``AllocationTableCache`` (kept by ``Pool``, shared
+automatically by every caller reading fingerprints through one) resolves
+a group's whole allocation table once and answers every later bucket in
+it from memory.
 """
 
 from __future__ import annotations
@@ -86,13 +80,11 @@ async def _read_full_allocation_table(
 class AllocationTableCache:
     """Caches each distinct ``(stream_id, group's starting bucket id)``'s
     whole, header-validated ``.inf`` allocation table for this cache
-    instance's whole lifetime — since up to ``GROUP_BUCKET_NUM`` (1024)
-    distinct buckets share one group's identical allocation-table bytes,
-    and without this they'd each re-read and re-validate them separately.
-    Pure in-memory bookkeeping on top of ``AsyncKeyedCache``; owns no
-    store/dir_cache/pool_root of its own, since every call already has
-    those in hand (mirrors ``dedup.pool.BucketReaderCache``'s own reason
-    for the same shape — see that class's docstring)."""
+    instance's lifetime — up to ``GROUP_BUCKET_NUM`` (1024) buckets share
+    one group's identical bytes. Pure in-memory bookkeeping on top of
+    ``AsyncKeyedCache``; owns no store/dir_cache/pool_root of its own,
+    since every call already has those in hand (mirrors
+    ``dedup.pool.BucketReaderCache``'s reason for the same shape)."""
 
     def __init__(self) -> None:
         self._tables: AsyncKeyedCache[tuple[int, int], tuple[str, str, str, bytes]] = AsyncKeyedCache()
@@ -215,14 +207,11 @@ def _group_contiguous_runs(chunk_indices: Iterable[ChunkIdx], byte_off: int) -> 
     time. Kept free of any I/O so it's trivial to reason about/test on
     its own.
 
-    A deliberately different merge rule from ``dedup.pool.BucketReader
-    ._fits_in_run``, not a duplicate of it: that one merges by *byte-gap
-    tolerance* between arbitrary offsets (a real gap up to
-    ``_GAP_TOLERANCE`` still merges), since ``.buk`` chunk data can be
-    fragmented by reclaimed space; every fixed-length ``.fgp`` record
-    is always tightly packed with zero gap, so what matters here instead
-    is index adjacency plus never crossing a segment file's own boundary
-    — a constraint ``_bucket_reader.py``'s own runs have no equivalent of.
+    A deliberately different merge rule from
+    ``dedup.pool.BucketReader._fits_in_run``: that one tolerates a byte
+    gap up to ``_GAP_TOLERANCE`` since ``.buk`` data can be fragmented;
+    ``.fgp`` records are always tightly packed, so what matters here is
+    index adjacency plus never crossing a segment boundary.
     """
     ordered = sorted(set(chunk_indices))
     runs: list[list[ChunkIdx]] = []
@@ -323,26 +312,19 @@ async def fingerprints(
 ) -> dict[ChunkIdx, bytes]:
     """Batched ``fingerprint()`` for every ``chunk_idx`` in
     ``chunk_indices``, all within the same ``(stream_id, bucket_id)`` —
-    resolves the shared ``.inf`` header/allocation-table entry exactly
-    once regardless of how many chunks are checked, instead of once per
-    chunk the way calling ``fingerprint()`` in a loop would (a real gap
-    for ``Pool.verify_fingerprints``'s multi-chunk case: every chunk in
-    one bucket needs the identical two reads).
+    resolves the shared ``.inf`` header/allocation-table entry once
+    regardless of chunk count.
 
-    The digests themselves are batched too: ``chunk_indices`` is grouped
-    into maximal runs of consecutive integers that also stay within one
-    ``.fgp`` segment (``_group_contiguous_runs``), and each run costs one
-    ``store.read()`` spanning the whole run rather than one 32-byte read
-    per chunk. This is the common case for a bucket-wide sweep (FULL-level
-    verify's own "every non-``COMPACTED`` chunk" walk): a large bucket's
-    fingerprints fit in a single ``.fgp`` segment, so an unbatched
-    per-chunk read would otherwise turn one bucket's worth of checking
-    into tens of thousands of separate 32-byte reads. A caller passing genuinely scattered indices
-    (no two adjacent) still costs one read per index, same as before —
-    grouping never makes an unmergeable case worse.
+    Digests are also batched: ``chunk_indices`` is grouped into maximal
+    runs of consecutive integers within one ``.fgp`` segment
+    (``_group_contiguous_runs``), each run costing one ``store.read()``
+    instead of one 32-byte read per chunk — the common case for a
+    bucket-wide sweep, where an unbatched read would turn one bucket's
+    worth of checking into tens of thousands of separate reads. Scattered
+    indices (no two adjacent) cost one read per index, same as unbatched.
 
     ``cache``, when given, shares one group's already-resolved allocation
-    table across every bucket in it instead of resolving fresh each call.
+    table across every bucket in it.
 
     Raises the same exceptions ``fingerprint()`` does, for the same
     reasons.

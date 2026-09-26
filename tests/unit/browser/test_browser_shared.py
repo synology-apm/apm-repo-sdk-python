@@ -134,10 +134,8 @@ class _BreadcrumbScreen(NavigableScreen):
 
 class _BreadcrumbApp(App[None]):
     # The real theme.tcss, not a bare Static -- #breadcrumb's own real
-    # "padding: 0 1" is exactly what a real, reported bug involved (the
-    # hint's own "(t)" silently clipped off the right edge because
-    # _render_breadcrumb used the *screen's* raw width, 2 columns wider
-    # than the padded widget's own usable one).
+    # "padding: 0 1" makes its usable width 2 columns narrower than the
+    # screen's raw width, which _render_breadcrumb must account for.
     CSS_PATH = ApmRepoBrowserApp.CSS_PATH
     jobs: var[dict[object, object]] = var(dict)
 

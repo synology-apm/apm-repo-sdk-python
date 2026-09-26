@@ -43,62 +43,37 @@ class ApmRepoBrowserApp(App[None]):
     """Offline browser/exporter for Synology APV/Object-Storage dedup
     repositories.
 
-    Holds exactly the state shared across every screen: the one ``Session``
-    (closed on exit — it owns every connection it opens and is the single
-    place responsible for releasing them), which repository is currently
-    selected (``repo_handle``), whether verbose mode (``d``) is on, ``default_sparse``
-    (every export starts from this session-wide setting, set once at
-    launch, not a per-export choice), ``resources`` (the one
-    ``ResourceTable`` every screen's own ``Store``-held
-    ``ProviderHandle``/``RepoHandle`` resolves through, because a
-    ``Repository``/``UnitProvider`` owns a non-daemon-thread ``aiosqlite``
-    connection that a frozen ``core.*`` model can't hold without leaking
-    threads across repeated version visits), and ``store``, the app-level
-    MVU loop every screen dispatches a job-related ``AppMsg`` into
-    (``ExportScreen`` on Export/Cancel, ``WorklistScreen``'s own ``x``)
-    and can subscribe to for job state. Screen-specific state stays on
-    the screen itself, not here."""
+    Holds the state shared across every screen: the one ``Session`` (closed
+    on exit), which repository is selected (``repo_handle``), ``verbose``
+    mode, ``default_sparse`` (session-wide, set once at launch), ``resources``
+    (the ``ResourceTable`` every screen's ``ProviderHandle``/``RepoHandle``
+    resolves through — a frozen ``core.*`` model can't hold a real closable
+    connection directly), and ``store``, the app-level MVU loop for
+    background jobs. Screen-specific state stays on the screen itself."""
 
     TITLE = "APM Repository Browser"
     CSS_PATH = _CSS_PATH
     BINDINGS = [*COMMON_BINDINGS, WORKLIST_BINDING]
 
-    #: Toggled by ``d``. A screen that has anything verbose-mode-dependent
-    #: to redraw registers ``self.watch(self.app, "verbose",
-    #: self.refresh_for_verbose_mode, init=False)`` in its own ``on_mount``
-    #: (see ``BrowseScreen``/``UnitScreen``) — that watch fires regardless
-    #: of whether the registering screen is currently on top of the screen
-    #: stack. The reactive's own ``init=False`` is
-    #: a separate, unrelated knob (whether *this* class's own
-    #: ``watch_verbose`` fires once automatically right after the App
-    #: mounts) — left at ``var``'s own default of ``True`` here would
-    #: fire an unwanted "verbose mode off" notification on every launch
-    #: even though the user never pressed ``d``.
+    #: Toggled by ``d``. A screen registers ``self.watch(self.app, "verbose",
+    #: ..., init=False)`` in its own ``on_mount`` to redraw regardless of
+    #: screen-stack position. ``init=False`` here is separate: it stops this
+    #: class's own ``watch_verbose`` firing an unwanted notification on launch.
     verbose: var[bool] = var(False, init=False)
 
-    #: A mirror of ``self.store.model.jobs``, kept in sync by the
-    #: subscription registered in ``__init__`` below. Exists as a real
-    #: reactive (rather than reading ``self.store.model.jobs`` directly)
-    #: because ``self.watch(self.app, "jobs", ...)`` — how
-    #: ``NavigableScreen``'s own breadcrumb tasks-hint (shared by
-    #: ``BrowseScreen``/``UnitScreen``) stays in sync regardless of
-    #: screen-stack position, and how ``WorklistScreen`` reacts live —
-    #: needs an actual ``Reactive`` descriptor to hook into, not just a
-    #: same-named plain attribute (``Store.subscribe`` has no equivalent
-    #: "fires regardless of who's currently on top" behavior of its own).
+    #: A mirror of ``self.store.model.jobs``, synced by the subscription in
+    #: ``__init__`` below. A real ``Reactive`` (not read from the store
+    #: directly) so screens can ``self.watch(self.app, "jobs", ...)`` to stay
+    #: in sync regardless of screen-stack position.
     jobs: var[Mapping[JobId, Job]] = var(dict)
 
     def __init__(self, *, default_sparse: bool = True) -> None:
         super().__init__()
         self.session = Session()
         self.resources = ResourceTable(self.session)
-        #: The currently-selected repository's own handle -- never the live
-        #: object itself, since ``ResourceTable`` is the sole owner of the
-        #: live ``Repository`` for its whole lifetime. Every
-        #: reader dereferences through ``self.resources.repo(...)`` at the
-        #: point of use rather than caching the live object, so a repo
-        #: released between selection and use naturally reads back as
-        #: ``None`` instead of needing a separate, hand-synchronized reset.
+        #: The selected repository's handle, not the live object —
+        #: ``ResourceTable`` is the sole owner; readers dereference through
+        #: ``self.resources.repo(...)`` at point of use.
         self.repo_handle: RepoHandle | None = None
         self.default_sparse = default_sparse
         self.store: Store[AppModel, AppMsg, AppCmd] = Store(AppModel(), update, self._perform)
@@ -107,20 +82,13 @@ class ApmRepoBrowserApp(App[None]):
 
     @property
     def current_repo(self) -> Repository | None:
-        """``repo_handle`` dereferenced through ``resources`` -- the one
-        place every reader does this, rather than repeating the same
-        ``resources.repo(repo_handle) if repo_handle is not None else
-        None`` ternary at each call site."""
+        """``repo_handle`` dereferenced through ``resources``."""
         return self.resources.repo(self.repo_handle) if self.repo_handle is not None else None
 
     def _perform(self, cmd: AppCmd) -> None:
         self.effects.perform(cmd)
 
     def _sync_jobs(self, jobs: Mapping[JobId, Job]) -> None:
-        # A plain assignment, not mutate_reactive(): update() always
-        # returns a fresh dict on any real change (never mutates
-        # model.jobs in place), so Textual's own reactive `!=` check
-        # already fires exactly when the mirror genuinely needs to.
         self.jobs = jobs
 
     def compose(self) -> ComposeResult:
@@ -128,69 +96,28 @@ class ApmRepoBrowserApp(App[None]):
         yield Static(id="root-placeholder")
 
     def on_mount(self) -> None:
-        # BrowseScreen is the only root screen -- pushed exactly once, here,
-        # and never popped by anything else -- but it starts with nothing to
-        # show: picking *what* to browse (a local directory, an S3/Azure
-        # Blob Storage-backed repository, or an SMB share) is entirely
-        # ConnectDialog's job now -- it's the only place a source is ever
-        # picked, and BrowseScreen has no path field of its own -- so it's
-        # auto-opened immediately on top, the exact
-        # same push ``c``/action_connect_remote triggers later. Esc-ing out
-        # of this first dialog without connecting anything just leaves
-        # BrowseScreen empty, reopenable any time with ``c``.
+        # BrowseScreen is the only root screen, pushed once here; it starts
+        # empty and immediately opens ConnectDialog, the only place a
+        # source is picked (also reachable later via `c`).
         screen = BrowseScreen()
         self.push_screen(screen)
         screen.action_connect_remote()
 
     async def on_unmount(self) -> None:
-        # ``async def`` deliberately: ``Session.close()`` is a coroutine.
-        # Textual dispatches handlers through ``textual._callback.invoke()``,
-        # which awaits the result when it's awaitable, so an ``async def``
-        # handler here is awaited to completion exactly like any other
-        # handler.
-
-        # Closed first so a job's own worker racing this shutdown (its
-        # CancelledError handler dispatching ExportFinished) can't reach
-        # back into a store that's mid-teardown -- matches every screen's
-        # own on_unmount, which closes its store before touching workers.
+        # Closed first so a racing job worker can't reach a mid-teardown store.
         self.store.close()
 
-        # Textual's own shutdown already cancels every outstanding worker
-        # before dispatching Unmount — same mechanism cancel_group relies
-        # on below. Cancelling each job's own group explicitly here is
-        # kept anyway, so the ordering holds without depending on
-        # Textual's internals.
-        #
-        # Then *waited for*: cancellation only lands at the job's next await,
-        # and ``session.close()`` closes the providers those jobs are still
-        # reading through — closing one underneath an in-flight read leaks its
-        # connection (see ``UnitScreen.on_unmount``). ``drain()`` bounds the
-        # wait: a job parked inside an already-started ``to_thread`` read does
-        # not come back until that read returns, and quitting must not hang on
-        # it. A job that outlives the bound is left to the cancellation it was
-        # already handed; only the ordering guarantee is given up, not the
-        # cancel. cancel_group's own return value is exactly the workers it
-        # actually cancelled, so nothing here needs its own live-Worker
-        # bookkeeping.
-        # Read from the store directly, not the `jobs` mirror -- close()
-        # just above already dropped every subscription, so the mirror
-        # stops receiving further updates from this point on; the store's
-        # own model is still readable and remains the source of truth.
+        # Cancel each job's workers, then wait them out with a bound: a
+        # worker parked in an already-started to_thread() read won't return
+        # until that read finishes, and quitting must not hang on it.
         cancelled: list[Worker[None]] = []
         for job in self.store.model.jobs.values():
             cancelled.extend(self.workers.cancel_group(self, job.group))
         await drain(cancelled)
 
-        # A provider-close/repo-close worker (a UnitScreen's/BrowseScreen's
-        # own, hosted here on the App rather than the screen -- Textual's
-        # own ``Widget._on_unmount`` cancels every worker on a node once that
-        # node unmounts, regardless of its own group, so a close worker
-        # hosted on the screen could be cancelled out from under itself
-        # mid-close, exactly the leaked-connection failure mode closing a
-        # provider exists to prevent) is never cancelled, only drained: unlike a job,
-        # its own cleanup must actually finish, not just stop, before
-        # ``session.close()`` below closes the same connections it's still
-        # releasing.
+        # Provider/repo-close workers are drained, not cancelled: their
+        # cleanup must finish before session.close() below closes the same
+        # connections they're still releasing.
         resource_closes = [w for w in self.workers if w.group in (UNIT_PROVIDER_CLOSE_GROUP, BROWSE_REPO_CLOSE_GROUP)]
         await drain(resource_closes)
         await self.session.close()
@@ -208,10 +135,8 @@ class ApmRepoBrowserApp(App[None]):
     def action_show_help(self) -> None:
         from synology_apm_repo.browser.screens.help_screen import HelpScreen
 
-        # Captured from ``self.screen`` -- the screen that was active when
-        # ``?`` was pressed -- before ``HelpScreen`` itself becomes the
-        # active screen and its own (much smaller) bindings would otherwise
-        # be what gets shown.
+        # Captured before HelpScreen becomes active and its own bindings
+        # would otherwise be what's shown.
         self.push_screen(HelpScreen(self.screen.active_bindings))
 
     def action_toggle_worklist(self) -> None:
@@ -240,37 +165,18 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
 
 
 def main(argv: list[str] | None = None) -> None:  # pragma: no cover - opens a real terminal, see below
-    """``argv`` is ``None`` in real use (argparse then reads ``sys.argv``
-    itself); a real list is only ever passed by a test that wants a
-    fixed argument list.
-
-    ``--no-sparse-export`` sets ``ApmRepoBrowserApp.default_sparse`` for the
-    whole session; ``ExportScreen`` has no per-export toggle, because
-    skipping sparse writes is a rare exception not worth asking about on
-    every export.
-
-    Excluded from the coverage gate: ``.run()`` opens a real terminal —
-    ``App.run_test()`` (used everywhere else in this package's tests) is
-    the tested path; ``_parse_args()`` right above is pure and already
-    covered directly by ``test_browser_app.py``."""
-    # A TUI cannot share its terminal: anything a dependency writes to
-    # stderr lands on top of the rendered screen while the app runs, and
-    # after it exits, in the user's shell. Shared with the CLI's own call
-    # site (cli/main.py::main()), since both must behave identically here.
-    # configure_logging() adds a NullHandler to the root logger so
-    # logging's last-resort handler (which would otherwise dump every
-    # WARNING and above from a dependency like smbprotocol straight to
-    # stderr) never fires -- or redirects everything to a file named by
-    # SYNOLOGY_APM_REPO_LOG instead, for debugging a backend.
+    """``argv`` is ``None`` in real use; a real list is only passed by a
+    test wanting a fixed argument list. Excluded from the coverage gate:
+    ``.run()`` opens a real terminal — ``App.run_test()`` is the tested
+    path elsewhere in this package."""
+    # A TUI can't share its terminal with a dependency's own stderr output
+    # (shared call site with cli/main.py::main()); configure_logging()
+    # suppresses it, or redirects to SYNOLOGY_APM_REPO_LOG for debugging.
     configure_logging()
     args = _parse_args(argv)
-    # Must happen before .run(): once the app is running, Textual redirects
-    # sys.stderr to its own capture stream, whose fileno() returns a
-    # sentinel instead of raising. preload_resource_tracker()'s launch code
-    # appends sys.stderr.fileno() to the file descriptors it hands the
-    # tracker helper with no validation, and crashes the first
-    # ProcessPoolExecutor built afterward if that value isn't a real, open
-    # descriptor -- so it needs the real stderr, captured here first.
+    # Must happen before .run(): once running, Textual redirects sys.stderr
+    # to a capture stream whose fileno() isn't a real descriptor, which
+    # preload_resource_tracker() requires.
     preload_resource_tracker()
     ApmRepoBrowserApp(default_sparse=not args.no_sparse_export).run()
 

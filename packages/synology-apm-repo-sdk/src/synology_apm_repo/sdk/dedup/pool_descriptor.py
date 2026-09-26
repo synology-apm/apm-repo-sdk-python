@@ -1,13 +1,10 @@
 """``PoolDescriptor``: a picklable recipe for rebuilding one ``Pool`` fresh
 inside a worker process — the ``dedup``-layer counterpart to
-``storage.store_descriptor``, named to match it (both are "a picklable
-descriptor + a worker-side rebuild factory for X"). Neither module depends
-on the other's caller; this one only needs a ``StoreDescriptor`` already in
-hand, from whichever ``DedupRepo``/``Pool`` a caller is dispatching work
-for — ``verify_reachable.py`` has a ``DedupRepo`` (``from_repo``),
-``export_scheduler.py`` only ever has a bare ``Pool`` (``from_pool``), since
-a ``DedupFile``/``ByteRangeView`` exposes its own ``.pool``, never a whole
-``DedupRepo``.
+``storage.store_descriptor``. This one only needs a ``StoreDescriptor``
+already in hand: ``verify_reachable.py`` has a ``DedupRepo``
+(``from_repo``), ``export_scheduler.py`` only ever has a bare ``Pool``
+(``from_pool``), since a ``DedupFile``/``ByteRangeView`` exposes its own
+``.pool``, never a whole ``DedupRepo``.
 """
 
 from __future__ import annotations
@@ -42,10 +39,7 @@ class PoolDescriptor:
     ) -> PoolDescriptor | None:
         """``None`` when ``repo.store`` can't be reconstructed in a fresh
         process (an unrecognized store wrapper, or a backend built from
-        an already-live client with no picklable recipe) — the one place
-        a caller assembles the other four fields alongside that probe,
-        instead of each repeating the same "call ``describe_store``, check
-        ``None``, then assemble" sequence inline."""
+        an already-live client with no picklable recipe)."""
         store_descriptor = describe_store(repo.store)
         if store_descriptor is None:
             return None
@@ -59,15 +53,12 @@ class PoolDescriptor:
 
     @classmethod
     def from_pool(cls, pool: Pool) -> PoolDescriptor | None:
-        """Same ``None``-on-undescribable-store contract as
-        ``from_repo``, for a caller (``export_scheduler.py``) that only
-        ever has a bare, already-configured ``Pool`` in hand, never a
-        whole ``DedupRepo`` to build a fresh one from — so, unlike
-        ``from_repo``, this mirrors ``pool``'s own current
+        """Same ``None``-on-undescribable-store contract as ``from_repo``,
+        for a caller that only has a bare ``Pool``, never a ``DedupRepo``
+        to build from — mirrors ``pool``'s own current
         ``verify_fingerprint``/``verify_ciphertext_crc`` settings rather
-        than taking an explicit override for either: a worker rebuilding
-        this pool should behave identically to it, not silently reset
-        either flag."""
+        than an explicit override, so a worker rebuild behaves
+        identically to it."""
         store_descriptor = describe_store(pool.store)
         if store_descriptor is None:
             return None
@@ -82,13 +73,9 @@ class PoolDescriptor:
 
 def build_worker_pool(descriptor: PoolDescriptor) -> tuple[ObjectStore, Pool]:
     """Rebuilds a fresh ``ObjectStore``/``DirCache``/``Pool`` from
-    ``descriptor`` — called once per worker process (from a
-    ``ProcessPoolExecutor``'s synchronous ``initializer=``, safe since
-    every real backend's constructor is synchronous and does no I/O),
-    never once per task: the resulting ``Pool``'s own caches (bucket
-    readers, and — when
-    ``verify_fingerprint`` — its ``AllocationTableCache``) are only worth
-    anything if they persist across every task that worker ever runs.
+    ``descriptor`` — called once per worker process, never once per
+    task: the resulting ``Pool``'s caches only pay off if they persist
+    across every task the worker runs.
     """
     store = rebuild_store(descriptor.store_descriptor)
     dir_cache = DirCache(store)
@@ -104,17 +91,12 @@ def build_worker_pool(descriptor: PoolDescriptor) -> tuple[ObjectStore, Pool]:
 
 
 async def aclose_worker_store(store: ObjectStore | None) -> None:
-    """The natural counterpart to ``build_worker_pool()`` above: best-effort
-    release of a worker's own ``ObjectStore`` at shutdown — its ``aiohttp``
-    connector, for ``S3Store``/``AzureStore``; a no-op for
-    ``LocalFsStore``/``SmbStore``, or ``None`` (nothing was ever built).
-    A second, separate ``isinstance(store, AsyncCloseable)`` check rather
-    than a call to ``storage.base.aclose_if_possible`` (the one every
-    other caller — ``api/session.py``'s ``Session.close()``,
-    ``storage/recording.py``'s ``_InstrumentedStore.aclose()`` — shares):
-    that helper propagates a close failure, but a worker's own shutdown
-    hook (``_export_worker_shutdown``/``_verify_worker_shutdown``) has
-    nothing left to report a failure to, so this one swallows it instead."""
+    """The natural counterpart to ``build_worker_pool()``: best-effort
+    release of a worker's ``ObjectStore`` at shutdown. Uses a direct
+    ``isinstance(store, AsyncCloseable)`` check rather than
+    ``storage.base.aclose_if_possible`` — that helper propagates a close
+    failure, but a worker shutdown hook has nowhere left to report one,
+    so this swallows it instead."""
     if isinstance(store, AsyncCloseable):
         with contextlib.suppress(Exception):
             await store.aclose()

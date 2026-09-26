@@ -117,15 +117,12 @@ test with synthetic bytes (no real sample needed). **Untouched by the async
 migration** — there is no I/O here to make async.
 
 Unlike every other layer, a narrow `format/` function is reachable directly
-from any layer above it, not just its immediate consumer — the "never
-knowledge of what's two layers down" rule above is about avoiding coupling to
-another layer's *state* or *I/O*, and a pure, zero-I/O codec function has
-neither: `catalog/version.py`'s `decrypt_version_spec`,
-`units/verify_reachable.py`'s `group_start_bucket_id`, and
-`api/catalog.py`'s `RepoInfo` are real, intentional skip-layer imports, not a
-violation. The mermaid graph only draws `format/`'s two most structurally
-load-bearing edges (from Storage/Dedup) rather than every such narrow-utility
-import, the same simplification it applies to the kernel primitives below.
+from any layer above it — the "never knowledge of what's two layers down"
+rule is about avoiding coupling to another layer's *state* or *I/O*, and a
+pure, zero-I/O codec function has neither: `catalog/version.py`'s
+`decrypt_version_spec`, `units/verify_reachable.py`'s
+`group_start_bucket_id`, and `api/catalog.py`'s `RepoInfo` are real,
+intentional skip-layer imports, not a violation.
 
 ### Storage Layer — `storage/`, "how do I get these bytes"
 
@@ -181,11 +178,9 @@ verify FULL's per-bucket decode) — DATA chunks grouped by
 `Pool.read_chunk()` per chunk, so a dedup'd file's scattered chunk references
 get read in disk order instead of randomly re-visiting the same `.buk` file.
 A bounded, already-windowed multi-chunk read (an interactive `read()`
-spanning one extent) uses the same grouped-fetch strategy independently,
-without going through this module — `dedup_file.py`'s `_fill_data_extent()`
-stays independent because its range is always caller-bounded, never a
-whole-file sweep, so this module's windowed machinery would only add
-overhead there for no gain.
+spanning one extent) uses the same grouped-fetch strategy independently, via
+`dedup_file.py`'s `_fill_data_extent()` — kept separate since its range is
+always caller-bounded, never a whole-file sweep.
 `export_scheduler.py::export_to()` (used by `DedupFile.export_to()`/
 `ByteRangeView.export_to()`, `synology-apm-repo-cli export`, and the Content
 Layer's `VirtualDiskContentSource`) goes through it — on a real S3-backed
@@ -214,16 +209,13 @@ the specific chunk-map-referenced indices that caused the bucket to be
 touched. `VerifyLevel.QUICK` reads no chunk content at all — its own
 per-chunk "depth" is zero, by design; there is no sampled middle tier. Only
 FULL does any per-chunk checking.
-Buckets are *discovered* by walking Catalog/Workload/Version
-serially, but *checked* concurrently once claimed, in batches bounded by a
-semaphore — each bucket its own isolated task, so one bucket's failure never
-aborts its batch siblings — since I/O-redundancy fixes alone plateau well
-before serial, one-bucket-at-a-time checking stops being the bottleneck.
-Raising the semaphore's own value further hasn't helped: a small regression
-at double the shipped value on a local-disk sample, no measurable
-difference at several times the shipped value against a real S3-compatible
-object-storage backend — see `git log` for the measurements behind
-`_MAX_CONCURRENT_BUCKET_CHECKS`'s current value.
+Buckets are *discovered* by walking Catalog/Workload/Version serially, but
+*checked* concurrently once claimed, in batches bounded by a semaphore —
+each bucket its own isolated task, so one bucket's failure never aborts its
+batch siblings. Raising `_MAX_CONCURRENT_BUCKET_CHECKS` further hasn't
+helped: a small regression at double its shipped value on a local-disk
+sample, and no measurable difference at several times it against a real
+S3-compatible object-storage backend.
 
 **Validation strength is tiered by context**, because `mapCrc` covers a
 chunk-map array that can be hundreds of MB — validating it on every open would
@@ -237,18 +229,15 @@ make interactive browsing unusable:
 | `verify` at `VerifyLevel.FULL` | checked | checked | checked | checked | every live chunk in a touched bucket | every live chunk in a touched bucket |
 
 `export_to()` has no `verify_map_crc` option of its own — chunk-map CRC
-validation is `verify`'s job specifically, not export's. Header/SizeStore
-CRC is unconditionally checked by `BucketReader.open()` itself, so every
-row gets that one for free — but the ChunkCrcStore trailer's own
-`crcOfChunkCrc` self-consistency (`BucketReader.ensure_chunk_crc_store()`)
-and `expected_bucket_size()`'s real-on-disk-size check
-(`dedup/verify_checks.py::check_bucket_structure()`) are verify-exclusive,
-called by neither a normal read nor `export_to()`. Per-chunk
-ciphertext-CRC/fingerprint verification (`BucketReader.read_chunk`/
-`read_chunks`' own `verify_ciphertext_crc`/`Pool.read_chunk`'s
-`verify_fingerprint`) is likewise off by default everywhere except
-`verify` at `VerifyLevel.FULL`, which forces both on per the table above;
-`VerifyLevel.QUICK` leaves both off too.
+validation is `verify`'s job specifically. Header/SizeStore CRC is
+unconditionally checked by `BucketReader.open()` itself; the ChunkCrcStore
+trailer's own `crcOfChunkCrc` self-consistency
+(`BucketReader.ensure_chunk_crc_store()`) and `expected_bucket_size()`'s
+real-on-disk-size check (`dedup/verify_checks.py::check_bucket_structure()`)
+are verify-exclusive. Per-chunk ciphertext-CRC/fingerprint verification
+(`BucketReader.read_chunk`/`read_chunks`' own
+`verify_ciphertext_crc`/`Pool.read_chunk`'s `verify_fingerprint`) is off by
+default everywhere except `VerifyLevel.FULL`.
 
 ### Catalog Layer — `catalog/`, cheap enumeration
 
@@ -341,8 +330,7 @@ Calendars for Calendar). `TeamsChatProvider` is deliberately *not* folded into
 that base — its service-DB location mechanism (the object-name index names an
 *index object*, itself read once to find the further, per-channel message-DB
 object ids — one more level of indirection, not a scan) is genuinely different
-from "look up one fixed table name," and forcing it into the shared shape
-would make the shared shape worse for everyone else. It still builds its own
+from "look up one fixed table name." It still builds its own
 channel listing as a `TreeStrategy` (a flat, in-memory tree over the
 already-resolved channel/chat index, no I/O of its own) and wraps that same
 `CategorizedGroupTree` around it for Channel's own Standard/Private/Shared
@@ -369,8 +357,9 @@ enumerates rather than this document duplicating — the list changes as
 call sites are added or removed, and a second copy here would just be
 one more place for it to drift out of sync.
 
-**`Repository` is one opened bucket or vault — never one connection
-within it.** This distinction matters because the two backends' physical
+**Repository/Catalog naming follows FORMAT-SPEC.md §2.1's canonical
+mapping** (`Repository` = one opened bucket or vault, `Catalog` = one
+connection within it). This distinction matters because the two backends' physical
 shapes genuinely differ: a vault's several `db/connection_config` rows
 share one physical dedup pool (one `Pool`/`Composition`/`db`, opened
 once), while an object-storage bucket's several sibling `<repo-id>`
@@ -392,45 +381,30 @@ sibling), `resolve()`/`walk_human_ref()` (thin dispatchers: pick the
 right `Catalog` by its first ref segment, then delegate the rest to
 `Catalog.walk_human_ref()`), and `close()`.
 
-`is_encrypted` answers "is this repository encrypted" — no catalog ever opened,
-no Pool scan, and (unlike an async method) no I/O at the point a caller
-actually reads it: `Session.discover()`/`Session.open()` already resolve
-it eagerly, once, before constructing each `Repository` — passed in as
-that constructor's own `encrypted` argument — by reading
-its own encryption-key record directly (`db/vault_encryption_key`'s
-latest row for VAULT, the `@ActiveProtectKey/userKey/` object listing for
-OBJECT_STORE — see `dedup/keys.py`'s `probe_encrypted()` for the exact
-mechanism) — this needs only the bucket-level layout, never a specific
-opened `DedupRepo`, which is what makes resolving it before anything
-is opened possible at all.
+`is_encrypted` answers "is this repository encrypted" with no catalog
+opened, no Pool scan, and no I/O at the point a caller reads it — it needs
+only the bucket-level layout, never a specific opened `DedupRepo`, which is
+what makes resolving it before anything is opened possible at all:
+`Session.discover()`/`Session.open()` resolve it eagerly, once, before
+constructing each `Repository`, passed as that constructor's `encrypted`
+argument, by reading `db/vault_encryption_key`'s latest row (VAULT) or the
+`@ActiveProtectKey/userKey/` object listing (OBJECT_STORE) — see
+`dedup/keys.py`'s `probe_encrypted()` for the mechanism.
 
-`Repository.catalogs()` never gates on key state up front — the tables
-each catalog's own listing reads (`connection_config`, `workload_config`)
-are genuinely unencrypted plaintext, key or no key, and opening a
-`DedupRepo` itself never requires one to be given at all. A key that
-*was* given but doesn't match, though, still makes that `DedupRepo`'s
-own open raise `KeyMismatchError` — `catalogs()` surfaces that immediately
-rather than quietly excluding the catalog, the same as any other open
-failure. `Catalog.workloads()`/`versions()`, by
-contrast, raise `KeyRequiredError`/
-`KeyMismatchError` before any catalog I/O once a repository is *confirmed* encrypted
-(`is_encrypted is True`) and not yet key-verified — without this, a
-locked repository's version list would otherwise come back silently empty
-(`version_spec` fails to decrypt, so no row passes the browsable-status
-filter), indistinguishable from "this workload genuinely has no
-backups." Gating at the SDK level is what lets every consumer (CLI, TUI, a
-smoke-test tool, ...) get this for free without an equivalent client-side
-check of its own, while still preserving the TUI's own flow: catalog names
-show up before any key prompt, which only appears once a catalog is
-actually opened for browsing. Deliberately narrower than "any key-status
-other than verified": a repository whose encryption status itself couldn't be
-resolved (`is_encrypted is None`, a rare case) is left ungated rather than
-presumed encrypted. `Repository.verify()`/`Catalog.verify()` share this
-exact same gate, for the same reason — `units.verify_reachable`'s own
-top-down walk discovers versions through `catalog.versions()`, the same
-call whose browsable-status filter would otherwise silently see none of
-them and report a misleadingly clean integrity check instead of refusing
-to run.
+`Repository.catalogs()` never gates on key state up front — its own
+`connection_config`/`workload_config` tables are plaintext regardless — but
+still surfaces `KeyMismatchError` immediately if a given key doesn't match.
+`Catalog.workloads()`/`versions()` instead raise `KeyRequiredError`/
+`KeyMismatchError` before any catalog I/O once `is_encrypted is True` and
+not yet key-verified — without that gate, an unverified key would leave
+`version_spec` failing to decrypt so no row passes the browsable-status
+filter, so a locked repository's version list can't come back
+silently empty and be mistaken for "no backups" — this also lets catalog
+names show up before any key prompt in the TUI. `is_encrypted is None` (a
+rare case) is left ungated rather than presumed encrypted.
+`Repository.verify()`/`Catalog.verify()` share this same gate, since
+`units.verify_reachable`'s top-down walk also discovers versions through
+`catalog.versions()`.
 
 `NodeRef` is the canonical, round-trippable address format shared by CLI
 arguments, TUI breadcrumbs, and error messages, with a `human` display
@@ -459,57 +433,43 @@ new here.
 
 The whole SDK, CLI, and TUI are async-native end to end:
 
-- **`asyncio.to_thread()` is used for exactly one reason: getting a single
-  blocking call off the event loop** — `LocalFsStore`'s syscalls (`pread`,
-  `fstat`, `iterdir`; there is no async-native local-file I/O in CPython, this
-  is the same technique `aiofiles` uses internally), `SmbStore`'s calls into
-  `smbprotocol`'s synchronous `smbclient` module (no `aiohttp`-shaped async
-  surface to sit on, unlike S3/Azure below), and `BucketReader._read_run`'s
-  batch chunk decode/decrypt — one hop per merged run of chunks, not per
-  chunk, so the round-trip amortizes; the single-chunk interactive path,
-  `BucketReader.read_chunk`, decodes inline instead, since one 4096-byte
-  decode is cheaper than a thread hop. **It never parallelizes CPU-bound work,
-  no matter how many OS threads dispatch it** — decompress/decrypt/hash all
-  serialize under CPython's GIL regardless (see `git log` for
-  `concurrency.py`'s profiling history).
-- **Real multi-core parallelism, where this CPU-bound work is heavy enough
-  to be worth it, comes from a `concurrent.futures.ProcessPoolExecutor`
-  instead** — verify FULL's per-bucket decode sweep
+- **`asyncio.to_thread()` gets exactly one blocking call off the event
+  loop** — `LocalFsStore`'s syscalls (`pread`, `fstat`, `iterdir`; no
+  async-native local-file I/O exists in CPython, the same technique
+  `aiofiles` uses), `SmbStore`'s calls into `smbprotocol`'s synchronous
+  `smbclient` module, and `BucketReader._read_run`'s batch chunk
+  decode/decrypt (one hop per merged run, not per chunk — the single-chunk
+  path, `BucketReader.read_chunk`, decodes inline instead, since one
+  4096-byte decode is cheaper than a thread hop). It never parallelizes
+  CPU-bound work: decompress/decrypt/hash all serialize under CPython's
+  GIL regardless.
+- **Real multi-core parallelism, when CPU-bound work is heavy enough to be
+  worth it, comes from a `concurrent.futures.ProcessPoolExecutor`** —
+  verify FULL's per-bucket decode sweep
   (`units/verify_reachable.py::check_all_buckets`) and export's
   bucket-group decode (`dedup/chunk_walk.py::exec_chunks`'s multiprocess
   counterpart, dispatched from `dedup/export_scheduler.py`). Sized by
   `concurrency.default_worker_count()` (`clamp(os.cpu_count() // 2, 1, 8)`
-  — the `// 2` deliberately biases toward a machine's faster cores: on an
-  asymmetric-core machine, some tasks land on the slower cores, and since
-  these call sites synchronize a whole batch at a shared boundary, the
-  batch's own completion time is dragged down to whichever task landed on
-  a slow core — using every core measurably makes the batch slower, not
-  faster). Applied unconditionally wherever it structurally applies — no
-  size threshold gates it off for a small input — except when the
-  repository's `ObjectStore` can't be reconstructed inside a fresh process
-  (`storage.store_descriptor.describe_store()` returns `None`: a
-  `TracingStore`/`RecordingStore` wrapper, or a store built from an
-  already-live injected client), in which case the original
-  single-process/`asyncio` path is used instead, silently and correctly.
-  `concurrency.dispatch_to_pool()` is the one shared "bounded, dynamically
-  load-balanced dispatch of N items to a process pool" primitive both call
-  sites use — a free worker always picks up the next not-yet-started item
-  via the executor's own internal queue, which measurably beats even an
-  exactly-balanced *static* partition of the same work decided ahead of
-  time, since real per-item cost isn't perfectly predictable from a cheap
-  proxy metric. A worker process handles many such items over its whole
-  lifetime, so its per-task entry point drives each one via
-  `concurrency.run_in_worker_loop()` — one persistent event loop, lazily
-  created and reused across every task that worker ever runs — rather than
-  `asyncio.run()`'s own throwaway-loop-per-call shape, which would silently
-  orphan a worker-lifetime resource lazily bound to the first loop it saw
-  (an `S3Store`/`AzureStore` client, say) the moment that first loop closed.
-  `concurrency.close_worker_loop()` releases it gracefully, called from an
-  `atexit` hook each worker's own initializer registers.
+  — the `// 2` biases toward a machine's faster cores, since an
+  asymmetric-core machine's slowest task drags down the whole batch's
+  completion time). Applied unconditionally except when the repository's
+  `ObjectStore` can't be reconstructed in a fresh process
+  (`storage.store_descriptor.describe_store()` returns `None`), falling
+  back to the single-process/`asyncio` path. `concurrency.dispatch_to_pool()`
+  is the shared "bounded, dynamically load-balanced dispatch of N items to
+  a process pool" primitive both call sites use — a free worker always
+  picks up the next item via the executor's own queue, which measurably
+  beats a statically pre-balanced partition. Each worker drives its tasks
+  via `concurrency.run_in_worker_loop()` — one persistent event loop reused
+  for the worker's whole lifetime, not `asyncio.run()`'s
+  throwaway-loop-per-call shape, which would orphan a loop-bound resource
+  (an `S3Store`/`AzureStore` client, say) the moment that loop closed;
+  `concurrency.close_worker_loop()` releases it, called from an `atexit`
+  hook each worker's initializer registers.
 
-  A known, accepted cost of export's own windowed multiprocess dispatch: a
+  A known, accepted cost of export's windowed multiprocess dispatch: a
   bucket independently re-referenced (via internal dedup) at two
-  logically-far-apart points in a file can land in two different
+  far-apart points in a file can land in two different
   `plan_chunks_windowed` windows and get opened/decoded twice — measured
   ~12% of buckets on a real 32GB VM fixture. The duplication comes from
   genuinely separate references, not a splittable run, so no windowing
@@ -517,26 +477,20 @@ The whole SDK, CLI, and TUI are async-native end to end:
 - **`S3Store`/`AzureStore`** are the one place async is *actually* non-blocking
   (network I/O via `aioboto3`/`azure.storage.blob.aio`, both on `aiohttp`) —
   genuinely different from the local-file/SMB cases above.
-- **`aiosqlite`** everywhere SQLite is touched — not `sqlite3` wrapped in
-  `to_thread()` — specifically because it dedicates one background thread to a
-  connection's whole lifetime, which structurally eliminates the
-  cross-thread-close hazard `check_same_thread=False` alone doesn't guard
-  against. **The cost of that guarantee: every connection must be closed.** That
-  background thread is created *without* `daemon=True`, so a single leaked
-  connection makes `threading._shutdown()` block forever and the interpreter
-  never exits. This is why `Repository` tracks every provider it hands out,
-  why `SaasWorkloadProvider.close()` also closes its `SaasStream`, and why
-  `ObjectDb.from_bytes()` closes its `SqliteSource` when introspection fails.
-  Whatever opens one owns closing it, on every path including the error paths.
-  A cache reusing many such connection-holding objects across one long run
-  also needs an upper bound on how many stay open *concurrently* — a
-  guarantee they eventually close isn't enough on its own, since "eventually"
-  can mean "after a single run has already opened hundreds of them at once."
-  `units.saas.stream.SaasStreamCache` is this project's example: an
-  LRU-bounded cache that closes an evicted stream immediately rather than
-  leaving it to a future close pass. Hand-rolled instead of built on
-  `AsyncKeyedCache`, which has no hook for that kind of eager close on
-  eviction.
+- **`aiosqlite` everywhere SQLite is touched**, not `sqlite3` wrapped in
+  `to_thread()` — it dedicates one background thread to a connection's whole
+  lifetime, eliminating the cross-thread-close hazard `check_same_thread=False`
+  alone doesn't guard against. That thread is created without `daemon=True`,
+  so one leaked connection makes `threading._shutdown()` block forever and
+  the interpreter never exits — whatever opens a connection owns closing it,
+  on every path including error paths (`Repository` tracks every provider it
+  hands out; `SaasWorkloadProvider.close()` closes its `SaasStream`;
+  `ObjectDb.from_bytes()` closes its `SqliteSource` on introspection
+  failure). A cache reusing many such connections also needs an upper bound
+  on how many stay open *concurrently*, not just a guarantee they eventually
+  close — `units.saas.stream.SaasStreamCache` is an LRU-bounded cache that
+  closes an evicted stream immediately, hand-rolled instead of built on
+  `AsyncKeyedCache`, which has no hook for eager close on eviction.
 - **Cancellation is native `asyncio.CancelledError`/`Task.cancel()`**, not a
   `threading.Event` parameter threaded through every long-running call.
 - **`Table.__init__` cannot be `async def`**, so schema introspection
@@ -579,30 +533,20 @@ below), not a separate placeholder-substitution mechanism of its own.
 
 - **`concurrency.py` / `storage.store_descriptor` / `dedup.pool_descriptor`**
   — real multi-core parallelism for CPU-bound decode work, as a trio: the
-  first owns "how many worker processes to use, how to dispatch a batch of
-  independent work items to them, and how each one drives its own tasks
-  over its whole lifetime" (`default_worker_count()`, `new_process_pool()`,
-  `dispatch_to_pool()`, `run_in_worker_loop()`/`close_worker_loop()`); the
-  second, "can this repository's `ObjectStore` be rebuilt inside a fresh
-  process, and how"
-  (`describe_store()`/`rebuild_store()`, one backend at a time, never
-  raising — `None` means "no, fall back"); the third, "rebuild an
-  equivalent `Pool` from one of those descriptors" (`PoolDescriptor`/
-  `build_worker_pool()`). `units/verify_reachable.py` (FULL level) and
-  `dedup/export_scheduler.py` are today's two call sites — see the
-  "Async-native, by design" section above for why this exists and what it
-  measured. A third call site wanting the same real parallelism for its
-  own CPU-bound work should reach for this trio, not stand up its own
-  `ProcessPoolExecutor`. Building the very first `ProcessPoolExecutor` in a
-  process whose `sys.stderr` has been replaced by a stream whose
-  `fileno()` returns a sentinel instead of raising — Textual's own output
-  capture does this for an `App`'s whole run — crashes with `ValueError:
-  bad value(s) in fds_to_keep`, since `multiprocessing`'s resource tracker
-  blindly forwards that value when it launches its own one-time helper
-  process; `concurrency.preload_resource_tracker()` sidesteps this by
-  launching that helper up front, while `sys.stderr` is still real —
-  `browser/app.py::main()` calls it before `.run()` for exactly this
-  reason.
+  first owns worker sizing/dispatch/lifecycle (`default_worker_count()`,
+  `new_process_pool()`, `dispatch_to_pool()`,
+  `run_in_worker_loop()`/`close_worker_loop()`); the second, whether a
+  repository's `ObjectStore` can be rebuilt inside a fresh process
+  (`describe_store()`/`rebuild_store()`, `None` meaning "no, fall back");
+  the third, rebuilding an equivalent `Pool` from one of those descriptors
+  (`PoolDescriptor`/`build_worker_pool()`). `units/verify_reachable.py`
+  (FULL level) and `dedup/export_scheduler.py` are today's two call sites —
+  see "Async-native, by design" above for why. A third call site wanting
+  the same real parallelism should reach for this trio, not stand up its
+  own `ProcessPoolExecutor`. `concurrency.preload_resource_tracker()` avoids
+  a `ProcessPoolExecutor`-construction crash under Textual's stderr capture
+  — see its own docstring for the mechanism; `browser/app.py::main()` calls
+  it before `.run()`.
 - **`RecordingStore`/`ReplayStore`** (`storage/recording.py`) — wraps a real
   `ObjectStore`, records every call/result pair, and replays it with zero real
   I/O. This is how a handful of real, production-shaped bytes become a
@@ -644,9 +588,6 @@ below), not a separate placeholder-substitution mechanism of its own.
 - **`ApmRepoError.safe_message`** (`errors.py`) — the message alone, with the
   `ref=`/`spec=` tags `str(exc)` appends stripped, so the same exception can
   render two ways: full detail, or that detail stripped down. Only the CLI's
-  `cli/errors.py::friendly_message()` actually picks between the two, gated
-  on `--verbose` — the mechanism behind the Presentation section's
-  error-message claim above. The TUI does not: it always renders an
-  `ApmRepoError` via plain `str(exc)`, `d`-toggle or not — a deliberate,
-  scoped exception to that same claim (see the Presentation section itself
-  for why), not an oversight.
+  `cli/errors.py::friendly_message()` picks between the two, gated on
+  `--verbose`. The TUI always renders via plain `str(exc)` instead,
+  `d`-toggle or not — a deliberate, scoped exception, not an oversight.

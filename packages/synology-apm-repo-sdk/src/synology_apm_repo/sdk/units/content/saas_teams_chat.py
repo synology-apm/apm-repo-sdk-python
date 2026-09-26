@@ -456,15 +456,10 @@ def render_channel_html(
     resolve a real ``reply_to_id`` to its parent's sender/preview
     rather than a bare id.
 
-    Known limitation: ``rows`` is the caller's *entire* channel/chat
-    history (``units/saas/teams_chat.py``'s own ``unit()`` reads every
-    ``msg_info_table`` row, no cap), and this function's whole result is
-    then held in memory at once as one string inside a ``LazyArtifact``
-    (sized for "a small, fully in-memory blob," which a genuinely large
-    channel's transcript is not). Not
-    fixed speculatively — would need a streaming rendering shape, a real
-    architectural change — until a real large-channel sample actually
-    shows this as a practical problem."""
+    Known limitation: ``rows`` is the caller's entire channel/chat
+    history (no cap), held in memory at once as one string inside a
+    ``LazyArtifact`` — not the "small" blob that class assumes, for a
+    genuinely large channel's transcript."""
     stickers_by_msg_id = stickers_by_msg_id or {}
     messages = sorted((_message_from_row(row, stickers_by_msg_id) for row in rows), key=lambda m: m.created or "")
     by_msg_id = {m.msg_id: m for m in messages if m.msg_id is not None}

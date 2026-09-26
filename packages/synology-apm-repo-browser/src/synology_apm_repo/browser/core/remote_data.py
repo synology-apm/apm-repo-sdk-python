@@ -33,12 +33,9 @@ class FailureKind(enum.StrEnum):
 
 @dataclasses.dataclass(frozen=True, slots=True)
 class FailureInfo:
-    """``message`` is already ``str(exc)`` — this TUI never gates an
-    ``ApmRepoError``'s detail behind verbose mode (``ARCHITECTURE.md``'s
-    Presentation section), so nothing downstream ever needs the original
-    exception object. Keeping the exception
-    itself out of the model is what keeps a model comparable
-    (``==``/``!=``) and a failure assertable in a plain unit test."""
+    """``message`` is already ``str(exc)`` — nothing downstream needs the
+    original exception object, and keeping it out of the model keeps a
+    model comparable and a failure assertable in a plain unit test."""
 
     message: str
     kind: FailureKind = FailureKind.OTHER
@@ -54,8 +51,7 @@ class NoValue:
     """The sentinel ``Loading.previous``/``value_or_stale`` use in place
     of bare ``None``, so a ``T`` that's itself ``Optional`` doesn't get
     confused with "nothing resolved yet." Checked with ``isinstance``,
-    like every other ``RemoteData`` variant -- never ``is``/``==`` against
-    one particular instance."""
+    never ``is``/``==`` against one particular instance."""
 
 
 @dataclasses.dataclass(frozen=True, slots=True)
@@ -78,12 +74,8 @@ RemoteData: TypeAlias = NotAsked | Loading[T] | Success[T] | FailureInfo
 
 
 def loading_preserving(previous: RemoteData[T]) -> Loading[T]:
-    """The one place ``update()`` decides whether a fresh ``Loading()``
-    should carry the slot's own last-known value forward -- only when
-    ``previous`` was a real ``Success``; ``NotAsked``/``Loading``/
-    ``FailureInfo`` have nothing worth keeping. A policy decided once
-    here, instead of re-argued at every call site that resets a slot
-    before dispatching a fetch."""
+    """Whether a fresh ``Loading()`` should carry the slot's last-known
+    value forward -- only when ``previous`` was a real ``Success``."""
     if isinstance(previous, Success):
         return Loading(previous=previous.value)
     return Loading()
@@ -91,28 +83,18 @@ def loading_preserving(previous: RemoteData[T]) -> Loading[T]:
 
 def is_pending_or_done(data: RemoteData[T]) -> bool:
     """Whether ``data`` must not be (re-)fetched: a ``Loading`` fetch is
-    already in flight, or a ``Success`` already has the answer. Re-dispatching
-    while ``Loading`` duplicates the worker and its loading indicator on
-    whatever widget the fetch is anchored to -- exactly as wasteful as
-    re-dispatching an already-``Success`` slot, which is why both share one
-    guard instead of each call site hand-writing its own ``isinstance``
-    check (and risking the same "forgot `Loading`" gap more than once)."""
+    already in flight, or a ``Success`` already has the answer.
+    Re-dispatching either duplicates a worker and its loading indicator
+    for no benefit."""
     return isinstance(data, Loading | Success)
 
 
 def value_or_stale(data: RemoteData[T]) -> T | NoValue:
-    """The value a selector should render for ``data``: a real
-    ``Success``'s value, or a refreshing ``Loading``'s own carried-forward
-    ``previous`` (see ``loading_preserving`` above) -- both rendered
-    identically, since a caller only cares "is there something real to
-    show," not which of the two put it there. ``NoValue()`` for
-    ``NotAsked``, a first ``Loading`` with nothing stale yet, or
-    ``FailureInfo`` (a caller renders that error separately, via its own
-    ``message``). The one place this "unwrap or fall back to
-    stale-while-revalidate" policy is decided, instead of re-argued at
-    every selector that reads a ``RemoteData`` field and wants ordinary
-    content rendering, not the ``NotAsked``/``Loading``/``FailureInfo``
-    cases themselves."""
+    """The value a selector should render: a real ``Success``'s value, or
+    a refreshing ``Loading``'s carried-forward ``previous`` -- both
+    rendered identically. ``NoValue()`` for ``NotAsked``, a first
+    ``Loading`` with nothing stale yet, or ``FailureInfo`` (rendered
+    separately via its own ``message``)."""
     if isinstance(data, Success):
         return data.value
     if isinstance(data, Loading) and not isinstance(data.previous, NoValue):
@@ -122,9 +104,8 @@ def value_or_stale(data: RemoteData[T]) -> T | NoValue:
 
 def has_ever_resolved(data: RemoteData[T]) -> bool:
     """Whether ``value_or_stale(data)`` would return a real value rather
-    than a ``NoValue()`` -- for a caller that, unlike ``value_or_stale``'s
-    own callers, renders an explicit empty-state placeholder and so needs
-    to tell a genuinely resolved-empty answer apart from one that simply
-    hasn't resolved yet."""
+    than a ``NoValue()`` -- for a caller rendering an explicit empty-state
+    placeholder, which needs to tell resolved-empty apart from
+    not-yet-resolved."""
     value = value_or_stale(data)
     return not isinstance(value, NoValue)

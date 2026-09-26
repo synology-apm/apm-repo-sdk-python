@@ -330,13 +330,9 @@ async def inspect_chunk_map(
         map_crc_ok = await _verify_map_crc(store, rel, map_off, record)
 
     shown = min(record.map_num, limit)
-    # One read covering every shown entry, not one read per entry — the
-    # same "read once, parse many" shape composition_reader.py's own
-    # page-fetching uses, and this function's own sibling _verify_map_crc
-    # already does for the identical array. shown == 0 (record.map_num == 0,
-    # or --limit 0) skips the read entirely rather than issuing a
-    # zero-length one — a length of 0 has no real meaning to ask a backend
-    # for, and nothing below needs its result anyway.
+    # One read covering every shown entry, not one read per entry.
+    # shown == 0 skips the read entirely rather than issuing a
+    # zero-length one.
     raw = b"" if shown == 0 else await store.read(rel, map_off, shown * CHUNK_MAP_RECORD_LENGTH)
     entries: list[ChunkMapEntryInspection] = []
     for i in range(shown):

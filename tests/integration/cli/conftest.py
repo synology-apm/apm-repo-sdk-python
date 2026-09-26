@@ -18,21 +18,16 @@ def patch_profile_store(
     """``patch_profile_store(fixture_name, module, allow_content=False)``
     monkeypatches ``module``'s own ``resolve_profile_store`` name to
     return ``record_target(fixture_name, allow_content=allow_content)``
-    for any profile name — the exact ``async def _resolve(name): return
-    await record_target(...)`` + ``monkeypatch.setattr(module,
-    "resolve_profile_store", _resolve)`` block every
-    ``tests/integration/cli/test_*.py`` file used to copy-paste for
-    itself. Call it once per module that needs patching — most files
-    patch only ``cli.repo_session``; ``test_cli_export.py`` patches
-    ``cli.commands.export`` instead, and
+    for any profile name. Call it once per module that needs patching —
+    most files patch only ``cli.repo_session``; ``test_cli_export.py``
+    patches ``cli.commands.export`` instead, and
     ``test_cli_canonical_ref_roundtrip.py`` patches both.
 
-    Routes through ``record_target`` rather than a
-    bare ``ReplayStore.from_path`` so these CLI tests get ``--record-against``
-    support for free, the same as every other replay test — including its
-    real-content recording guard, so ``allow_content`` forwards straight
-    through for the rare CLI test that genuinely needs one (e.g. ``cli cat``
-    reading a real MBR/GPT header as a structural oracle)."""
+    Routes through ``record_target`` (not a bare ``ReplayStore.from_path``)
+    so these CLI tests get ``--record-against`` support and its real-content
+    recording guard for free; ``allow_content`` forwards straight through
+    for the rare CLI test that genuinely needs one (e.g. ``cli cat`` reading
+    a real MBR/GPT header as a structural oracle)."""
 
     def _patch(fixture_name: str, module: ModuleType, *, allow_content: bool = False) -> None:
         async def _resolve(name: str) -> ObjectStore:

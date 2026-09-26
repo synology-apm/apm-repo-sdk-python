@@ -1,38 +1,28 @@
-"""``S3Store`` — a real, executable ``ObjectStore`` implementation for
-S3-compatible object storage, one of the two backends this project's own
-object-storage samples are laid out for.
+"""``S3Store`` — an ``ObjectStore`` implementation for S3-compatible object
+storage, one of the two backends this project's own object-storage samples
+are laid out for.
 
 ``aioboto3``/``botocore`` are imported lazily, inside ``__init__`` and each
-method, rather than at module scope: ``aioboto3`` is always installed (a
-required dependency), but it's a substantial import graph (botocore,
-aiohttp, ...), and this module is imported unconditionally by
-``storage/__init__.py``, so a module-level import would make every caller
-of ``storage`` pay that cost even if it never touches ``S3Store``. Python
-caches the import after the first successful call, so the repeated
-``import`` statements below cost a dict lookup, not a re-import.
+method — a substantial import graph, and ``storage/__init__.py`` imports
+this module unconditionally, so a module-level import would make every
+caller of ``storage`` pay that cost even if it never touches ``S3Store``.
+Python caches the import after the first call, so the repeated ``import``
+statements below cost a dict lookup, not a re-import.
 
-This and ``AzureStore`` use ``aioboto3``/async rather than a thread around
-plain ``boto3`` because both sit on ``aiohttp``, where many outstanding
-network round-trips genuinely overlap on one thread — a real gain a
-thread-pool wrapper around a synchronous client wouldn't provide. One
-consequence: ``aioboto3``'s client is an *async context manager*, so this
-class creates it lazily on first use and owns its teardown via
-``S3Store.aclose`` (called by ``Session.close()``) — forgetting that would
-leak an ``aiohttp`` connector. The constructor itself stays synchronous
-(it only builds an ``aioboto3.Session``, which does no I/O).
+``aioboto3``'s client is an async context manager, sitting on ``aiohttp``
+(many outstanding round-trips overlap on one thread); this class creates
+it lazily on first use and owns its teardown via ``S3Store.aclose``
+(called by ``Session.close()``) — forgetting that would leak the
+connector. The constructor itself stays synchronous.
 
-Two contract differences from ``LocalFsStore``, both because S3 genuinely
-has no directory entities (``listdir``'s and ``exists``'s own docstrings
-cover the "directory" side of that): ``S3Store.read`` treats an
-out-of-range ``Range`` request as the ``ObjectStore`` contract's own
-short-read-at-EOF case (``b""``) rather than S3's own ``InvalidRange``
-client error, to match the same contract every other backend already
-provides.
+S3 has no directory entities: ``S3Store.read`` treats an out-of-range
+``Range`` request as the ``ObjectStore`` contract's short-read-at-EOF case
+(``b""``) rather than S3's own ``InvalidRange`` client error, matching
+every other backend.
 
 Every client this module builds goes through ``_with_default_timeouts``,
-which caps botocore's own long batch-job timeouts down to values an
-interactive caller — the TUI's connect dialog, in particular — can actually
-wait through when an endpoint is unreachable.
+which caps botocore's batch-job-tuned timeouts to values an interactive
+caller can actually wait through.
 """
 
 from __future__ import annotations
@@ -50,34 +40,20 @@ if TYPE_CHECKING:
 
 _NOT_FOUND_ERROR_CODES = frozenset({"NoSuchKey", "404", "NotFound"})
 
-# botocore's own defaults (60s connect, 60s read, plus several retries on a
-# connect timeout) are tuned for long-running batch jobs, not an interactive
-# "is this endpoint even reachable" probe — left alone, an unreachable or
-# black-holed endpoint can block a caller for minutes. These apply to every
-# client this module builds unless the caller already passed its own
-# ``config``, in which case only the fields left unset there fall back to
-# these.
+# botocore's own defaults (60s connect, 60s read) are tuned for a batch job,
+# not an interactive reachability probe. These apply unless the caller
+# already passed its own `config`, which wins field-by-field over these.
 _DEFAULT_CONNECT_TIMEOUT = 5
 _DEFAULT_READ_TIMEOUT = 15
 _DEFAULT_MAX_ATTEMPTS = 2
 
-# botocore's own default (10, botocore.config.Config.max_pool_connections)
-# flows straight into aiohttp.TCPConnector(limit=...), meaning it caps the
-# *total* concurrent connections one S3Store's client
-# can ever hold open, across every caller sharing it: chunk_walk.py's
-# max_concurrent_reads (one semaphore sized to it gates both the
-# cross-bucket dispatch loop and each bucket's own in-bucket fan-out) and
-# max_concurrent_opens both ultimately compete for slots in
-# this one pool, and either knob raised past this ceiling on its own (let
-# alone the two together) would queue inside the connector itself before a
-# single byte moves, on top of whatever the network/server itself is
-# doing — a silent, easy-to-miss
-# second bottleneck neither knob's docstring accounts for. Raised
-# generously above any concurrency this SDK exposes today (their sum
-# rarely exceeds double digits) rather than tied to a specific caller's
-# setting, since one client is shared across a whole session's unrelated
-# callers (interactive browsing, a concurrent verify, ...), not scoped to
-# one export call.
+# botocore's own default (10) flows into aiohttp.TCPConnector(limit=...),
+# capping the total concurrent connections one client can hold open across
+# every caller sharing it — including chunk_walk.py's max_concurrent_reads/
+# max_concurrent_opens, which would otherwise queue inside the connector
+# itself. Raised well above any concurrency this SDK exposes today, since
+# one client is shared across a whole session's unrelated callers, not
+# scoped to one export call.
 _DEFAULT_MAX_POOL_CONNECTIONS = 32
 
 
@@ -200,19 +176,11 @@ class S3Store:
         try:
             return await body.read()  # type: ignore[no-any-return]
         except asyncio.CancelledError:
-            # A cancellation landing mid-body-read must not let this
-            # partially-read response's connection quietly return to
-            # aiohttp's connection pool: a connection released mid-stream
-            # still has the rest of the old response body sitting unread
-            # on the wire, and the next request to reuse it from the pool
-            # would desync, reading stale bytes as if they were its own
-            # response (or worse) rather than a fresh one. ``close()``
-            # (synchronous — StreamingBody proxies straight through to the
-            # wrapped ``aiohttp.ClientResponse``, whose own ``close()``
-            # explicitly discards the connection instead of releasing it)
-            # forces that instead, at the cost of this one connection (a
-            # new one is opened on the next request) rather than risking
-            # a corrupted one silently reused.
+            # A cancellation mid-body-read must not let this connection
+            # quietly return to aiohttp's pool with the rest of the old
+            # response unread on the wire — close() discards it outright
+            # (a new connection opens next time) instead of risking reuse
+            # of a desynced one.
             body.close()
             raise
 

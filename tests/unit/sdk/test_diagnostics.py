@@ -1,16 +1,11 @@
 """Unit tests for ``synology_apm_repo.sdk.diagnostics`` — its own contract
-at the SDK layer, owned by the layer that actually implements it, rather
-than only exercised indirectly through ``cli/commands/dump.py``'s JSON/
-text rendering (``tests/unit/cli/test_cli_dump.py`` covers that CLI-layer
-concern already, thoroughly). This file stays narrow and non-duplicative:
-``_verify_map_crc``/``_walk_composition_records`` directly (the two
-private helpers a CLI-level test can only reach indirectly), plus one or
-two dataclass-shape assertions per public function — not a second full
-pass over every branch ``test_cli_dump.py`` already covers.
-
-Same synthetic byte-construction approach (and several of the same
-builder helpers, duplicated here per ``tests/CLAUDE.md``'s "no test
-module ever imports from another") as ``tests/unit/cli/test_cli_dump.py``.
+at the SDK layer, not just exercised indirectly via
+``tests/unit/cli/test_cli_dump.py``'s JSON/text rendering. Stays narrow:
+``_verify_map_crc``/``_walk_composition_records`` directly, plus one or two
+dataclass-shape assertions per public function, not a second full pass
+over every branch the CLI-level test already covers. Same synthetic
+byte-construction approach (and duplicated builder helpers, per
+``tests/CLAUDE.md``) as that file.
 """
 
 from __future__ import annotations
@@ -236,10 +231,7 @@ class TestInspectChunkMap:
         assert result.entries[1].addr is None
 
     async def test_limit_zero_skips_the_batched_read_entirely(self, tmp_path: Path) -> None:
-        # shown == 0 must not reach store.read() with a zero-length
-        # request -- a call shape a real S3/Azure backend was never
-        # exercised against before the entries loop was batched into one
-        # read.
+        # shown == 0 must not reach store.read() with a zero-length request.
         record = _build_record(map_array=_build_map_array())
         header = _build_composition_header()
         (tmp_path / "c0").write_bytes(header + record)

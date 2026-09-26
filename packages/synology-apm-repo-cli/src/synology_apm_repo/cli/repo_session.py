@@ -39,14 +39,12 @@ async def open_single_repo(
     filesystem path.
 
     Raises:
-        NotFoundError: For zero or more than one repository — several sibling
-            repo-ids sharing one bucket collapse into a single
-            ``Repository`` with several ``catalogs()`` (not an error
-            here); this only fires for genuinely separate repositories
-            (distinct buckets/vaults) found under ``fs_path``, which
-            needs a more specific path pointed at just one; picking one
-            silently on the caller's behalf would be surprising for a
-            forensics tool.
+        NotFoundError: For zero or more than one repository — several
+            sibling repo-ids sharing one bucket collapse into a single
+            ``Repository`` with several ``catalogs()`` (not an error here);
+            this only fires for genuinely separate repositories (distinct
+            buckets/vaults) found under ``fs_path``, which needs a more
+            specific path pointed at just one.
     """
     if store is not None:
         repos = await session.open_remote(store, key, root=fs_path, progress=progress, trace=trace)
@@ -74,25 +72,15 @@ async def opened_repo(
     ``async with`` body — is translated to ``fail``'s standard CLI error
     exit; the session is always closed after, success or failure.
 
-    Callers that need ``require_one_of(repo, profile)``-style validation
-    of REPO/``--profile`` run it themselves *before* entering this
-    context manager — a bare CLI argument mismatch isn't an
-    ``ApmRepoError`` and isn't this function's job to check.
+    Callers needing ``require_one_of(repo, profile)``-style validation of
+    REPO/``--profile`` run it themselves before entering this context
+    manager — a bare argument mismatch isn't an ``ApmRepoError``.
 
-    ``finish_live_progress`` runs in ``finally`` — after the caller's own
-    ``async with`` body (which may itself have rendered further progress
-    via its own separate meter, e.g. ``verify``'s) has finished, whether
-    it finished cleanly or not, so every command sharing this skeleton
-    gets a clean line for its own next output without repeating the call
-    itself. ``fail_from_apm_error`` (the ``except ApmRepoError`` branch)
-    also calls it explicitly, *before* ``fail()``'s own print — ``finally``
-    alone would run only after that print, too late to prevent this same
-    error message from landing on top of a dangling progress line; calling
-    it again from ``finally`` afterwards is a harmless no-op there, and is
-    what covers a non-``ApmRepoError`` exception this function doesn't
-    otherwise catch at all (a bug, not an expected failure — still
-    deserves a clean line under whatever traceback ``fail_unexpected``
-    goes on to print)."""
+    ``finish_live_progress`` runs both in the ``except ApmRepoError``
+    branch (before ``fail()``'s own print, so the error doesn't land on a
+    dangling progress line) and in ``finally`` (covering every other exit
+    path); the second call is a harmless no-op when the first already
+    ran."""
     session = Session()
     meter = build_progress_meter(state)
     trace = build_trace_callback(state)

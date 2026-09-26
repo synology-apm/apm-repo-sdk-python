@@ -160,10 +160,10 @@ class _EventGatedCatalog:
     """A fake ``Catalog`` whose own ``workloads()`` only resolves once
     ``started`` records that *every* sibling catalog in the same
     ``_build_report`` call has itself started -- the last one to start
-    sets ``release``, waking every earlier one. Under today's concurrent
-    ``asyncio.gather`` this always resolves; under a regression back to
-    the old serial ``for`` loop, the first catalog would block forever
-    waiting on a sibling that never gets a chance to run."""
+    sets ``release``, waking every earlier one. This always resolves
+    under concurrent ``asyncio.gather``; a serial loop instead would
+    block the first catalog forever waiting on a sibling that never
+    gets a chance to run."""
 
     def __init__(self, connection: Connection, *, started: list[str], total: int, release: asyncio.Event) -> None:
         self.connection = connection

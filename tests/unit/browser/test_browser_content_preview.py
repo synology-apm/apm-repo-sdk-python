@@ -6,6 +6,7 @@ pane against real recorded sample data."""
 
 from __future__ import annotations
 
+import base64
 import json
 
 from synology_apm_repo.browser.content_preview import (
@@ -43,6 +44,93 @@ _HTML_EML = (
 _NO_HEADERS_EML = b"Content-Type: text/plain; charset=utf-8\r\n\r\nJust a body, no headers.\r\n"
 
 _EMPTY_SUBJECT_EML = b"From: Alice <alice@example.com>\r\nSubject:\r\n\r\nBody text.\r\n"
+
+# A real sender's own text/plain alternative can be a template-generation
+# bug -- a byte-for-byte copy of the raw HTML rather than a real
+# conversion -- so a multipart/alternative with both must prefer the
+# text/html part, not just whichever one a caller-agnostic preferencelist
+# happens to try first.
+_MULTIPART_RAW_HTML_PLAIN_EML = (
+    b"From: Alice <alice@example.com>\r\n"
+    b"Subject: Broken plain-text alternative\r\n"
+    b'Content-Type: multipart/alternative; boundary="BOUNDARY1"\r\n'
+    b"\r\n"
+    b"--BOUNDARY1\r\n"
+    b"Content-Type: text/plain; charset=utf-8\r\n"
+    b"\r\n"
+    b"<html><body><table><tr><td>Welcome, Sample User</td></tr></table></body></html>\r\n"
+    b"--BOUNDARY1\r\n"
+    b"Content-Type: text/html; charset=utf-8\r\n"
+    b"\r\n"
+    b"<html><body><p>Welcome, Sample User</p></body></html>\r\n"
+    b"--BOUNDARY1--\r\n"
+)
+
+# A real mail client's own text/plain auto-conversion can embed a raw URL
+# in angle brackets right after a link's visible text -- preferring the
+# text/html part instead avoids ever showing that URL at all, since
+# _html_to_text never reads a tag's href.
+_MULTIPART_BRACKETED_URL_PLAIN_EML = (
+    b"From: Alice <alice@example.com>\r\n"
+    b"Subject: Meeting invite\r\n"
+    b'Content-Type: multipart/alternative; boundary="BOUNDARY2"\r\n'
+    b"\r\n"
+    b"--BOUNDARY2\r\n"
+    b"Content-Type: text/plain; charset=utf-8\r\n"
+    b"\r\n"
+    b"Join the meeting<https://example.com/join/abc123>\r\n"
+    b"--BOUNDARY2\r\n"
+    b"Content-Type: text/html; charset=utf-8\r\n"
+    b"\r\n"
+    b'<html><body><a href="https://example.com/join/abc123">Join the meeting</a></body></html>\r\n'
+    b"--BOUNDARY2--\r\n"
+)
+
+# A purely decorative text/html alternative (e.g. a tracking-pixel-only
+# body) next to a substantive text/plain one must not blank out the
+# preview just because _html_to_text's own output is empty.
+_MULTIPART_EMPTY_HTML_EML = (
+    b"From: Alice <alice@example.com>\r\n"
+    b"Subject: Decorative html alternative\r\n"
+    b'Content-Type: multipart/alternative; boundary="BOUNDARY4"\r\n'
+    b"\r\n"
+    b"--BOUNDARY4\r\n"
+    b"Content-Type: text/plain; charset=utf-8\r\n"
+    b"\r\n"
+    b"The real message content is here.\r\n"
+    b"--BOUNDARY4\r\n"
+    b"Content-Type: text/html; charset=utf-8\r\n"
+    b"\r\n"
+    b'<html><body><img src="cid:tracker"></body></html>\r\n'
+    b"--BOUNDARY4--\r\n"
+)
+
+# A read window cut mid-``Content-Transfer-Encoding: base64`` stream can
+# make the stdlib email package's own decode come back as its still-
+# encoded payload verbatim (no ``<`` anywhere) rather than real HTML. Built
+# as literal bytes (fixed boundary, precomputed base64, no auto-generated
+# Message-ID/boundary) so the truncation offset below is fully
+# deterministic, not dependent on any random header the ``email`` package
+# might otherwise insert.
+_TRUNCATED_BASE64_HTML_BODY = base64.encodebytes(
+    ("<html><body><p>Hello</p></body></html>" + "x" * 4000).encode("utf-8")
+)
+_TRUNCATED_BASE64_HTML_EML_FULL = (
+    b"Subject: Truncated base64 html alternative\r\n"
+    b'Content-Type: multipart/alternative; boundary="BOUNDARY3"\r\n'
+    b"\r\n"
+    b"--BOUNDARY3\r\n"
+    b"Content-Type: text/plain; charset=utf-8\r\n"
+    b"\r\n"
+    b"Plain-text fallback content.\r\n"
+    b"--BOUNDARY3\r\n"
+    b"Content-Type: text/html; charset=utf-8\r\n"
+    b"Content-Transfer-Encoding: base64\r\n"
+    b"\r\n" + _TRUNCATED_BASE64_HTML_BODY + b"--BOUNDARY3--\r\n"
+)
+# Lands mid-base64-group, making the base64 decode of the html
+# alternative come back still-encoded (no literal "<" anywhere).
+_TRUNCATED_BASE64_HTML_EML = _TRUNCATED_BASE64_HTML_EML_FULL[:5558]
 
 
 class TestRenderMailPreview:
@@ -90,6 +178,118 @@ class TestRenderMailPreview:
         text = render_mail_preview(_PLAIN_EML, max_chars=4000)
         assert "truncated" not in text.lower()
 
+    def test_prefers_html_over_a_plain_alternative_that_is_actually_raw_html(self) -> None:
+        text = render_mail_preview(_MULTIPART_RAW_HTML_PLAIN_EML)
+        assert "Welcome, Sample User" in text
+        assert "<html" not in text and "<table" not in text
+
+    def test_prefers_html_over_a_plain_alternative_that_embeds_a_bracketed_url(self) -> None:
+        text = render_mail_preview(_MULTIPART_BRACKETED_URL_PLAIN_EML)
+        assert "Join the meeting" in text
+        assert "https://example.com/join/abc123" not in text
+
+    def test_a_read_window_truncated_mid_attribute_shows_a_placeholder_not_raw_base64(self) -> None:
+        # Same truncation-safety treatment render_html_preview's own
+        # test of the same name covers, applied to an HTML mail body.
+        fake_base64 = "AAAA" * 20_000
+        html_eml = (
+            b"From: Alice <alice@example.com>\r\n"
+            b"Subject: Long image\r\n"
+            b"Content-Type: text/html; charset=utf-8\r\n"
+            b"\r\n"
+            b'<html><body><p>flower~~</p><img src="data:image/jpeg;base64,' + fake_base64.encode()
+        )
+        text = render_mail_preview(html_eml, max_chars=4000)
+        assert "flower~~" in text
+        assert "AAAA" not in text
+        assert "[image, ≥" in text
+        assert "not shown in preview" in text
+
+    def test_falls_back_to_plain_when_the_html_alternative_flattens_to_nothing(self) -> None:
+        text = render_mail_preview(_MULTIPART_EMPTY_HTML_EML)
+        assert "The real message content is here." in text
+
+    def test_falls_back_to_plain_when_a_truncated_base64_html_body_fails_to_decode(self) -> None:
+        # A Content-Transfer-Encoding: base64 body cut mid-stream by the
+        # read window can decode to its own still-encoded payload verbatim
+        # (no literal "<" anywhere) rather than real HTML -- must fall
+        # back to the plain alternative rather than showing that garbage.
+        text = render_mail_preview(_TRUNCATED_BASE64_HTML_EML)
+        assert "Plain-text fallback content." in text
+
+    def test_falls_back_to_plain_when_the_html_alternatives_own_content_is_entirely_inside_a_truncated_tag(
+        self,
+    ) -> None:
+        # All of this html alternative's real (non-script) content sits
+        # inside one <img> tag that never closes -- _drop_trailing_
+        # unterminated_tag drops it, leaving only the truncation-note
+        # placeholder, which must not be mistaken for real content: a
+        # placeholder-only render must still fall back to the plain
+        # alternative rather than silently dropping its real message body.
+        eml = (
+            b"From: Alice <alice@example.com>\r\n"
+            b"Subject: Placeholder-only html alternative\r\n"
+            b'Content-Type: multipart/alternative; boundary="BOUNDARY7"\r\n'
+            b"\r\n"
+            b"--BOUNDARY7\r\n"
+            b"Content-Type: text/plain; charset=utf-8\r\n"
+            b"\r\n"
+            b"This is the real plain-text message body.\r\n"
+            b"--BOUNDARY7\r\n"
+            b"Content-Type: text/html; charset=utf-8\r\n"
+            b"\r\n"
+            b'<html><body><script>void</script><img src="data:image/jpeg;base64,'
+            + b"A" * 5000
+            + b"\r\n--BOUNDARY7--\r\n"
+        )
+        text = render_mail_preview(eml)
+        assert "This is the real plain-text message body." in text
+
+    def test_falls_back_to_plain_when_the_html_alternative_has_an_unrecognized_charset(self) -> None:
+        # An unrecognized charset name raises LookupError from get_content()
+        # -- must fall back to the plain alternative rather than letting
+        # that propagate as a preview error when a good body sits right
+        # next to it.
+        eml = (
+            b"From: Alice <alice@example.com>\r\n"
+            b"Subject: Bad charset\r\n"
+            b'Content-Type: multipart/alternative; boundary="BOUNDARY5"\r\n'
+            b"\r\n"
+            b"--BOUNDARY5\r\n"
+            b"Content-Type: text/plain; charset=utf-8\r\n"
+            b"\r\n"
+            b"Perfectly good plain text body.\r\n"
+            b"--BOUNDARY5\r\n"
+            b"Content-Type: text/html; charset=bogus-charset-xyz\r\n"
+            b"\r\n"
+            b"<html><body>hi</body></html>\r\n"
+            b"--BOUNDARY5--\r\n"
+        )
+        text = render_mail_preview(eml)
+        assert "Perfectly good plain text body." in text
+
+    def test_a_stray_inequality_sign_is_not_mistaken_for_a_real_tag(self) -> None:
+        # "5 < 10" has a literal "<" but nothing tag-shaped after it --
+        # must still fall back to the plain alternative rather than
+        # treating the html part as real markup.
+        eml = (
+            b"From: Alice <alice@example.com>\r\n"
+            b"Subject: Inequality signs\r\n"
+            b'Content-Type: multipart/alternative; boundary="BOUNDARY6"\r\n'
+            b"\r\n"
+            b"--BOUNDARY6\r\n"
+            b"Content-Type: text/plain; charset=utf-8\r\n"
+            b"\r\n"
+            b"Plain fallback for stray inequality signs.\r\n"
+            b"--BOUNDARY6\r\n"
+            b"Content-Type: text/html; charset=utf-8\r\n"
+            b"\r\n"
+            b"5 < 10 and 20 > 15, no real markup here at all.\r\n"
+            b"--BOUNDARY6--\r\n"
+        )
+        text = render_mail_preview(eml)
+        assert "Plain fallback for stray inequality signs." in text
+
 
 _MESSAGE_ROWS = [
     {
@@ -113,11 +313,8 @@ _MESSAGE_ROWS = [
 
 class TestRenderHtmlPreview:
     def test_recognizes_and_flattens_a_real_channel_export(self) -> None:
-        # render_channel_html is the actual SDK function that produces the
-        # one real, self-contained HTML document this preview exists to
-        # handle (TeamsChatProvider's channel export) — using it directly
-        # here (not a hand-rolled HTML fixture) means this test breaks if
-        # the two ever drift out of sync with each other.
+        # Uses the real render_channel_html output, not a hand-rolled HTML
+        # fixture, so this test breaks if the two ever drift apart.
         html = render_channel_html(_MESSAGE_ROWS, channel_name="General").encode("utf-8")
         text = render_html_preview(html)
         assert text is not None
@@ -490,10 +687,9 @@ class TestVisibleSiteFields:
 
 
 class TestRenderTeamsChatPreview:
-    """Every case here builds its HTML via the real ``render_channel_html``
-    (not a hand-rolled fixture) — the same reasoning
-    ``TestRenderHtmlPreview.test_recognizes_and_flattens_a_real_channel_export``
-    already gives: this breaks if the two ever drift out of sync."""
+    """Every case here builds its HTML via the real ``render_channel_html``,
+    not a hand-rolled fixture (same reasoning as
+    ``TestRenderHtmlPreview.test_recognizes_and_flattens_a_real_channel_export``)."""
 
     def test_sender_and_timestamp_sit_directly_above_the_body_no_gap(self) -> None:
         rows = [

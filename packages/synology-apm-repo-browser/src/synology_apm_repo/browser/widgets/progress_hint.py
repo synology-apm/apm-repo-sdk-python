@@ -98,21 +98,13 @@ class _BreadcrumbSink:
 
 class TreeNodeLoadingSink:
     """Targets one expanding ``TreeNode``'s own label instead of the
-    breadcrumb — for a call site whose loading is naturally attached to a
-    single tree node being expanded. Never snapshots the node's "real"
-    label once at construction: each ``show``/``hide`` instead strips
-    *this sink's own* previously-appended suffix (if still present) off
-    whatever the label currently is, so an unrelated relabel of the same
-    node while this sink is animating (e.g. ``BrowseScreen``'s
-    ``_refresh_repo_labels``, run when the user toggles verbose mode
-    mid-load) is preserved rather than clobbered by a stale snapshot —
-    the next tick/``hide()`` picks up the new real label as its base
-    instead of overwriting it. Real children added under the node
-    meanwhile are unaffected either way, since children are separate
-    child ``TreeNode``s, never encoded into the parent's own label text.
-    A ``Tree``'s label doesn't parse Rich markup the way a ``Static``'s
-    text does, so the frame is appended as plain text, with no
-    ``_LOADING_STYLE`` wrapping."""
+    breadcrumb. Each ``show``/``hide`` strips *this sink's own*
+    previously-appended suffix (if present) off whatever the label
+    currently is, rather than snapshotting it once at construction — an
+    unrelated relabel of the same node while this sink is animating (e.g.
+    toggling verbose mode mid-load) is preserved instead of clobbered. A
+    ``Tree``'s label doesn't parse Rich markup the way a ``Static``'s
+    text does, so the frame is appended as plain text."""
 
     def __init__(self, node: TreeNode[Any]) -> None:
         self._node = node
@@ -138,17 +130,15 @@ class TreeNodeLoadingSink:
 
 class _ConditionalResetSink:
     """Shared bookkeeping for a sink whose ``show``/``hide`` write into a
-    widget that a slow-enough operation's own final result might *also*
-    write into: ``work()`` wraps a decorated method's entire body, so a
-    call that runs past the debounce delay can already have its real
-    result on screen by the time ``hide()`` runs. Resetting unconditionally
-    there would clobber that result right after showing it -- ``hide()``
-    only resets when ``read()`` still returns exactly what ``show()`` last
-    wrote, i.e. nothing else has touched the widget since. Used by both
-    ``StaticTextSink`` (below) and ``screens/detail_pane.py``'s
-    ``DetailPaneLoadingSink`` -- same mechanism, same reasoning, each
-    supplying only its own widget-specific ``write_loading``/
-    ``write_reset``/``read``."""
+    widget a slow-enough operation's own final result might also write
+    into (``work()`` wraps the whole decorated method, so a call past
+    the debounce delay can already show its real result by the time
+    ``hide()`` runs): ``hide()`` only resets when ``read()`` still
+    returns exactly what ``show()`` last wrote, avoiding clobbering that
+    result. Used by both ``StaticTextSink`` (below) and
+    ``screens/detail_pane.py``'s ``DetailPaneLoadingSink``, each
+    supplying only its own widget-specific
+    ``write_loading``/``write_reset``/``read``."""
 
     def __init__(
         self, *, write_loading: Callable[[str], None], write_reset: Callable[[], None], read: Callable[[], str]
@@ -221,44 +211,18 @@ class StaticTextSink:
 
 class DataTableLoadingRowSink:
     """A flat ``DataTable`` column's own counterpart to
-    ``TreeNodeLoadingSink`` -- used for both ``BrowseScreen``'s own
-    column 3 (the version list) and ``UnitScreen``'s own file table, each
-    with no per-node label to append a suffix onto, so this instead
-    appends one trailing ``"{frame} Loading"`` row rather than clearing
-    the table — real rows already on screen (a stale-but-real render
-    kept visible during a refresh, per ``RemoteData.Loading.previous``)
-    stay untouched underneath it instead of being wiped by the spinner.
-    ``hide()`` removes exactly that row and no other.
+    ``TreeNodeLoadingSink``: with no per-node label to append a suffix
+    onto, this instead appends one trailing ``"{frame} Loading"`` row,
+    leaving real rows already on screen untouched underneath it.
+    ``hide()`` removes exactly that row and no other, tolerating it
+    already being gone (the common case — a finished fetch's dispatch
+    typically clears/repopulates the table, taking this row with it,
+    before ``hide()`` ever runs).
 
     ``is_current`` (default: always current) is ``show()``'s own
-    staleness guard -- a caller whose fetch is for one specific
-    row/folder/workload, not the table as a whole, passes a predicate
-    reading live selection state, the same shape ``DetailPaneLoadingSink``
-    already uses via ``DetailPane._render_if_current``. Deliberately
-    asymmetric with that sink, though: only ``show()`` checks it.
-    Removing this sink's own tracked row by key is self-scoped and
-    always safe regardless of staleness (already idempotent via
-    ``hide()``'s own ``RowDoesNotExist`` tolerance below) — unlike
-    ``DetailPaneLoadingSink``'s guard, which exists to avoid clobbering
-    *real content* a newer selection already wrote, ``hide()`` here never
-    touches anything but its own row, so gating it on staleness would
-    only risk the opposite failure: a fetch that outlives the user's own
-    selection (e.g. switching between two folders that are both already
-    empty, so nothing else ever calls ``table.clear()`` to clean this
-    row up first) would then never get its own leftover row removed at
-    all once its last tick's ``hide()`` skipped it.
-
-    ``hide()`` tolerates the row already being gone: it runs inside
-    ``DebouncedProgress.stop()``, called from ``__exit__`` only once the
-    ``with`` block's own body -- the whole fetch, dispatch included --
-    has returned. Since a successful/failed fetch's own dispatch
-    (``VersionsLoaded``/``VersionsLoadFailed``) triggers
-    ``BrowseScreen._render_versions()`` synchronously (``Store.dispatch``
-    drains inline), the table has typically *already* been cleared and
-    repopulated by the time ``hide()`` runs -- taking this sink's own row
-    with it. ``remove_row`` would otherwise raise ``RowDoesNotExist``
-    every time a fetch actually finishes, which is the common case, not
-    an edge one."""
+    staleness guard for a fetch scoped to one row/folder/workload —
+    only ``show()`` checks it; ``hide()`` only ever touches its own
+    tracked row, so it needs no staleness gate of its own."""
 
     def __init__(self, table: DataTable[Any], *, is_current: Callable[[], bool] = lambda: True) -> None:
         self._table = table
