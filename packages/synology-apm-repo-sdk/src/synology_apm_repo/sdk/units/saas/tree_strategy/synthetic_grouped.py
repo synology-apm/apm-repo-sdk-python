@@ -1,45 +1,31 @@
-"""``SyntheticGroupedTree``: Mail/Contact's shape — a flat list,
-optionally grouped by one key, one of the two schema shapes every
-service-level DB in this project expands into (the other being
-parent-pointer recursion).
+"""``SyntheticGroupedTree``: one table, optionally grouped by a column's
+values (Mail, Contact).
 """
 
 from __future__ import annotations
 
 from collections.abc import Callable, Sequence
-from typing import TYPE_CHECKING
 
 from ....storage.table import Column, Table
-from ...base import paginate
-from ._base import _flat_leaf_entries, _Key, _LazyTable, _Row
-
-if TYPE_CHECKING:
-    from ..provider import SaasWorkloadProvider
+from ....units.provider_kit import paginate
+from ._base import Key, Row, SupportsTable, TreeEntry, _flat_leaf_entries, _LazyTable
 
 
 class SyntheticGroupedTree:
-    """Mail/Contact's shape: one table, grouped by a *value* of its own
-    group column; there is no separate group-naming table, so a
-    group's display name defaults to the group-key value itself unless
-    ``group_display_name`` resolves it.
-
-    ``group_column`` is the real column to filter by (e.g.
-    ``"parent_folder_id"``). GWS passes ``None`` because it genuinely
-    has no such column — Gmail has no folder hierarchy at all, only
-    many-to-many labels surfaced as an ``extra_attrs`` field rather than
-    a tree grouping, and GWS Contact's groups are themselves M:N — so
-    every row then falls into one synthetic ``root_name`` group
-    instead."""
+    """One group per distinct ``group_column`` value, named by
+    ``group_display_name`` (default: the value itself); rows whose value is
+    NULL fall in the ``root_name`` group. With ``group_column=None`` every
+    row is in the single ``root_name`` group."""
 
     def __init__(
         self,
-        provider: SaasWorkloadProvider,
+        provider: SupportsTable,
         *,
         table: str,
         columns: list[Column],
         id_column: str,
         group_column: str | None,
-        display_name: Callable[[_Row], str],
+        display_name: Callable[[Row], str],
         root_name: str,
         order_by: Sequence[str],
         descending: bool = False,
@@ -56,24 +42,18 @@ class SyntheticGroupedTree:
         self._group_display_name = group_display_name
         hints = [[group_column]] if group_column is not None else []
         self._lazy_table = _LazyTable(provider, table=table, columns=columns, index_hints=hints)
-        self._rows: dict[_Key, _Row] = {}
 
-    async def children_of(
-        self, key: _Key, *, offset: int = 0, limit: int | None = None
-    ) -> list[tuple[_Key, str, bool]]:
+    async def children_of(self, key: Key, *, offset: int = 0, limit: int | None = None) -> list[TreeEntry]:
         table = await self._lazy_table.get()
         if key == ():
             return await self._list_groups(offset=offset, limit=limit)
         if len(key) != 1:
-            # A leaf's own key (2 segments) genuinely has no children, but
-            # no real caller ever reaches this branch: children_of() is only
-            # ever called on a key by a caller expanding a container, and a
-            # leaf node (built with is_leaf=True) is never expanded.
+            # A leaf key (2 segments) has no children; never expanded in practice.
             return []  # pragma: no cover
         (group,) = key
         return await self._list_members(table, group, offset=offset, limit=limit)
 
-    async def _list_groups(self, *, offset: int, limit: int | None) -> list[tuple[_Key, str, bool]]:
+    async def _list_groups(self, *, offset: int, limit: int | None) -> list[TreeEntry]:
         if self._group_column is None:
             groups = [self._root_name]
         else:
@@ -82,23 +62,17 @@ class SyntheticGroupedTree:
                 f"SELECT DISTINCT {self._group_column} FROM {self._table} ORDER BY {self._group_column}"
             )
             groups = [str(value) if value is not None else self._root_name for (value,) in await cursor.fetchall()]
-        entries = [((group,), self._display_name_for_group(group), False) for group in groups]
+        entries = [TreeEntry((group,), self._display_name_for_group(group), False) for group in groups]
         return paginate(entries, offset, limit)
 
-    async def _list_members(
-        self, table: Table, group: str, *, offset: int, limit: int | None
-    ) -> list[tuple[_Key, str, bool]]:
+    async def _list_members(self, table: Table, group: str, *, offset: int, limit: int | None) -> list[TreeEntry]:
         where: str
         params: tuple[object, ...]
         if self._group_column is None:
-            # Nothing to filter by, but children_of() below still costs
-            # only one page's I/O via ORDER BY ... LIMIT ? OFFSET ?, not
-            # a full-table load.
+            # Nothing to filter by; the page is still bounded by LIMIT/OFFSET.
             where, params = "", ()
         elif group == self._root_name:
-            # IS NULL, never a literal "= root_name" — that string
-            # would never match a real column value and would silently
-            # hide these rows.
+            # IS NULL: "= root_name" would never match, hiding these rows.
             where, params = f"{self._group_column} IS NULL", ()
         else:
             where, params = f"{self._group_column} = ?", (group,)
@@ -113,11 +87,7 @@ class SyntheticGroupedTree:
             offset=offset,
             limit=limit,
             key_prefix=(group,),
-            rows=self._rows,
         )
-
-    def row_for(self, key: _Key) -> _Row | None:
-        return self._rows.get(key) if len(key) == 2 else None
 
     def _display_name_for_group(self, group: str) -> str:
         if group == self._root_name:

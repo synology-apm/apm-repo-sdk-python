@@ -6,32 +6,38 @@ from __future__ import annotations
 
 import asyncio
 import base64
-import json
+import contextlib
+import dataclasses
 import os
 import sqlite3
-import struct
-import zlib
 from pathlib import Path
 
 import pytest
-import zstandard
-from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
+from support.format_builders import (
+    mapping_record,
+    repo_info_bytes,
+)
+from support.repo_builders import (
+    write_bucket,
+    write_composition_entries,
+    write_file_map,
+    write_vault_encryption_key_db,
+)
+from support.store_fakes import WrappingStore
 from synology_apm_repo.sdk.asynccache import AsyncKeyedCache
+from synology_apm_repo.sdk.cachemanager import DEFAULT_LIMITS, CacheLimits
+from synology_apm_repo.sdk.dedup.composition_reader import CompositionRecord
+from synology_apm_repo.sdk.dedup.fingerprint import FingerprintIndex
 from synology_apm_repo.sdk.dedup.keys import KeyMaterial
-from synology_apm_repo.sdk.dedup.repository import DedupRepo
+from synology_apm_repo.sdk.dedup.pool import FULL_VERIFY
+from synology_apm_repo.sdk.dedup.pool_descriptor import PoolDescriptor, build_worker_pool, close_worker_store
+from synology_apm_repo.sdk.dedup.repository import DB_SOURCE_NAMES, DedupRepo
 from synology_apm_repo.sdk.errors import DataCorruptError, KeyMismatchError, KeyRequiredError, NotFoundError
-from synology_apm_repo.sdk.format.addressing import ChunkAddress
-from synology_apm_repo.sdk.format.bucket import MODE_CHUNK_CRC, MODE_COMPRESS, MODE_VAULT_ENCRYPT
-from synology_apm_repo.sdk.format.chunkmap import ChunkMapKind
-from synology_apm_repo.sdk.format.compression import CompressType
-from synology_apm_repo.sdk.format.const import SUB_FILE_SIZE
-from synology_apm_repo.sdk.format.crypto import chunk_iv
-from synology_apm_repo.sdk.format.redundancy import redundancy_size
-from synology_apm_repo.sdk.format.repo_info import MAGIC as REPO_INFO_MAGIC
-from synology_apm_repo.sdk.identifiers import BucketId, ChunkIdx, CompOffset, SessionId, StreamId
-from synology_apm_repo.sdk.storage.base import ObjectStore
+from synology_apm_repo.sdk.identifiers import CompOffset, SessionId, StreamId
+from synology_apm_repo.sdk.storage.base import Entry, ObjectStore
+from synology_apm_repo.sdk.storage.dircache import DirCache
 from synology_apm_repo.sdk.storage.layout import RepoKind, RepoLayout
 from synology_apm_repo.sdk.storage.local import LocalFsStore
 from synology_apm_repo.sdk.storage.sqlite_source import SqliteSource
@@ -51,43 +57,8 @@ def _write_repo_info(path: Path, *, uuid: str = "abcdefghijklmnop") -> None:
         "is_worm_supported": False,
         "storage_algorithm": {"compress_algorithm": 1, "encrypt_algorithm": 0},
     }
-    payload = json.dumps(payload_obj).encode("utf-8")
-    header = bytearray(64)
-    header[0:4] = REPO_INFO_MAGIC
-    header[4:6] = (2).to_bytes(2, "big")
-    header[8:12] = (zlib.crc32(payload) & 0xFFFFFFFF).to_bytes(4, "big")
-    header[12:20] = len(payload).to_bytes(8, "big")
-    header[20:36] = uuid.encode("ascii")
-    header[60:64] = (zlib.crc32(bytes(header[:60])) & 0xFFFFFFFF).to_bytes(4, "big")
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_bytes(bytes(header) + payload)
-
-
-def _write_vault_encryption_key_db(path: Path, rows: list[tuple[str, str]]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(path)
-    conn.execute(
-        "CREATE TABLE vault_encryption_key(user_key_uuid TEXT UNIQUE NOT NULL, "
-        "encrypted_data_key TEXT, crtime DATETIME DEFAULT CURRENT_TIMESTAMP)"
-    )
-    conn.executemany("INSERT INTO vault_encryption_key(user_key_uuid, encrypted_data_key) VALUES (?, ?)", rows)
-    conn.commit()
-    conn.close()
-
-
-def _write_file_map(path: Path, rows: list[tuple[str, int, int, int, int, int]]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(path)
-    conn.execute(
-        "CREATE TABLE file_map(path TEXT PRIMARY KEY, crtime DATETIME, mtime DATETIME, "
-        "stream_id INTEGER, session_id INTEGER, comp_offset INTEGER, block INTEGER, status INTEGER)"
-    )
-    conn.executemany(
-        "INSERT INTO file_map(path, stream_id, session_id, comp_offset, block, status) VALUES (?, ?, ?, ?, ?, ?)",
-        rows,
-    )
-    conn.commit()
-    conn.close()
+    path.write_bytes(repo_info_bytes(payload_obj, uuid=uuid.encode("ascii")))
 
 
 def _write_file_meta(path: Path, rows: list[tuple[str, int]]) -> None:
@@ -99,108 +70,17 @@ def _write_file_meta(path: Path, rows: list[tuple[str, int]]) -> None:
     conn.close()
 
 
-def _chunk_map_record_bytes(*, kind_value: int, file_chunk_idx: int, addr_int: int, tail_u32: int) -> bytes:
-    type_byte = kind_value & 0x0F
-    idx_bytes = file_chunk_idx.to_bytes(7, "big")
-    return bytes([type_byte]) + idx_bytes + addr_int.to_bytes(8, "big") + tail_u32.to_bytes(4, "big")
-
-
-def _mapping_record(file_offset: int, bucket_id: int, chunk_idx: int, map_num: int = 1) -> bytes:
-    addr_int = (bucket_id << 16) | chunk_idx  # stream_id=0 implicitly
-    return _chunk_map_record_bytes(
-        kind_value=ChunkMapKind.MAPPING.value,
-        file_chunk_idx=file_offset >> 12,
-        addr_int=addr_int,
-        tail_u32=map_num << 16,
-    )
-
-
-def _composition_header_bytes() -> bytes:
-    header = bytearray(64)
-    header[0:4] = b"cMpS"
-    header[4:6] = (1).to_bytes(2, "big")
-    header[6:8] = (1).to_bytes(2, "big")
-    header[8:12] = SUB_FILE_SIZE.to_bytes(4, "big")
-    header[60:64] = (zlib.crc32(bytes(header[:60])) & 0xFFFFFFFF).to_bytes(4, "big")
-    return bytes(header)
-
-
-def _record_head_bytes(*, map_num: int, mode: int = 0x0001) -> bytes:
-    head = bytearray(32)
-    head[0:2] = b"Mu"
-    head[6:14] = map_num.to_bytes(8, "big")
-    head[18:20] = mode.to_bytes(2, "big")
-    head[28:32] = (zlib.crc32(bytes(head[:28])) & 0xFFFFFFFF).to_bytes(4, "big")
-    return bytes(head)
-
-
 def _write_composition(root: Path) -> None:
-    entries = _mapping_record(0, 0, 0, map_num=1)
-    record_bytes = _record_head_bytes(map_num=1) + entries
-    path = root / str(_STREAM_ID) / f"{_SESSION_ID}.com" / "c0"
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_bytes(_composition_header_bytes() + record_bytes)
-
-
-def _encode_size_store(entries: list[tuple[int, int]]) -> bytes:
-    n = len(entries)
-    tight_len = (n * 15 + 7) >> 3
-    buf = bytearray(tight_len + 4)
-    for idx, (type_value, size) in enumerate(entries):
-        bit_off = idx * 15
-        byte_off = bit_off >> 3
-        bit_shift = 17 - (bit_off & 7)
-        blob = (type_value << 12) | size
-        window = int.from_bytes(buf[byte_off : byte_off + 4], "big")
-        window |= (blob << bit_shift) & 0xFFFFFFFF
-        buf[byte_off : byte_off + 4] = window.to_bytes(4, "big")
-    return bytes(buf[:tight_len])
-
-
-def _write_bucket(path: Path, plaintext: bytes) -> None:
-    compressed = zstandard.ZstdCompressor().compress(plaintext)
-    tight = _encode_size_store([(CompressType.ZSTD.value, len(compressed))])
-    chunk_size_crc = zlib.crc32(tight) & 0xFFFFFFFF
-    header = bytearray(64)
-    header[0:4] = b"bFiL"
-    header[4:6] = (3).to_bytes(2, "big")
-    header[8:12] = struct.pack(">I", MODE_COMPRESS | MODE_CHUNK_CRC)
-    header[12:16] = struct.pack(">I", 1)
-    header[16:20] = struct.pack(">I", chunk_size_crc)
-    header[60:64] = (zlib.crc32(bytes(header[:60])) & 0xFFFFFFFF).to_bytes(4, "big")
-    trailer = os.urandom(4 + redundancy_size((15 + 7) >> 3, 256))
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_bytes(bytes(header) + sizestore_region_pad(tight) + compressed + trailer)
-
-
-def _write_encrypted_bucket(path: Path, plaintext: bytes, vault_key: bytes, *, bucket_id: int = 0) -> None:
-    """Same shape as ``_write_bucket``, real AES-CTR encrypted under
-    ``vault_key`` and flagged ``MODE_VAULT_ENCRYPT``."""
-    compressed = zstandard.ZstdCompressor().compress(plaintext)
-    addr = ChunkAddress(StreamId(0), BucketId(bucket_id), ChunkIdx(0))
-    encryptor = Cipher(algorithms.AES(vault_key), modes.CTR(chunk_iv(addr))).encryptor()
-    ciphertext = encryptor.update(compressed) + encryptor.finalize()
-    tight = _encode_size_store([(CompressType.ZSTD.value, len(ciphertext))])
-    chunk_size_crc = zlib.crc32(tight) & 0xFFFFFFFF
-    header = bytearray(64)
-    header[0:4] = b"bFiL"
-    header[4:6] = (3).to_bytes(2, "big")
-    header[8:12] = struct.pack(">I", MODE_COMPRESS | MODE_CHUNK_CRC | MODE_VAULT_ENCRYPT)
-    header[12:16] = struct.pack(">I", 1)
-    header[16:20] = struct.pack(">I", chunk_size_crc)
-    header[60:64] = (zlib.crc32(bytes(header[:60])) & 0xFFFFFFFF).to_bytes(4, "big")
-    trailer = os.urandom(4 + redundancy_size((15 + 7) >> 3, 256))
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_bytes(bytes(header) + sizestore_region_pad(tight) + ciphertext + trailer)
+    write_composition_entries(root, mapping_record(0, 0, 0, map_num=1), stream_id=_STREAM_ID, session_id=_SESSION_ID)
 
 
 def _build_full_repo(tmp_path: Path, *, encryption_user_key_uuid: str = "NoEncryption") -> None:
     _write_repo_info(tmp_path / "repo_info")
-    _write_vault_encryption_key_db(tmp_path / "db" / "vault_encryption_key", [(encryption_user_key_uuid, "")])
-    _write_file_map(tmp_path / "db" / "file_map", [(_PATH, _STREAM_ID, _SESSION_ID, _HEAD_OFF, 1, 2)])
+    write_vault_encryption_key_db(tmp_path / "db" / "vault_encryption_key", [(encryption_user_key_uuid, "")])
+    write_file_map(tmp_path / "db" / "file_map", [(_PATH, _STREAM_ID, _SESSION_ID, _HEAD_OFF, 1, 2)])
     _write_file_meta(tmp_path / "db" / "file_meta", [(_PATH, 4096)])
     _write_composition(tmp_path / "@data" / "Composition")
-    _write_bucket(tmp_path / "@data" / "Pool" / "0" / "0.buk", _PLAINTEXT)
+    write_bucket(tmp_path / "@data" / "Pool" / "0" / "0.buk", [_PLAINTEXT])
 
 
 @pytest.fixture
@@ -225,8 +105,8 @@ class TestOpen:
 
     async def test_no_encryption_never_touches_the_key_db(self, tmp_path: Path, vault_layout: RepoLayout) -> None:
         _write_repo_info(tmp_path / "repo_info")
-        # deliberately no db/vault_encryption_key at all — open() must not
-        # need it when keys.is_no_encryption is True.
+        # No db/vault_encryption_key: open() must not need it when
+        # keys.is_no_encryption.
         store = _SpyStore(LocalFsStore(tmp_path))
         keys = KeyMaterial(user_key_id="NoEncryption", user_key=b"\x00" * 32)
         async with await DedupRepo.open(store, vault_layout, keys) as repo:
@@ -236,32 +116,28 @@ class TestOpen:
     async def test_missing_keys_argument_defers_failure_to_first_read(
         self, tmp_path: Path, vault_layout: RepoLayout
     ) -> None:
-        # open() with keys=None never raises even for an encrypted repository —
-        # KeyRequiredError only surfaces later, from Pool.read_chunk(). Build a
-        # bucket whose header marks it vault-encrypted; the stored bytes
-        # never actually get decrypted or decompressed, since read_chunk()
-        # raises as soon as it sees a vault-encrypted chunk with no key.
+        # open() with keys=None never raises for an encrypted repository;
+        # KeyRequiredError surfaces from the first chunk read, before any
+        # decrypt.
         _write_repo_info(tmp_path / "repo_info")
-        _write_file_map(tmp_path / "db" / "file_map", [(_PATH, _STREAM_ID, _SESSION_ID, _HEAD_OFF, 1, 2)])
+        write_file_map(tmp_path / "db" / "file_map", [(_PATH, _STREAM_ID, _SESSION_ID, _HEAD_OFF, 1, 2)])
         _write_file_meta(tmp_path / "db" / "file_meta", [(_PATH, 4096)])
         _write_composition(tmp_path / "@data" / "Composition")
 
-        # The vault key here is never actually used to decrypt anything —
-        # KeyRequiredError fires before read_chunk() ever gets that far — so
-        # any random 32 bytes stand in for it.
-        _write_encrypted_bucket(tmp_path / "@data" / "Pool" / "0" / "0.buk", _PLAINTEXT, os.urandom(32))
+        # Never used to decrypt, so any 32 bytes do.
+        write_bucket(tmp_path / "@data" / "Pool" / "0" / "0.buk", [_PLAINTEXT], vault_key=os.urandom(32))
 
         store = LocalFsStore(tmp_path)
         async with await DedupRepo.open(store, vault_layout, keys=None) as repo:
-            with pytest.raises(KeyRequiredError):
+            with pytest.raises(KeyRequiredError, match="is encrypted but no vault key was provided"):
                 await (await repo.open_file(_PATH)).read(0, 4096)
 
     async def test_missing_wrapped_key_raises_key_required(self, tmp_path: Path, vault_layout: RepoLayout) -> None:
         _write_repo_info(tmp_path / "repo_info")
-        _write_vault_encryption_key_db(tmp_path / "db" / "vault_encryption_key", [("NoEncryption", "")])
+        write_vault_encryption_key_db(tmp_path / "db" / "vault_encryption_key", [("NoEncryption", "")])
         store = LocalFsStore(tmp_path)
         keys = KeyMaterial(user_key_id="abcdefghijkl", user_key=os.urandom(32))
-        with pytest.raises(KeyRequiredError):
+        with pytest.raises(KeyRequiredError, match="no wrapped VaultKey on record for user_key_id"):
             await DedupRepo.open(store, vault_layout, keys)
 
     async def test_wrong_key_propagates_key_mismatch(self, tmp_path: Path, vault_layout: RepoLayout) -> None:
@@ -271,12 +147,12 @@ class TestOpen:
         vault_key = os.urandom(32)
         nonce = user_key_id.encode("ascii")[:12]
         wrapped = AESGCM(correct_user_key).encrypt(nonce, vault_key, None)
-        _write_vault_encryption_key_db(
+        write_vault_encryption_key_db(
             tmp_path / "db" / "vault_encryption_key", [(user_key_id, base64.b64encode(wrapped).decode())]
         )
         store = LocalFsStore(tmp_path)
         wrong_keys = KeyMaterial(user_key_id=user_key_id, user_key=os.urandom(32))
-        with pytest.raises(KeyMismatchError):
+        with pytest.raises(KeyMismatchError, match="AES-256-GCM tag check failed"):
             await DedupRepo.open(store, vault_layout, wrong_keys)
 
     async def test_correct_key_enables_reading_encrypted_content(
@@ -289,77 +165,18 @@ class TestOpen:
         wrapped = AESGCM(user_key).encrypt(nonce, vault_key, None)
 
         _write_repo_info(tmp_path / "repo_info")
-        _write_vault_encryption_key_db(
+        write_vault_encryption_key_db(
             tmp_path / "db" / "vault_encryption_key", [(user_key_id, base64.b64encode(wrapped).decode())]
         )
-        _write_file_map(tmp_path / "db" / "file_map", [(_PATH, _STREAM_ID, _SESSION_ID, _HEAD_OFF, 1, 2)])
+        write_file_map(tmp_path / "db" / "file_map", [(_PATH, _STREAM_ID, _SESSION_ID, _HEAD_OFF, 1, 2)])
         _write_file_meta(tmp_path / "db" / "file_meta", [(_PATH, 4096)])
         _write_composition(tmp_path / "@data" / "Composition")
-        _write_encrypted_bucket(tmp_path / "@data" / "Pool" / "0" / "0.buk", _PLAINTEXT, vault_key)
+        write_bucket(tmp_path / "@data" / "Pool" / "0" / "0.buk", [_PLAINTEXT], vault_key=vault_key)
 
         store = LocalFsStore(tmp_path)
         keys = KeyMaterial(user_key_id=user_key_id, user_key=user_key)
         async with await DedupRepo.open(store, vault_layout, keys) as repo:
             assert await (await repo.open_file(_PATH)).read(0, 4096) == _PLAINTEXT
-
-
-def sizestore_region_pad(tight: bytes) -> bytes:
-    return tight + b"\x00" * (16320 - len(tight))
-
-
-class TestProbeEncrypted:
-    """``DedupRepo.probe_encrypted`` — cheap, keyless, never raises
-    ``KeyRequiredError`` (the SDK-side half of refusing to list an encrypted
-    vault's workloads and asking for the encryption key up front — the
-    browser needs to know *before* trying to load a workload list, not
-    after hitting ``KeyRequiredError`` three clicks deep).
-
-    Reads ``db/vault_encryption_key`` directly, rather than opening a
-    real bucket's header — the bucket this module's other tests write
-    (``_write_bucket``) never carries a real vault-encrypted header at
-    all, so these tests vary the db row instead of the bucket bytes."""
-
-    async def test_returns_false_when_the_key_record_says_no_encryption(
-        self, tmp_path: Path, vault_layout: RepoLayout
-    ) -> None:
-        _build_full_repo(tmp_path)  # default: encryption_user_key_uuid="NoEncryption"
-        store = LocalFsStore(tmp_path)
-        async with await DedupRepo.open(store, vault_layout) as repo:
-            assert await repo.probe_encrypted() is False
-
-    async def test_returns_true_when_the_key_record_names_a_real_key(
-        self, tmp_path: Path, vault_layout: RepoLayout
-    ) -> None:
-        _build_full_repo(tmp_path, encryption_user_key_uuid="rEalUserKeyID")
-        store = LocalFsStore(tmp_path)
-        # keys=None — the whole point: probe_encrypted() must not need one.
-        async with await DedupRepo.open(store, vault_layout, keys=None) as repo:
-            assert await repo.probe_encrypted() is True
-
-    async def test_returns_none_when_the_encryption_key_record_is_entirely_absent(
-        self, tmp_path: Path, vault_layout: RepoLayout
-    ) -> None:
-        # repo_info only — no db/vault_encryption_key at all (should not
-        # happen for a properly initialized repo). None is a genuinely
-        # different, honest answer from False — "couldn't tell", not
-        # "confirmed not encrypted" — not an error either.
-        _write_repo_info(tmp_path / "repo_info")
-        store = LocalFsStore(tmp_path)
-        async with await DedupRepo.open(store, vault_layout) as repo:
-            assert await repo.probe_encrypted() is None
-
-    async def test_result_is_cached_for_the_repository_lifetime(self, tmp_path: Path, vault_layout: RepoLayout) -> None:
-        _build_full_repo(tmp_path)
-        spy = _SpyStore(LocalFsStore(tmp_path))
-        async with await DedupRepo.open(spy, vault_layout) as repo:
-            first = await repo.probe_encrypted()
-            touched_after_first = list(spy.touched_paths)
-            second = await repo.probe_encrypted()
-            assert second == first
-            # The second call must not touch the store again at all — same
-            # "cheap enough to call more than once without worrying about
-            # cost" contract the docstring promises.
-            assert spy.touched_paths == touched_after_first
 
 
 class TestDb:
@@ -393,10 +210,8 @@ class TestDb:
     async def test_concurrent_opens_for_the_same_name_build_the_source_only_once(
         self, tmp_path: Path, vault_layout: RepoLayout, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """``_db_sources`` is an ``AsyncKeyedCache``, whose ``resolve()``
-        de-duplicates in-flight fetches. Concurrent
-        misses on the *same* name must build exactly one ``SqliteSource``,
-        with every caller sharing that one cached connection afterwards."""
+        """Concurrent misses on the same name build exactly one
+        ``SqliteSource``, and every caller shares its connection."""
         _build_full_repo(tmp_path)
         store = LocalFsStore(tmp_path)
         async with await DedupRepo.open(store, vault_layout) as repo:
@@ -419,10 +234,8 @@ class TestDb:
     async def test_concurrent_opens_for_different_names_do_not_serialize_on_each_other(
         self, tmp_path: Path, vault_layout: RepoLayout, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """Regression test for the AsyncKeyedCache migration: unlike a
-        single lock guarding the whole ``_db_sources`` dict, two different
-        names' fetches must never block behind each other — only two
-        misses on the *same* name contend (the sibling test above)."""
+        """Only misses on the same name contend; different names never wait
+        on each other."""
         _build_full_repo(tmp_path)
         store = LocalFsStore(tmp_path)
         async with await DedupRepo.open(store, vault_layout) as repo:
@@ -442,9 +255,13 @@ class TestDb:
             await asyncio.wait_for(file_map_started.wait(), timeout=1)
             # file_map's own fetch is still parked on release_file_map — a
             # different name must resolve without waiting behind it.
-            await asyncio.wait_for(repo.db("file_meta"), timeout=1)
+            file_meta = await asyncio.wait_for(repo.db("file_meta"), timeout=1)
+            assert not file_map_task.done()
             release_file_map.set()
-            await file_map_task
+            file_map = await asyncio.wait_for(file_map_task, timeout=1)
+            assert file_map is not file_meta
+            assert await repo.db("file_map") is file_map
+            assert await repo.db("file_meta") is file_meta
 
 
 class TestLocateFile:
@@ -462,18 +279,18 @@ class TestLocateFile:
         _build_full_repo(tmp_path)
         store = LocalFsStore(tmp_path)
         async with await DedupRepo.open(store, vault_layout) as repo:
-            with pytest.raises(NotFoundError):
+            with pytest.raises(NotFoundError, match="no file_map entry for path"):
                 await repo.locate_file("no/such/path")
 
     async def test_deleted_renamed_path_still_resolves_via_its_own_triple(
         self, tmp_path: Path, vault_layout: RepoLayout
     ) -> None:
         _write_repo_info(tmp_path / "repo_info")
-        _write_vault_encryption_key_db(tmp_path / "db" / "vault_encryption_key", [("NoEncryption", "")])
+        write_vault_encryption_key_db(tmp_path / "db" / "vault_encryption_key", [("NoEncryption", "")])
         deleted_path = f"{_PATH}_deleted_1699999999000"
-        _write_file_map(tmp_path / "db" / "file_map", [(deleted_path, _STREAM_ID, _SESSION_ID, _HEAD_OFF, 1, 2)])
+        write_file_map(tmp_path / "db" / "file_map", [(deleted_path, _STREAM_ID, _SESSION_ID, _HEAD_OFF, 1, 2)])
         _write_composition(tmp_path / "@data" / "Composition")
-        _write_bucket(tmp_path / "@data" / "Pool" / "0" / "0.buk", _PLAINTEXT)
+        write_bucket(tmp_path / "@data" / "Pool" / "0" / "0.buk", [_PLAINTEXT])
         store = LocalFsStore(tmp_path)
         async with await DedupRepo.open(store, vault_layout) as repo:
             loc = await repo.locate_file(deleted_path)
@@ -486,9 +303,9 @@ class TestLocateFile:
         self, tmp_path: Path, vault_layout: RepoLayout
     ) -> None:
         _write_repo_info(tmp_path / "repo_info")
-        _write_vault_encryption_key_db(tmp_path / "db" / "vault_encryption_key", [("NoEncryption", "")])
-        _write_file_map(tmp_path / "db" / "file_map", [(_PATH, _STREAM_ID, _SESSION_ID, _HEAD_OFF, 1, 2)])
-        # no file_meta db file at all — the NotFoundError branch of _file_size_from_meta.
+        write_vault_encryption_key_db(tmp_path / "db" / "vault_encryption_key", [("NoEncryption", "")])
+        write_file_map(tmp_path / "db" / "file_map", [(_PATH, _STREAM_ID, _SESSION_ID, _HEAD_OFF, 1, 2)])
+        # No db/file_meta at all: _build_file_meta_table's NotFoundError branch.
         store = LocalFsStore(tmp_path)
         async with await DedupRepo.open(store, vault_layout) as repo:
             loc = await repo.locate_file(_PATH)
@@ -497,13 +314,11 @@ class TestLocateFile:
     async def test_file_meta_db_exists_but_lacks_the_file_meta_table_gives_none_size(
         self, tmp_path: Path, vault_layout: RepoLayout
     ) -> None:
-        # A genuinely different failure mode from the "db file doesn't
-        # exist at all" case above — this repository shape *has* a db/file_meta
-        # file, it just doesn't contain a file_meta table (some other
-        # table, or none). Table.exists_in()'s branch, not NotFoundError's.
+        # db/file_meta exists without a file_meta table: Table.exists_in()'s
+        # branch.
         _write_repo_info(tmp_path / "repo_info")
-        _write_vault_encryption_key_db(tmp_path / "db" / "vault_encryption_key", [("NoEncryption", "")])
-        _write_file_map(tmp_path / "db" / "file_map", [(_PATH, _STREAM_ID, _SESSION_ID, _HEAD_OFF, 1, 2)])
+        write_vault_encryption_key_db(tmp_path / "db" / "vault_encryption_key", [("NoEncryption", "")])
+        write_file_map(tmp_path / "db" / "file_map", [(_PATH, _STREAM_ID, _SESSION_ID, _HEAD_OFF, 1, 2)])
         (tmp_path / "db").mkdir(parents=True, exist_ok=True)
         conn = sqlite3.connect(tmp_path / "db" / "file_meta")
         conn.execute("CREATE TABLE some_other_table(x INTEGER)")
@@ -517,11 +332,9 @@ class TestLocateFile:
     async def test_file_meta_table_has_no_row_for_this_path_gives_none_size(
         self, tmp_path: Path, vault_layout: RepoLayout
     ) -> None:
-        # A fourth, still-different failure mode: the file_meta table
-        # exists and has rows, just none for this exact path.
         _write_repo_info(tmp_path / "repo_info")
-        _write_vault_encryption_key_db(tmp_path / "db" / "vault_encryption_key", [("NoEncryption", "")])
-        _write_file_map(tmp_path / "db" / "file_map", [(_PATH, _STREAM_ID, _SESSION_ID, _HEAD_OFF, 1, 2)])
+        write_vault_encryption_key_db(tmp_path / "db" / "vault_encryption_key", [("NoEncryption", "")])
+        write_file_map(tmp_path / "db" / "file_map", [(_PATH, _STREAM_ID, _SESSION_ID, _HEAD_OFF, 1, 2)])
         _write_file_meta(tmp_path / "db" / "file_meta", [("some/other/path", 4096)])
         store = LocalFsStore(tmp_path)
         async with await DedupRepo.open(store, vault_layout) as repo:
@@ -531,13 +344,10 @@ class TestLocateFile:
     async def test_file_meta_table_exists_but_lacks_file_size_column_gives_none_size(
         self, tmp_path: Path, vault_layout: RepoLayout
     ) -> None:
-        # A third, still-different failure mode: the file_meta table
-        # exists (with ``path``) but this repository shape's schema never grew a
-        # file_size column — Table's own missing-optional-column
-        # handling, not Table.exists_in() and not NotFoundError.
+        # No file_size column: Table's missing-optional-column handling.
         _write_repo_info(tmp_path / "repo_info")
-        _write_vault_encryption_key_db(tmp_path / "db" / "vault_encryption_key", [("NoEncryption", "")])
-        _write_file_map(tmp_path / "db" / "file_map", [(_PATH, _STREAM_ID, _SESSION_ID, _HEAD_OFF, 1, 2)])
+        write_vault_encryption_key_db(tmp_path / "db" / "vault_encryption_key", [("NoEncryption", "")])
+        write_file_map(tmp_path / "db" / "file_map", [(_PATH, _STREAM_ID, _SESSION_ID, _HEAD_OFF, 1, 2)])
         (tmp_path / "db").mkdir(parents=True, exist_ok=True)
         conn = sqlite3.connect(tmp_path / "db" / "file_meta")
         conn.execute("CREATE TABLE file_meta(path TEXT)")
@@ -553,8 +363,8 @@ class TestLocateFile:
         self, tmp_path: Path, vault_layout: RepoLayout
     ) -> None:
         _write_repo_info(tmp_path / "repo_info")
-        _write_vault_encryption_key_db(tmp_path / "db" / "vault_encryption_key", [("NoEncryption", "")])
-        _write_file_map(tmp_path / "db" / "file_map", [(_PATH, _STREAM_ID, _SESSION_ID, _HEAD_OFF, 1, 2)])
+        write_vault_encryption_key_db(tmp_path / "db" / "vault_encryption_key", [("NoEncryption", "")])
+        write_file_map(tmp_path / "db" / "file_map", [(_PATH, _STREAM_ID, _SESSION_ID, _HEAD_OFF, 1, 2)])
         (tmp_path / "db").mkdir(parents=True, exist_ok=True)
         conn = sqlite3.connect(tmp_path / "db" / "file_meta")
         conn.execute("CREATE TABLE file_meta(path TEXT, file_size INTEGER)")
@@ -570,37 +380,35 @@ class TestLocateFile:
     async def test_not_yet_or_no_longer_complete_status_raises_not_found(
         self, tmp_path: Path, vault_layout: RepoLayout, status: int
     ) -> None:
-        # Initialized (0) / Written (1) / Compacted (3): not documented as
-        # "known-bad" the way Corrupted/Tainted are, but also not the one
-        # trustworthy Complete (2) value — FORMAT-SPEC.md: file_map-status.
+        # Initialized (0) / Written (1) / Compacted (3): neither known-bad
+        # nor Complete (2) (FORMAT-SPEC.md: db/file_map).
         _write_repo_info(tmp_path / "repo_info")
-        _write_vault_encryption_key_db(tmp_path / "db" / "vault_encryption_key", [("NoEncryption", "")])
-        _write_file_map(tmp_path / "db" / "file_map", [(_PATH, _STREAM_ID, _SESSION_ID, _HEAD_OFF, 1, status)])
+        write_vault_encryption_key_db(tmp_path / "db" / "vault_encryption_key", [("NoEncryption", "")])
+        write_file_map(tmp_path / "db" / "file_map", [(_PATH, _STREAM_ID, _SESSION_ID, _HEAD_OFF, 1, status)])
         store = LocalFsStore(tmp_path)
         async with await DedupRepo.open(store, vault_layout) as repo:
-            with pytest.raises(NotFoundError):
+            with pytest.raises(NotFoundError, match=r"file_map row for path .* not Complete"):
                 await repo.locate_file(_PATH)
 
     @pytest.mark.parametrize("status", [4, 5])
     async def test_known_bad_status_raises_data_corrupt(
         self, tmp_path: Path, vault_layout: RepoLayout, status: int
     ) -> None:
-        # Corrupted (4) / Tainted (5): FORMAT-SPEC.md's own "known-bad"
-        # values — never returned as a readable FileLocation.
+        # Corrupted (4) / Tainted (5): the known-bad values (FORMAT-SPEC.md: db/file_map).
         _write_repo_info(tmp_path / "repo_info")
-        _write_vault_encryption_key_db(tmp_path / "db" / "vault_encryption_key", [("NoEncryption", "")])
-        _write_file_map(tmp_path / "db" / "file_map", [(_PATH, _STREAM_ID, _SESSION_ID, _HEAD_OFF, 1, status)])
+        write_vault_encryption_key_db(tmp_path / "db" / "vault_encryption_key", [("NoEncryption", "")])
+        write_file_map(tmp_path / "db" / "file_map", [(_PATH, _STREAM_ID, _SESSION_ID, _HEAD_OFF, 1, status)])
         store = LocalFsStore(tmp_path)
         async with await DedupRepo.open(store, vault_layout) as repo:
-            with pytest.raises(DataCorruptError):
+            with pytest.raises(DataCorruptError, match=r"file_map row for path .* \(Corrupted/Tainted\)"):
                 await repo.locate_file(_PATH)
 
 
 class TestFileMapPathsWithPrefix:
     async def test_status_filter_excludes_non_matching_rows(self, tmp_path: Path, vault_layout: RepoLayout) -> None:
         _write_repo_info(tmp_path / "repo_info")
-        _write_vault_encryption_key_db(tmp_path / "db" / "vault_encryption_key", [("NoEncryption", "")])
-        _write_file_map(
+        write_vault_encryption_key_db(tmp_path / "db" / "vault_encryption_key", [("NoEncryption", "")])
+        write_file_map(
             tmp_path / "db" / "file_map",
             [
                 ("prefix/a", _STREAM_ID, _SESSION_ID, _HEAD_OFF, 1, 2),
@@ -627,15 +435,13 @@ class TestOpenFileAndComposition:
     async def test_open_file_surfaces_the_same_status_gate_as_locate_file(
         self, tmp_path: Path, vault_layout: RepoLayout
     ) -> None:
-        # open_file() has no status check of its own -- it must be getting
-        # this for free from locate_file(), the single choke point both go
-        # through.
+        # open_file() has no status check of its own; it goes through locate_file().
         _write_repo_info(tmp_path / "repo_info")
-        _write_vault_encryption_key_db(tmp_path / "db" / "vault_encryption_key", [("NoEncryption", "")])
-        _write_file_map(tmp_path / "db" / "file_map", [(_PATH, _STREAM_ID, _SESSION_ID, _HEAD_OFF, 1, 4)])
+        write_vault_encryption_key_db(tmp_path / "db" / "vault_encryption_key", [("NoEncryption", "")])
+        write_file_map(tmp_path / "db" / "file_map", [(_PATH, _STREAM_ID, _SESSION_ID, _HEAD_OFF, 1, 4)])
         store = LocalFsStore(tmp_path)
         async with await DedupRepo.open(store, vault_layout) as repo:
-            with pytest.raises(DataCorruptError):
+            with pytest.raises(DataCorruptError, match=r"file_map row for path .* \(Corrupted/Tainted\)"):
                 await repo.open_file(_PATH)
 
     async def test_open_composition_bypasses_file_map(self, tmp_path: Path, vault_layout: RepoLayout) -> None:
@@ -644,6 +450,30 @@ class TestOpenFileAndComposition:
         async with await DedupRepo.open(store, vault_layout) as repo:
             f = repo.open_composition(_STREAM_ID, _SESSION_ID, _HEAD_OFF, size=4096)
             assert await f.read(0, 4096) == _PLAINTEXT
+
+    async def test_open_composition_shares_its_repo_wide_composition_record_cache(
+        self, tmp_path: Path, vault_layout: RepoLayout
+    ) -> None:
+        """``open_composition()`` threads the repository's shared record
+        cache into each ``CompositionReader`` it builds, so two calls for the
+        same triple resolve the identical ``CompositionRecord``."""
+        _build_full_repo(tmp_path)
+        store = LocalFsStore(tmp_path)
+        async with await DedupRepo.open(store, vault_layout) as repo:
+            first = repo.open_composition(_STREAM_ID, _SESSION_ID, _HEAD_OFF, size=4096)
+            second = repo.open_composition(_STREAM_ID, _SESSION_ID, _HEAD_OFF, size=4096)
+            assert await first.cached_record() is await second.cached_record()
+
+    async def test_composition_records_limit_propagates_from_open(
+        self, tmp_path: Path, vault_layout: RepoLayout
+    ) -> None:
+        _write_repo_info(tmp_path / "repo_info")
+        write_vault_encryption_key_db(tmp_path / "db" / "vault_encryption_key", [("NoEncryption", "")])
+        store = LocalFsStore(tmp_path)
+        async with await DedupRepo.open(
+            store, vault_layout, limits=dataclasses.replace(DEFAULT_LIMITS, composition_records=5)
+        ) as repo:
+            assert repo._composition_records.maxsize == 5
 
 
 class TestCloseAndContextManager:
@@ -662,17 +492,65 @@ class TestCloseAndContextManager:
             assert await (await repo.open_file(_PATH)).read(0, 4096) == _PLAINTEXT
         assert repo._db_sources == {}
 
-    async def test_a_db_call_still_in_flight_when_close_runs_still_gets_closed(
-        self, tmp_path: Path, vault_layout: RepoLayout
+    async def test_close_clears_composition_record_cache(self, tmp_path: Path, vault_layout: RepoLayout) -> None:
+        _build_full_repo(tmp_path)
+        store = LocalFsStore(tmp_path)
+        repo = await DedupRepo.open(store, vault_layout)
+        await repo.open_composition(_STREAM_ID, _SESSION_ID, _HEAD_OFF, size=4096).cached_record()
+        assert len(repo._composition_records) > 0
+        await repo.close()
+        assert repo._composition_records == {}
+
+    async def test_close_waits_for_a_composition_record_fetch_still_in_flight(
+        self, tmp_path: Path, vault_layout: RepoLayout, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """Same in-flight race as ``api.Repository.close()``'s own
-        ``AsyncKeyedCache.settle_all()``-based fix (``test_api_repository.py``) --
-        a ``db()`` call already in flight (its own ``SqliteSource`` open
-        not yet settled) when ``close()`` runs must still have that
-        connection closed once it lands, not left invisible to a plain
-        ``_db_sources.values()`` snapshot -- ``.values()`` only sees
-        already-settled entries, so ``close()`` uses ``known_keys()``'s
-        broader view (settled plus in-flight) instead."""
+        """``close()`` does not return while a composition-record fetch is
+        still in flight."""
+        _build_full_repo(tmp_path)
+        store = LocalFsStore(tmp_path)
+        repo = await DedupRepo.open(store, vault_layout)
+
+        started = asyncio.Event()
+        release = asyncio.Event()
+        dedup_file = repo.open_composition(_STREAM_ID, _SESSION_ID, _HEAD_OFF, size=4096)
+        real_build = dedup_file._comp_reader._build_record
+
+        async def _slow_build(head_off: int) -> CompositionRecord:
+            started.set()
+            await release.wait()
+            return await real_build(head_off)
+
+        monkeypatch.setattr(dedup_file._comp_reader, "_build_record", _slow_build)
+
+        cache = repo._composition_records
+        real_quiesce = cache.quiesce
+        quiescing = asyncio.Event()
+
+        async def _signalling_quiesce() -> list[Exception]:
+            quiescing.set()
+            return await real_quiesce()
+
+        monkeypatch.setattr(cache, "quiesce", _signalling_quiesce)
+
+        resolve_task = asyncio.create_task(dedup_file.cached_record())
+        await started.wait()  # the fetch is in flight (owner determined), not yet settled
+
+        close_task = asyncio.create_task(repo.close())
+        await quiescing.wait()  # close() reached the cache while the fetch is still in flight
+        assert not close_task.done()  # blocked on the in-flight fetch, not returned early
+        release.set()
+
+        await resolve_task
+        await close_task
+
+        assert repo._composition_records == {}
+
+    async def test_a_db_call_still_in_flight_when_close_runs_still_gets_closed(
+        self, tmp_path: Path, vault_layout: RepoLayout, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A ``SqliteSource`` whose open is still in flight when ``close()``
+        runs is closed once it lands: ``close()`` settles in-flight entries
+        (``settle_all()``), not only settled ones."""
         _build_full_repo(tmp_path)
         store = LocalFsStore(tmp_path)
         repo = await DedupRepo.open(store, vault_layout)
@@ -689,18 +567,25 @@ class TestCloseAndContextManager:
             created.append(source)
             return source
 
-        # A fresh cache bound to the slow fetch -- db()'s own resolve()
-        # call passes no per-call override, so the fetch has to be rebound
-        # here rather than monkeypatched on the instance (AsyncKeyedCache
-        # captures whatever bound method it's constructed with).
-        repo._db_sources = AsyncKeyedCache(_slow_build)
+        # Rebind the fetch rather than replace the cache, which the
+        # repository's CacheManager owns.
+        repo._db_sources._fetch = _slow_build
+        real_settle_all = repo._db_sources.settle_all
+        settling = asyncio.Event()
+
+        async def _signalling_settle_all() -> tuple[dict[str, SqliteSource], list[Exception]]:
+            settling.set()
+            return await real_settle_all()
+
+        monkeypatch.setattr(repo._db_sources, "settle_all", _signalling_settle_all)
 
         resolve_task = asyncio.create_task(repo.db("file_map"))
         await started.wait()  # the open is in flight (owner determined), not yet settled
 
         close_task = asyncio.create_task(repo.close())
-        await asyncio.sleep(0)  # let close() take its known_keys() snapshot while still in flight
-        release.set()  # let the open finish
+        await settling.wait()  # close() reached the cache while the open is still in flight
+        assert not close_task.done()
+        release.set()
 
         await resolve_task
         await close_task
@@ -712,12 +597,8 @@ class TestCloseAndContextManager:
     async def test_close_reports_but_does_not_abort_when_one_source_fails_to_close(
         self, tmp_path: Path, vault_layout: RepoLayout, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """Same "attempt all, then report" posture as
-        ``api.Repository.close()`` -- one source failing (or hanging) to
-        close must not stop every other already-opened source from
-        getting its own close attempt, and the failure must still
-        surface via ``ExceptionGroup`` rather than be silently
-        swallowed."""
+        """One source failing to close doesn't stop the others' close
+        attempts, and the failure surfaces in an ``ExceptionGroup``."""
         _build_full_repo(tmp_path)
         store = LocalFsStore(tmp_path)
         repo = await DedupRepo.open(store, vault_layout)
@@ -733,22 +614,16 @@ class TestCloseAndContextManager:
         monkeypatch.setattr(failing_source, "close", _failing_close)
 
         try:
-            with pytest.raises(ExceptionGroup) as exc_info:
+            with pytest.raises(
+                ExceptionGroup, match=r"DedupRepo\.close\(\) failed to close every tracked resource"
+            ) as exc_info:
                 await repo.close()
             assert len(exc_info.value.exceptions) == 1
             assert isinstance(exc_info.value.exceptions[0], RuntimeError)
-            # the other source still got its own close attempt despite the
-            # first one's failure, and the cache itself was still cleared.
             assert other_source._closed is True
             assert repo._db_sources == {}
         finally:
-            # The monkeypatched close() above never releases the real
-            # aiosqlite connection underneath it (that's the point -- it
-            # simulates a close that genuinely fails) -- close it directly
-            # here, bypassing the broken wrapper, so this test doesn't
-            # leak a live connection/background thread for the rest of
-            # the session (see "Closing a provider built directly against
-            # a repository" for what that can surface as, elsewhere).
+            # The patched close() never releases the real connection.
             await failing_source.connection.close()
 
 
@@ -757,17 +632,16 @@ async def test_bad_repo_info_magic_raises_data_corrupt(tmp_path: Path, vault_lay
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_bytes(b"X" * 64)
     store = LocalFsStore(tmp_path)
-    with pytest.raises(DataCorruptError):
+    with pytest.raises(DataCorruptError, match="bad magic"):
         await DedupRepo.open(store, vault_layout)
 
 
-class _SpyStore:
-    """Wraps a real ``ObjectStore``, recording every path passed to
-    ``read``/``listdir``/``exists`` — used to prove *absence* of reads
-    against specific paths, not just that the right bytes come back."""
+class _SpyStore(WrappingStore):
+    """Records every path passed to ``read``/``size``/``exists``/``listdir``,
+    to prove a path is never touched."""
 
     def __init__(self, backing: LocalFsStore) -> None:
-        self._backing = backing
+        super().__init__(backing)
         self.touched_paths: list[str] = []
 
     async def read(self, path: str, offset: int = 0, length: int | None = None) -> bytes:
@@ -782,7 +656,7 @@ class _SpyStore:
         self.touched_paths.append(path)
         return await self._backing.exists(path)
 
-    async def listdir(self, path: str) -> list[str]:
+    async def listdir(self, path: str) -> list[Entry]:
         self.touched_paths.append(path)
         return await self._backing.listdir(path)
 
@@ -804,3 +678,188 @@ class TestRestorePathNeverTouchesAuxiliaryFiles:
             assert content == _PLAINTEXT
             forbidden = (".ref", "sample.index", "Hot/")
             assert not any(pat in touched for touched in spy.touched_paths for pat in forbidden)
+
+
+class TestCacheRegistry:
+    async def test_every_cache_this_repository_owns_is_registered(
+        self, tmp_path: Path, vault_layout: RepoLayout
+    ) -> None:
+        """Guard: a cache attribute added to ``DedupRepo``/``Pool`` without a
+        registry decision fails here, so ``invalidate_all()`` cannot silently
+        miss it."""
+        _build_full_repo(tmp_path)
+        async with await DedupRepo.open(LocalFsStore(tmp_path), vault_layout) as repo:
+            repo_caches = {name for name, value in vars(repo).items() if isinstance(value, AsyncKeyedCache | DirCache)}
+            pool_caches = {
+                name
+                for name, value in vars(repo._pool).items()
+                if isinstance(value, AsyncKeyedCache | FingerprintIndex)
+            }
+            assert repo_caches == {
+                "_db_sources",
+                "_file_meta_table_cache",
+                "_composition_records",
+                "_dir_cache",
+                "_fixed_dir_cache",
+            }
+            assert pool_caches == {"_buckets", "_chunks", "_fingerprints"}
+            assert repo.caches.names() == [
+                "dir_scan",
+                "dir_fixed",
+                "pool",
+                "db_sources",
+                "file_meta_table",
+                "composition_records",
+            ]
+            assert set(repo.caches.stats()) == {
+                "dir_scan",
+                "dir_fixed",
+                "pool.buckets",
+                "pool.chunks",
+                "pool.allocation_tables",
+                "db_sources",
+                "file_meta_table",
+                "composition_records",
+            }
+
+    async def test_every_registered_cache_is_bounded_or_says_what_bounds_it(
+        self, tmp_path: Path, vault_layout: RepoLayout
+    ) -> None:
+        _build_full_repo(tmp_path)
+        async with await DedupRepo.open(LocalFsStore(tmp_path), vault_layout) as repo:
+            unbounded = {name for name, stats in repo.caches.stats().items() if stats.maxsize is None}
+
+            assert unbounded == {"db_sources"}
+            assert repo.caches.bounds()["db_sources"] == "closed key set DB_SOURCE_NAMES"
+
+    async def test_default_bounds_come_from_cache_limits(self, tmp_path: Path, vault_layout: RepoLayout) -> None:
+        _build_full_repo(tmp_path)
+        async with await DedupRepo.open(LocalFsStore(tmp_path), vault_layout) as repo:
+            stats = repo.caches.stats()
+
+            assert stats["dir_scan"].maxsize == DEFAULT_LIMITS.dir_scan
+            assert stats["dir_fixed"].maxsize == DEFAULT_LIMITS.dir_fixed
+            assert stats["pool.buckets"].maxsize == DEFAULT_LIMITS.bucket_readers
+            assert stats["pool.chunks"].maxsize == DEFAULT_LIMITS.chunks
+            assert stats["pool.allocation_tables"].maxsize == DEFAULT_LIMITS.allocation_tables
+            assert stats["composition_records"].maxsize == DEFAULT_LIMITS.composition_records
+
+    async def test_custom_limits_bound_every_cache_and_every_derived_pool(
+        self, tmp_path: Path, vault_layout: RepoLayout
+    ) -> None:
+        _build_full_repo(tmp_path)
+        limits = CacheLimits(
+            bucket_readers=3, chunks=5, composition_records=7, dir_scan=11, dir_fixed=13, allocation_tables=17
+        )
+        async with await DedupRepo.open(LocalFsStore(tmp_path), vault_layout, limits=limits) as repo:
+            stats = repo.caches.stats()
+            assert stats["dir_scan"].maxsize == 11
+            assert stats["dir_fixed"].maxsize == 13
+            assert stats["pool.buckets"].maxsize == 3
+            assert stats["pool.chunks"].maxsize == 5
+            assert stats["pool.allocation_tables"].maxsize == 17
+            assert stats["composition_records"].maxsize == 7
+
+            derived = repo.new_pool(verify=FULL_VERIFY)
+            assert derived.limits == limits
+            assert derived.cache_stats()["pool.buckets"].maxsize == 3
+
+            descriptor = PoolDescriptor.from_pool(derived)
+            assert descriptor is not None
+            assert descriptor.limits == limits
+            store, worker_pool = build_worker_pool(descriptor)
+            try:
+                assert worker_pool.cache_stats()["pool.chunks"].maxsize == 5
+            finally:
+                await close_worker_store(store)
+
+    async def test_invalidate_all_closes_the_db_sources_and_the_repository_keeps_working(
+        self, tmp_path: Path, vault_layout: RepoLayout
+    ) -> None:
+        _build_full_repo(tmp_path)
+        async with await DedupRepo.open(LocalFsStore(tmp_path), vault_layout) as repo:
+            assert await (await repo.open_file(_PATH)).read(0, 4096) == _PLAINTEXT
+            first = repo._db_sources["file_map"]
+
+            await repo.caches.invalidate_all()
+
+            assert first._closed is True
+            assert len(repo._db_sources) == 0
+            assert len(repo._composition_records) == 0
+            assert await (await repo.open_file(_PATH)).read(0, 4096) == _PLAINTEXT  # reopened on demand
+            assert repo._db_sources["file_map"] is not first
+
+    async def test_invalidate_drops_the_file_meta_table_before_its_connection_is_closed(
+        self, tmp_path: Path, vault_layout: RepoLayout
+    ) -> None:
+        _build_full_repo(tmp_path)
+        async with await DedupRepo.open(LocalFsStore(tmp_path), vault_layout) as repo:
+            await repo.open_file(_PATH)  # builds the file_meta Table on its connection
+            assert len(repo._file_meta_table_cache) == 1
+
+            await repo.caches.invalidate("db_sources", "file_meta_table")
+
+            assert len(repo._file_meta_table_cache) == 0
+            assert len(repo._db_sources) == 0
+
+    async def test_invalidating_only_db_sources_still_drops_the_table_bound_to_a_closed_connection(
+        self, tmp_path: Path, vault_layout: RepoLayout
+    ) -> None:
+        _build_full_repo(tmp_path)
+        async with await DedupRepo.open(LocalFsStore(tmp_path), vault_layout) as repo:
+            await repo.open_file(_PATH)  # builds the file_meta Table on its connection
+            assert len(repo._file_meta_table_cache) == 1
+
+            await repo.caches.invalidate("db_sources")  # the dependent cache is not named
+
+            assert len(repo._file_meta_table_cache) == 0
+            assert await (await repo.open_file(_PATH)).read(0, 4096) == _PLAINTEXT  # no closed-connection Table
+
+    async def test_invalidating_the_pool_bumps_its_release_epoch(
+        self, tmp_path: Path, vault_layout: RepoLayout
+    ) -> None:
+        _build_full_repo(tmp_path)
+        async with await DedupRepo.open(LocalFsStore(tmp_path), vault_layout) as repo:
+            before = repo._pool.release_epoch
+
+            await repo.caches.invalidate("pool")
+
+            assert repo._pool.release_epoch == before + 1
+
+    async def test_db_rejects_a_name_outside_the_closed_key_set(self, tmp_path: Path, vault_layout: RepoLayout) -> None:
+        _build_full_repo(tmp_path)
+        async with await DedupRepo.open(LocalFsStore(tmp_path), vault_layout) as repo:
+            with pytest.raises(ValueError, match="DB_SOURCE_NAMES"):
+                await repo.db("not_a_known_db")
+
+            assert len(repo._db_sources) == 0
+
+    async def test_the_alias_copy_target_file_resolves_to_a_registered_name(
+        self, tmp_path: Path, vault_layout: RepoLayout
+    ) -> None:
+        _build_full_repo(tmp_path)
+        async with await DedupRepo.open(LocalFsStore(tmp_path), vault_layout) as repo:
+            with contextlib.suppress(NotFoundError):  # this synthetic repo has no copy_target_version file
+                await repo.db("copy_target_file")  # the alias itself must be accepted
+
+            assert "copy_target_file" not in DB_SOURCE_NAMES
+
+    async def test_close_reports_failures_flattened_under_its_own_message(
+        self, tmp_path: Path, vault_layout: RepoLayout, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        _build_full_repo(tmp_path)
+        repo = await DedupRepo.open(LocalFsStore(tmp_path), vault_layout)
+        await repo.db("file_map")
+        source = repo._db_sources["file_map"]
+
+        async def failing_close() -> None:
+            raise OSError("cannot close")
+
+        monkeypatch.setattr(source, "close", failing_close)
+
+        with pytest.raises(ExceptionGroup, match=r"DedupRepo.close") as exc_info:
+            await repo.close()
+
+        assert [type(e) for e in exc_info.value.exceptions] == [OSError]
+        monkeypatch.undo()
+        await source.close()

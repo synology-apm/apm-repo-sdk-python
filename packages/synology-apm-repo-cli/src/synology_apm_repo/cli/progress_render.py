@@ -12,9 +12,8 @@
   above (machine-consumable; the command's actual result still goes to
   stdout, untouched by any of this).
 
-``build_progress_meter`` is the one entry point every CLI command should
-call, never ``ProgressMeter()`` directly — CLI and TUI both build on it, so
-ETA/rate math is never reimplemented twice.
+Commands get a meter from ``build_progress_meter``, never ``ProgressMeter()``
+directly.
 """
 
 from __future__ import annotations
@@ -25,60 +24,44 @@ import time
 
 from rich.console import Console
 
+from synology_apm_repo.cli.consoles import err_console
 from synology_apm_repo.cli.state import CliState, ProgressMode
-from synology_apm_repo.sdk.presentation.format import format_bytes as _format_bytes
-from synology_apm_repo.sdk.presentation.format import format_duration as _format_duration
-from synology_apm_repo.sdk.presentation.format import format_rate as _format_rate
-from synology_apm_repo.sdk.presentation.progress import Progress, ProgressMeter
+from synology_apm_repo.sdk.presentation import Progress, ProgressMeter
+from synology_apm_repo.sdk.presentation import format_bytes as _format_bytes
 
 _PLAIN_TEXT_INTERVAL = 5.0
 _BAR_WIDTH = 24
 
 
 def build_progress_meter(state: CliState) -> ProgressMeter:
-    """The one entry point every CLI command uses to get a ``ProgressMeter``
-    that renders according to ``state.progress``/``state.json``. Callers
-    pass ``meter.update`` as the SDK-level ``progress`` callback
-    (``Session.open``, ``ContentSource.export_to()``, ...); this function
-    never needs to know which SDK call it's attached to.
-
-    A plain ``def``: building the meter is pure construction — only the
-    *callback* it wraps is ``async def``, since
-    ``ProgressMeter.update()`` awaits it."""
+    """A ``ProgressMeter`` that renders according to
+    ``state.progress``/``state.json``; callers pass ``meter.update`` as an
+    SDK ``progress`` callback."""
     if state.progress is ProgressMode.NEVER:
         return ProgressMeter(callback=None)
 
-    # Built once, not per-render — a fresh Console() re-probes terminal
-    # capabilities each time, and on_update() can run up to 10x/second.
-    # None when --json is on: NDJSON rendering never touches a Console.
-    err_console = None if state.json else Console(stderr=True)
+    # None under --json, which never touches a Console.
+    progress_console = None if state.json else err_console
 
-    # Plain-text throttle clock, scoped to this call — never keyed by
-    # id(meter) in a module-level dict, since CPython can reuse a
-    # garbage-collected meter's id() for an unrelated later one.
+    # Plain-text throttle clock, scoped to this meter.
     last_plain_emit = [0.0]
 
-    # async def only to satisfy ProgressMeter's callback type; nothing
-    # here actually awaits.
+    # async only to satisfy ProgressMeter's callback type.
     async def on_update(p: Progress) -> None:
-        _render(state, err_console, meter, p, last_plain_emit)
+        _render(state, progress_console, meter, p, last_plain_emit)
 
     meter = ProgressMeter(callback=on_update)
     return meter
 
 
 def finish_live_progress(state: CliState) -> None:
-    """Clear any live progress line still sitting on stderr, once a
-    command's progress-bearing work is done and it's about to print its
-    own final report — ``_render_live_line``'s bare ``\\r`` otherwise
-    leaves the old line's tail dangling behind a shorter report line
-    sharing the same row. A no-op in every mode that never renders a live
-    line, so every caller can call this unconditionally."""
+    """Clear any live progress line left on stderr before a command prints
+    its final report, which would otherwise share that row. A no-op in
+    every mode that renders no live line."""
     if state.json or state.progress is ProgressMode.NEVER:
         return
-    console = Console(stderr=True)
-    if state.progress is ProgressMode.ALWAYS or console.is_terminal:
-        console.print("\x1b[2K", end="\r", style="dim", highlight=False)
+    if state.progress is ProgressMode.ALWAYS or err_console.is_terminal:
+        err_console.print("\x1b[2K", end="\r", style="dim", highlight=False)
 
 
 def _render(
@@ -104,13 +87,12 @@ def _render_ndjson(meter: ProgressMeter, p: Progress) -> None:
     payload["rate"] = round(meter.rate, 2)
     eta = meter.eta
     payload["eta"] = eta.total_seconds() if eta is not None else None
-    print(json.dumps(payload), file=sys.stderr, flush=True)
+    print(json.dumps(payload), file=sys.stderr, flush=True)  # noqa: T201 - one raw NDJSON line, past Rich
 
 
 def _render_live_line(console: Console, meter: ProgressMeter, p: Progress) -> None:
-    # Clear-to-end-of-line (\x1b[2K) so a shorter line doesn't leave stale
-    # trailing characters behind. No trailing newline (end="\r") so the
-    # next update overwrites this same terminal row.
+    # \x1b[2K clears the previous, possibly longer line; end="\r" lets the
+    # next update overwrite this row.
     console.print("\x1b[2K" + _format_line(meter, p), end="\r", style="dim", highlight=False)
 
 
@@ -123,9 +105,10 @@ def _render_plain_line(console: Console, meter: ProgressMeter, p: Progress, last
 
 
 def _format_line(meter: ProgressMeter, p: Progress) -> str:
-    parts = [p.phase]
+    text = meter.formatted(p.unit)
+    parts: list[str] = [p.phase]
     if p.determinate and p.total:
-        pct = min(100, int(100 * p.done / p.total)) if p.total else 0
+        pct = min(100, int(100 * p.done / p.total))
         filled = int(_BAR_WIDTH * pct / 100)
         bar = "█" * filled + "░" * (_BAR_WIDTH - filled)
         parts.append(f"│ {bar} {pct:3d}%")
@@ -133,20 +116,16 @@ def _format_line(meter: ProgressMeter, p: Progress) -> str:
             parts.append(f"│ {_format_bytes(p.done)}/{_format_bytes(p.total)}")
         else:
             parts.append(f"│ {p.done}/{p.total} {p.unit}")
-        rate = meter.rate
-        if rate > 0:
-            parts.append(f"│ {_format_rate(rate, p.unit)}")
-        eta = meter.eta
-        if eta is not None:
-            parts.append(f"│ ETA {_format_duration(eta.total_seconds())}")
+        if text.rate:
+            parts.append(f"│ {text.rate}")
+        if text.eta:
+            parts.append(f"│ ETA {text.eta}")
     else:
         found = p.found if p.found is not None else p.done
         parts.append(f"│ found {found} {p.unit}")
-        # No ETA here — there's no total yet to divide the remainder by.
-        rate = meter.rate
-        if rate > 0:
-            parts.append(f"│ {_format_rate(rate, p.unit)}")
-    parts.append(f"│ elapsed {_format_duration(meter.elapsed.total_seconds())}")
+        if text.rate:
+            parts.append(f"│ {text.rate}")
+    parts.append(f"│ elapsed {text.elapsed}")
     if p.detail:
         parts.append(f"│ {p.detail}")
     return " ".join(parts)

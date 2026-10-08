@@ -1,18 +1,17 @@
-"""Unit tests for ``synology_apm_repo.sdk.storage.sqlite_source`` —
-synthetic envelopes built the same way as
-``tests/unit/sdk/test_format_crypto.py``'s ``_build_ahlt`` (see
-``tests/integration/sdk/test_storage_sqlite_source_envelopes.py``
-for the byte-for-byte cross-check against all four envelope combinations
-found in real samples)."""
+"""Unit tests for ``storage.sqlite_source`` using synthetic ``aHlT``/zstd
+envelopes; ``tests/integration/sdk/test_storage_sqlite_source_envelopes.py``
+covers the real-sample envelope combinations."""
 
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import os
 import sqlite3
 import tempfile
 import threading
 import zlib
+from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
 
@@ -21,9 +20,21 @@ import pytest
 import zstandard
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 
-from synology_apm_repo.sdk.errors import KeyRequiredError
+import synology_apm_repo.sdk.storage.disk_space as disk_space_module
+import synology_apm_repo.sdk.storage.sqlite_source as sqlite_source_module
+from support.fakes import faithful_to
+from support.format_builders import zstd_frame_without_content_size
+from synology_apm_repo.sdk.errors import DataCorruptError, KeyRequiredError, ResourceLimitExceededError
+from synology_apm_repo.sdk.format.compression import iter_decompressed_zstd
+from synology_apm_repo.sdk.storage.base import Entry, ObjectStore
+from synology_apm_repo.sdk.storage.disk_space import DiskReservation
 from synology_apm_repo.sdk.storage.local import LocalFsStore
-from synology_apm_repo.sdk.storage.sqlite_source import Envelope, SqliteSource, peel
+from synology_apm_repo.sdk.storage.sqlite_source import (
+    Envelope,
+    SqliteSource,
+    peel,
+)
+from unit.sdk.storage_fakes import fake_disk_usage
 
 
 def _build_ahlt(vault_key: bytes, plaintext: bytes) -> bytes:
@@ -38,8 +49,7 @@ def _build_ahlt(vault_key: bytes, plaintext: bytes) -> bytes:
 
 
 def _real_sqlite_bytes() -> bytes:
-    # Plain, synchronous sqlite3: this only *builds* the fixture bytes the
-    # SDK is then asked to read; it is not the SDK's own read path.
+    # Plain sqlite3 only builds the fixture bytes; it isn't the SDK's read path.
     conn = sqlite3.connect(":memory:")
     try:
         conn.execute("CREATE TABLE t(x INTEGER)")
@@ -51,26 +61,25 @@ def _real_sqlite_bytes() -> bytes:
 
 
 async def _fetchone(conn: aiosqlite.Connection, sql: str) -> Any:
-    """One row, as a plain tuple. Typed ``Any`` because aiosqlite declares
-    ``fetchone() -> Row | None`` while the default (None) row_factory
-    really produces ordinary tuples at runtime."""
+    """One row as a plain tuple; ``Any`` because aiosqlite types ``fetchone()``
+    as ``Row | None`` but the default row_factory yields tuples."""
     cursor = await conn.execute(sql)
     return await cursor.fetchone()
 
 
 class TestPeel:
-    """``peel()`` stays synchronous — it is pure bytes work, no I/O."""
+    """``peel()`` is synchronous — pure bytes work, no I/O."""
 
     def test_raw_passes_through_unchanged(self) -> None:
         data = _real_sqlite_bytes()
-        payload, envelopes = peel(data)
+        payload, envelopes = peel(data, max_zstd_output_size=None)
         assert payload == data
         assert envelopes == []
 
     def test_zstd_only(self) -> None:
         raw = _real_sqlite_bytes()
         compressed = zstandard.ZstdCompressor().compress(raw)
-        payload, envelopes = peel(compressed)
+        payload, envelopes = peel(compressed, max_zstd_output_size=None)
         assert payload == raw
         assert envelopes == [Envelope.ZSTD]
 
@@ -78,7 +87,7 @@ class TestPeel:
         vault_key = os.urandom(32)
         raw = _real_sqlite_bytes()
         enveloped = _build_ahlt(vault_key, raw)
-        payload, envelopes = peel(enveloped, vault_key=vault_key)
+        payload, envelopes = peel(enveloped, vault_key=vault_key, max_zstd_output_size=None)
         assert payload == raw
         assert envelopes == [Envelope.AHLT]
 
@@ -87,21 +96,100 @@ class TestPeel:
         raw = _real_sqlite_bytes()
         compressed = zstandard.ZstdCompressor().compress(raw)
         enveloped = _build_ahlt(vault_key, compressed)
-        payload, envelopes = peel(enveloped, vault_key=vault_key)
+        payload, envelopes = peel(enveloped, vault_key=vault_key, max_zstd_output_size=None)
         assert payload == raw
         assert envelopes == [Envelope.AHLT, Envelope.ZSTD]
 
     def test_ahlt_without_vault_key_raises_key_required(self) -> None:
         vault_key = os.urandom(32)
         enveloped = _build_ahlt(vault_key, _real_sqlite_bytes())
-        with pytest.raises(KeyRequiredError):
-            peel(enveloped)
+        with pytest.raises(KeyRequiredError, match="data is aHlT-enveloped but no vault_key was given"):
+            peel(enveloped, max_zstd_output_size=None)
+
+
+class TestEffectiveZstdOutputSize:
+    """``_effective_zstd_output_size()`` sizes the disk-space reservation that
+    ``from_enveloped_bytes``/``from_enveloped_store`` run before writing."""
+
+    def test_not_zstd_framed_uses_the_exact_write_size_not_the_fallback(self) -> None:
+        # A plain payload is written as-is, so its own length sizes the check.
+        plain = b"not a zstd frame, just some plain bytes"
+        assert sqlite_source_module._effective_zstd_output_size(plain, 64 << 20) == len(plain)
+
+    def test_zstd_framed_with_a_declared_size_uses_it(self) -> None:
+        raw = _real_sqlite_bytes()
+        compressed = zstandard.ZstdCompressor().compress(raw)
+        assert sqlite_source_module._effective_zstd_output_size(compressed, 16) == len(raw)
+
+    def test_zstd_framed_with_no_declared_size_uses_the_fallback(self) -> None:
+        compressed = zstd_frame_without_content_size(_real_sqlite_bytes())
+        assert sqlite_source_module._effective_zstd_output_size(compressed, 12345) == 12345
+
+
+class TestPeelInto:
+    """``_peel_into()``: ``peel()``'s contract, streaming the plain bytes into
+    an open file instead of returning them (behind every enveloped
+    ``SqliteSource`` factory)."""
+
+    def test_raw_passes_through_unchanged(self, tmp_path: Path) -> None:
+        data = _real_sqlite_bytes()
+        dest = tmp_path / "out.db"
+        with open(dest, "wb") as f:
+            envelopes = sqlite_source_module._peel_into(
+                data, f, vault_key=None, max_output_size=None, dir_path=tmp_path
+            )
+        assert dest.read_bytes() == data
+        assert envelopes == []
+
+    def test_zstd_only(self, tmp_path: Path) -> None:
+        raw = _real_sqlite_bytes()
+        compressed = zstandard.ZstdCompressor().compress(raw)
+        dest = tmp_path / "out.db"
+        with open(dest, "wb") as f:
+            envelopes = sqlite_source_module._peel_into(
+                compressed, f, vault_key=None, max_output_size=None, dir_path=tmp_path
+            )
+        assert dest.read_bytes() == raw
+        assert envelopes == [Envelope.ZSTD]
+
+    def test_ahlt_then_zstd(self, tmp_path: Path) -> None:
+        vault_key = os.urandom(32)
+        raw = _real_sqlite_bytes()
+        compressed = zstandard.ZstdCompressor().compress(raw)
+        enveloped = _build_ahlt(vault_key, compressed)
+        dest = tmp_path / "out.db"
+        with open(dest, "wb") as f:
+            envelopes = sqlite_source_module._peel_into(
+                enveloped, f, vault_key=vault_key, max_output_size=None, dir_path=tmp_path
+            )
+        assert dest.read_bytes() == raw
+        assert envelopes == [Envelope.AHLT, Envelope.ZSTD]
+
+    def test_ahlt_without_vault_key_raises_key_required(self, tmp_path: Path) -> None:
+        vault_key = os.urandom(32)
+        enveloped = _build_ahlt(vault_key, _real_sqlite_bytes())
+        dest = tmp_path / "out.db"
+        with (
+            open(dest, "wb") as f,
+            pytest.raises(KeyRequiredError, match="data is aHlT-enveloped but no vault_key was given"),
+        ):
+            sqlite_source_module._peel_into(enveloped, f, vault_key=None, max_output_size=None, dir_path=tmp_path)
+
+    def test_max_zstd_output_size_rejects_an_oversized_frame(self, tmp_path: Path) -> None:
+        # No declared content size, so the fallback cap is enforced.
+        raw = _real_sqlite_bytes() * 1000
+        compressed = zstd_frame_without_content_size(raw)
+        dest = tmp_path / "out.db"
+        with (
+            open(dest, "wb") as f,
+            pytest.raises(zstandard.ZstdError, match="decompressed output exceeds max_output_size"),
+        ):
+            sqlite_source_module._peel_into(compressed, f, vault_key=None, max_output_size=16, dir_path=tmp_path)
 
 
 class TestSqliteSource:
-    """Opening the connection is itself an ``await``, so ``SqliteSource``
-    takes no constructor arguments — every case below goes through the
-    ``await SqliteSource.from_bytes(...)`` factory instead."""
+    """``SqliteSource``'s connection, temp-file cleanup and ``close()``,
+    built through its factories (mostly ``from_bytes``)."""
 
     async def test_opens_a_working_connection(self) -> None:
         data = _real_sqlite_bytes()
@@ -110,11 +198,7 @@ class TestSqliteSource:
             assert row == (1,)
 
     async def test_connection_is_writable_so_index_hints_can_take_effect(self) -> None:
-        """Deliberately *not* read-only. The connection is onto this
-        instance's own temp copy of already-peeled bytes, which ``close()``
-        unlinks, so nothing written here can reach the store — and writability
-        is the whole reason ``apply_index_hint`` can build a real index rather
-        than silently leaving its caller a full table scan."""
+        """The connection is writable (a private temp copy), which ``apply_index_hint`` needs."""
         data = _real_sqlite_bytes()
         async with await SqliteSource.from_bytes(data) as src:
             await src.connection.execute("INSERT INTO t VALUES (2)")
@@ -139,32 +223,55 @@ class TestSqliteSource:
         data = _real_sqlite_bytes()
         src = await SqliteSource.from_bytes(data)
         path = src._path
-        assert path is not None  # built from bytes, always set
+        assert path is not None
         assert os.path.exists(path)
         await src.close()
         assert not os.path.exists(path)
 
-    async def test_close_is_idempotent(self) -> None:
-        # A caller that closes a provider itself, ahead of the
-        # session-wide cleanup that would otherwise close the same
-        # underlying SqliteSource again at session end (Repository's own
-        # provider list and DedupRepo's db_sources cache can both
-        # hold a reference to it), must not crash on the second close.
+    async def test_close_removes_scratch_files_off_the_event_loop_thread(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Deleting the scratch copy is filesystem work that must not run on
+        the thread driving the event loop."""
+        src = await SqliteSource.from_bytes(_real_sqlite_bytes())
+        path = src._path
+        assert path is not None
+        loop_thread = threading.get_ident()
+        unlinks: list[tuple[str, int]] = []
+        real_unlink = os.unlink
+
+        def _recording_unlink(path: str) -> None:
+            unlinks.append((path, threading.get_ident()))
+            real_unlink(path)
+
+        monkeypatch.setattr(os, "unlink", _recording_unlink)
+
+        await src.close()
+
+        assert [p for p, _ in unlinks] == [path, path + "-wal", path + "-shm", path + "-journal"]
+        unlink_threads = {t for _, t in unlinks}
+        assert len(unlink_threads) == 1
+        assert loop_thread not in unlink_threads
+
+    async def test_close_is_idempotent(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        # Several owners can close the same source, so a second close must be safe.
         data = _real_sqlite_bytes()
         src = await SqliteSource.from_bytes(data)
+        path = src._path
+        assert path is not None
         await src.close()
+        assert not os.path.exists(path)
+        unlinked: list[str] = []
+        monkeypatch.setattr(os, "unlink", unlinked.append)
         await src.close()  # must not raise FileNotFoundError
+        assert unlinked == []  # the second close does no cleanup work at all
 
     async def test_failure_during_open_still_cleans_up_the_temp_file(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        # build the fixture data *before* patching the connect function —
-        # it calls sqlite3.connect(":memory:") itself to build it.
         data = _real_sqlite_bytes()
 
         created_paths: list[str] = []
         real_mkstemp = tempfile.mkstemp
 
-        def spying_mkstemp(suffix: str | None = None) -> tuple[int, str]:
-            fd, path = real_mkstemp(suffix=suffix)
+        def spying_mkstemp(suffix: str | None = None, dir: str | Path | None = None) -> tuple[int, str]:  # noqa: A002
+            fd, path = real_mkstemp(suffix=suffix, dir=dir)
             created_paths.append(path)
             return fd, path
 
@@ -172,25 +279,74 @@ class TestSqliteSource:
             raise sqlite3.OperationalError("simulated failure")
 
         monkeypatch.setattr(tempfile, "mkstemp", spying_mkstemp)
-        # from_bytes() now opens via ``aiosqlite.connect``, not ``sqlite3.connect``.
         monkeypatch.setattr(aiosqlite, "connect", failing_connect)
 
-        with pytest.raises(sqlite3.OperationalError):
+        with pytest.raises(sqlite3.OperationalError, match="simulated failure"):
             await SqliteSource.from_bytes(data)
 
         assert len(created_paths) == 1
         assert not os.path.exists(created_paths[0])
 
+    async def test_cancelling_a_temp_file_write_removes_the_file_once_the_write_ends(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        entered, release = threading.Event(), threading.Event()
+
+        def blocking_peel_into(data: bytes, dest: Any, **_kwargs: Any) -> list[Envelope]:
+            entered.set()
+            release.wait(timeout=10)
+            dest.write(data)
+            return []
+
+        monkeypatch.setattr(sqlite_source_module, "_peel_into", blocking_peel_into)
+        task = asyncio.ensure_future(
+            SqliteSource.from_enveloped_bytes(_real_sqlite_bytes(), max_output_size=None, tmp_dir=tmp_path, what="test")
+        )
+        await asyncio.to_thread(entered.wait, 10)
+        task.cancel()
+        await asyncio.sleep(0)
+        assert [p.suffix for p in tmp_path.iterdir()] == [".db"]  # still being written: not yet unlinked
+        task.cancel()  # a second cancellation, during that cleanup wait
+        await asyncio.sleep(0)
+        release.set()
+
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert list(tmp_path.iterdir()) == []
+
+    async def test_a_connect_cancelled_mid_flight_closes_what_it_opened_and_removes_the_file(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        connecting, release = asyncio.Event(), asyncio.Event()
+        opened: list[_ClosingConnection] = []
+
+        class _ClosingConnection:
+            closed = False
+
+            async def close(self) -> None:
+                self.closed = True
+
+        async def slow_connect(database: str, uri: bool = False) -> _ClosingConnection:
+            connecting.set()
+            await release.wait()  # the thread opening it can't be interrupted
+            opened.append(_ClosingConnection())
+            return opened[0]
+
+        monkeypatch.setattr(aiosqlite, "connect", slow_connect)
+        monkeypatch.setattr(tempfile, "tempdir", str(tmp_path))
+        task = asyncio.ensure_future(SqliteSource.from_bytes(_real_sqlite_bytes()))
+        await connecting.wait()  # the temp file is written; the connect is in flight
+        task.cancel()
+        await asyncio.sleep(0)
+        release.set()
+
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert opened and opened[0].closed
+        assert list(tmp_path.iterdir()) == []
+
     async def test_close_from_a_different_thread_than_the_one_that_opened_it(self) -> None:
-        # Same thread-pinning guarantee as test_storage_sqlite.py's
-        # test_connection_opened_in_worker_thread_can_be_closed_from_main_thread,
-        # exercised through SqliteSource instead of open_sqlite directly.
-        # SqliteSource instances materialized inside one
-        # @work(thread=True) worker (device.py's target.db, fs.py's
-        # version.db.zst, ...) are routinely closed from a different
-        # thread later (the TUI's main thread at shutdown). The worker
-        # runs its own event loop, so this really is two different OS
-        # threads, not two Tasks.
+        # A source opened on a worker thread's own event loop closes from the main thread.
         data = _real_sqlite_bytes()
         errors: list[BaseException] = []
         sources: list[SqliteSource] = []
@@ -201,7 +357,7 @@ class TestSqliteSource:
         def worker_thread() -> None:
             try:
                 asyncio.run(open_on_worker_loop())
-            except BaseException as exc:
+            except BaseException as exc:  # noqa: BLE001
                 errors.append(exc)
 
         worker = threading.Thread(target=worker_thread)
@@ -218,24 +374,213 @@ class TestSqliteSource:
         compressed = zstandard.ZstdCompressor().compress(raw)
         enveloped = _build_ahlt(vault_key, compressed)
 
-        payload, envelopes = peel(enveloped, vault_key=vault_key)
+        payload, envelopes = peel(enveloped, vault_key=vault_key, max_zstd_output_size=None)
         assert envelopes == [Envelope.AHLT, Envelope.ZSTD]
         async with await SqliteSource.from_bytes(payload) as src:
             assert await _fetchone(src.connection, "SELECT x FROM t") == (1,)
 
-    async def test_from_bytes_is_the_only_bytes_facing_factory(self) -> None:
-        assert not hasattr(SqliteSource(), "connection")
+    async def test_from_bytes_opens_the_content(self) -> None:
         data = _real_sqlite_bytes()
         async with await SqliteSource.from_bytes(data) as src:
             assert await _fetchone(src.connection, "SELECT x FROM t") == (1,)
 
 
+class TestFromEnvelopedBytes:
+    """``from_enveloped_bytes()`` streams the decrypt+decompress into its own
+    temp file rather than materializing the decompressed payload as
+    ``bytes`` first."""
+
+    async def test_zstd_only_with_a_real_cap(self) -> None:
+        raw = _real_sqlite_bytes()
+        compressed = zstandard.ZstdCompressor().compress(raw)
+        source, envelopes = await SqliteSource.from_enveloped_bytes(
+            compressed, max_output_size=1 << 20, what="test blob"
+        )
+        try:
+            assert envelopes == [Envelope.ZSTD]
+            assert await _fetchone(source.connection, "SELECT x FROM t") == (1,)
+        finally:
+            await source.close()
+
+    async def test_disk_space_check_runs_off_the_event_loop(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # reserve_disk_space blocks, so it must run via asyncio.to_thread().
+        seen: list[threading.Thread] = []
+        real_reserve_disk_space = disk_space_module.reserve_disk_space
+
+        @contextlib.contextmanager
+        def _spy(dir_path: Path, needed_bytes: int | None) -> Iterator[DiskReservation]:
+            seen.append(threading.current_thread())
+            with real_reserve_disk_space(dir_path, needed_bytes) as reservation:
+                yield reservation
+
+        monkeypatch.setattr(sqlite_source_module, "reserve_disk_space", _spy)
+        raw = _real_sqlite_bytes()
+        compressed = zstandard.ZstdCompressor().compress(raw)
+        source, _envelopes = await SqliteSource.from_enveloped_bytes(
+            compressed, max_output_size=1 << 20, tmp_dir=str(tmp_path), what="test blob"
+        )
+        await source.close()
+        assert seen and seen[0] is not threading.main_thread()
+
+    async def test_ahlt_then_zstd_with_max_output_size_none(self) -> None:
+        vault_key = os.urandom(32)
+        raw = _real_sqlite_bytes()
+        compressed = zstandard.ZstdCompressor().compress(raw)
+        enveloped = _build_ahlt(vault_key, compressed)
+        source, envelopes = await SqliteSource.from_enveloped_bytes(
+            enveloped, vault_key=vault_key, max_output_size=None, what="test blob"
+        )
+        try:
+            assert envelopes == [Envelope.AHLT, Envelope.ZSTD]
+            assert await _fetchone(source.connection, "SELECT x FROM t") == (1,)
+        finally:
+            await source.close()
+
+    async def test_close_removes_the_temp_file(self) -> None:
+        raw = _real_sqlite_bytes()
+        compressed = zstandard.ZstdCompressor().compress(raw)
+        source, _envelopes = await SqliteSource.from_enveloped_bytes(
+            compressed, max_output_size=1 << 20, what="test blob"
+        )
+        path = source.path
+        assert path is not None
+        assert os.path.exists(path)
+        await source.close()
+        assert not os.path.exists(path)
+
+    async def test_ahlt_without_vault_key_raises_data_corrupt_and_creates_no_leaked_file(self, tmp_path: Path) -> None:
+        # KeyRequiredError is translated to DataCorruptError, like a malformed
+        # zstd frame, so a candidate that merely fakes the aHlT magic
+        # degrades like any other corrupt one.
+        vault_key = os.urandom(32)
+        enveloped = _build_ahlt(vault_key, _real_sqlite_bytes())
+        with pytest.raises(DataCorruptError, match="failed to decompress"):
+            await SqliteSource.from_enveloped_bytes(
+                enveloped, max_output_size=1 << 20, tmp_dir=str(tmp_path), what="test blob"
+            )
+        assert list(tmp_path.iterdir()) == []
+
+    async def test_a_decompression_failure_mid_stream_cleans_up_the_partial_temp_file(self, tmp_path: Path) -> None:
+        # An invalid frame descriptor byte (right after the magic) raises after the temp file exists.
+        raw = _real_sqlite_bytes() * 1000
+        compressed = bytearray(zstandard.ZstdCompressor().compress(raw))
+        compressed[4] = 0xFF
+        with pytest.raises(DataCorruptError, match="failed to decompress"):
+            await SqliteSource.from_enveloped_bytes(
+                bytes(compressed), max_output_size=1 << 30, tmp_dir=str(tmp_path), what="test blob"
+            )
+        assert list(tmp_path.iterdir()) == []
+
+    async def test_max_output_size_exceeded_cleans_up_the_partial_temp_file(self, tmp_path: Path) -> None:
+        # No declared content size, so the fallback cap is enforced.
+        raw = _real_sqlite_bytes() * 1000
+        compressed = zstd_frame_without_content_size(raw)
+        with pytest.raises(DataCorruptError, match="failed to decompress"):
+            await SqliteSource.from_enveloped_bytes(
+                compressed, max_output_size=16, tmp_dir=str(tmp_path), what="test blob"
+            )
+        assert list(tmp_path.iterdir()) == []
+
+    async def test_insufficient_disk_space_raises_and_leaves_no_file(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # Nothing free above the 1 GiB floor of a 16 GiB filesystem.
+        fake_disk_usage(monkeypatch, total=16 << 30, free=1 << 30)
+        raw = _real_sqlite_bytes()
+        compressed = zstandard.ZstdCompressor().compress(raw)
+        with pytest.raises(ResourceLimitExceededError, match="not enough free space under"):
+            await SqliteSource.from_enveloped_bytes(
+                compressed, max_output_size=1 << 30, tmp_dir=str(tmp_path), what="test blob"
+            )
+        assert list(tmp_path.iterdir()) == []
+
+    async def test_max_output_size_none_with_no_declared_size_stops_at_the_space_above_the_reserve(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # The resource error must not be translated to DataCorruptError.
+        raw = _real_sqlite_bytes() * 10
+        fake_disk_usage(monkeypatch, total=16 << 30, free=(1 << 30) + len(raw) - 1)
+        compressed = zstd_frame_without_content_size(raw)
+        with pytest.raises(ResourceLimitExceededError, match=r"needs more than 80\.0 KiB plus 1\.0 GiB kept free"):
+            await SqliteSource.from_enveloped_bytes(
+                compressed, max_output_size=None, tmp_dir=str(tmp_path), what="test blob"
+            )
+        assert list(tmp_path.iterdir()) == []
+        assert disk_space_module._in_flight == {}
+
+    async def test_max_output_size_none_with_no_declared_size_fits_when_there_is_room(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        raw = _real_sqlite_bytes()
+        fake_disk_usage(monkeypatch, total=16 << 30, free=(1 << 30) + len(raw))
+        compressed = zstd_frame_without_content_size(raw)
+        source, envelopes = await SqliteSource.from_enveloped_bytes(
+            compressed, max_output_size=None, tmp_dir=str(tmp_path), what="test blob"
+        )
+        async with source:
+            assert envelopes == [Envelope.ZSTD]
+            assert await _fetchone(source.connection, "SELECT x FROM t") == (1,)
+
+    async def test_a_cancelled_write_releases_its_disk_space_hold(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        raw = _real_sqlite_bytes()
+        compressed = zstandard.ZstdCompressor().compress(raw)
+        started = threading.Event()
+        proceed = threading.Event()
+        real_iter = iter_decompressed_zstd
+
+        def _blocking_iter(data: bytes | bytearray, *, max_output_size: int | None) -> Iterator[bytes]:
+            started.set()
+            proceed.wait()
+            yield from real_iter(data, max_output_size=max_output_size)
+
+        monkeypatch.setattr(sqlite_source_module, "iter_decompressed_zstd", _blocking_iter)
+        task = asyncio.ensure_future(
+            SqliteSource.from_enveloped_bytes(compressed, max_output_size=None, tmp_dir=str(tmp_path), what="test blob")
+        )
+        await asyncio.to_thread(started.wait)
+        assert sum(disk_space_module._in_flight.values()) == len(raw)
+        task.cancel()
+        proceed.set()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert disk_space_module._in_flight == {}
+        assert list(tmp_path.iterdir()) == []
+
+    async def test_max_output_size_none_with_a_declared_size_frame_still_checks_disk_space(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # A declared size is the effective ceiling even with max_output_size=None.
+        raw = _real_sqlite_bytes()
+        compressed = zstandard.ZstdCompressor().compress(raw)
+        declared = zstandard.get_frame_parameters(compressed).content_size
+        assert declared == len(raw)
+        fake_disk_usage(monkeypatch, total=16 << 30, free=(1 << 30) + declared - 1)
+        with pytest.raises(ResourceLimitExceededError, match="not enough free space under"):
+            await SqliteSource.from_enveloped_bytes(
+                compressed, max_output_size=None, tmp_dir=str(tmp_path), what="test blob"
+            )
+        assert list(tmp_path.iterdir()) == []
+
+        fake_disk_usage(monkeypatch, total=16 << 30, free=(1 << 30) + declared)
+        source, envelopes = await SqliteSource.from_enveloped_bytes(
+            compressed, max_output_size=None, tmp_dir=str(tmp_path), what="test blob"
+        )
+        try:
+            assert envelopes == [Envelope.ZSTD]
+            assert await _fetchone(source.connection, "SELECT x FROM t") == (1,)
+        finally:
+            await source.close()
+
+
+@faithful_to(ObjectStore)
 class _CountingMemoryStore:
-    """A minimal, non-``LocalFsStore`` ``ObjectStore`` fake — deliberately
-    *not* ``LocalFsStore``, so ``open_sqlite``'s ``isinstance(store,
-    LocalFsStore)`` fast-path check fails and every open goes through the
-    materialize-via-``store.read()`` path, making ``read()`` call counts a
-    direct proxy for network round trips on a real remote backend."""
+    """A non-``LocalFsStore`` ``ObjectStore`` fake: ``open_sqlite``'s
+    ``LocalFsStore`` fast path is skipped, so ``read()`` call counts proxy
+    network round trips."""
 
     def __init__(self, files: dict[str, bytes]) -> None:
         self._files = files
@@ -252,22 +597,18 @@ class _CountingMemoryStore:
     async def exists(self, path: str) -> bool:
         return path in self._files
 
-    async def listdir(self, path: str) -> list[str]:
+    async def close(self) -> None:
+        pass
+
+    async def listdir(self, path: str) -> list[Entry]:
         raise NotImplementedError
 
 
 class TestFromRawStore:
-    """``from_raw_store`` — the entry point for a caller that already
-    knows ``path`` is never enveloped, reading it directly via
-    ``open_sqlite`` (real ``db/<name>``,
-    ``saas/*/db/saas_{version,snapshot}``). A caller whose source may be
-    enveloped instead uses ``from_enveloped_store`` (``target.db``, which
-    may also have a real ``-wal``/``-shm`` sidecar; see ``TestFromEnvelopedStore``
-    below) or its own ``store.read()`` + ``peel`` + ``SqliteSource.from_bytes()``
-    (``version.db.zst``, ``units/fs.py``'s ``_entry_table_connection()``,
-    which never has WAL sidecars to merge) — see
-    ``TestPeel``/``TestSqliteSource`` above for that half's own
-    coverage."""
+    """``from_raw_store``: the entry point for a path that is never enveloped,
+    read via ``open_sqlite`` (``db/<name>``, ``saas/*/db/saas_{version,
+    snapshot}``). Possibly-enveloped sources use ``from_enveloped_store`` or
+    ``from_enveloped_bytes`` (covered in their own classes)."""
 
     async def test_reads_a_raw_file_correctly(self, tmp_path: Path) -> None:
         (tmp_path / "db").write_bytes(_real_sqlite_bytes())
@@ -276,8 +617,7 @@ class TestFromRawStore:
             assert await _fetchone(src.connection, "SELECT x FROM t") == (1,)
 
     async def test_reads_the_path_only_once(self) -> None:
-        # Goes straight to open_sqlite() with no throwaway peek read
-        # first — one store.read() per open, not two.
+        # No throwaway peek read: one store.read() per open.
         raw = _real_sqlite_bytes()
         raw_store = _CountingMemoryStore({"db": raw})
         async with await SqliteSource.from_raw_store(raw_store, "db") as src:
@@ -289,17 +629,13 @@ class TestFromRawStore:
         store = LocalFsStore(tmp_path)
         async with await SqliteSource.from_raw_store(store, "db") as src:
             assert await _fetchone(src.connection, "SELECT x FROM t") == (1,)
-            # the fast path opens the real file directly — no temp file/dir.
+            # The fast path opens the real file directly: no temp file/dir.
             assert src._path is None
             assert src._tmp_dir is None
 
     async def test_a_real_nonempty_wal_sees_the_wals_content(self, tmp_path: Path) -> None:
-        # A real -wal sidecar with actual uncommitted pages — proves this
-        # doesn't just read the main file's bytes and ignore WAL, the way
-        # a naive store.read() would. The writer connection is
-        # deliberately kept *open* throughout: sqlite checkpoints
-        # (folding the -wal back into the main file and deleting it) on
-        # connection close, which would defeat the setup.
+        # A real -wal with un-checkpointed pages must be honored. The writer
+        # stays open because closing it would checkpoint the -wal away.
         db_path = tmp_path / "db"
         writer = sqlite3.connect(db_path)
         try:
@@ -322,30 +658,31 @@ class TestFromRawStore:
 
 
 class TestFromEnvelopedStore:
-    """``from_enveloped_store`` — the entry point for a caller whose
-    source may be ``aHlT``-enveloped *and* may have a real ``-wal``/``-shm``
-    sidecar (``copy_meta_file/*/target.db``, FORMAT-SPEC.md: copy_meta_file-layout;
-    ``catalog/version.py``'s ``open_target_db()`` is the one real call
-    site)."""
+    """``from_enveloped_store``: the entry point for a source that may be
+    ``aHlT``-enveloped and have a ``-wal``/``-shm`` sidecar
+    (``copy_meta_file/*/target.db``, opened by ``catalog/version.py``'s
+    ``open_target_db()``; see FORMAT-SPEC.md: Landing directory layout; File-level encryption)."""
 
     async def test_reads_a_plaintext_file_with_no_vault_key(self, tmp_path: Path) -> None:
         (tmp_path / "target.db").write_bytes(_real_sqlite_bytes())
         store = LocalFsStore(tmp_path)
-        async with await SqliteSource.from_enveloped_store(store, "target.db", vault_key=None) as src:
+        async with await SqliteSource.from_enveloped_store(store, "target.db", vault_key=None, what="test blob") as src:
             assert await _fetchone(src.connection, "SELECT x FROM t") == (1,)
 
-    async def test_ahlt_without_vault_key_raises_key_required(self, tmp_path: Path) -> None:
+    async def test_ahlt_without_vault_key_raises_data_corrupt(self, tmp_path: Path) -> None:
         vault_key = os.urandom(32)
         (tmp_path / "target.db").write_bytes(_build_ahlt(vault_key, _real_sqlite_bytes()))
         store = LocalFsStore(tmp_path)
-        with pytest.raises(KeyRequiredError):
-            await SqliteSource.from_enveloped_store(store, "target.db", vault_key=None)
+        with pytest.raises(DataCorruptError, match="failed to decompress"):
+            await SqliteSource.from_enveloped_store(store, "target.db", vault_key=None, what="test blob")
 
     async def test_ahlt_with_no_wal_decrypts_correctly(self, tmp_path: Path) -> None:
         vault_key = os.urandom(32)
         (tmp_path / "target.db").write_bytes(_build_ahlt(vault_key, _real_sqlite_bytes()))
         store = LocalFsStore(tmp_path)
-        async with await SqliteSource.from_enveloped_store(store, "target.db", vault_key=vault_key) as src:
+        async with await SqliteSource.from_enveloped_store(
+            store, "target.db", vault_key=vault_key, what="test blob"
+        ) as src:
             assert await _fetchone(src.connection, "SELECT x FROM t") == (1,)
 
     async def test_zero_length_wal_is_still_ignored_under_envelope(self, tmp_path: Path) -> None:
@@ -353,13 +690,14 @@ class TestFromEnvelopedStore:
         (tmp_path / "target.db").write_bytes(_build_ahlt(vault_key, _real_sqlite_bytes()))
         (tmp_path / "target.db-wal").write_bytes(b"")  # present, but empty
         store = LocalFsStore(tmp_path)
-        async with await SqliteSource.from_enveloped_store(store, "target.db", vault_key=vault_key) as src:
+        async with await SqliteSource.from_enveloped_store(
+            store, "target.db", vault_key=vault_key, what="test blob"
+        ) as src:
             assert await _fetchone(src.connection, "SELECT x FROM t") == (1,)
 
     async def test_ahlt_with_a_real_wal_decrypts_and_merges_both_independently(self, tmp_path: Path) -> None:
-        # Main file and its -wal are wrapped with two *different* random
-        # IVs (_build_ahlt draws a fresh one each call) -- proving each is
-        # peeled independently, not as one shared ciphertext.
+        # The main file and its -wal get different random IVs, so each must
+        # be peeled independently.
         vault_key = os.urandom(32)
         db_path = tmp_path / "target.db"
         writer = sqlite3.connect(db_path)
@@ -381,7 +719,58 @@ class TestFromEnvelopedStore:
         wal_path.write_bytes(_build_ahlt(vault_key, real_wal_bytes))
 
         store = LocalFsStore(tmp_path)
-        async with await SqliteSource.from_enveloped_store(store, "target.db", vault_key=vault_key) as src:
+        async with await SqliteSource.from_enveloped_store(
+            store, "target.db", vault_key=vault_key, what="test blob"
+        ) as src:
             cursor = await src.connection.execute("SELECT x FROM t ORDER BY x")
             rows: list[Any] = list(await cursor.fetchall())
             assert rows == [(1,), (2,)]  # the WAL-only row decoded and merged correctly
+
+    async def test_a_declared_size_over_the_fallback_is_still_honored_in_full(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # A declared size takes precedence over the fallback cap (patched small here).
+        monkeypatch.setattr(sqlite_source_module, "_MAX_TARGET_DB_DECOMPRESS_SIZE_FALLBACK", 16)
+        raw = _real_sqlite_bytes()
+        compressed = zstandard.ZstdCompressor().compress(raw)
+        assert zstandard.get_frame_parameters(compressed).content_size == len(raw) > 16
+        (tmp_path / "target.db").write_bytes(compressed)
+        store = LocalFsStore(tmp_path)
+        async with await SqliteSource.from_enveloped_store(store, "target.db", vault_key=None, what="test blob") as src:
+            assert await _fetchone(src.connection, "SELECT x FROM t") == (1,)
+
+    async def test_disk_space_check_is_sized_off_a_declared_size_when_present(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        raw = _real_sqlite_bytes()
+        compressed = zstandard.ZstdCompressor().compress(raw)
+        declared = zstandard.get_frame_parameters(compressed).content_size
+        assert declared == len(raw)
+        seen: list[int | None] = []
+        real_reserve_disk_space = disk_space_module.reserve_disk_space
+
+        @contextlib.contextmanager
+        def _spy(dir_path: Path, needed_bytes: int | None) -> Iterator[DiskReservation]:
+            seen.append(needed_bytes)
+            with real_reserve_disk_space(dir_path, needed_bytes) as reservation:
+                yield reservation
+
+        monkeypatch.setattr(sqlite_source_module, "reserve_disk_space", _spy)
+        (tmp_path / "target.db").write_bytes(compressed)
+        store = LocalFsStore(tmp_path)
+        async with await SqliteSource.from_enveloped_store(store, "target.db", vault_key=None, what="test blob"):
+            pass
+        assert declared in seen  # sized off the declared value, not the fallback
+
+    async def test_no_declared_size_falls_back_to_the_fallback_and_rejects_an_oversized_frame(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # A cap-exceeded zstandard.ZstdError is translated to DataCorruptError.
+        monkeypatch.setattr(sqlite_source_module, "_MAX_TARGET_DB_DECOMPRESS_SIZE_FALLBACK", 16)
+        raw = _real_sqlite_bytes() * 1000
+        compressed = zstd_frame_without_content_size(raw)
+        assert zstandard.get_frame_parameters(compressed).content_size == zstandard.CONTENTSIZE_UNKNOWN
+        (tmp_path / "target.db").write_bytes(compressed)
+        store = LocalFsStore(tmp_path)
+        with pytest.raises(DataCorruptError, match="failed to decompress"):
+            await SqliteSource.from_enveloped_store(store, "target.db", vault_key=None, what="test blob")

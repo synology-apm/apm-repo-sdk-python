@@ -16,11 +16,9 @@ def _join_nonempty(*parts: str, sep: str = ", ") -> str:
 
 
 def _render_m365_contact_csv(data: bytes) -> str:
-    """Full Name/Email always shown (placeholder when absent, same as
-    ``render_calendar_event_preview``'s Title); every other real CSV
-    column (``FORMAT-SPEC.md`` §7.5) is dropped when blank rather than
-    shown as ``(none)`` — a contact this sparse is the common case, and
-    a wall of placeholders would bury the fields that *are* real."""
+    """Full Name/Email always (``_NONE_LABEL`` when absent); every other
+    column (``FORMAT-SPEC.md``: M365 Contact) only when set, since most contacts are
+    sparse."""
     reader = csv.reader(io.StringIO(data.decode("utf-8-sig")))
     header = next(reader, [])
     row = next(reader, [])
@@ -48,21 +46,14 @@ def _render_m365_contact_csv(data: bytes) -> str:
 
 
 def _gws_first_entry(items: object) -> dict[str, object] | None:
-    """The first entry of a People API repeated field (``names``/
-    ``emailAddresses``/``organizations``/``biographies``/``birthdays``/
-    ``phoneNumbers``/``addresses``, each a list of objects) -- ``None``
-    if the list is empty, isn't a list, or its first entry isn't an
-    object itself."""
+    """The first object of a People API repeated field, or ``None``."""
     if isinstance(items, list) and items and isinstance(items[0], dict):
         return items[0]
     return None
 
 
 def _gws_first(items: object, key: str) -> str:
-    """The first entry's own ``key`` from a People API repeated field,
-    first-entry-wins the same way ``build_contact_csv``'s M365 side
-    already treats a repeated Graph field -- ``""`` if
-    ``_gws_first_entry`` finds no entry, or that key is missing/blank."""
+    """``key`` of a People API repeated field's first entry, or ``""``."""
     entry = _gws_first_entry(items)
     if entry is not None:
         value = entry.get(key)
@@ -82,9 +73,7 @@ def _gws_phone_lines(client_metadata: dict[str, object]) -> list[str]:
         value = phone.get("value")
         if not (isinstance(value, str) and value):
             continue
-        # Real sample data has no "type"/"formattedType" on every entry
-        # (People API declares both optional) -- shown only when present,
-        # never guessed at.
+        # Both type fields are optional in the People API.
         phone_type = phone.get("formattedType") or phone.get("type")
         label = f"Phone ({phone_type})" if isinstance(phone_type, str) and phone_type else "Phone"
         lines.append(f"{label}: {value}")
@@ -106,23 +95,16 @@ def _gws_birthday_line(client_metadata: dict[str, object]) -> str:
     birthday = _gws_first_entry(client_metadata.get("birthdays"))
     if birthday is None:
         return ""
-    # "text" is the People API's own pre-formatted display string (real
-    # sample: "10/11/1996") -- used as-is rather than re-composed from
-    # the sibling ``date.{day,month,year}`` object, which would risk a
-    # different (and possibly locale-wrong) rendering of the same value.
+    # "text" is the People API's own display string; prefer it to
+    # re-composing ``date``.
     text = birthday.get("text")
     if isinstance(text, str) and text:
         return text
     date = birthday.get("date")
     if isinstance(date, dict):
         year, month, day = date.get("year"), date.get("month"), date.get("day")
-        # The People API's own "unspecified" sentinel is 0, not an
-        # absent field, for year/month/day alike -- checked
-        # independently for each so a partially-known birthday still
-        # shows whichever fields ARE known (e.g. a year-omitted
-        # "06-15", or a day-omitted "1990-06") instead of either
-        # dropping a known field or rendering a nonsensical "0"/"00"
-        # placeholder for an unknown one.
+        # 0 means "unspecified" for each part; show whichever parts are
+        # known (e.g. "06-15" with no year).
         has_year = isinstance(year, int) and bool(year)
         has_month = isinstance(month, int) and bool(month)
         has_day = isinstance(day, int) and bool(day)
@@ -141,10 +123,8 @@ def _gws_birthday_line(client_metadata: dict[str, object]) -> str:
 
 
 def _render_gws_contact_json(data: bytes) -> str:
-    """Full Name/Email always shown (placeholder when absent); every
-    other real People API field (organizations/phoneNumbers/addresses/
-    biographies/birthdays) is dropped when absent rather than shown as
-    ``(none)``, same reasoning as ``_render_m365_contact_csv``."""
+    """Full Name/Email always; every other field only when set, as in
+    ``_render_m365_contact_csv``."""
     client_metadata = (json.loads(data).get("client_metadata")) or {}
     full_name = _gws_first(client_metadata.get("names"), "displayName") or _NONE_LABEL
     email_address = _gws_first(client_metadata.get("emailAddresses"), "value") or _NONE_LABEL
@@ -169,16 +149,10 @@ def _render_gws_contact_json(data: bytes) -> str:
 
 
 def render_contact_preview(data: bytes) -> str:
-    """Full Name and Email, plus whichever of the platform's own other
-    real fields this contact actually has (job title/company, phone
-    numbers, address, birthday, notes) — from CSV (M365,
-    Outlook-compatible, UTF-8 BOM — ``units/content/saas_contact.py::
-    build_contact_csv``'s output shape) or raw JSON (GWS, Google
-    People API ``client_metadata``). Which shape ``data`` actually is gets
-    sniffed from the bytes (a leading UTF-8 BOM vs. a JSON object), the
-    same "no caller-supplied flag" posture as ``render_html_preview``'s
-    doctype sniff. Unlike that one, a genuinely malformed contact still
-    propagates — same let-it-propagate posture as ``render_mail_preview``."""
+    """Full Name and Email plus whichever other fields the contact has (job
+    title, company, phones, address, birthday, notes), from M365's
+    Outlook-compatible CSV (UTF-8 BOM) or GWS's People API JSON, told
+    apart by the BOM. Parse failures propagate."""
     if data.startswith(b"\xef\xbb\xbf"):
         return _render_m365_contact_csv(data)
     return _render_gws_contact_json(data)

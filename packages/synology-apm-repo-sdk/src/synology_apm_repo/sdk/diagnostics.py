@@ -1,19 +1,13 @@
-"""Repository Layer sibling — raw, catalog-bypassing inspection of one
-physical file, addressed by a bare store-relative path rather than a
-``NodeRef``. For forensics tooling (the CLI's ``dump`` command family) that
-needs "what does this byte layout actually say" for one
-``.buk``/composition/chunk-map file outside any discovered repository —
-the same Codec/Dedup Layer parsers the real read path uses, wrapped here
-so CLI/TUI code never imports ``format``/``storage``/``dedup`` internals
-directly for this. Every function here takes an already-resolved
-``ObjectStore`` rather than opening one itself — the CLI decides local vs.
-``--profile`` and hands in whichever store applies; ``open_local()`` is
-only the local-path adapter it uses for its own local case.
+"""Raw inspection of one physical ``.buk``/composition/chunk-map file,
+addressed by a store-relative path instead of a ``NodeRef`` and bypassing
+the catalog, for forensics tooling such as the CLI's ``dump`` commands. It
+uses the same parsers as the read path, so callers need no
+``format``/``storage``/``dedup`` internals.
 
-Deliberately out of scope: resolving a ``.<N>`` sequence-id suffix
-(FORMAT-SPEC.md: sequence-id-suffix) from a logical name — callers pass
-the literal on-disk filename, local or remote, the same way they always
-have.
+Every function takes an already-resolved ``ObjectStore`` (``open_local()``
+builds one for a local path) and the literal on-disk filename: a ``.<N>``
+sequence-id suffix (FORMAT-SPEC.md: Sequence-id suffix mechanism) is not
+resolved from a logical name.
 """
 
 from __future__ import annotations
@@ -24,8 +18,18 @@ from pathlib import Path
 
 from .dedup.pool import BucketReader
 from .dedup.verify_checks import verify_chunk_map_crc_threaded
-from .errors import ApmRepoError
-from .format.bucket import expected_bucket_size
+from .errors import ApmRepoError, NotFoundError, StorageBackendError
+from .format.bucket import (
+    MODE_BUCKET_PARITY,
+    MODE_CHUNK_CRC,
+    MODE_COMPRESS,
+    MODE_ENCRYPT,
+    MODE_EXTENT_PARITY,
+    MODE_INPLACE_PARITY,
+    MODE_LOGIC_LOCALITY,
+    MODE_VAULT_ENCRYPT,
+    expected_bucket_size,
+)
 from .format.chunkmap import ChunkMapKind, parse_chunk_map_record
 from .format.composition import (
     RecordHead,
@@ -40,36 +44,32 @@ from .storage.base import ObjectStore
 from .storage.local import LocalFsStore
 
 _MODE_BIT_NAMES = [
-    (0x01, "compress"),
-    (0x02, "chunk_crc"),
-    (0x04, "bucket_parity"),
-    (0x08, "encrypt"),
-    (0x10, "logic_locality"),
-    (0x20, "extent_parity"),
-    (0x40, "inplace_parity"),
-    (0x80, "vault_encrypt"),
+    (MODE_COMPRESS, "compress"),
+    (MODE_CHUNK_CRC, "chunk_crc"),
+    (MODE_BUCKET_PARITY, "bucket_parity"),
+    (MODE_ENCRYPT, "encrypt"),
+    (MODE_LOGIC_LOCALITY, "logic_locality"),
+    (MODE_EXTENT_PARITY, "extent_parity"),
+    (MODE_INPLACE_PARITY, "inplace_parity"),
+    (MODE_VAULT_ENCRYPT, "vault_encrypt"),
 ]
 
 
 def mode_flags(mode: int) -> list[str]:
-    """Bucket-header ``mode`` bits as their names — bit→string is format
-    knowledge, not a CLI rendering concern."""
+    """Bucket-header ``mode`` bits as their names."""
     return [name for bit, name in _MODE_BIT_NAMES if mode & bit]
 
 
 def open_local(path: Path) -> tuple[ObjectStore, str]:
-    """Split a literal local file path into an ``ObjectStore`` rooted at
-    the parent directory plus the bare filename — the CLI's own adapter
-    for its local (non-``--profile``) case, so the actual reads still go
-    through the storage layer, the same as every ``--profile``-resolved
-    remote store, rather than a second, ad hoc ``open()`` call here."""
+    """A local file path as an ``ObjectStore`` rooted at its parent
+    directory plus the bare filename, for the functions here."""
     return LocalFsStore(path.parent), path.name
 
 
-@dataclasses.dataclass(frozen=True)
+@dataclasses.dataclass(frozen=True, slots=True)
 class ChunkEntryInspection:
-    """One ``--chunk``-selected entry's own fields, nested under
-    ``BucketInspection`` when a specific chunk was asked for."""
+    """One bucket entry's fields, as ``inspect_bucket``'s ``chunk``
+    selected it."""
 
     index: int
     compress_type: str
@@ -79,7 +79,7 @@ class ChunkEntryInspection:
     length: int
 
 
-@dataclasses.dataclass(frozen=True)
+@dataclasses.dataclass(frozen=True, slots=True)
 class BucketInspection:
     """A ``.buk`` file's header, SizeStore summary, and the
     ``expected_bucket_size`` self-check."""
@@ -92,9 +92,11 @@ class BucketInspection:
     chunk_num: int
     chunk_size_crc: int
     compress_type_counts: dict[str, int]
-    expected_size: int
+    #: ``None`` for the legacy uncompressed layout, which has no
+    #: ``expected_bucket_size`` formula; ``size_check_ok`` is ``None`` then too.
+    expected_size: int | None
     actual_size: int
-    size_check_ok: bool
+    size_check_ok: bool | None
     chunk: ChunkEntryInspection | None = None
 
 
@@ -103,22 +105,24 @@ async def inspect_bucket(store: ObjectStore, rel: str, *, chunk: int | None = No
     ``expected_bucket_size`` self-check.
 
     Raises:
-        IndexError: ``chunk`` is out of range for this bucket's own
-            entry count.
+        NotFoundError: ``rel`` does not exist, or ``chunk`` is out of range
+            for this bucket's entry count.
+        DataCorruptError: The header or SizeStore is corrupt and not
+            repairable.
     """
     reader = await BucketReader.open(store, rel)
     actual_size = await store.size(rel)
 
     header = reader.header
-    counts = dict(Counter(entry.compress_type.name for entry in reader.entries))
-    expected = expected_bucket_size(header, reader.entries)
+    counts = dict(Counter(entry.compress_type.name for entry in reader.index))
+    expected = expected_bucket_size(header, reader.index) if header.is_compressed else None
 
     chunk_info: ChunkEntryInspection | None = None
     if chunk is not None:
-        if not 0 <= chunk < len(reader.entries):
-            raise IndexError(f"--chunk {chunk} out of range [0, {len(reader.entries)})")
-        entry = reader.entries[chunk]
-        locator = reader.locators[chunk]
+        if not 0 <= chunk < len(reader.index):
+            raise NotFoundError(f"chunk {chunk} out of range [0, {len(reader.index)})", ref=rel)
+        entry = reader.index[chunk]
+        locator = reader.index.locator(chunk)
         chunk_info = ChunkEntryInspection(
             index=chunk,
             compress_type=entry.compress_type.name,
@@ -139,17 +143,15 @@ async def inspect_bucket(store: ObjectStore, rel: str, *, chunk: int | None = No
         compress_type_counts=counts,
         expected_size=expected,
         actual_size=actual_size,
-        size_check_ok=expected == actual_size,
+        size_check_ok=expected == actual_size if expected is not None else None,
         chunk=chunk_info,
     )
 
 
-@dataclasses.dataclass(frozen=True)
+@dataclasses.dataclass(frozen=True, slots=True)
 class CompositionRecordInspection:
-    """One composition record's own fields, mirroring
-    ``ChunkMapEntryInspection``'s shape one section down: ``map_crc_ok``
-    holds a real bool only when ``verify_map`` was given (set by
-    ``_walk_composition_records``), staying ``None`` otherwise."""
+    """One composition record's fields; ``map_crc_ok`` is ``None`` unless
+    ``walk_composition`` was asked to ``verify_map``."""
 
     head_off: int
     status: str
@@ -160,13 +162,20 @@ class CompositionRecordInspection:
     map_crc_ok: bool | None = None
 
 
-@dataclasses.dataclass(frozen=True)
+@dataclasses.dataclass(frozen=True, slots=True)
 class CompositionWalk:
-    """``walk_composition``'s result: the header (if the file starts with
-    one — ``subID=0`` only), every record walked up to ``limit``, the
-    offset walking stopped at, and — only when the walk stopped because a
-    record failed to parse partway through, not because it reached
-    ``limit``/the file's end — that failure's message."""
+    """``walk_composition``'s result.
+
+    Attributes:
+        path: The walked file, as ``rel`` named it.
+        header: The composition header's ``(major, minor)``; ``None`` when
+            the file has none (only ``subID=0`` does).
+        records: The records walked, at most ``limit``.
+        next_offset: Where walking stopped.
+        file_size: The file's size, which bounds the walk.
+        stopped_with_error: Why a record failed to parse, when that ended
+            the walk before ``limit`` or the end of the file.
+    """
 
     path: str
     header: tuple[int, int] | None
@@ -177,15 +186,14 @@ class CompositionWalk:
 
 
 async def _verify_map_crc(store: ObjectStore, rel: str, map_off: int, record: RecordHead) -> bool:
-    """Read ``record``'s chunk-map array bytes and check them against
-    ``record.map_crc`` via ``verify_chunk_map_crc_threaded``, collapsing
-    any mismatch to ``False`` rather than propagating — shared by
-    ``_walk_composition_records``'s and ``inspect_chunk_map``'s identical
-    read-then-verify-then-collapse shape."""
+    """Whether ``record``'s chunk-map array matches ``record.map_crc``; a
+    storage failure still raises."""
     map_bytes = await store.read(rel, map_off, record.map_num * CHUNK_MAP_RECORD_LENGTH)
     try:
         await verify_chunk_map_crc_threaded(map_bytes, record.map_crc)
         return True
+    except StorageBackendError:
+        raise
     except ApmRepoError:
         return False
 
@@ -193,23 +201,19 @@ async def _verify_map_crc(store: ObjectStore, rel: str, map_off: int, record: Re
 async def _walk_composition_records(
     store: ObjectStore, rel: str, *, start: int, file_size: int, limit: int, verify_map: bool
 ) -> tuple[list[CompositionRecordInspection], int, ApmRepoError | None]:
-    """Walks up to ``limit`` composition records starting at ``start``,
-    never past ``file_size``. Stops cleanly (not raising) the moment a
-    record fails to parse, since that's the normal end-of-walk boundary
-    for a file with no trailing padding, not necessarily corruption —
-    ``walk_composition`` decides whether the stopping error is actually
-    fatal.
-
-    Returns ``(records, next_offset, stopping_error)`` — ``stopping_error``
-    is ``None`` only when the walk stopped because it reached ``limit``
-    or ``file_size``, never because a record failed to parse.
-    """
+    """Walks up to ``limit`` composition records from ``start``, never
+    past ``file_size``, as ``(records, next_offset, stopping_error)``. A
+    record that fails to parse ends the walk without raising (it may just
+    be the end of the data); ``walk_composition`` decides whether it is
+    fatal."""
     pos = start
     records: list[CompositionRecordInspection] = []
     while pos < file_size and len(records) < limit:
         try:
             head_bytes = await store.read(rel, pos, RECORD_HEAD_LENGTH)
             record = parse_record_head(head_bytes)
+        except StorageBackendError:
+            raise
         except ApmRepoError as exc:
             return records, pos, exc
         map_crc_ok: bool | None = None
@@ -234,16 +238,14 @@ async def _walk_composition_records(
 async def walk_composition(
     store: ObjectStore, rel: str, *, offset: int | None = None, limit: int = 10, verify_map: bool = False
 ) -> CompositionWalk:
-    """Walk composition records in ``rel`` — the header, if present
-    (``subID=0`` only), plus up to ``limit`` records starting at
-    ``offset`` (default: right after the header, or byte 0 for a
-    non-``subID=0`` file).
+    """The composition header of ``rel``, if present, plus up to ``limit``
+    records from ``offset`` (default: right after the header, else byte 0).
+    A parse failure after something was parsed is reported in
+    ``stopped_with_error``.
 
-    Raises the underlying ``ApmRepoError`` when nothing at all could be
-    parsed (no header, and the record walk failed before it collected
-    even one record); a failure partway through an otherwise-successful
-    walk is reported in the returned ``CompositionWalk``'s
-    ``stopped_with_error`` instead.
+    Raises:
+        ApmRepoError: Nothing could be parsed: no header, and not even one
+            record.
     """
     head_probe = await store.read(rel, 0, 64)
 
@@ -276,21 +278,19 @@ async def walk_composition(
     )
 
 
-@dataclasses.dataclass(frozen=True)
+@dataclasses.dataclass(frozen=True, slots=True)
 class ChunkMapAddrInspection:
-    """A ``MAPPING`` chunk-map entry's resolved chunk address — which
-    stream, bucket, and chunk index it points at."""
+    """A ``MAPPING`` chunk-map entry's chunk address."""
 
     stream_id: int
     bucket_id: int
     chunk_idx: int
 
 
-@dataclasses.dataclass(frozen=True)
+@dataclasses.dataclass(frozen=True, slots=True)
 class ChunkMapEntryInspection:
-    """One ``ChunkMapRecord`` entry — ``addr`` only carries a real value
-    for a ``ChunkMapKind.MAPPING`` record; every other kind leaves it
-    ``None``."""
+    """One ``ChunkMapRecord`` entry; ``addr`` is set only for a
+    ``ChunkMapKind.MAPPING`` entry."""
 
     index: int
     kind: str
@@ -302,11 +302,10 @@ class ChunkMapEntryInspection:
     addr: ChunkMapAddrInspection | None = None
 
 
-@dataclasses.dataclass(frozen=True)
+@dataclasses.dataclass(frozen=True, slots=True)
 class ChunkMapInspection:
-    """The result of dumping one record's ``ChunkMapRecord`` array — its
-    own map-entry count, decoded entries, and (when checked) the mapCrc
-    verdict."""
+    """``inspect_chunk_map``'s result: the record's entry count, the
+    decoded entries, and the map-CRC verdict when checked."""
 
     path: str
     head_off: int
@@ -318,10 +317,9 @@ class ChunkMapInspection:
 async def inspect_chunk_map(
     store: ObjectStore, rel: str, offset: int, *, limit: int = 50, verify: bool = False
 ) -> ChunkMapInspection:
-    """Dump the ``ChunkMapRecord`` array — the core read structure — of
-    the record at ``offset``: each entry's kind, file/end offsets,
-    inherit flag, map number and repeat count, plus (with ``verify=True``)
-    the chunk-map CRC check result."""
+    """The first ``limit`` entries of the ``ChunkMapRecord`` array of the
+    record at ``offset``, plus the chunk-map CRC verdict when ``verify``
+    is set."""
     record = parse_record_head(await store.read(rel, offset, RECORD_HEAD_LENGTH))
 
     map_crc_ok: bool | None = None
@@ -330,9 +328,6 @@ async def inspect_chunk_map(
         map_crc_ok = await _verify_map_crc(store, rel, map_off, record)
 
     shown = min(record.map_num, limit)
-    # One read covering every shown entry, not one read per entry.
-    # shown == 0 skips the read entirely rather than issuing a
-    # zero-length one.
     raw = b"" if shown == 0 else await store.read(rel, map_off, shown * CHUNK_MAP_RECORD_LENGTH)
     entries: list[ChunkMapEntryInspection] = []
     for i in range(shown):

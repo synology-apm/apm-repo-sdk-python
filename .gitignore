@@ -18,3 +18,4 @@ docs/_build/
 docs/api/
 tests/smoke/reports/
 tests/smoke/smoke_samples.toml
+tests/support/recording/targets.toml

@@ -1,9 +1,6 @@
-"""``catalog`` domain: correctness checks over what each repository's own
-catalog reports -- discovery and catalog/workload/version enumeration
-itself is driven per-repository by ``__main__.py``'s own loop, not this
-module. Every key/encryption check also lives here, in one place, rather
-than split across domains: this is where the key material discovery
-already resolved is in scope.
+"""``catalog`` domain: checks over what each repository's catalog reports
+(``__main__.py`` does the enumeration itself), plus every key/encryption
+check.
 """
 
 from __future__ import annotations
@@ -20,13 +17,10 @@ from .._context import RepoInfo, SmokeContext
 #: any real sample, used only to exercise set_key()'s rejection path.
 _DUMMY_KEY = "DUMMYKEYID12@" + base64.b64encode(bytes(32)).decode()
 
-#: Wall-clock budget for one sample's own catalog enumeration
-#: (``__main__.py``'s per-repo loop, ``ctx.data["bootstrap_elapsed"]``) --
-#: set with generous headroom above a large repository's real
-#: enumeration cost over a slow network mount, for ordinary
-#: run-to-run/network variance. Not about small samples at all -- catches
-#: a genuine performance regression (a query that stops batching, say)
-#: before it's only noticed by someone waiting on a real, large repository.
+#: Wall-clock budget for one sample's catalog enumeration
+#: (``ctx.data["bootstrap_elapsed"]``): generous headroom over a large
+#: repository on a slow network mount, so only a real regression (a query
+#: that stops batching) trips it.
 _ENUMERATION_BUDGET_SECONDS = 60.0
 
 
@@ -50,11 +44,8 @@ async def run_for_repo(ctx: SmokeContext, ri: RepoInfo) -> None:
             return ri.repo.workload_is_supported(workload)
 
         await ctx.call("catalog", step, _check)
-        # An empty version list is a legitimate, documented outcome for
-        # some samples (ps-sample-1's fids are all absent from the current
-        # generation -- see its own comment in your smoke_samples.toml)
-        # -- recorded as a plain fact via ctx.check, never asserted to be
-        # non-empty.
+        # An empty version list is legitimate for some samples, so the count
+        # is recorded, never asserted non-empty.
         ctx.check(
             "catalog",
             f"catalog.versions_non_negative[{ri.sample_name}.{workload.workload_id}]",
@@ -63,8 +54,6 @@ async def run_for_repo(ctx: SmokeContext, ri: RepoInfo) -> None:
         )
 
     if not ri.repo.is_encrypted:
-        # Purely per-repo judgment: this sample alone not being encrypted
-        # is reported here, not deferred to a once-per-run aggregate.
         ctx.skip("catalog", f"catalog.encryption[{ri.sample_name}]", f"{ri.sample_name} is not encrypted")
         return
 
@@ -83,13 +72,9 @@ async def run_for_repo(ctx: SmokeContext, ri: RepoInfo) -> None:
         )
         return
 
-    # The negative path, for every encrypted+keyed repository independently:
-    # a deliberately wrong (but syntactically valid) key must land on
-    # INVALID, not silently keep the previously-verified key's status.
-    # Always this repo's own catalog turn first (__main__.py's per-repo
-    # loop runs "catalog" before any other domain for a given repo), so
-    # the correct key is always restored below before any later domain
-    # reads this same shared Repository instance.
+    # A wrong (but well-formed) key must land on INVALID. "catalog" runs
+    # first in each repository's turn, so the correct key is restored below
+    # before any other domain reads this shared Repository.
     async def _try_wrong_key(ri: RepoInfo = ri) -> KeyStatus:
         await ri.repo.set_key(_DUMMY_KEY)
         return ri.repo.key_status

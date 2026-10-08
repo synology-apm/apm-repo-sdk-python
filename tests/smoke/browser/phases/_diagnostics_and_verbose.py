@@ -1,8 +1,6 @@
-"""``diagnostics_and_verbose`` domain: ``DiagnosticsScreen``'s real
-``verify()`` findings render without crashing, and ``d``'s verbose-mode
-toggle actually propagates (``refresh_for_verbose_mode``) -- a
-currently-connected repository's own screen-level behavior, not decode
-correctness (already ``sdk/``'s job).
+"""``diagnostics_and_verbose`` domain: ``DiagnosticsScreen`` renders a real
+``verify()``'s findings, and ``d``'s verbose-mode toggle propagates
+(``refresh_for_verbose_mode``).
 """
 
 from __future__ import annotations
@@ -27,13 +25,13 @@ async def run(ctx: SmokeContext, app: Any, pilot: Any) -> None:
 
         await pilot.press("v")
         await wait_until(
-            pilot, lambda: isinstance(app.screen, DiagnosticsScreen), message="DiagnosticsScreen never appeared"
+            pilot,
+            lambda: isinstance(app.screen, DiagnosticsScreen) and app.screen.is_mounted,
+            message="DiagnosticsScreen never appeared",
         )
         status = app.screen.query_one("#diag-status", Static)
-        # _show_findings' own two possible status strings both include
-        # "level=" -- the initial DIAGNOSTICS_QUICK_STATUS constant
-        # doesn't, so this is the real "verify() finished" signal, not a
-        # fixed sleep.
+        # Both of _show_findings' status strings include "level=", the
+        # initial DIAGNOSTICS_QUICK_STATUS doesn't: verify() finished.
         await wait_until(
             pilot, lambda: "level=" in str(status.render()), timeout=15.0, message="verify() never finished"
         )
@@ -49,8 +47,11 @@ async def run(ctx: SmokeContext, app: Any, pilot: Any) -> None:
     async def _toggle_verbose() -> bool:
         before = app.verbose
         await pilot.press("d")
-        await pilot.pause(0.2)
-        return app.verbose is not before
+        try:
+            await wait_until(pilot, lambda: app.verbose is not before, timeout=2.0)
+        except TimeoutError:
+            return False
+        return True
 
     toggled = await ctx.call("diagnostics_and_verbose", "diagnostics_and_verbose.toggle_verbose", _toggle_verbose)
     if toggled is not None:

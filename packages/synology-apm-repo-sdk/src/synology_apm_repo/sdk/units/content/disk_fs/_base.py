@@ -1,11 +1,8 @@
-"""Shared, dependency-free plumbing every per-format module in this
-package (``_ntfs``/``_apfs``/``_posix_formats``) builds on: the
-``_Format`` shape itself, the defaults most formats use unmodified, and
-the two ``ContentUnavailableError`` reason strings shared across formats.
-Part of this package's read-only, per-file browsing/export view of a
-VM/PC/PS disk image via the Dissect framework. Nothing here imports
-from a sibling format module — that's what keeps this the one leaf every
-other module in the package can import from without a cycle.
+"""Shared plumbing every per-format module in this package
+(``_ntfs``/``_apfs``/``_posix_formats``) builds on: the ``_Format`` shape,
+the defaults most formats use unmodified, and the
+``ContentUnavailableError`` reason strings. Imports no sibling module, so
+every module in the package can import it without a cycle.
 """
 
 from __future__ import annotations
@@ -19,14 +16,10 @@ from typing import BinaryIO
 
 from ...base import FileState
 
-# Pin dissect.util's read-alignment granularity (Python 3.14 changed
-# io.DEFAULT_BUFFER_SIZE, dissect.util's inherited default, from 8192 to
-# 131072) -- must run before dissect.util.stream is first imported,
-# which this module's own import time precedes. 8192 stays deliberate: a
-# read below it already rounds up to one aligned block, and a read at or
-# above it already collapses into one call (AlignedStream's own
-# divmod-based batching) -- a larger value only wastes bytes on real
-# filesystem browsing's small/scattered reads.
+# Pin dissect.util's read-alignment granularity before dissect.util.stream
+# is first imported: its default follows io.DEFAULT_BUFFER_SIZE, which
+# Python 3.14 raised from 8192 to 131072. A larger block only wastes bytes
+# on filesystem browsing's small, scattered reads.
 os.environ.setdefault("DISSECT_STREAM_BUFFER_SIZE", "8192")
 
 
@@ -37,15 +30,12 @@ def _try_import(module_path: str) -> object | None:
         return None
 
 
-@dataclasses.dataclass(frozen=True)
+@dataclasses.dataclass(frozen=True, slots=True)
 class _DirEntry:
-    """One directory's real child, as every format's own ``iterdir``
-    reports it — the ``_Format.iterdir`` contract's own return element.
-    ``mtime`` is ``None`` when a format/entry has no reliable value: each
-    format's own ``_safe_mtime``/``_*_entry_mtime`` helper degrades a raise
-    there to ``None`` for that one entry rather than aborting the whole
-    listing (the same posture ``_ntfs_size``/``_apfs_size`` apply to
-    size)."""
+    """One directory child, as ``_Format.iterdir`` returns it. ``size``
+    and ``mtime`` are ``None`` when the entry has no reliable value; a
+    failure reading ``mtime`` degrades for that entry alone rather than
+    aborting the listing."""
 
     name: str
     is_dir: bool
@@ -54,14 +44,12 @@ class _DirEntry:
     mtime: datetime | None
 
 
-@dataclasses.dataclass(frozen=True)
+@dataclasses.dataclass(frozen=True, slots=True)
 class _Format:
-    """Describes one flat, single-volume-per-offset Dissect filesystem
-    format — new formats (e.g. HFS+ or ISO9660, if this project ever needs
-    them) are a new entry here, not a new class. Each format's own callables are not
-    assumed identical across formats just from matching method names —
-    the shapes are close but not identical (see each format's own
-    construction below)."""
+    """One single-volume-per-offset Dissect filesystem format; a new format
+    is a new ``_Format`` instance, not a new class. Dissect's per-format
+    APIs look alike but differ, so each format supplies its own callables
+    (see the ``_*_FORMAT`` instances in the sibling modules)."""
 
     label: str
     open: Callable[[BinaryIO], object]
@@ -74,23 +62,18 @@ class _Format:
     size: Callable[[object], int | None]
     """``entry -> size`` for a resolved file entry."""
     volume_label: Callable[[object], str | None]
-    """``volume -> label``, the filesystem's own human-assigned volume
-    name if it set one (``None`` if absent/empty) — distinct from the
-    partition *table*'s own name/type (``_partition_table_label``),
-    which a caller sees regardless of whether Dissect can even open this
-    offset as this format at all."""
+    """``volume -> label``, the filesystem's own volume name (``None`` if
+    absent/empty) — distinct from the partition table's name/type
+    (``_partition_table_label``)."""
     content_unavailable: Callable[[object], str | None]
     """``entry -> reason``, or ``None`` if this format has no cloud-sync/
     encryption concept or this entry looks normal. Checked before
-    ``.open()`` is ever called — must never itself trigger a real content
-    read."""
+    ``.open()``, so it must not read content."""
 
 
 def _module_open(module_path: str, class_name: str) -> Callable[[BinaryIO], object]:
-    """Builds a ``_Format.open`` callable that lazily imports
-    ``module_path`` and constructs ``class_name`` from it — the one
-    shape every format's own ``open`` needs (a fresh handle per call,
-    raising whenever the byte range isn't this format)."""
+    """A ``_Format.open`` callable that lazily imports ``module_path`` and
+    constructs ``class_name`` from the handle."""
 
     def open_fn(fh: BinaryIO) -> object:
         module = _try_import(module_path)
@@ -101,41 +84,29 @@ def _module_open(module_path: str, class_name: str) -> Callable[[BinaryIO], obje
 
 
 def _default_resolve(volume: object, path: str) -> object:
-    """``_Format.resolve`` for every format whose opened volume object
-    resolves an absolute path via a plain ``get(path)`` call — every
-    flat format except NTFS (``_ntfs.py``'s ``_ntfs_resolve``), which has
-    no such method on its own root."""
+    """``_Format.resolve`` via the volume's ``get(path)``; every format
+    except NTFS (``_ntfs._ntfs_resolve``)."""
     return volume.get(path or "/")  # type: ignore[attr-defined]
 
 
 def _default_size(entry: object) -> int | None:
-    """``_Format.size`` for every format whose resolved entry exposes a
-    plain ``.size`` attribute — every flat format except NTFS
-    (``_ntfs.py``'s ``_ntfs_size``), which needs its own missing-``$DATA``-
-    stream fallback. Falls back to ``None`` the same defensive way if
-    reading ``.size`` raises on any other format's own entry."""
+    """``_Format.size`` via the entry's ``.size`` attribute, ``None`` if
+    reading it raises. NTFS and APFS have their own."""
     try:
         return entry.size  # type: ignore[attr-defined,no-any-return]
-    except Exception:
+    except Exception:  # noqa: BLE001
         return None
 
 
 def _default_content_unavailable(entry: object) -> None:
-    """``_Format.content_unavailable`` for every format with no
-    cloud-sync/encryption concept of its own (ext2/3/4, XFS, Btrfs,
-    FAT) — always ``None``. APFS and NTFS each have their own, in
-    ``_apfs.py``/``_ntfs.py``."""
-    return None
+    """``_Format.content_unavailable`` for a format with no cloud-sync/
+    encryption concept (ext2/3/4, XFS, Btrfs, FAT): always ``None``."""
+    return
 
 
-#: User-facing explanation for each ``ContentUnavailableError`` case,
-#: shown verbatim wherever it surfaces (CLI error output via
-#: ``ApmRepoError.safe_message``; the TUI's detail-pane note) — distinct
-#: from ``Node.attrs["file_state"]`` (a bare ``FileState`` a presentation
-#: layer renders its own way). ``_CLOUD_ONLY_REASON`` is shared between
-#: NTFS's reparse-tag check and APFS's flag/xattr check, both confirmed
-#: rather than heuristic. ``_ENCRYPTED_REASON`` (NTFS only) is likewise
-#: trusted on its own — this SDK has no key material to attempt
-#: decryption.
+#: User-facing ``ContentUnavailableError`` messages, shown verbatim
+#: (unlike ``Node.file_state``, which a presentation layer renders its own
+#: way). ``_CLOUD_ONLY_REASON`` serves NTFS and APFS, ``_ENCRYPTED_REASON``
+#: NTFS only; this SDK has no key material to attempt decryption.
 _CLOUD_ONLY_REASON = "cloud-sync placeholder — no data at backup time"
 _ENCRYPTED_REASON = "EFS-encrypted — no key to decrypt it"

@@ -1,4 +1,4 @@
-"""Composition file format (FORMAT-SPEC.md: composition-splitting, RecordHead).
+"""Composition file format (FORMAT-SPEC.md: Composition file splitting; RecordHead).
 
 Two independent binary structures live in a composition sub-file:
 
@@ -30,7 +30,7 @@ from .const import (
 from .headers import MAGIC, parse_index_header, verify_crc32
 from .redundancy import redundancy_size
 
-_SPEC_HEADER = "FORMAT-SPEC.md: composition-splitting"
+_SPEC_HEADER = "FORMAT-SPEC.md: Composition file splitting"
 _SPEC_RECORD = "FORMAT-SPEC.md: RecordHead"
 
 _COMPOSITION_MAJOR = 1
@@ -43,7 +43,7 @@ _RECORD_MAGIC = b"Mu"
 _MODE_REDUNDANCY = 0x0001
 
 
-@dataclasses.dataclass(frozen=True)
+@dataclasses.dataclass(frozen=True, slots=True)
 class CompositionHeader:
     """Parsed composition sub-file header."""
 
@@ -53,13 +53,14 @@ class CompositionHeader:
 
 def parse_composition_header(data: bytes) -> CompositionHeader:
     """Parse the 64-byte header at the start of a session's ``subID=0``
-    file (FORMAT-SPEC.md: composition-splitting).
+    file (FORMAT-SPEC.md: Composition file splitting).
 
     Raises:
+        FormatError: ``data`` is shorter than 64 bytes.
+        DataCorruptError: A magic or header-CRC mismatch, or ``subFileSize``
+            is not the fixed 16 MiB every sub-file uses.
         UnsupportedVersionError: ``major`` is not exactly 1 (the only value
             ever written).
-        DataCorruptError: ``subFileSize`` does not equal the fixed 16 MiB
-            constant every sub-file uses.
     """
     header = parse_index_header(data, expect_magic=MAGIC["composition"], spec=_SPEC_HEADER)
     if header.major != _COMPOSITION_MAJOR:
@@ -74,16 +75,15 @@ def parse_composition_header(data: bytes) -> CompositionHeader:
 
 
 class CompositionStatus(enum.Enum):
-    """(FORMAT-SPEC.md: RecordHead) — the restore path never branches on this;
-    a record reached via ``file_map`` (i.e. successfully committed) is
-    always ``COMPLETE`` in practice, but this module decodes whichever
-    value is present rather than rejecting ``INTERRUPTED``."""
+    """A record's status (FORMAT-SPEC.md: RecordHead). The restore path never
+    branches on it: a record reached via ``file_map`` is ``COMPLETE`` in
+    practice, but ``INTERRUPTED`` is decoded rather than rejected."""
 
     COMPLETE = 0
     INTERRUPTED = 1
 
 
-@dataclasses.dataclass(frozen=True)
+@dataclasses.dataclass(frozen=True, slots=True)
 class RecordHead:
     """Parsed 32-byte ``RecordHead`` (FORMAT-SPEC.md: RecordHead)."""
 
@@ -100,14 +100,12 @@ class RecordHead:
 
 
 def parse_record_head(data: bytes) -> RecordHead:
-    """Decode the 32-byte ``RecordHead`` at the start of ``data``.
-
-    Every current reader (and this one) refuses the pre-Redundancy record
-    layout outright rather than guess at its (unspecified here) trailer
-    shape.
+    """Decode the 32-byte ``RecordHead`` at the start of ``data``. The
+    pre-Redundancy record layout is refused outright.
 
     Raises:
-        DataCorruptError: A magic or head-CRC mismatch.
+        FormatError: ``data`` is shorter than 32 bytes.
+        DataCorruptError: A magic or head-CRC mismatch, or an unknown status.
         UnsupportedVersionError: The ``Redundancy`` mode bit is absent.
     """
     if len(data) < RECORD_HEAD_LENGTH:
@@ -147,44 +145,23 @@ def verify_chunk_map_crc(map_array_bytes: bytes, expected_crc: int) -> None:
     """Validate a full ``ChunkMapRecord`` array's bytes against a
     ``RecordHead.map_crc`` (FORMAT-SPEC.md: RecordHead).
 
-    Deliberately **not** called automatically by ``parse_record_head``
-    — doing so would force every interactive read to first load the entire
-    (potentially multi-hundred-MB) map array. Callers doing a full-unit
-    export or ``verify`` call this explicitly once they already have those
-    bytes in hand.
+    Not called by ``parse_record_head``, which would force every read to
+    load the whole (possibly multi-hundred-MB) array; ``verify`` and
+    ``diagnostics`` call it explicitly.
+
+    Raises:
+        DataCorruptError: The CRC32 does not match.
     """
     verify_crc32(map_array_bytes, expected_crc, label="chunk-map array", spec=_SPEC_RECORD)
 
 
-_CRC_THREAD_HOP_MIN_BYTES = 1 << 18  # 256 KiB
-"""``zlib.crc32`` runs on the order of 1+ GB/s; an ``asyncio.to_thread()``
-dispatch/context-switch costs on the order of 100us — below this many
-bytes, calling ``verify_chunk_map_crc`` directly is faster than the hop
-itself, the same "too small to bother" reasoning
-``dedup/pool/_bucket_reader.py``'s ``read_chunk``/``units/saas/objectdb.py``
-already document for a decrypt+decompress pass. Most ``file_map`` rows'
-chunk-map arrays are
-well under this; the rare multi-hundred-MB array is what actually needs
-it."""
-
-
-def should_thread_chunk_map_crc(map_array_bytes: bytes) -> bool:
-    """Whether ``verify_chunk_map_crc(map_array_bytes, ...)`` is worth
-    running via ``asyncio.to_thread()`` rather than calling directly —
-    see ``_CRC_THREAD_HOP_MIN_BYTES``. This module stays
-    synchronous throughout (the Codec Layer never does I/O or threading
-    itself), so both async callers (``dedup/verify_checks.py``,
-    ``diagnostics.py``) that CRC-verify a chunk-map array make this same
-    decision themselves rather than each guessing independently."""
-    return len(map_array_bytes) >= _CRC_THREAD_HOP_MIN_BYTES
-
-
 def verify_attr_crc(attr_bytes: bytes, expected_crc: int) -> None:
-    """Validate a record's JSON attribute blob bytes against its own
-    ``RecordHead.attr_crc`` (FORMAT-SPEC.md: RecordHead) — like
-    ``verify_chunk_map_crc``, not needed to read the record's content and
-    not called automatically by ``parse_record_head``; a ``verify`` caller
-    checks it explicitly once the blob bytes are already in hand.
+    """Validate a record's JSON attribute blob against
+    ``RecordHead.attr_crc`` (FORMAT-SPEC.md: RecordHead). Only ``verify``
+    calls it.
+
+    Raises:
+        DataCorruptError: The CRC32 does not match.
     """
     verify_crc32(attr_bytes, expected_crc, label="attribute blob", spec=_SPEC_RECORD)
 
@@ -192,7 +169,8 @@ def verify_attr_crc(attr_bytes: bytes, expected_crc: int) -> None:
 def record_total_length(map_num: int, attr_leng: int) -> int:
     """Total byte length of one composition record starting at its
     ``headOff``: ``RECORD_HEAD_LENGTH + map_num*20 + attr_leng +
-    redundancy_size(map_num*20, 8192)`` (FORMAT-SPEC.md: RecordHead/ChunkCrcStore).
+    redundancy_size(map_num*20, 8192)`` (FORMAT-SPEC.md: RecordHead;
+    ChunkCrcStore & Redundancy).
 
     Records are packed back-to-back with no padding, so ``headOff +
     record_total_length(...)`` is exactly the next record's ``headOff``.
@@ -203,7 +181,6 @@ def record_total_length(map_num: int, attr_leng: int) -> int:
 
 
 def chunk_map_array_offset(head_off: int) -> int:
-    """Byte offset (relative to the composition sub-file) where a record's
-    ``ChunkMapRecord`` array begins — immediately after its ``RecordHead``
-    (FORMAT-SPEC.md: RecordHead)."""
+    """Session-global offset where a record's ``ChunkMapRecord`` array begins,
+    right after its ``RecordHead`` (FORMAT-SPEC.md: RecordHead)."""
     return head_off + RECORD_HEAD_LENGTH

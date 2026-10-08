@@ -1,7 +1,4 @@
-"""Silencing dependency logging before it reaches the CLI/TUI's own output —
-shared by both surfaces since they must behave identically here: a
-per-surface copy would let a future fix (encoding, handler behavior, ...)
-land in only one of them.
+"""Silencing dependency logging before it reaches a frontend's own output.
 
 With no handler configured anywhere, ``logging`` falls back to its
 last-resort handler, which writes every WARNING and above straight to

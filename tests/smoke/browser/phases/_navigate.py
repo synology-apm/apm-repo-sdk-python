@@ -1,7 +1,5 @@
-"""``navigate`` domain: connect to a real sample, drill via goto (``g``)
-straight to a picked, real leaf -- the one thing ``sdk/`` smoke has no
-equivalent of at all (real screen navigation against real content, not
-an SDK call made directly)."""
+"""``navigate`` domain: connect to a real sample and goto (``g``) straight
+to a picked leaf, checking ``UnitScreen`` lands with it selected."""
 
 from __future__ import annotations
 
@@ -30,9 +28,7 @@ async def run(ctx: SmokeContext, app: Any, pilot: Any) -> None:
 
     connected = await ctx.call("navigate", f"navigate.{ref.sample_name}.connect", _connect)
     if connected is not True:
-        # ctx.call already recorded the real failure/traceback -- avoid a
-        # second, confusing FAILED step from _goto asserting against a
-        # screen state the failed connect never reached.
+        # ctx.call already recorded the failure.
         ctx.skip("navigate", f"navigate.{ref.sample_name}.goto", "connect step failed, see .connect above")
         return
 
@@ -44,7 +40,11 @@ async def run(ctx: SmokeContext, app: Any, pilot: Any) -> None:
         await pilot.press("g")
         app.screen.query_one("#goto-input", Input).value = ref.ref
         await pilot.press("enter")
-        await wait_until(pilot, lambda: isinstance(app.screen, UnitScreen), message="UnitScreen never appeared")
+        await wait_until(
+            pilot,
+            lambda: isinstance(app.screen, UnitScreen) and app.screen.is_mounted,
+            message="UnitScreen never appeared",
+        )
         unit_screen = app.screen
         assert isinstance(unit_screen, UnitScreen), unit_screen
         return unit_screen.unit_tree
@@ -58,16 +58,11 @@ async def run(ctx: SmokeContext, app: Any, pilot: Any) -> None:
             unit_screen = app.screen
             if not isinstance(unit_screen, UnitScreen):
                 return False
-            # ref.node is always a leaf; a leaf target's own cursor lands on
-            # the folder tree's parent node, while the leaf itself is
-            # selected in the file table -- _selected_node() covers
-            # whichever of the two is actually focused.
+            # A leaf target is selected in the file table, with the folder
+            # tree's cursor on its parent; _selected_node() covers either.
             selected = unit_screen._selected_node()
-            # This session's own connect_local() scan and bootstrap's
-            # separate in-process scan can resolve different repo_path
-            # values for the same node (bootstrap scans one level higher
-            # for an unkeyed ref) -- segments alone are the stable "which
-            # node" identity across both.
+            # This session's scan and bootstrap's can root the same node at
+            # different repo_paths; segments are the stable identity.
             return selected is not None and selected.ref.segments == ref.node.ref.segments
 
         landed = await ctx.call("navigate", f"navigate.{ref.sample_name}.cursor_on_leaf", _check_landed)

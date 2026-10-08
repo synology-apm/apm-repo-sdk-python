@@ -1,16 +1,15 @@
-"""Unit tests for ``browser.content_preview`` — pure-function coverage,
-no Textual/Pilot needed. The
-Pilot test (``tests/integration/browser/test_browser_pilot_preview.py``)
-covers the real, end-to-end version wired into ``UnitScreen``'s detail
-pane against real recorded sample data."""
+"""Pure-function tests for ``browser.content_preview``'s renderers, which the
+replay Pilot tests can't cover: loading real mail/contact/calendar/Teams
+content would record it into a committed fixture."""
 
 from __future__ import annotations
 
 import base64
 import json
 
+import pytest
+
 from synology_apm_repo.browser.content_preview import (
-    _drop_trailing_unterminated_tag,
     render_calendar_event_preview,
     render_contact_preview,
     render_html_preview,
@@ -18,6 +17,7 @@ from synology_apm_repo.browser.content_preview import (
     render_teams_chat_preview,
     visible_site_fields,
 )
+from synology_apm_repo.browser.content_preview._common import _MAX_PREVIEW_CHARS, _drop_trailing_unterminated_tag
 from synology_apm_repo.sdk.units.content.saas_calendar import build_ics
 from synology_apm_repo.sdk.units.content.saas_contact import build_contact_csv
 from synology_apm_repo.sdk.units.content.saas_teams_chat import render_channel_html
@@ -45,11 +45,8 @@ _NO_HEADERS_EML = b"Content-Type: text/plain; charset=utf-8\r\n\r\nJust a body, 
 
 _EMPTY_SUBJECT_EML = b"From: Alice <alice@example.com>\r\nSubject:\r\n\r\nBody text.\r\n"
 
-# A real sender's own text/plain alternative can be a template-generation
-# bug -- a byte-for-byte copy of the raw HTML rather than a real
-# conversion -- so a multipart/alternative with both must prefer the
-# text/html part, not just whichever one a caller-agnostic preferencelist
-# happens to try first.
+# A sender's text/plain alternative can be a byte-for-byte copy of the raw
+# HTML, so a multipart/alternative with both must prefer the text/html part.
 _MULTIPART_RAW_HTML_PLAIN_EML = (
     b"From: Alice <alice@example.com>\r\n"
     b"Subject: Broken plain-text alternative\r\n"
@@ -66,10 +63,8 @@ _MULTIPART_RAW_HTML_PLAIN_EML = (
     b"--BOUNDARY1--\r\n"
 )
 
-# A real mail client's own text/plain auto-conversion can embed a raw URL
-# in angle brackets right after a link's visible text -- preferring the
-# text/html part instead avoids ever showing that URL at all, since
-# _html_to_text never reads a tag's href.
+# A mail client's text/plain auto-conversion can embed a raw URL in angle
+# brackets after a link's text; the text/html part never shows an href.
 _MULTIPART_BRACKETED_URL_PLAIN_EML = (
     b"From: Alice <alice@example.com>\r\n"
     b"Subject: Meeting invite\r\n"
@@ -105,13 +100,10 @@ _MULTIPART_EMPTY_HTML_EML = (
     b"--BOUNDARY4--\r\n"
 )
 
-# A read window cut mid-``Content-Transfer-Encoding: base64`` stream can
-# make the stdlib email package's own decode come back as its still-
-# encoded payload verbatim (no ``<`` anywhere) rather than real HTML. Built
-# as literal bytes (fixed boundary, precomputed base64, no auto-generated
-# Message-ID/boundary) so the truncation offset below is fully
-# deterministic, not dependent on any random header the ``email`` package
-# might otherwise insert.
+# A read window cut mid-``Content-Transfer-Encoding: base64`` stream makes
+# the stdlib decode come back as the still-encoded payload (no ``<``
+# anywhere). Literal bytes (fixed boundary, no generated headers) keep the
+# truncation offset below deterministic.
 _TRUNCATED_BASE64_HTML_BODY = base64.encodebytes(
     ("<html><body><p>Hello</p></body></html>" + "x" * 4000).encode("utf-8")
 )
@@ -128,8 +120,7 @@ _TRUNCATED_BASE64_HTML_EML_FULL = (
     b"Content-Transfer-Encoding: base64\r\n"
     b"\r\n" + _TRUNCATED_BASE64_HTML_BODY + b"--BOUNDARY3--\r\n"
 )
-# Lands mid-base64-group, making the base64 decode of the html
-# alternative come back still-encoded (no literal "<" anywhere).
+# Lands mid-base64-group.
 _TRUNCATED_BASE64_HTML_EML = _TRUNCATED_BASE64_HTML_EML_FULL[:5558]
 
 
@@ -156,26 +147,23 @@ class TestRenderMailPreview:
         assert "To:" not in text
 
     def test_missing_subject_shows_the_no_subject_placeholder_not_omitted(self) -> None:
-        # Unlike From/To/Date, Subject is never dropped -- a missing one
-        # must show the placeholder, not disappear from the preview.
+        # Unlike From/To/Date, a missing Subject is never dropped.
         text = render_mail_preview(_NO_HEADERS_EML)
         assert "Subject: (no subject)" in text
 
     def test_empty_subject_header_shows_the_no_subject_placeholder(self) -> None:
-        # A present-but-empty Subject header is a different real case from
-        # a wholly missing one -- both must show the same placeholder.
         text = render_mail_preview(_EMPTY_SUBJECT_EML)
         assert "Subject: (no subject)" in text
 
     def test_long_body_is_truncated_with_a_note(self) -> None:
-        long_body = b"From: Alice <a@x.com>\r\nSubject: Long\r\n\r\n" + b"x" * 20_000
-        text = render_mail_preview(long_body, max_chars=100)
+        long_body = b"From: Alice <a@example.com>\r\nSubject: Long\r\n\r\n" + b"x" * 20_000
+        text = render_mail_preview(long_body)
         assert len(text) < 20_000
         assert "truncated" in text.lower()
         assert "export" in text.lower()
 
     def test_short_content_is_not_truncated(self) -> None:
-        text = render_mail_preview(_PLAIN_EML, max_chars=4000)
+        text = render_mail_preview(_PLAIN_EML)
         assert "truncated" not in text.lower()
 
     def test_prefers_html_over_a_plain_alternative_that_is_actually_raw_html(self) -> None:
@@ -189,8 +177,6 @@ class TestRenderMailPreview:
         assert "https://example.com/join/abc123" not in text
 
     def test_a_read_window_truncated_mid_attribute_shows_a_placeholder_not_raw_base64(self) -> None:
-        # Same truncation-safety treatment render_html_preview's own
-        # test of the same name covers, applied to an HTML mail body.
         fake_base64 = "AAAA" * 20_000
         html_eml = (
             b"From: Alice <alice@example.com>\r\n"
@@ -199,7 +185,7 @@ class TestRenderMailPreview:
             b"\r\n"
             b'<html><body><p>flower~~</p><img src="data:image/jpeg;base64,' + fake_base64.encode()
         )
-        text = render_mail_preview(html_eml, max_chars=4000)
+        text = render_mail_preview(html_eml)
         assert "flower~~" in text
         assert "AAAA" not in text
         assert "[image, ≥" in text
@@ -210,22 +196,14 @@ class TestRenderMailPreview:
         assert "The real message content is here." in text
 
     def test_falls_back_to_plain_when_a_truncated_base64_html_body_fails_to_decode(self) -> None:
-        # A Content-Transfer-Encoding: base64 body cut mid-stream by the
-        # read window can decode to its own still-encoded payload verbatim
-        # (no literal "<" anywhere) rather than real HTML -- must fall
-        # back to the plain alternative rather than showing that garbage.
         text = render_mail_preview(_TRUNCATED_BASE64_HTML_EML)
         assert "Plain-text fallback content." in text
 
     def test_falls_back_to_plain_when_the_html_alternatives_own_content_is_entirely_inside_a_truncated_tag(
         self,
     ) -> None:
-        # All of this html alternative's real (non-script) content sits
-        # inside one <img> tag that never closes -- _drop_trailing_
-        # unterminated_tag drops it, leaving only the truncation-note
-        # placeholder, which must not be mistaken for real content: a
-        # placeholder-only render must still fall back to the plain
-        # alternative rather than silently dropping its real message body.
+        # The html alternative's only content is an unclosed <img>, so it
+        # renders to the dropped-tag placeholder alone -- not real content.
         eml = (
             b"From: Alice <alice@example.com>\r\n"
             b"Subject: Placeholder-only html alternative\r\n"
@@ -246,10 +224,7 @@ class TestRenderMailPreview:
         assert "This is the real plain-text message body." in text
 
     def test_falls_back_to_plain_when_the_html_alternative_has_an_unrecognized_charset(self) -> None:
-        # An unrecognized charset name raises LookupError from get_content()
-        # -- must fall back to the plain alternative rather than letting
-        # that propagate as a preview error when a good body sits right
-        # next to it.
+        # An unrecognized charset raises LookupError from get_content().
         eml = (
             b"From: Alice <alice@example.com>\r\n"
             b"Subject: Bad charset\r\n"
@@ -269,9 +244,6 @@ class TestRenderMailPreview:
         assert "Perfectly good plain text body." in text
 
     def test_a_stray_inequality_sign_is_not_mistaken_for_a_real_tag(self) -> None:
-        # "5 < 10" has a literal "<" but nothing tag-shaped after it --
-        # must still fall back to the plain alternative rather than
-        # treating the html part as real markup.
         eml = (
             b"From: Alice <alice@example.com>\r\n"
             b"Subject: Inequality signs\r\n"
@@ -313,8 +285,7 @@ _MESSAGE_ROWS = [
 
 class TestRenderHtmlPreview:
     def test_recognizes_and_flattens_a_real_channel_export(self) -> None:
-        # Uses the real render_channel_html output, not a hand-rolled HTML
-        # fixture, so this test breaks if the two ever drift apart.
+        # Built from the real render_channel_html, so the two can't drift apart.
         html = render_channel_html(_MESSAGE_ROWS, channel_name="General").encode("utf-8")
         text = render_html_preview(html)
         assert text is not None
@@ -335,29 +306,25 @@ class TestRenderHtmlPreview:
 
     def test_long_html_is_truncated_with_a_note(self) -> None:
         html = b"<!doctype html><html><body>" + (b"<p>x</p>" * 5000) + b"</body></html>"
-        text = render_html_preview(html, max_chars=100)
+        text = render_html_preview(html)
         assert text is not None
         assert len(text) < 5000
         assert "truncated" in text.lower()
 
     def test_html_that_flattens_to_nothing_returns_none(self) -> None:
-        # A syntactically-HTML document with no actual text content (only
-        # markup/style) has nothing worth previewing.
         html = b"<!doctype html><html><head><style>.x{color:red}</style></head><body></body></html>"
         assert render_html_preview(html) is None
 
     def test_a_read_window_truncated_mid_attribute_shows_a_placeholder_not_raw_base64(self) -> None:
-        """Simulates a large inline base64 image (e.g. a Teams sticker's
-        ``<img src="data:image/jpeg;base64,...">``) that exceeds
-        ``UnitScreen``'s size-bounded read window, cutting off mid-attribute
-        with no closing quote or tag."""
-        fake_base64 = "AAAA" * 20_000  # ~80,000 chars, well past max_chars — would dominate the preview if leaked
+        """A large inline base64 ``<img>`` (e.g. a Teams sticker) cut off
+        mid-attribute by the preview's bounded read."""
+        fake_base64 = "AAAA" * 20_000
         html = (
-            b'<!doctype html><html><body><div class="msg"><div class="hdr">Snow Jon</div>'
+            b'<!doctype html><html><body><div class="msg"><div class="hdr">Alice</div>'
             b'<div class="body">flower~~</div></div><div class="msg"><img class="sticker" '
             b'alt="[sticker]" src="data:image/jpeg;base64,' + fake_base64.encode()
         )
-        text = render_html_preview(html, max_chars=4000)
+        text = render_html_preview(html)
         assert text is not None
         assert "flower~~" in text
         assert "AAAA" not in text
@@ -367,24 +334,18 @@ class TestRenderHtmlPreview:
     def test_a_truncated_non_img_tag_gets_a_generic_placeholder_label(self) -> None:
         fake_attr = "x" * 5000
         html = b'<!doctype html><html><body><p>hi</p><div data-blob="' + fake_attr.encode()
-        text = render_html_preview(html, max_chars=4000)
+        text = render_html_preview(html)
         assert text is not None
         assert "hi" in text
         assert "[content, ≥" in text
 
     def test_trailing_plain_text_after_the_last_real_tag_is_not_mistaken_for_a_truncation(self) -> None:
-        # No incomplete tag here at all — just prose after the last real
-        # closing tag (e.g. a read window that happens to end mid-word in
-        # ordinary text) — must not get a spurious placeholder.
         html = b"<!doctype html><html><body><p>hello</p> trailing plain text with no tag at all"
-        text = render_html_preview(html, max_chars=4000)
+        text = render_html_preview(html)
         assert text is not None
         assert "[" not in text
 
     def test_a_window_ending_on_a_real_tag_boundary_is_unaffected(self) -> None:
-        # The trim-to-last-> defense must not cut anything when the
-        # window already ends cleanly — the common case (most real
-        # units are smaller than the read cap and this never triggers).
         html = b"<!doctype html><html><body><p>hello</p><p>world</p></body></html>"
         text = render_html_preview(html)
         assert text is not None
@@ -420,8 +381,7 @@ class TestRenderCalendarEventPreview:
         )
 
     def test_empty_summary_shows_no_title_not_the_raw_id(self) -> None:
-        # An empty summary must show "(no title)", never the raw event
-        # id, since the .ics UID also falls back to event_id.
+        # The .ics UID falls back to the event id, which must not leak into the title.
         meta = json.dumps({"client_metadata": {"id": "AAMkAGEzYWI2", "summary": ""}}).encode()
         ics = build_ics(meta, "AAMkAGEzYWI2")
         text = render_calendar_event_preview(ics)
@@ -454,10 +414,7 @@ class TestRenderCalendarEventPreview:
         assert "End Time: 2026-03-02" in text
 
     def test_no_vevent_at_all_shows_the_none_placeholder(self) -> None:
-        # A hand-built .ics with no VEVENT at all -- build_ics() (used by
-        # every other test in this class) always emits exactly one, so
-        # this is the one way to reach the "genuinely nothing to show"
-        # fallback rather than a real, if bare, event.
+        # Hand-built: build_ics() always emits exactly one VEVENT.
         ics = b"BEGIN:VCALENDAR\r\nVERSION:2.0\r\nEND:VCALENDAR\r\n"
         assert render_calendar_event_preview(ics) == "(none)"
 
@@ -471,11 +428,17 @@ class TestDropTrailingUnterminatedTag:
 class TestRenderContactPreview:
     def test_m365_csv_shows_full_name_and_email(self) -> None:
         meta = json.dumps(
-            {"client_metadata": {"givenName": "Alice", "surname": "Wu", "emailAddresses": [{"address": "alice@x.com"}]}}
+            {
+                "client_metadata": {
+                    "givenName": "Alice",
+                    "surname": "Wu",
+                    "emailAddresses": [{"address": "alice@example.com"}],
+                }
+            }
         ).encode()
         csv_bytes = build_contact_csv(meta)
         text = render_contact_preview(csv_bytes)
-        assert text == "Full Name: Alice Wu\nEmail: alice@x.com"
+        assert text == "Full Name: Alice Wu\nEmail: alice@example.com"
 
     def test_m365_csv_with_no_name_or_email_shows_the_none_placeholder(self) -> None:
         csv_bytes = build_contact_csv(json.dumps({"client_metadata": {}}).encode())
@@ -483,8 +446,6 @@ class TestRenderContactPreview:
         assert text == "Full Name: (none)\nEmail: (none)"
 
     def test_gws_json_shows_full_name_and_email(self) -> None:
-        # Google's People API nests names/emails as lists of objects,
-        # unlike M365's flat CSV columns above.
         data = json.dumps(
             {
                 "client_metadata": {
@@ -507,7 +468,7 @@ class TestRenderContactPreview:
                 "client_metadata": {
                     "givenName": "Alice",
                     "surname": "Wu",
-                    "emailAddresses": [{"address": "alice@x.com"}],
+                    "emailAddresses": [{"address": "alice@example.com"}],
                     "jobTitle": "Engineer",
                     "companyName": "Acme",
                     "businessPhones": ["555-1000"],
@@ -528,7 +489,7 @@ class TestRenderContactPreview:
         text = render_contact_preview(csv_bytes)
         assert text == (
             "Full Name: Alice Wu\n"
-            "Email: alice@x.com\n"
+            "Email: alice@example.com\n"
             "Job Title: Engineer\n"
             "Company: Acme\n"
             "Business Phone: 555-1000\n"
@@ -539,29 +500,28 @@ class TestRenderContactPreview:
         )
 
     def test_gws_json_shows_every_present_optional_field(self) -> None:
-        # Real GWS contact field shapes: organizations[0].{name,title},
-        # phoneNumbers[0].value (no "type" in real data), biographies[0].value,
-        # birthdays[0].text.
+        # Real shape: organizations[0].{name,title}, phoneNumbers[0].value
+        # (no type), biographies[0].value, birthdays[0].text.
         data = json.dumps(
             {
                 "client_metadata": {
-                    "names": [{"displayName": "a bc"}],
-                    "emailAddresses": [{"value": "a@x.com"}],
-                    "organizations": [{"name": "syno", "title": "bartender"}],
-                    "phoneNumbers": [{"value": "08000000123"}],
-                    "birthdays": [{"date": {"day": 11, "month": 10, "year": 1996}, "text": "10/11/1996"}],
+                    "names": [{"displayName": "Alice Example"}],
+                    "emailAddresses": [{"value": "alice@example.com"}],
+                    "organizations": [{"name": "Example Corp", "title": "Engineer"}],
+                    "phoneNumbers": [{"value": "555-0100"}],
+                    "birthdays": [{"date": {"day": 2, "month": 1, "year": 1990}, "text": "1/2/1990"}],
                     "biographies": [{"value": "likes cats"}],
                 }
             }
         ).encode()
         text = render_contact_preview(data)
         assert text == (
-            "Full Name: a bc\n"
-            "Email: a@x.com\n"
-            "Job Title: bartender\n"
-            "Company: syno\n"
-            "Phone: 08000000123\n"
-            "Birthday: 10/11/1996\n"
+            "Full Name: Alice Example\n"
+            "Email: alice@example.com\n"
+            "Job Title: Engineer\n"
+            "Company: Example Corp\n"
+            "Phone: 555-0100\n"
+            "Birthday: 1/2/1990\n"
             "Notes: likes cats"
         )
 
@@ -572,75 +532,72 @@ class TestRenderContactPreview:
         text = render_contact_preview(data)
         assert "Phone (Mobile): 555-1000" in text
 
-    def test_gws_address_prefers_the_formatted_value_over_composing_components(self) -> None:
-        data = json.dumps(
-            {
-                "client_metadata": {
-                    "addresses": [{"formattedValue": "1 Main St, Springfield", "streetAddress": "should not be used"}]
-                }
-            }
-        ).encode()
+    @pytest.mark.parametrize(
+        "address",
+        [
+            pytest.param(
+                {"formattedValue": "1 Main St, Springfield", "streetAddress": "should not be used"},
+                id="prefers_the_formatted_value_over_composing_components",
+            ),
+            pytest.param(
+                {"streetAddress": "1 Main St", "city": "Springfield"},
+                id="composes_from_components_when_no_formatted_value",
+            ),
+        ],
+    )
+    def test_gws_address(self, address: dict[str, str]) -> None:
+        data = json.dumps({"client_metadata": {"addresses": [address]}}).encode()
         text = render_contact_preview(data)
         assert "Address: 1 Main St, Springfield" in text
 
-    def test_gws_address_composes_from_components_when_no_formatted_value(self) -> None:
-        data = json.dumps(
-            {"client_metadata": {"addresses": [{"streetAddress": "1 Main St", "city": "Springfield"}]}}
-        ).encode()
+    @pytest.mark.parametrize(
+        ("date", "expected"),
+        [
+            pytest.param(
+                {"year": 1990, "month": 1, "day": 2}, "Birthday: 1990-01-02", id="composed_from_date_when_no_text"
+            ),
+            pytest.param({"month": 1, "day": 2}, "Birthday: 01-02", id="without_a_year_omits_it"),
+            pytest.param({"year": 1990}, "Birthday: 1990", id="year_only_shows_just_the_year"),
+            # day=0 is the People API's "unspecified" sentinel: the month
+            # still shows, not a fall back to year-only.
+            pytest.param(
+                {"year": 1990, "month": 6, "day": 0},
+                "Birthday: 1990-06",
+                id="a_known_month_and_unspecified_day_still_shows_the_month",
+            ),
+            pytest.param({"day": 15}, "Birthday: 15", id="a_known_day_and_unspecified_month_still_shows_the_day"),
+        ],
+    )
+    def test_gws_birthday_composes_from_the_date_parts_present(self, date: dict[str, int], expected: str) -> None:
+        data = json.dumps({"client_metadata": {"birthdays": [{"date": date}]}}).encode()
         text = render_contact_preview(data)
-        assert "Address: 1 Main St, Springfield" in text
+        assert expected in text
 
-    def test_gws_birthday_falls_back_to_composing_from_date_when_no_text(self) -> None:
-        data = json.dumps(
-            {"client_metadata": {"birthdays": [{"date": {"year": 1996, "month": 10, "day": 11}}]}}
-        ).encode()
+    @pytest.mark.parametrize(
+        ("date", "expected", "forbidden"),
+        [
+            # Real GWS data for a year-only birthday: month/day are 0, not absent.
+            pytest.param(
+                {"year": 1990, "month": 0, "day": 0},
+                "Birthday: 1990",
+                "00",
+                id="month_and_day_as_the_unspecified_sentinel_shows_just_the_year",
+            ),
+            pytest.param(
+                {"year": 0, "month": 6, "day": 15},
+                "Birthday: 06-15",
+                "0-06-15",
+                id="the_unspecified_year_sentinel_omits_the_year",
+            ),
+        ],
+    )
+    def test_gws_birthday_omits_the_zero_unspecified_sentinel(
+        self, date: dict[str, int], expected: str, forbidden: str
+    ) -> None:
+        data = json.dumps({"client_metadata": {"birthdays": [{"date": date}]}}).encode()
         text = render_contact_preview(data)
-        assert "Birthday: 1996-10-11" in text
-
-    def test_gws_birthday_without_a_year_omits_it(self) -> None:
-        data = json.dumps({"client_metadata": {"birthdays": [{"date": {"month": 10, "day": 11}}]}}).encode()
-        text = render_contact_preview(data)
-        assert "Birthday: 10-11" in text
-
-    def test_gws_birthday_with_year_only_shows_just_the_year(self) -> None:
-        data = json.dumps({"client_metadata": {"birthdays": [{"date": {"year": 1996}}]}}).encode()
-        text = render_contact_preview(data)
-        assert "Birthday: 1996" in text
-
-    def test_gws_birthday_with_month_and_day_as_the_unspecified_sentinel_shows_just_the_year(self) -> None:
-        """The People API's own "unspecified" sentinel for a repeated
-        Date field's ``month``/``day`` is ``0``, not an absent key --
-        real GWS data for a year-only birthday. Must not render the
-        nonsensical "1996-00-00"."""
-        data = json.dumps({"client_metadata": {"birthdays": [{"date": {"year": 1996, "month": 0, "day": 0}}]}}).encode()
-        text = render_contact_preview(data)
-        assert "Birthday: 1996" in text
-        assert "00" not in text
-
-    def test_gws_birthday_with_a_known_month_and_unspecified_day_still_shows_the_month(self) -> None:
-        """A known month with the People API's own ``day=0``
-        "unspecified" sentinel must still show the month, not fall all
-        the way back to year-only."""
-        data = json.dumps({"client_metadata": {"birthdays": [{"date": {"year": 1990, "month": 6, "day": 0}}]}}).encode()
-        text = render_contact_preview(data)
-        assert "Birthday: 1990-06" in text
-
-    def test_gws_birthday_with_the_unspecified_year_sentinel_omits_the_year(self) -> None:
-        """Regression test: ``year=0`` is the People API's own
-        "unspecified" sentinel too (same as ``month``/``day``'s), so a
-        year-omitted birthday must not render the nonsensical
-        "0-06-15"."""
-        data = json.dumps({"client_metadata": {"birthdays": [{"date": {"year": 0, "month": 6, "day": 15}}]}}).encode()
-        text = render_contact_preview(data)
-        assert "Birthday: 06-15" in text
-        assert "0-06-15" not in text
-
-    def test_gws_birthday_with_a_known_day_and_unspecified_month_still_shows_the_day(self) -> None:
-        """A known day with no month (and no year) must still render
-        that one real field, not nothing."""
-        data = json.dumps({"client_metadata": {"birthdays": [{"date": {"day": 15}}]}}).encode()
-        text = render_contact_preview(data)
-        assert "Birthday: 15" in text
+        assert expected in text
+        assert forbidden not in text
 
     def test_gws_birthday_with_no_text_and_no_usable_date_at_all_is_omitted_entirely(self) -> None:
         data = json.dumps({"client_metadata": {"birthdays": [{"date": {}}]}}).encode()
@@ -665,10 +622,6 @@ class TestRenderContactPreview:
 
 
 class TestVisibleSiteFields:
-    """Direct unit tests for ``visible_site_fields`` — no test anywhere
-    in this package gives it its own direct coverage, unlike every
-    sibling ``render_*`` function."""
-
     def test_drops_odata_prefixed_keys_case_insensitively(self) -> None:
         values: dict[str, object] = {"odata.type": "x", "OData__UIVersionString": "y", "Title": "Real"}
         assert visible_site_fields(values) == {"Title": "Real"}
@@ -687,9 +640,7 @@ class TestVisibleSiteFields:
 
 
 class TestRenderTeamsChatPreview:
-    """Every case here builds its HTML via the real ``render_channel_html``,
-    not a hand-rolled fixture (same reasoning as
-    ``TestRenderHtmlPreview.test_recognizes_and_flattens_a_real_channel_export``)."""
+    """Every case builds its HTML via the real ``render_channel_html``."""
 
     def test_sender_and_timestamp_sit_directly_above_the_body_no_gap(self) -> None:
         rows = [
@@ -708,8 +659,7 @@ class TestRenderTeamsChatPreview:
         lines = text.splitlines()
         hdr_index = next(i for i, line in enumerate(lines) if "Alice" in line and "·" in line)
         assert lines[hdr_index + 1] == "hello there"
-        # The avatar's own single-letter placeholder never appears as its
-        # own line -- pure visual noise in a text rendering.
+        # The avatar's single-letter placeholder is not rendered.
         assert "A" not in lines
 
     def test_date_separator_appears_as_its_own_block(self) -> None:
@@ -808,11 +758,8 @@ class TestRenderTeamsChatPreview:
         assert "— (system event) —" in text
 
     def test_nested_divs_inside_an_html_body_dont_truncate_the_message(self) -> None:
-        """Regression test: a real Teams "html" contentType body commonly
-        uses plain, unclassed ``<div>``s for line breaks -- these must
-        keep inheriting the surrounding "body" role, not be mistaken for
-        that role-bearing ``<div>``'s own matching close just because they
-        share a tag name."""
+        """Unclassed ``<div>``s (line breaks in a Teams html body) inherit
+        the enclosing body role rather than closing it."""
         rows = [
             {
                 "author": '{"name": "Alice"}',
@@ -905,9 +852,6 @@ class TestRenderTeamsChatPreview:
         assert render_teams_chat_preview(html) == "(no messages)"
 
     def test_a_read_window_truncated_mid_sticker_shows_a_placeholder_not_raw_base64(self) -> None:
-        # A real sticker sits directly inside its own message's body, with
-        # no other body text ahead of it -- the shape
-        # ``_drop_trailing_unterminated_tag`` expects.
         rows = [
             {
                 "author": '{"name": "Alice"}',
@@ -924,7 +868,7 @@ class TestRenderTeamsChatPreview:
             rows, channel_name="General", stickers_by_msg_id={"1": {"sticker1": fake_base64}}
         ).encode("utf-8")
         truncated = html[: html.index(b"base64,") + len("base64,") + 5000]
-        text = render_teams_chat_preview(truncated, max_chars=100_000)
+        text = render_teams_chat_preview(truncated)
         assert "AAAA" not in text
         assert "[image, ≥" in text
         assert "not shown in preview" in text
@@ -943,16 +887,11 @@ class TestRenderTeamsChatPreview:
             for i in range(50)
         ]
         html = render_channel_html(rows, channel_name="General").encode("utf-8")
-        text = render_teams_chat_preview(html, max_chars=500)
+        text = render_teams_chat_preview(html)
         assert len(text) < 5000
         assert "truncated" in text.lower()
 
     def test_truncation_drops_the_oldest_messages_keeping_the_newest(self) -> None:
-        # The whole point of this renderer's own truncation: a channel's
-        # newest messages are what a user wants visible, not its oldest
-        # ones -- a raw character-count truncation from the tail (the
-        # generic render_html_preview's own approach) would get this
-        # backwards.
         rows = [
             {
                 "author": f'{{"name": "User{i}"}}',
@@ -963,16 +902,13 @@ class TestRenderTeamsChatPreview:
                 "reply_to_id": None,
                 "msg_id": str(i),
             }
-            for i in range(30)
+            for i in range(300)
         ]
         html = render_channel_html(rows, channel_name="General").encode("utf-8")
-        text = render_teams_chat_preview(html, max_chars=500)
-        assert "message number 29" in text
+        text = render_teams_chat_preview(html)
+        assert "message number 299" in text
         assert "message number 0" not in text
         assert "earlier messages truncated" in text.lower()
-        # The note comes before the kept messages, not after -- dropping
-        # from the front means whatever's missing is always older
-        # messages.
         assert text.index("earlier messages truncated") < text.index("message number")
 
     def test_truncation_note_appears_only_when_something_was_actually_dropped(self) -> None:
@@ -988,17 +924,15 @@ class TestRenderTeamsChatPreview:
             }
         ]
         html = render_channel_html(rows, channel_name="General").encode("utf-8")
-        text = render_teams_chat_preview(html, max_chars=4000)
+        text = render_teams_chat_preview(html)
         assert "truncated" not in text.lower()
 
-    def test_a_single_message_longer_than_max_chars_is_still_shown_in_full(self) -> None:
-        # Never cut the one message actually kept -- a long last message
-        # is still more useful shown whole than truncated mid-sentence.
+    def test_a_single_message_longer_than_the_limit_is_still_shown_in_full(self) -> None:
         rows = [
             {
                 "author": '{"name": "Alice"}',
                 "create_time": 1700000000,
-                "content_preview": "y" * 3000,
+                "content_preview": "y" * (_MAX_PREVIEW_CHARS + 1000),
                 "metadata": None,
                 "is_sys_message": 0,
                 "reply_to_id": None,
@@ -1006,8 +940,5 @@ class TestRenderTeamsChatPreview:
             }
         ]
         html = render_channel_html(rows, channel_name="General").encode("utf-8")
-        text = render_teams_chat_preview(html, max_chars=500)
-        assert "y" * 3000 in text
-
-
-__all__: list[str] = []
+        text = render_teams_chat_preview(html)
+        assert "y" * (_MAX_PREVIEW_CHARS + 1000) in text

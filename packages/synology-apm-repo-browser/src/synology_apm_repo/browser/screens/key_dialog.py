@@ -1,36 +1,30 @@
-"""``KeyDialog``: a small, centered modal overlay — not a full-screen
-view — for pasting a ``<userKeyID>@<base64(userKey)>`` key string.
+"""``KeyDialog``: a centered modal for pasting a
+``<userKeyID>@<base64(userKey)>`` key string. ``BrowseScreen`` pushes it
+automatically (see ``BrowseEffects._prompt_for_key``); no keybinding reaches it.
 
-For why ``BrowseScreen`` pushes this dialog automatically with no
-keybinding reaching it, see its ``_prompt_for_key`` (``browse_screen.py``),
-triggered by ``KeyRequiredError``/``KeyMismatchError`` from ``catalog.workloads()``.
-
-Dismisses with ``True`` (a key was verified) or ``False`` (cancelled, or
-every attempt so far failed) — ``BrowseScreen`` decides what to do with
-either outcome (proceed to load the blocked workload list, or leave it
-blocked and the connection effectively un-entered).
+Dismisses with ``True`` (a key was verified) or ``False`` (cancelled with Esc).
 """
 
 from __future__ import annotations
 
+from typing import ClassVar, override
+
 from textual.app import ComposeResult
-from textual.binding import Binding
+from textual.binding import Binding, BindingType
 from textual.containers import Vertical
 from textual.screen import ModalScreen
 from textual.widgets import Input, Static
 
-from synology_apm_repo.browser.screens._shared import modal_box_css, notify_warning, show_error
+from synology_apm_repo.browser.screens._shared import modal_box_css, show_error
 from synology_apm_repo.browser.strings import KEY_INPUT_PLACEHOLDER, KEY_PROMPT
 from synology_apm_repo.browser.widgets.progress_hint import StaticTextSink
 from synology_apm_repo.browser.widgets.worker_progress import work
-from synology_apm_repo.sdk.api import Repository
-from synology_apm_repo.sdk.errors import ApmRepoError
+from synology_apm_repo.sdk import ApmRepoError, Repository
 
 
 class KeyDialog(ModalScreen[bool]):
-    """``ModalScreen`` truncates the App-level binding chain at itself, so
-    there is deliberately no ``d``/``q``/``?`` reachable while this dialog
-    is open -- only the two actions it needs, declared directly here."""
+    """Keeps no ``COMMON_BINDINGS``: the App's ``q``/``d``/``?`` don't reach
+    past a modal."""
 
     DEFAULT_CSS = (
         modal_box_css("KeyDialog", width=64)
@@ -41,7 +35,7 @@ class KeyDialog(ModalScreen[bool]):
     """
     )
 
-    BINDINGS = [
+    BINDINGS: ClassVar[list[BindingType]] = [
         Binding("escape", "cancel", "Cancel", show=False),
         Binding("enter", "verify", "Verify", show=False),
     ]
@@ -50,6 +44,7 @@ class KeyDialog(ModalScreen[bool]):
         super().__init__()
         self._repo = repo
 
+    @override
     def compose(self) -> ComposeResult:
         with Vertical():
             yield Static(KEY_PROMPT, id="key-dialog-prompt")
@@ -71,26 +66,21 @@ class KeyDialog(ModalScreen[bool]):
     def action_cancel(self) -> None:
         self.dismiss(False)
 
-    # No busy feedback here at all before this -- `set_key()` is real SDK I/O
-    # with no size/latency guarantee, and #key-status starts empty, so an
-    # empty base text is what the debounced sink falls back to.
+    # set_key() is real I/O; #key-status starts empty, so the debounced sink's
+    # base text is "".
     @work(sink=lambda self, key_string: StaticTextSink(self, "#key-status", base=lambda: ""))
     async def _verify(self, key_string: str) -> None:
         status = self.query_one("#key-status", Static)
         try:
-            verification = await self._repo.set_key(key_string)
+            result = await self._repo.set_key(key_string)
         except ApmRepoError as exc:
             show_error(self, "#key-status", exc)
             return
-        except ExceptionGroup as exc:
-            # Raised only when the key itself verified fine but
-            # reopening/closing one sibling catalog independently failed
-            # -- key_status is already VERIFIED, so notify but still
-            # proceed with the verified key rather than re-prompting.
-            notify_warning(self, exc)
-            maybe_verification = self._repo.key_verification
-            assert maybe_verification is not None  # set_key() always sets this before raising
-            verification = maybe_verification
+        if result.warning is not None:
+            # The key verified but a sibling catalog failed to reopen/close:
+            # notify, and still proceed with the verified key.
+            self.notify(result.warning, severity="warning")
+        verification = result.verification
         color = "green" if verification.ok else "red"
         text = (
             f"[{color}]{'verified' if verification.ok else 'invalid'}[/{color}] "

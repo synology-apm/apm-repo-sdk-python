@@ -1,5 +1,5 @@
-"""All user-facing help text lives here so it can't drift between
-commands. Command docstrings stay inline — typer surfaces them via
+"""App, option and argument help text, shared so it can't drift between commands.
+Command help stays in each command's docstring, which Typer shows as
 ``--help``.
 """
 
@@ -9,7 +9,7 @@ from __future__ import annotations
 
 APP_HELP = "Offline browser/exporter for Synology APV/Object-Storage dedup repositories."
 VERBOSE_HELP = "Show internal identifiers."
-JSON_HELP = "Structured JSON output, keyed by stable internal ids."
+JSON_HELP = "Structured JSON output on stdout."
 PROGRESS_HELP = (
     "Progress display on stderr: auto (default, live bar on a real terminal, "
     "periodic text line otherwise), always (force the live bar), or never (fully silent)."
@@ -31,14 +31,18 @@ REPO_PATH_HELP = (
 )
 SHOW_REF_HELP = "Also print each item's canonical NodeRef."
 
-# -- per-command (cat/export share one ref phrasing; ls/tree each have
-# their own, since ls's points readers at its own --help) --------------
+# -- per-command ----------------------------------------------------------
 
 REF_HELP_SINGLE_ITEM = (
     "A <path>#<fragment> ref naming exactly one item. With --profile, <path> is a "
     "store-relative sub-path instead of a filesystem path. A name containing a literal "
     "'/' needs percent-encoding within its segment — see `synology-apm-repo-cli ls --help`."
-)  # cat, export
+)  # cat
+REF_HELP_EXPORT = (
+    "A <path>#<fragment> ref naming one item, or a folder (its items are exported into the --output "
+    "directory). With --profile, <path> is a store-relative sub-path instead of a filesystem path. A name "
+    "containing a literal '/' needs percent-encoding within its segment — see `synology-apm-repo-cli ls --help`."
+)
 REF_HELP_LS = "<path>, optionally followed by #<name>/<name>/... — see the description above for what each part means."
 REF_HELP_TREE = (
     r"A <path>\[#<fragment>] ref. With --profile, <path> is a store-relative sub-path instead of a filesystem path. "
@@ -49,9 +53,9 @@ REF_HELP_TREE = (
 CAT_OFFSET_HELP = "Byte offset to start reading from."
 CAT_LENGTH_HELP = "Number of bytes to read (default: to the end)."
 
-EXPORT_OUTPUT_HELP = "Destination file path."
+EXPORT_OUTPUT_HELP = "Destination file path; a directory when REF is a folder."
 EXPORT_SPARSE_HELP = "Skip writing zero/hole regions (default: on)."
-EXPORT_KEEP_PARTIAL_HELP = "Keep the .part file after a Ctrl-C cancel instead of deleting it."
+EXPORT_KEEP_PARTIAL_HELP = "Keep the .part file after a cancelled or failed export instead of deleting it."
 EXPORT_FORCE_HELP = "Overwrite the destination file if it already exists (default: refuse)."
 
 VERIFY_LEVEL_HELP = (
@@ -64,7 +68,7 @@ VERIFY_LEVEL_HELP = (
 TREE_DEPTH_HELP = "Maximum levels to descend."
 
 OBJECT_DB_ID_HELP = (
-    "Manually override automatic ObjectDB sequence disambiguation — "
+    "List a SaaS version raw, as the objects of this ObjectDB by id — "
     "'<streamUuid>_<offset>_<length>', from an online SnapshotDB or a prior --verbose browse."
 )
 
@@ -83,7 +87,7 @@ DUMP_LIMIT_RECORDS_HELP = "Maximum number of records to walk/print."
 DUMP_VERIFY_MAP_HELP = "Also read and CRC-check each record's full chunk-map array (expensive)."
 DUMP_CHUNKMAP_OFFSET_HELP = "The record's head_off (from `dump composition`)."
 DUMP_LIMIT_ENTRIES_HELP = "Maximum number of chunk-map entries to print."
-DUMP_VERIFY_HELP = "CRC-check the full chunk-map array before printing."
+DUMP_CHUNKMAP_VERIFY_MAP_HELP = "CRC-check the full chunk-map array before printing."
 
 # -- profile add|list|show|remove -----------------------------------------
 
@@ -107,9 +111,9 @@ PROFILE_VERIFY_TLS_HELP = (
     "Verify the server's TLS certificate (S3/Azure only, ignored for --backend smb; default: on). "
     "Turn off only for a known endpoint with a self-signed/internal cert, e.g. an internal test S3 server."
 )
-PROFILE_FORCE_HELP = "Overwrite an existing profile of the same name without asking."
+PROFILE_FORCE_HELP = "Overwrite an existing profile of the same name (default: refuse)."
 PROFILE_REMOVE_FORCE_HELP = "Skip the confirmation prompt."
 PROFILE_SERVER_HELP = "SMB server hostname or IP address."
 PROFILE_SHARE_HELP = "SMB share name."
-PROFILE_PORT_HELP = "SMB server port (default: 445)."
+PROFILE_PORT_HELP = "SMB server port."
 PROFILE_USERNAME_HELP = 'SMB username, optionally "DOMAIN\\username" (omit for an anonymous/guest session).'

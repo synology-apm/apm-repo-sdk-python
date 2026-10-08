@@ -1,12 +1,5 @@
-"""Unit tests for ``browser.runtime.store.Store`` — the shared MVU
-dispatch loop every screen's own model will run on. No Textual/App/Pilot
-involved at all: ``Store`` is plain Python, and this is exactly the kind
-of test the rest of this refactor is meant to make possible.
-
-A small self-contained counter model/update/cmd triple stands in for a
-real domain's own ``core/*/model.py`` — this file doesn't import one
-from a sibling test module (``tests/`` isn't a package, see
-``tests/CLAUDE.md``)."""
+"""Unit tests for ``browser.runtime.store.Store``, the MVU dispatch loop
+every screen runs on, driven by a small counter model/update/cmd triple."""
 
 from __future__ import annotations
 
@@ -60,12 +53,6 @@ def _update(model: _Model, msg: _Msg) -> tuple[_Model, tuple[_Cmd, ...]]:
                 _Log(text=f"second:{new_count}"),
             )
         case _Append(text=text):
-            # Deliberately leaves `count` untouched and unreplaced -- a
-            # fresh tuple would still compare == to the old one, but
-            # dataclasses.replace() only touching `log` here is what lets
-            # test_unrelated_dispatch_does_not_render_an_untouched_slice
-            # below exercise the real "same object" identity path rather
-            # than an incidentally-equal new one.
             return dataclasses.replace(model, log=(*model.log, text)), ()
         case _:
             assert_never(msg)
@@ -115,9 +102,6 @@ def test_subscribe_renders_again_when_the_selected_slice_changes() -> None:
 
 
 def test_unrelated_dispatch_does_not_render_an_untouched_slice() -> None:
-    """``_Append`` never touches ``count`` -- the whole point of
-    slice-diffed subscriptions is that this dispatch costs this
-    subscriber nothing at all."""
     rendered: list[int] = []
     store: Store[_Model, _Msg, _Cmd] = Store(_Model(), _update, lambda cmd: None)
     store.subscribe(lambda m: m.count, rendered.append, init=False)
@@ -134,11 +118,8 @@ def test_notify_runs_before_perform_for_the_same_dispatch() -> None:
 
 
 def test_a_command_dispatching_again_is_deferred_to_a_second_drain_pass() -> None:
-    """A ``perform`` handler that calls ``store.dispatch(...)`` again
-    (a synchronous command reacting to its own effect, e.g. "show a
-    notification then immediately update again") must not have that
-    second dispatch run ``update()`` while the first dispatch's own
-    ``perform`` loop is still in progress."""
+    """A ``dispatch`` from inside ``perform`` must not run ``update()`` while
+    the first dispatch's ``perform`` loop is still in progress."""
     events: list[str] = []
 
     def perform(cmd: _Cmd) -> None:
@@ -165,13 +146,9 @@ def test_unsubscribe_stops_further_renders() -> None:
 
 
 def test_a_subscribers_own_render_unsubscribing_itself_does_not_skip_the_next_subscriber() -> None:
-    """A render callback can synchronously unsubscribe itself (e.g. a
-    screen popping itself in reaction to the very value just rendered).
-    ``list.remove()`` during a live ``for`` loop over that same list
-    shifts a later entry into the removed one's own index, and the
-    loop's cursor then advances past it -- silently skipping that
-    subscriber for this notify pass even though its own slice changed
-    too. Proves ``_notify`` iterates a snapshot, not the live list."""
+    """A render callback can unsubscribe itself (e.g. a screen popping
+    itself); ``_notify`` must iterate a snapshot, or removing an entry from
+    the live list skips the next subscriber."""
     store: Store[_Model, _Msg, _Cmd] = Store(_Model(), _update, lambda cmd: None)
     rendered_b: list[int] = []
     subscription_a: Subscription | None = None
@@ -190,9 +167,15 @@ def test_a_subscribers_own_render_unsubscribing_itself_does_not_skip_the_next_su
 
 def test_unsubscribe_is_safe_to_call_more_than_once() -> None:
     store: Store[_Model, _Msg, _Cmd] = Store(_Model(), _update, lambda cmd: None)
-    subscription = store.subscribe(lambda m: m.count, lambda count: None, init=False)
+    rendered_a: list[int] = []
+    rendered_b: list[int] = []
+    subscription = store.subscribe(lambda m: m.count, rendered_a.append, init=False)
+    store.subscribe(lambda m: m.count, rendered_b.append, init=False)
     subscription.unsubscribe()
     subscription.unsubscribe()  # must not raise
+    store.dispatch(_Increment())
+    assert rendered_a == []
+    assert rendered_b == [1]  # the repeat removed nobody else's subscription
 
 
 def test_close_makes_further_dispatch_a_no_op() -> None:
@@ -203,10 +186,8 @@ def test_close_makes_further_dispatch_a_no_op() -> None:
 
 
 def test_close_drops_every_subscription() -> None:
-    """A worker whose result lands after its screen unmounted must not
-    be able to call back into a removed widget -- close() clears
-    subscriptions outright rather than relying on dispatch() alone to
-    guard every path."""
+    """A worker result landing after unmount must not call back into a
+    removed widget."""
     store: Store[_Model, _Msg, _Cmd] = Store(_Model(), _update, lambda cmd: None)
     store.subscribe(lambda m: m.count, lambda count: None, init=False)
     store.close()

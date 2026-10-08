@@ -1,59 +1,48 @@
 """``S3Store`` — an ``ObjectStore`` implementation for S3-compatible object
-storage, one of the two backends this project's own object-storage samples
-are laid out for.
+storage.
 
 ``aioboto3``/``botocore`` are imported lazily, inside ``__init__`` and each
-method — a substantial import graph, and ``storage/__init__.py`` imports
-this module unconditionally, so a module-level import would make every
-caller of ``storage`` pay that cost even if it never touches ``S3Store``.
-Python caches the import after the first call, so the repeated ``import``
-statements below cost a dict lookup, not a re-import.
+method: ``storage/__init__.py`` imports this module unconditionally and
+their import graph is large.
 
-``aioboto3``'s client is an async context manager, sitting on ``aiohttp``
-(many outstanding round-trips overlap on one thread); this class creates
-it lazily on first use and owns its teardown via ``S3Store.aclose``
-(called by ``Session.close()``) — forgetting that would leak the
-connector. The constructor itself stays synchronous.
-
-S3 has no directory entities: ``S3Store.read`` treats an out-of-range
-``Range`` request as the ``ObjectStore`` contract's short-read-at-EOF case
-(``b""``) rather than S3's own ``InvalidRange`` client error, matching
-every other backend.
-
-Every client this module builds goes through ``_with_default_timeouts``,
-which caps botocore's batch-job-tuned timeouts to values an interactive
-caller can actually wait through.
+The ``aiohttp``-based client is created on first use; ``S3Store.close``
+(called by ``Session.close()``) must release it or the connector leaks.
+Every client gets ``_with_default_timeouts``' interactive-friendly config.
 """
 
 from __future__ import annotations
 
 import asyncio
-from contextlib import AsyncExitStack
-from typing import TYPE_CHECKING, Any
+import dataclasses
+from collections.abc import Iterator
+from contextlib import AsyncExitStack, contextmanager
+from typing import TYPE_CHECKING, Any, override
 
-from ..errors import NotFoundError
+from .._util.closing import AsyncClosing
+from ..errors import NotFoundError, PermissionDeniedError, StorageBackendError
+from .base import NETWORK_CONNECT_TIMEOUT, NETWORK_READ_TIMEOUT, Entry
 from .base import backend_key as _key
-from .prefix_listing import as_list_prefix, exists_via_prefix_probe, sorted_relative_names
+from .prefix_listing import (
+    as_list_prefix,
+    exists_via_prefix_probe,
+    sorted_relative_entries,
+)
 
 if TYPE_CHECKING:
     from botocore.exceptions import ClientError
 
 _NOT_FOUND_ERROR_CODES = frozenset({"NoSuchKey", "404", "NotFound"})
+_ACCESS_DENIED_ERROR_CODES = frozenset(
+    {"AccessDenied", "AllAccessDisabled", "Forbidden", "403", "InvalidAccessKeyId", "SignatureDoesNotMatch"}
+)
 
-# botocore's own defaults (60s connect, 60s read) are tuned for a batch job,
-# not an interactive reachability probe. These apply unless the caller
-# already passed its own `config`, which wins field-by-field over these.
-_DEFAULT_CONNECT_TIMEOUT = 5
-_DEFAULT_READ_TIMEOUT = 15
+# Total attempts per request, down from botocore's default for a batch job.
 _DEFAULT_MAX_ATTEMPTS = 2
 
-# botocore's own default (10) flows into aiohttp.TCPConnector(limit=...),
-# capping the total concurrent connections one client can hold open across
-# every caller sharing it — including chunk_walk.py's max_concurrent_reads/
-# max_concurrent_opens, which would otherwise queue inside the connector
-# itself. Raised well above any concurrency this SDK exposes today, since
-# one client is shared across a whole session's unrelated callers, not
-# scoped to one export call.
+# The connection cap of one client (botocore's default is 10). One client
+# serves a whole session's callers, so it sits well above any single
+# caller's concurrency (e.g. an export's concurrent reads), which would
+# otherwise queue inside the connector.
 _DEFAULT_MAX_POOL_CONNECTIONS = 32
 
 
@@ -61,17 +50,34 @@ def _error_code(exc: ClientError) -> str:
     return str(exc.response.get("Error", {}).get("Code", ""))
 
 
+@contextmanager
+def _mapped_errors(key: str) -> Iterator[None]:
+    """Re-raise a ``botocore``/``aiohttp`` failure as ``ObjectStore``'s
+    ``NotFoundError``/``PermissionDeniedError``/``StorageBackendError``."""
+    import aiohttp
+    from botocore.exceptions import BotoCoreError, ClientError
+
+    try:
+        yield
+    except ClientError as exc:
+        code = _error_code(exc)
+        if code in _NOT_FOUND_ERROR_CODES:
+            raise NotFoundError("no such object", ref=key) from exc
+        if code in _ACCESS_DENIED_ERROR_CODES:
+            raise PermissionDeniedError(f"access denied ({code})", ref=key) from exc
+        raise StorageBackendError(f"S3 request failed ({code or exc})", ref=key) from exc
+    except (BotoCoreError, aiohttp.ClientError, TimeoutError) as exc:
+        raise StorageBackendError(f"S3 request failed: {exc}", ref=key) from exc
+
+
 def _with_default_timeouts(client_kwargs: dict[str, Any]) -> dict[str, Any]:
-    """``client_kwargs`` with an interactive-friendly ``config`` merged in
-    (values and rationale: the module-level constants above).
-    ``Config.merge()`` lets a ``config`` the caller already supplied take
-    precedence field-by-field over these defaults, rather than replacing
-    it outright."""
+    """``client_kwargs`` with the network timeouts and the constants above
+    as its ``config``; a caller-supplied ``config`` wins field by field."""
     from botocore.config import Config
 
     default_config = Config(
-        connect_timeout=_DEFAULT_CONNECT_TIMEOUT,
-        read_timeout=_DEFAULT_READ_TIMEOUT,
+        connect_timeout=NETWORK_CONNECT_TIMEOUT,
+        read_timeout=NETWORK_READ_TIMEOUT,
         retries={"max_attempts": _DEFAULT_MAX_ATTEMPTS},
         max_pool_connections=_DEFAULT_MAX_POOL_CONNECTIONS,
     )
@@ -82,24 +88,32 @@ def _with_default_timeouts(client_kwargs: dict[str, Any]) -> dict[str, Any]:
 
 
 def _import_aioboto3() -> Any:
-    """Lazy ``import aioboto3``, same rationale as the module docstring
-    above. Shared by every constructor/free function here that needs it,
-    so the choice of what to import lives in one place."""
+    """Lazy ``import aioboto3`` (see the module docstring)."""
     import aioboto3
 
     return aioboto3
 
 
-class S3Store:
+@dataclasses.dataclass(frozen=True, slots=True)
+class S3StoreDescriptor:
+    """Picklable recipe for rebuilding an equivalent ``S3Store``."""
+
+    bucket: str
+    client_kwargs: dict[str, object]
+
+    def build(self) -> S3Store:
+        return S3Store(self.bucket, **self.client_kwargs)
+
+
+class S3Store(AsyncClosing):
     """An S3 (or S3-compatible — MinIO, Synology C2, ...) bucket, addressed
     by ``"/"``-separated paths relative to the bucket root.
 
-    ``client``, if given, is used as-is (tests inject a fake or otherwise
-    pre-configured *async* client this way, already entered); otherwise
-    one is built lazily on first use from ``client_kwargs``
-    (``region_name``, ``endpoint_url`` — for S3-compatible but non-AWS
-    backends, ``aws_access_key_id``/``aws_secret_access_key``, ...), passed
-    straight through to ``aioboto3.Session().client("s3", **client_kwargs)``.
+    ``client``, if given, is an already-entered async client used as-is
+    and not closed here. Otherwise one is built on first use from
+    ``client_kwargs`` (``region_name``, ``endpoint_url``,
+    ``aws_access_key_id``/``aws_secret_access_key``, ...), passed to
+    ``aioboto3.Session().client("s3", ...)``.
     """
 
     def __init__(
@@ -121,16 +135,21 @@ class S3Store:
             # Session construction is pure configuration, no I/O.
             self._session = aioboto3.Session()
 
+    def descriptor(self) -> S3StoreDescriptor | None:
+        """How a worker process rebuilds this store; ``None`` for one built
+        on an injected ``client``, which has no picklable recipe."""
+        if not self._owns_client:
+            return None
+        return S3StoreDescriptor(self._bucket, dict(self._client_kwargs))
+
+    @override
     def __repr__(self) -> str:
         return f"S3Store(bucket={self._bucket!r})"
 
     async def _get_client(self) -> Any:
-        """The live async client, created on first use.
-
-        Double-checked under an ``asyncio.Lock`` because entering the client
-        context is itself an ``await`` — two Tasks racing here without it
-        would each build a connector and one would be leaked outright.
-        """
+        """The live async client, created on first use under a lock:
+        entering the client awaits, and two racing tasks would otherwise
+        each build one and leak a connector."""
         if self._client is not None:
             return self._client
         async with self._client_lock:
@@ -142,13 +161,10 @@ class S3Store:
                 self._stack = stack
         return self._client
 
-    async def aclose(self) -> None:
-        """Release the underlying ``aiohttp`` connector.
-
-        Required, not optional, for a client this class created itself. An
-        injected ``client`` is left alone: whoever created it owns closing
-        it. Safe to call more than once.
-        """
+    @override
+    async def close(self) -> None:
+        """Release the ``aiohttp`` connector of a client this store created
+        (an injected one is left alone). Safe to call more than once."""
         stack, self._stack = self._stack, None
         if stack is not None:
             self._client = None
@@ -157,54 +173,42 @@ class S3Store:
     async def read(self, path: str, offset: int = 0, length: int | None = None) -> bytes:
         from botocore.exceptions import ClientError
 
+        if length is not None and length <= 0:
+            # No valid Range header exists for zero bytes; the object must
+            # still exist, as for LocalFsStore.
+            await self.size(path)
+            return b""
         client = await self._get_client()
         key = _key(path)
         range_header = f"bytes={offset}-{offset + length - 1}" if length is not None else f"bytes={offset}-"
-        try:
-            response = await client.get_object(Bucket=self._bucket, Key=key, Range=range_header)
-        except ClientError as exc:
-            code = _error_code(exc)
-            if code == "InvalidRange":
-                # offset is at or past the object's real size - the same
-                # "short read at EOF" the ObjectStore contract already
-                # requires of every backend, just signaled differently here.
-                return b""
-            if code in _NOT_FOUND_ERROR_CODES:
-                raise NotFoundError("no such object", ref=key) from exc
-            raise
-        body = response["Body"]
-        try:
-            return await body.read()  # type: ignore[no-any-return]
-        except asyncio.CancelledError:
-            # A cancellation mid-body-read must not let this connection
-            # quietly return to aiohttp's pool with the rest of the old
-            # response unread on the wire — close() discards it outright
-            # (a new connection opens next time) instead of risking reuse
-            # of a desynced one.
-            body.close()
-            raise
+        with _mapped_errors(key):
+            try:
+                response = await client.get_object(Bucket=self._bucket, Key=key, Range=range_header)
+            except ClientError as exc:
+                if _error_code(exc) == "InvalidRange":
+                    # offset at or past the end: ObjectStore's short read at EOF.
+                    return b""
+                raise
+            body = response["Body"]
+            try:
+                return await body.read()  # type: ignore[no-any-return]
+            except asyncio.CancelledError:
+                # Discard the connection: returned to the pool with the rest of
+                # the response unread, it would desync the next request.
+                body.close()
+                raise
 
     async def size(self, path: str) -> int:
-        from botocore.exceptions import ClientError
-
         client = await self._get_client()
         key = _key(path)
-        try:
+        with _mapped_errors(key):
             response = await client.head_object(Bucket=self._bucket, Key=key)
-        except ClientError as exc:
-            if _error_code(exc) in _NOT_FOUND_ERROR_CODES:
-                raise NotFoundError("no such object", ref=key) from exc
-            raise
         return int(response["ContentLength"])
 
     async def exists(self, path: str) -> bool:
-        """``True`` for either an object exactly at ``path``, or a
-        "directory" — a prefix with at least one object under it.
-        ``ObjectStore.exists()``'s own contract explicitly covers both
-        (``layout.py`` relies on it: ``db``/``@data`` are never
-        objects in their own right on an object-storage backend, only
-        prefixes with real objects underneath — a ``head_object`` check
-        alone would wrongly report every such "directory" as absent)."""
+        """``True`` for an object exactly at ``path`` or a "directory" (a prefix
+        with at least one object under it). ``layout.py`` relies on the
+        latter: ``db``/``@data`` are only prefixes here."""
         from botocore.exceptions import ClientError
 
         client = await self._get_client()
@@ -215,45 +219,49 @@ class S3Store:
             response = await client.list_objects_v2(Bucket=self._bucket, Prefix=list_prefix, MaxKeys=1)
             return bool(response.get("Contents")) or bool(response.get("KeyCount", 0))
 
-        return await exists_via_prefix_probe(
-            head=lambda: client.head_object(Bucket=self._bucket, Key=key),
-            error_type=ClientError,
-            is_not_found=lambda exc: _error_code(exc) in _NOT_FOUND_ERROR_CODES,
-            probe_prefix=_probe_prefix,
-        )
+        with _mapped_errors(key):
+            return await exists_via_prefix_probe(
+                head=lambda: client.head_object(Bucket=self._bucket, Key=key),
+                error_type=ClientError,
+                is_not_found=lambda exc: _error_code(exc) in _NOT_FOUND_ERROR_CODES,
+                probe_prefix=_probe_prefix,
+            )
 
-    async def listdir(self, path: str) -> list[str]:
-        """An absent "directory" (a prefix with zero objects under it) and
-        an empty one are indistinguishable — S3 has no real directory
-        entities, only prefixes — so both correctly report ``[]`` rather
-        than one of them raising ``NotFoundError``."""
+    async def listdir(self, path: str) -> list[Entry]:
+        """Immediate entries under ``path``, each object with its ``Size``
+        from the list responses; a common prefix has no size. An absent
+        prefix and an empty one are indistinguishable, so both return ``[]``
+        rather than raising ``NotFoundError``."""
         client = await self._get_client()
         prefix = _key(path)
         list_prefix = as_list_prefix(prefix)
-        raw_names: list[str] = []
+        raw_entries: list[tuple[str, int | None]] = []
         paginator = client.get_paginator("list_objects_v2")
-        async for page in paginator.paginate(Bucket=self._bucket, Prefix=list_prefix, Delimiter="/"):
-            raw_names.extend(common_prefix["Prefix"] for common_prefix in page.get("CommonPrefixes", []))
-            raw_names.extend(obj["Key"] for obj in page.get("Contents", []))
-        return sorted_relative_names(raw_names, list_prefix)
+        with _mapped_errors(prefix):
+            async for page in paginator.paginate(Bucket=self._bucket, Prefix=list_prefix, Delimiter="/"):
+                raw_entries.extend((common_prefix["Prefix"], None) for common_prefix in page.get("CommonPrefixes", []))
+                raw_entries.extend((obj["Key"], int(obj["Size"])) for obj in page.get("Contents", []))
+        return sorted_relative_entries(raw_entries, list_prefix)
 
 
 async def list_buckets(**client_kwargs: Any) -> list[str]:
-    """Every bucket visible to these credentials — a bucket-*less* operation
-    ``S3Store`` has no method for, since all four of its methods are scoped
-    to one chosen bucket. Builds its own transient client the same
-    lazy-import way ``S3Store`` does and closes it before returning; there
-    is no lifecycle for a caller to manage beyond this one call.
+    """Every bucket visible to these credentials (``S3Store`` is scoped to one
+    bucket). Uses a transient client, closed before returning.
 
-    ``client_kwargs`` is exactly what a caller would otherwise pass to
-    ``S3Store``. Raises whatever the underlying ``aioboto3`` call raises
-    (e.g. ``ClientError`` for ``AccessDenied`` when the credentials aren't
-    authorized to list buckets at the account level) — unhandled, the same
-    as every other backend-specific exception ``S3Store``'s own methods let
-    propagate.
+    Args:
+        **client_kwargs: What a caller would pass to ``S3Store``.
+
+    Returns:
+        Bucket names, sorted.
+
+    Raises:
+        PermissionDeniedError: The credentials lack account-level list
+            permission.
+        StorageBackendError: The request failed otherwise.
     """
     aioboto3 = _import_aioboto3()
     session = aioboto3.Session()
-    async with session.client("s3", **_with_default_timeouts(client_kwargs)) as client:
-        response = await client.list_buckets()
+    with _mapped_errors(str(client_kwargs.get("endpoint_url") or "")):
+        async with session.client("s3", **_with_default_timeouts(client_kwargs)) as client:
+            response = await client.list_buckets()
     return sorted(bucket["Name"] for bucket in response.get("Buckets", []))

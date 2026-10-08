@@ -23,8 +23,12 @@ clean:
 sync:
 	uv sync --group docs
 
+# Excluded modules get no page: every class in profiles/errors.py is
+# re-exported, and so documented, on the profiles package's own page.
+APIDOC_EXCLUDE = $(PACKAGE)/profiles/errors.py
+
 apidoc: sync
-	uv run sphinx-apidoc --implicit-namespaces -o $(APIDOCDIR) $(PACKAGE_SRC) --separate --module-first --no-toc -f -q
+	uv run sphinx-apidoc --implicit-namespaces --separate --module-first --no-toc -f -q -o $(APIDOCDIR) $(PACKAGE_SRC) $(APIDOC_EXCLUDE)
 
 html: clean apidoc
 	uv run $(SPHINXBUILD) -b html $(SOURCEDIR) $(BUILDDIR)/html $(O)

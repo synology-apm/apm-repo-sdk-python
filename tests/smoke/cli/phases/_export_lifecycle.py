@@ -1,13 +1,10 @@
-"""``export_lifecycle`` domain: a real file export to a temp dir end to
-end (``.part`` -> renamed final file, byte size matches), plus the one
-genuinely subprocess-only check: a real, timed ``SIGINT`` mid-export.
+"""``export_lifecycle`` domain: a real file export to a temp dir (no
+leftover ``.part``, a non-empty final file), plus a real, timed ``SIGINT``
+mid-export.
 
-A first-press Ctrl-C during ``export`` is a *clean*, handled
-cancellation, not a crash: ``export.py``'s own ``except asyncio.
-CancelledError`` branch prints a message and returns normally, so the
-process exits **0**, the partial ``.part`` file is deleted (no
-``--keep-partial``), and the final destination is never written --
-this is the shape this smoke check verifies.
+A first Ctrl-C during ``export`` is a handled cancellation: it reports the
+cancel, deletes the ``.part`` file (no ``--keep-partial``), never writes the
+destination, and exits ``ExitCode.CANCELLED`` (130).
 """
 
 from __future__ import annotations
@@ -17,12 +14,10 @@ from pathlib import Path
 
 from ..._shared_refs import RepresentativeRef
 from .._context import SmokeContext
-from ._shared import common_args
+from ._shared import key_args
 
-#: Below this, a real export finishes too fast for a SIGINT sent after
-#: _CANCEL_AFTER seconds to reliably land mid-flight rather than after
-#: the export has already completed -- the cancellation check is skipped
-#: (not failed) for a run where no picked ref clears this bar.
+#: Below this size an export can finish before a SIGINT sent after
+#: _CANCEL_AFTER seconds lands, so the cancellation check is skipped.
 _CANCEL_MIN_SIZE = 20 * 1024 * 1024
 _CANCEL_AFTER = 0.2
 
@@ -34,7 +29,7 @@ def run(ctx: SmokeContext) -> None:
         return
 
     ref = refs[0]
-    args = common_args(ref)
+    args = key_args(ref)
 
     with tempfile.TemporaryDirectory(prefix="apm-cli-smoke-") as tmp_dir:
         dst = Path(tmp_dir) / "export.bin"
@@ -76,7 +71,7 @@ def run(ctx: SmokeContext) -> None:
             candidate.ref,
             "-o",
             str(dst),
-            *common_args(candidate),
+            *key_args(candidate),
             cancel_after=_CANCEL_AFTER,
         )
         ctx.check(

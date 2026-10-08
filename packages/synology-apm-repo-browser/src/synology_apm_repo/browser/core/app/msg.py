@@ -1,25 +1,19 @@
-"""Messages the app-level store's own ``update()`` reacts to — see
-``core/app/update.py``.
-"""
+"""Messages the app-level ``update()`` (``core/app/update.py``) handles."""
 
 from __future__ import annotations
 
 import dataclasses
 
-from synology_apm_repo.browser.core.app.model import JobOutcome
+from synology_apm_repo.browser.core.app.model import ExportTarget, JobOutcome
 from synology_apm_repo.browser.core.keys import JobId
-from synology_apm_repo.sdk.units.base import RestorableUnit
 
 
 @dataclasses.dataclass(frozen=True, slots=True)
 class StartExport:
-    """Dispatched by ``ExportScreen`` on Export/Enter. ``dst_text`` is
-    the raw, unvalidated destination path text — validation happens in
-    ``update()`` (pure, testable without a real filesystem), not in the
-    screen, the same "screen only reads widgets, model decides" split
-    every other domain's own ``update()`` follows."""
+    """Dispatched by ``ExportScreen`` on Export/Enter. ``dst_text`` is the
+    raw destination text; ``update()`` validates it."""
 
-    unit: RestorableUnit
+    target: ExportTarget
     dst_text: str
     sparse: bool
 
@@ -33,6 +27,8 @@ class ExportProgressed:
     rate_text: str
     eta_text: str
     elapsed_text: str
+    position: str = ""
+    item: str = ""
 
 
 @dataclasses.dataclass(frozen=True, slots=True)
@@ -43,31 +39,23 @@ class ExportFinished:
 
 @dataclasses.dataclass(frozen=True, slots=True)
 class CancelJobRequested:
-    """Dispatched by ``ExportScreen``'s own cancel action or
-    ``WorklistScreen``'s ``x`` — both request the same thing regardless
-    of which screen currently owns the job."""
+    """Dispatched by ``ExportScreen``'s cancel action or ``WorklistScreen``'s
+    ``x``."""
 
     job_id: JobId
 
 
 @dataclasses.dataclass(frozen=True, slots=True)
 class VerifyFullStarted:
-    """Dispatched synchronously by ``DiagnosticsScreen.action_run_full``,
-    before the screen-local worker that runs the check starts — a
-    ``@work``-decorated call only schedules the worker, so setting this
-    flag from inside the worker's body instead would let two quick
-    ``action_run_full`` calls both pass the busy-check guard first.
-    Verify FULL has no ``Job``/``RunX`` pair like export: its work never
-    outlives the screen that started it, so there's no App-hosting
-    boundary to cross."""
+    """Dispatched by ``DiagnosticsScreen.action_run_full`` before it starts
+    the check's worker, so a second quick press already sees the run as
+    busy (a ``@work`` call only schedules its worker)."""
 
 
 @dataclasses.dataclass(frozen=True, slots=True)
 class VerifyFullFinished:
-    """Dispatched from ``DiagnosticsScreen._run``'s ``finally``, so it
-    fires exactly once per FULL run regardless of how it ended
-    (success/cancelled/errored) — this is what lets a queued export
-    waiting behind it auto-start."""
+    """Dispatched once per FULL run however it ended; a queued export
+    waiting behind it then starts."""
 
 
 AppMsg = StartExport | ExportProgressed | ExportFinished | CancelJobRequested | VerifyFullStarted | VerifyFullFinished

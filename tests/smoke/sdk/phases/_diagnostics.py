@@ -9,7 +9,6 @@ from synology_apm_repo.sdk import (
     ChunkCompactedError,
     DataCorruptError,
     Finding,
-    Node,
     NotFoundError,
     UnitProvider,
     UnsupportedDataFormatError,
@@ -21,13 +20,10 @@ from synology_apm_repo.sdk.identifiers import CatalogId
 from ..._shared_refs import close_if_closable, resolve_catalog
 from .._context import RepoInfo, SmokeContext
 
-#: Same set _device.py/_fs.py/_saas.py already treat as a known,
-#: sample-specific data gap rather than a real bug -- version.meta being
-#: populated (see _browsable_versions) only means the catalog *claims*
-#: this version is browsable, not that its own object-store data still
-#: exists: a real S3 sample can have a stale catalog entry whose backing
-#: copy_meta_file directory was removed without the catalog being updated
-#: to match.
+#: Known, sample-specific data gaps rather than real bugs. A populated
+#: ``version.meta`` (see ``_browsable_versions``) only means the catalog
+#: *claims* the version is browsable; its ``copy_meta_file`` directory can be
+#: gone.
 _DEGRADE_ON = (NotFoundError, DataCorruptError, ChunkCompactedError, UnsupportedDataFormatError)
 
 
@@ -76,13 +72,8 @@ async def run_for_repo(ctx: SmokeContext, ri: RepoInfo) -> None:
     async def _round_trip(
         ri: RepoInfo = ri, versions: list[tuple[CatalogId, Version]] = versions
     ) -> tuple[bool, str, str]:
-        """Tries every version with browsable catalog metadata in turn,
-        same retry reasoning as ``_shared_refs.py``'s
-        ``pick_workload_with_retry`` -- needed here because
-        ``_browsable_versions``'s own filter can't tell a version with
-        real backing data from one whose catalog entry outlived it. Each
-        candidate's ``Catalog`` is resolved fresh via ``resolve_catalog``
-        (see that function's own docstring)."""
+        """Tries each browsable version in turn until one opens (see
+        ``_DEGRADE_ON``)."""
         last_exc: BaseException | None = None
         for catalog_id, version in versions:
             provider: UnitProvider | None = None
@@ -95,18 +86,14 @@ async def run_for_repo(ctx: SmokeContext, ri: RepoInfo) -> None:
                 await close_if_closable(provider)
                 last_exc = exc
                 continue
-            # Unlike _shared_refs.py's own pick_workload_with_retry (whose
-            # winning candidate is handed back to its caller, still needed),
-            # nothing past this point needs `provider` to stay open --
-            # closed on every remaining path below, not just the rejected
-            # one above.
             if not children:
                 await close_if_closable(provider)
                 return True, "", ""  # empty tree -- nothing to round-trip, not a failure
             child = children[0]
-            resolved: Node = await ri.repo.resolve(child.ref)
+            frame = await ri.repo.resolve(child.ref)
             await close_if_closable(provider)
-            return resolved.ref == child.ref, str(child.ref), str(resolved.ref)
+            assert frame.node is not None  # resolve() always reaches a node
+            return frame.node.ref == child.ref, str(child.ref), str(frame.node.ref)
         assert last_exc is not None  # versions is non-empty, so some iteration always sets this
         raise last_exc
 

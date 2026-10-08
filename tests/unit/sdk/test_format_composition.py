@@ -2,33 +2,20 @@
 
 from __future__ import annotations
 
-import struct
 import zlib
 
 import pytest
 
+from support.format_builders import composition_header_bytes
 from synology_apm_repo.sdk.errors import DataCorruptError, FormatError, UnsupportedVersionError
-from synology_apm_repo.sdk.format import composition
 from synology_apm_repo.sdk.format.composition import (
     CompositionStatus,
     chunk_map_array_offset,
     parse_composition_header,
     parse_record_head,
     record_total_length,
-    should_thread_chunk_map_crc,
     verify_chunk_map_crc,
 )
-from synology_apm_repo.sdk.format.const import SUB_FILE_SIZE
-
-
-def _build_composition_header(*, major: int = 1, minor: int = 1, sub_file_size: int = SUB_FILE_SIZE) -> bytes:
-    header = bytearray(64)
-    header[0:4] = b"cMpS"
-    header[4:6] = major.to_bytes(2, "big")
-    header[6:8] = minor.to_bytes(2, "big")
-    header[8:12] = struct.pack(">I", sub_file_size)
-    header[60:64] = (zlib.crc32(bytes(header[:60])) & 0xFFFFFFFF).to_bytes(4, "big")
-    return bytes(header)
 
 
 def _build_record_head(
@@ -55,33 +42,31 @@ def _build_record_head(
 
 class TestCompositionHeader:
     def test_valid_header(self) -> None:
-        data = _build_composition_header()
+        data = composition_header_bytes()
         header = parse_composition_header(data)
         assert header.major == 1
         assert header.minor == 1
 
     def test_bad_magic_raises(self) -> None:
-        data = bytearray(_build_composition_header())
+        data = bytearray(composition_header_bytes())
         data[0:4] = b"XXXX"
-        with pytest.raises(DataCorruptError):
+        with pytest.raises(DataCorruptError, match="bad magic"):
             parse_composition_header(bytes(data))
 
     def test_unsupported_major_raises(self) -> None:
-        data = _build_composition_header(major=0)  # major=0 is an obsolete, no-longer-supported composition format
-        with pytest.raises(UnsupportedVersionError):
+        data = composition_header_bytes(major=0)  # major=0 is an obsolete, no-longer-supported composition format
+        with pytest.raises(UnsupportedVersionError, match="composition major"):
             parse_composition_header(data)
 
     def test_wrong_sub_file_size_raises_data_corrupt(self) -> None:
-        data = _build_composition_header(sub_file_size=1234)
-        with pytest.raises(DataCorruptError):
+        data = composition_header_bytes(sub_file_size=1234)
+        with pytest.raises(DataCorruptError, match="subFileSize"):
             parse_composition_header(data)
 
 
 class TestRecordHead:
     def test_decodes_a_realistic_non_default_record(self) -> None:
-        # every field set to a distinct, non-default value at once, so a
-        # decoder bug that only shows up with a real combination (not all
-        # zeros/defaults) can't hide.
+        # Distinct values in every multi-byte field, so a swapped or misread one can't hide.
         data = _build_record_head()
         record = parse_record_head(data)
 
@@ -101,27 +86,27 @@ class TestRecordHead:
     def test_bad_magic_raises(self) -> None:
         data = bytearray(_build_record_head())
         data[0:2] = b"XX"
-        with pytest.raises(DataCorruptError):
+        with pytest.raises(DataCorruptError, match="bad magic"):
             parse_record_head(bytes(data))
 
     def test_bad_head_crc_raises(self) -> None:
         data = bytearray(_build_record_head())
         data[10] ^= 0xFF  # corrupt a byte inside the mapNum field
-        with pytest.raises(DataCorruptError):
+        with pytest.raises(DataCorruptError, match="RecordHead CRC mismatch"):
             parse_record_head(bytes(data))
 
     def test_unknown_status_raises_data_corrupt(self) -> None:
         data = _build_record_head(status=99)
-        with pytest.raises(DataCorruptError):
+        with pytest.raises(DataCorruptError, match="unknown RecordHead status"):
             parse_record_head(data)
 
     def test_missing_redundancy_bit_raises_unsupported_version(self) -> None:
         data = _build_record_head(mode=0x0000)
-        with pytest.raises(UnsupportedVersionError):
+        with pytest.raises(UnsupportedVersionError, match="RecordHead lacks the Redundancy mode bit"):
             parse_record_head(data)
 
     def test_too_short_raises_format_error(self) -> None:
-        with pytest.raises(FormatError):
+        with pytest.raises(FormatError, match="RecordHead too short"):
             parse_record_head(b"\x00" * 31)
 
 
@@ -152,25 +137,11 @@ class TestVerifyChunkMapCrc:
     def test_matching_crc_does_not_raise(self) -> None:
         data = b"some chunk map bytes" * 3
         crc = zlib.crc32(data) & 0xFFFFFFFF
-        verify_chunk_map_crc(data, crc)  # should not raise
+        verify_chunk_map_crc(data, crc)
+        with pytest.raises(DataCorruptError, match="chunk-map array CRC mismatch"):  # control: really checked
+            verify_chunk_map_crc(data, crc ^ 1)
 
     def test_mismatched_crc_raises_data_corrupt(self) -> None:
         data = b"some chunk map bytes"
-        with pytest.raises(DataCorruptError):
+        with pytest.raises(DataCorruptError, match="chunk-map array CRC mismatch"):
             verify_chunk_map_crc(data, 0)
-
-
-class TestShouldThreadChunkMapCrc:
-    def test_just_under_the_threshold_is_not_worth_threading(self) -> None:
-        assert should_thread_chunk_map_crc(b"\x00" * (composition._CRC_THREAD_HOP_MIN_BYTES - 1)) is False
-
-    def test_exactly_at_the_threshold_is_worth_threading(self) -> None:
-        assert should_thread_chunk_map_crc(b"\x00" * composition._CRC_THREAD_HOP_MIN_BYTES) is True
-
-    def test_well_past_the_threshold_is_worth_threading(self) -> None:
-        assert should_thread_chunk_map_crc(b"\x00" * (composition._CRC_THREAD_HOP_MIN_BYTES * 4)) is True
-
-    def test_a_small_real_map_array_is_not_worth_threading(self) -> None:
-        # A handful of ChunkMapRecord entries (20 bytes each) is the
-        # common case -- well under the threshold.
-        assert should_thread_chunk_map_crc(b"\x00" * 200) is False

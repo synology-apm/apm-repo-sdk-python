@@ -1,7 +1,5 @@
-"""Unit tests for ``browser.core.app.update`` — every branch, no
-Textual/App/Pilot involved at all. Each test asserts on the returned
-``(model, cmds)`` pair directly -- ``Cmd`` is data, never a callable, so
-this is a one-line test with no effects layer involved."""
+"""Unit tests for ``browser.core.app.update``, asserting on the returned
+``(model, cmds)`` pair directly -- no Textual involved."""
 
 from __future__ import annotations
 
@@ -25,24 +23,29 @@ from synology_apm_repo.browser.strings import (
     EXPORT_QUEUED_MESSAGE,
 )
 from synology_apm_repo.sdk.units.base import RestorableUnit
+from synology_apm_repo.sdk.units.content.saas_artifact import LazyArtifact
 from synology_apm_repo.sdk.units.node_ref import NodeRef
 
 
+async def _unread_content() -> bytes:
+    raise AssertionError("this test never reads a unit's content")
+
+
 def _unit(name: str = "file.bin") -> RestorableUnit:
-    return RestorableUnit(ref=NodeRef("repo", (name,)), name=name, is_leaf=True)
+    return RestorableUnit(ref=NodeRef("repo", (name,)), name=name, is_leaf=True, content=LazyArtifact(_unread_content))
 
 
 def test_start_export_with_empty_destination_is_rejected() -> None:
     model = AppModel()
-    new_model, cmds = update(model, StartExport(unit=_unit(), dst_text="", sparse=True))
-    assert new_model is model  # nothing changed
+    new_model, cmds = update(model, StartExport(target=_unit(), dst_text="", sparse=True))
+    assert new_model is model
     assert cmds == (Notify(message=EXPORT_NO_DESTINATION_WARNING, severity="warning"),)
 
 
 def test_start_export_mints_a_job_and_a_run_export_command() -> None:
     unit = _unit("file.bin")
     model = AppModel()
-    new_model, cmds = update(model, StartExport(unit=unit, dst_text="./out.bin", sparse=True))
+    new_model, cmds = update(model, StartExport(target=unit, dst_text="./out.bin", sparse=True))
 
     assert new_model.next_job_id == JobId(2)
     job = new_model.jobs[JobId(1)]
@@ -57,19 +60,16 @@ def test_start_export_mints_a_job_and_a_run_export_command() -> None:
     assert isinstance(run_export, RunExport)
     assert run_export.job_id == JobId(1)
     assert run_export.group == "job-1"
-    assert run_export.unit is unit
+    assert run_export.target is unit
     assert run_export.dst == Path("./out.bin")
     assert run_export.sparse is True
 
 
 def test_two_exports_get_distinct_job_ids_and_groups() -> None:
-    """The second export still mints its own distinct id/group even
-    though the one job slot is already taken, so it's queued rather than
-    started immediately -- see the queueing tests below for the rest of
-    that behavior."""
+    """The second export is queued, but still mints its own id/group."""
     model = AppModel()
-    model, _ = update(model, StartExport(unit=_unit("a.bin"), dst_text="./a.bin", sparse=True))
-    model, cmds = update(model, StartExport(unit=_unit("b.bin"), dst_text="./b.bin", sparse=True))
+    model, _ = update(model, StartExport(target=_unit("a.bin"), dst_text="./a.bin", sparse=True))
+    model, cmds = update(model, StartExport(target=_unit("b.bin"), dst_text="./b.bin", sparse=True))
 
     assert set(model.jobs) == {JobId(1), JobId(2)}
     assert model.jobs[JobId(2)].group == "job-2"
@@ -102,8 +102,7 @@ def test_export_progressed_updates_the_jobs_done_total_and_progress_text() -> No
 
 
 def test_export_progressed_for_an_unknown_job_is_a_no_op() -> None:
-    """A late progress tick for a job that already finished/was
-    cancelled -- not an error, a silent no-op."""
+    """A late progress tick for a job that already finished or was cancelled."""
     model = AppModel()
     new_model, cmds = update(
         model,
@@ -157,13 +156,10 @@ def test_export_finished_for_an_already_gone_job_is_a_no_op() -> None:
 
 
 def test_recent_is_capped_dropping_the_oldest_first() -> None:
-    """One model, 24 sequential start-then-finish cycles -- past
-    ``_MAX_RECENT`` (20) -- proves the cap trims from the front (oldest
-    first), not the back."""
     model = AppModel()
     outcome = JobOutcome(notify_message="x", notify_severity="information", status_text="x")
     for i in range(1, 25):
-        model, _ = update(model, StartExport(unit=_unit(f"job-{i}.bin"), dst_text=f"./{i}.bin", sparse=True))
+        model, _ = update(model, StartExport(target=_unit(f"job-{i}.bin"), dst_text=f"./{i}.bin", sparse=True))
         model, _ = update(model, ExportFinished(job_id=JobId(i), outcome=outcome))
 
     assert len(model.recent) == 20
@@ -193,24 +189,24 @@ def test_cancel_job_requested_for_an_unknown_job_is_a_no_op() -> None:
     assert cmds == ()
 
 
-# -- Queueing (bounding the total process count) --------------------------
+# -- Queueing: one export runs at a time -----------------------------------
 
 
 def test_start_export_queues_instead_of_running_while_another_export_runs() -> None:
     model = AppModel(jobs={JobId(1): Job(id=JobId(1), label="a.bin", group="job-1")}, next_job_id=JobId(2))
     unit = _unit("b.bin")
-    new_model, cmds = update(model, StartExport(unit=unit, dst_text="./b.bin", sparse=True))
+    new_model, cmds = update(model, StartExport(target=unit, dst_text="./b.bin", sparse=True))
 
     job = new_model.jobs[JobId(2)]
     assert job.status is JobStatus.QUEUED
-    assert new_model.queued_requests[JobId(2)] == QueuedExport(unit=unit, dst=Path("./b.bin"), sparse=True)
+    assert new_model.queued_requests[JobId(2)] == QueuedExport(target=unit, dst=Path("./b.bin"), sparse=True)
     assert cmds == (Notify(message=EXPORT_QUEUED_MESSAGE, severity="information"),)
 
 
 def test_start_export_queues_while_a_verify_full_check_runs() -> None:
     model = AppModel(verify_full_running=True)
     unit = _unit("a.bin")
-    new_model, cmds = update(model, StartExport(unit=unit, dst_text="./a.bin", sparse=True))
+    new_model, cmds = update(model, StartExport(target=unit, dst_text="./a.bin", sparse=True))
 
     job = new_model.jobs[JobId(1)]
     assert job.status is JobStatus.QUEUED
@@ -225,7 +221,7 @@ def test_export_finished_promotes_the_earliest_queued_job() -> None:
             JobId(1): Job(id=JobId(1), label="export a.bin", group="job-1"),
             JobId(2): Job(id=JobId(2), label="export b.bin", group="job-2", status=JobStatus.QUEUED),
         },
-        queued_requests={JobId(2): QueuedExport(unit=unit_b, dst=Path("./b.bin"), sparse=True)},
+        queued_requests={JobId(2): QueuedExport(target=unit_b, dst=Path("./b.bin"), sparse=True)},
         next_job_id=JobId(3),
     )
     outcome = JobOutcome(notify_message="a.bin: exported", notify_severity="information", status_text="done")
@@ -241,7 +237,7 @@ def test_export_finished_promotes_the_earliest_queued_job() -> None:
     assert isinstance(run_export, RunExport)
     assert run_export.job_id == JobId(2)
     assert run_export.group == "job-2"
-    assert run_export.unit is unit_b
+    assert run_export.target is unit_b
 
 
 def test_export_finished_with_nothing_queued_returns_only_the_notify() -> None:
@@ -261,7 +257,7 @@ def test_cancel_job_requested_for_a_queued_job_removes_it_without_cancel_group()
             JobId(1): Job(id=JobId(1), label="export a.bin", group="job-1"),
             JobId(2): Job(id=JobId(2), label="export b.bin", group="job-2", status=JobStatus.QUEUED),
         },
-        queued_requests={JobId(2): QueuedExport(unit=unit, dst=Path("./b.bin"), sparse=True)},
+        queued_requests={JobId(2): QueuedExport(target=unit, dst=Path("./b.bin"), sparse=True)},
     )
 
     new_model, cmds = update(model, CancelJobRequested(job_id=JobId(2)))
@@ -291,7 +287,7 @@ def test_verify_full_finished_clears_the_flag_and_promotes_a_queued_export() -> 
     model = AppModel(
         verify_full_running=True,
         jobs={JobId(1): Job(id=JobId(1), label="export a.bin", group="job-1", status=JobStatus.QUEUED)},
-        queued_requests={JobId(1): QueuedExport(unit=unit, dst=Path("./a.bin"), sparse=True)},
+        queued_requests={JobId(1): QueuedExport(target=unit, dst=Path("./a.bin"), sparse=True)},
     )
 
     new_model, cmds = update(model, VerifyFullFinished())
@@ -323,3 +319,25 @@ def test_export_occupied_reflects_running_and_cancelling_but_not_queued() -> Non
         is False
     )
     assert AppModel().export_occupied is False
+
+
+def test_progress_records_a_folder_exports_position_and_file_separately() -> None:
+    model, _ = update(AppModel(), StartExport(target=_unit(), dst_text="./a", sparse=True))
+    progressed = ExportProgressed(
+        job_id=JobId(1),
+        done=1,
+        total=4,
+        size_text="",
+        rate_text="",
+        eta_text="",
+        elapsed_text="",
+        position="file 2 of 3",
+        item="a/b.txt",
+    )
+
+    model, _ = update(model, progressed)
+
+    job = model.jobs[JobId(1)]
+    assert (job.position, job.item) == ("file 2 of 3", "a/b.txt")
+    assert job.file_text == "file 2 of 3 — a/b.txt"
+    assert Job(id=JobId(2), label="x", group="g", position="scanning...").file_text == "scanning..."

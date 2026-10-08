@@ -21,8 +21,8 @@ repository formats.
        async with Session() as session:
            async for repo in session.discover("/path/to/repository"):
                if repo.is_encrypted:
-                   verification = await repo.set_key("<userKeyID>@<base64 userKey>")
-                   if not verification.ok:
+                   result = await repo.set_key("<userKeyID>@<base64 userKey>")
+                   if not result.verification.ok:
                        print(f"wrong key for {repo}")
                        continue
                for catalog in await repo.catalogs():
@@ -37,7 +37,11 @@ repository formats.
 
    api/synology_apm_repo.sdk.api.repository
    api/synology_apm_repo.sdk.api.key_manager
+   api/synology_apm_repo.sdk.api.provider_registry
    api/synology_apm_repo.sdk.api.catalog
+   api/synology_apm_repo.sdk.api.export
+   api/synology_apm_repo.sdk.api.export_tree
+   api/synology_apm_repo.sdk.api.export_paths
    api/synology_apm_repo.sdk.api.session
    api/synology_apm_repo.sdk.diagnostics
    api/synology_apm_repo.sdk.catalog.connection
@@ -46,7 +50,10 @@ repository formats.
    api/synology_apm_repo.sdk.catalog.workload_config
    api/synology_apm_repo.sdk.errors
    api/synology_apm_repo.sdk.identifiers
+   api/synology_apm_repo.sdk.findings
    api/synology_apm_repo.sdk.asynccache
+   api/synology_apm_repo.sdk.cachemanager
+   api/synology_apm_repo.sdk.positional_io
    api/synology_apm_repo.sdk.concurrency
 
 .. toctree::
@@ -55,16 +62,24 @@ repository formats.
 
    api/synology_apm_repo.sdk.dedup.repository
    api/synology_apm_repo.sdk.dedup.dedup_file
+   api/synology_apm_repo.sdk.dedup.extent
    api/synology_apm_repo.sdk.dedup.composition_reader
    api/synology_apm_repo.sdk.dedup.chunk_walk
    api/synology_apm_repo.sdk.dedup.pool
    api/synology_apm_repo.sdk.dedup.pool_descriptor
    api/synology_apm_repo.sdk.dedup.export_scheduler
-   api/synology_apm_repo.sdk.dedup.presized_file
+   api/synology_apm_repo.sdk.dedup.export_workers
+   api/synology_apm_repo.sdk.dedup.export_sink
+   api/synology_apm_repo.sdk.dedup.buffered_export_sink
+   api/synology_apm_repo.sdk.dedup.segment_buffers
+   api/synology_apm_repo.sdk.dedup.local_file_sink
+   api/synology_apm_repo.sdk.dedup.local_file_io
    api/synology_apm_repo.sdk.dedup.fingerprint
    api/synology_apm_repo.sdk.dedup.keys
+   api/synology_apm_repo.sdk.dedup.redundancy_repair
    api/synology_apm_repo.sdk.dedup.verify_checks
-   api/synology_apm_repo.sdk.dedup.verify_report
+   api/synology_apm_repo.sdk.dedup.verify_bucket_check
+   api/synology_apm_repo.sdk.dedup.verify_walk
 
 .. toctree::
    :maxdepth: 2
@@ -96,6 +111,7 @@ repository formats.
    api/synology_apm_repo.sdk.storage.layout
    api/synology_apm_repo.sdk.storage.sqlite
    api/synology_apm_repo.sdk.storage.sqlite_source
+   api/synology_apm_repo.sdk.storage.disk_space
    api/synology_apm_repo.sdk.storage.table
    api/synology_apm_repo.sdk.storage.generations
    api/synology_apm_repo.sdk.storage.recording
@@ -107,24 +123,25 @@ repository formats.
    :caption: Restorable units
 
    api/synology_apm_repo.sdk.units.base
+   api/synology_apm_repo.sdk.units.provider_kit
    api/synology_apm_repo.sdk.units.dispatch
    api/synology_apm_repo.sdk.units.fs
    api/synology_apm_repo.sdk.units.device
    api/synology_apm_repo.sdk.units.device_pcps
    api/synology_apm_repo.sdk.units.device_disk_fs
-   api/synology_apm_repo.sdk.units.device_kind
+   api/synology_apm_repo.sdk.units.device_handles
    api/synology_apm_repo.sdk.units.node_ref
    api/synology_apm_repo.sdk.units.resolve
    api/synology_apm_repo.sdk.units.file_map_tree
    api/synology_apm_repo.sdk.units.verify_reachable
    api/synology_apm_repo.sdk.units.verify_extents
-   api/synology_apm_repo.sdk.units.verify_bucket_check
 
 .. toctree::
    :maxdepth: 2
    :caption: Content Layer (units/content/)
 
    api/synology_apm_repo.sdk.units.content.disk_fs
+   api/synology_apm_repo.sdk.units.content.local_file
    api/synology_apm_repo.sdk.units.content.pcps_disk
    api/synology_apm_repo.sdk.units.content.saas_artifact
    api/synology_apm_repo.sdk.units.content.saas_mail
@@ -132,12 +149,15 @@ repository formats.
    api/synology_apm_repo.sdk.units.content.saas_contact
    api/synology_apm_repo.sdk.units.content.saas_site
    api/synology_apm_repo.sdk.units.content.saas_teams_chat
+   api/synology_apm_repo.sdk.units.content.saas_teams_html_sanitizer
 
 .. toctree::
    :maxdepth: 2
    :caption: SaaS workloads (M365 / GWS)
 
+   api/synology_apm_repo.sdk.units.saas.context
    api/synology_apm_repo.sdk.units.saas.provider
+   api/synology_apm_repo.sdk.units.saas.workload_helpers
    api/synology_apm_repo.sdk.units.saas.composite_provider
    api/synology_apm_repo.sdk.units.saas.stream
    api/synology_apm_repo.sdk.units.saas.tree_strategy.synthetic_grouped
@@ -152,6 +172,7 @@ repository formats.
    api/synology_apm_repo.sdk.units.saas.drive
    api/synology_apm_repo.sdk.units.saas.site
    api/synology_apm_repo.sdk.units.saas.teams_chat
+   api/synology_apm_repo.sdk.units.saas.teams_discovery
    api/synology_apm_repo.sdk.units.saas.services
    api/synology_apm_repo.sdk.units.saas.raw_object
    api/synology_apm_repo.sdk.units.saas.objectdb
@@ -168,3 +189,5 @@ repository formats.
    api/synology_apm_repo.sdk.presentation.icons
    api/synology_apm_repo.sdk.presentation.logging_setup
    api/synology_apm_repo.sdk.presentation.export_target
+   api/synology_apm_repo.sdk.presentation.export_report
+   api/synology_apm_repo.sdk.presentation.verify_report

@@ -1,8 +1,5 @@
-"""Subprocess wrapper around the real, installed ``synology-apm-repo-cli``
-console script -- the one thing this smoke tool exists to exercise that
-neither ``tests/unit/cli/`` nor ``tests/integration/cli/`` do (both drive
-``synology_apm_repo.cli.main.app`` in-process via ``typer.testing.
-CliRunner``, never the packaged entry point as a real subprocess).
+"""Subprocess wrapper around the installed ``synology-apm-repo-cli`` console
+script; the pytest suite only ever runs the CLI in-process.
 """
 
 from __future__ import annotations
@@ -14,17 +11,12 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 
-#: Default wall-clock budget for one invocation -- generous enough for a
-#: real (small) export/verify against a real sample, but still bounded so
-#: a genuinely hung subprocess doesn't stall the whole tool.
+#: Default wall-clock budget (seconds) for one invocation.
 _DEFAULT_TIMEOUT = 120
 
 
 def _decode(raw: bytes) -> str:
-    """Lossy decode for report/log display only -- ``cat``'s stdout can be
-    arbitrary binary content (a VM disk image chunk, ...), never
-    necessarily valid UTF-8, so this never raises the way
-    ``subprocess.run(text=True)``'s default strict decoding would."""
+    """Lossy decode for report display: ``cat``'s stdout can be binary."""
     return raw.decode("utf-8", errors="replace")
 
 
@@ -39,23 +31,18 @@ class CliResult:
 
 
 class CliRunner:
-    """Invokes the real ``synology-apm-repo-cli`` binary via ``uv run``,
-    with two defaults baked into every call:
+    """Invokes ``synology-apm-repo-cli`` via ``uv run``, always with
+    ``--no-input`` (no call blocks on a prompt) and ``PAGER=""`` (the CLI's
+    "never page" signal, ``cli/paging.py``).
 
-    - ``--no-input`` is always passed, so a ``profile add``/``remove``
-      invocation never blocks forever on an interactive prompt with no
-      attached tty.
-    - ``PAGER=""`` is always set, so ``tree``/``dump`` never pipe their
-      output through a real pager regardless of tty-detection nuances --
-      an explicitly empty ``$PAGER`` is this CLI's own documented
-      "never page" signal (``cli/paging.py``).
-
-    Captures raw bytes throughout (never ``subprocess.run(text=True)``,
-    whose default strict decoding would crash on ``cat``'s binary
-    content) -- ``CliResult.stdout``/``.stderr`` are lossily decoded for
-    report display only; ``.stdout_bytes`` is the real byte count for any
-    check that cares about actual size.
+    Output is captured as bytes: ``CliResult.stdout``/``.stderr`` are
+    lossily decoded for display, ``.stdout_bytes`` is the real byte count.
+    ``base_env`` is merged into every call's environment, under each call's
+    ``env_overrides``.
     """
+
+    def __init__(self, base_env: dict[str, str] | None = None) -> None:
+        self.base_env: dict[str, str] = dict(base_env or {})
 
     def run(
         self,
@@ -65,7 +52,7 @@ class CliRunner:
         input_text: str | None = None,
     ) -> CliResult:
         argv = ["uv", "run", "synology-apm-repo-cli", "--no-input", *args]
-        env = {**os.environ, "PAGER": "", **(env_overrides or {})}
+        env = {**os.environ, "PAGER": "", **self.base_env, **(env_overrides or {})}
         input_bytes = input_text.encode("utf-8") if input_text is not None else None
         try:
             proc = subprocess.run(argv, capture_output=True, env=env, timeout=timeout, input=input_bytes)
@@ -94,13 +81,10 @@ class CliRunner:
         cancel_after: float,
         timeout: float = _DEFAULT_TIMEOUT,
     ) -> CliResult:
-        """Start the real subprocess, wait ``cancel_after`` seconds, then
-        send a real ``SIGINT`` -- the one check that's genuinely
-        subprocess-only (``export``'s real Ctrl-C double-press
-        cancellation), impossible to exercise through an in-process
-        ``CliRunner``."""
+        """Start the subprocess, wait ``cancel_after`` seconds, then send one
+        ``SIGINT``."""
         argv = ["uv", "run", "synology-apm-repo-cli", "--no-input", *args]
-        env = {**os.environ, "PAGER": "", **(env_overrides or {})}
+        env = {**os.environ, "PAGER": "", **self.base_env, **(env_overrides or {})}
         proc: subprocess.Popen[bytes] = subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env)
         time.sleep(cancel_after)
         proc.send_signal(signal.SIGINT)
@@ -127,20 +111,27 @@ class CliRunner:
 
     def sandboxed_env(self, home_dir: Path) -> dict[str, str]:
         """``env_overrides`` for a ``profile add/list/show/remove`` round
-        trip -- points every config-file lookup at a per-run temp
-        directory instead of the developer's real ``~/.config``.
-
-        ``PYTHON_KEYRING_BACKEND=keyring.backends.null.Keyring`` keeps
-        ``profile add``'s secret storage off the real OS keychain (an
-        env-var override, since a fresh subprocess can't be monkeypatched
-        the way ``tests/unit/conftest.py``'s ``fake_keyring`` does
-        in-process) -- the real backend can otherwise block indefinitely
-        on a GUI authorization prompt in a headless context. ``null.
-        Keyring`` (accepted by ``profiles/secrets.py``'s
-        ``_require_keyring()``, unlike ``fail.Keyring``) silently
-        discards the secret, which this phase never reads back."""
+        trip: config under ``home_dir`` instead of the real ``~/.config``,
+        and the ``null`` keyring backend, which ``profiles/secrets.py``
+        accepts (unlike ``fail``) and which discards secrets -- the real OS
+        keychain can block on a GUI prompt, and this phase never reads a
+        secret back."""
         return {
             "HOME": str(home_dir),
             "XDG_CONFIG_HOME": str(home_dir / ".config"),
             "PYTHON_KEYRING_BACKEND": "keyring.backends.null.Keyring",
+        }
+
+    @staticmethod
+    def file_keyring_env(config_dir: Path, keyring_file: Path) -> dict[str, str]:
+        """Environment that points the CLI's profile config at ``config_dir``
+        and its secrets at ``keyring_file`` (``tests/smoke/_file_keyring.py``),
+        leaving ``HOME`` alone so ``uv run`` keeps its own cache."""
+        return {
+            "XDG_CONFIG_HOME": str(config_dir),
+            "PYTHON_KEYRING_BACKEND": "_file_keyring.FileKeyring",
+            "SMOKE_KEYRING_FILE": str(keyring_file),
+            "PYTHONPATH": os.pathsep.join(
+                filter(None, [str(Path(__file__).resolve().parents[1]), os.environ.get("PYTHONPATH", "")])
+            ),
         }

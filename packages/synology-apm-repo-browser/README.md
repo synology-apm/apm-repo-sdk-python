@@ -33,6 +33,8 @@ path or a remote S3/Azure/SMB store, enter a decryption key if the repository
 is encrypted, then browse connections → workloads → versions → files.
 Press `c` to reconnect to a different repository, `d` to toggle verbose
 mode, `?` for a full list of keys, `q` to quit.
+Press `e` on a file to export it, or on a folder to export everything
+below it into a destination directory (existing files are never overwritten).
 
 Flags: `-h`/`--help`, `--version`, and `--no-sparse-export` (exports write
 sparse files — skipping zero/hole regions — by default; this turns that
@@ -40,7 +42,7 @@ off for the whole session).
 
 ## Requirements
 
-Python 3.11+.
+Python 3.12+.
 
 ## License
 

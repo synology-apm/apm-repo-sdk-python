@@ -1,37 +1,37 @@
-"""Display-name/kind helpers shared by ``ls``/``tree`` — the "fetch, build
-collision-suffix pairs, disambiguate" and "derive a printable per-``Node``
-field set" sequences both commands need so their outputs can't silently
-disagree on the same catalog/workload/version/node.
+"""Display-name and per-``Node`` field helpers shared by ``ls``/``tree``,
+so their outputs can't disagree on the same catalog/workload/version/node.
 """
 
 from __future__ import annotations
 
 import dataclasses
+from typing import TypedDict
 
-from synology_apm_repo.sdk.api import Catalog, Repository, Version, Workload
-from synology_apm_repo.sdk.units.base import FileState, Node, node_file_state, node_is_diagnostic, node_kind_label
-from synology_apm_repo.sdk.units.node_ref import disambiguate_catalogs, disambiguate_versions, disambiguate_workloads
+from synology_apm_repo.sdk import (
+    Catalog,
+    FileState,
+    Node,
+    Repository,
+    Version,
+    Workload,
+    disambiguate_catalogs,
+    disambiguate_versions,
+    disambiguate_workloads,
+    node_kind_label,
+)
+from synology_apm_repo.sdk.presentation import diagnostic_suffix, file_state_suffix, safe
 
 
 def display_ref(node: Node, fs_path: str) -> str:
-    """The printed ref must be directly reusable, as printed, as a fresh
-    CLI argument from the same working directory.
-
-    ``node.ref.repo_path`` is the SDK's own ``layout.repo_root`` (a
-    short, store-relative fragment like ``""`` or
-    ``"@ActiveProtectVault"``), never the filesystem path REF was
-    actually invoked with, so printing ``str(node.ref)`` verbatim would
-    hand back something that only round-trips by coincidence. Substitute
-    the real ``fs_path`` this command was given before printing. Shared
-    by ``ls``/``tree`` — both print refs from the same kind of resolved
-    ``Node``."""
+    """``node.ref`` with its repo path replaced by the ``fs_path`` the
+    command was given, so the printed ref works as a CLI argument from the
+    same working directory (``node.ref.repo_path`` is the store-relative
+    ``layout.repo_root``)."""
     return str(dataclasses.replace(node.ref, repo_path=fs_path))
 
 
 async def named_catalogs(repo: Repository) -> list[tuple[str, Catalog]]:
-    """Every catalog in ``repo``, each paired with its own disambiguated
-    display name — shared by ``ls``'s root case and ``tree``'s
-    root-catalog-entries case."""
+    """Every catalog in ``repo``, paired with its disambiguated display name."""
     catalogs = await repo.catalogs()
     return list(zip(disambiguate_catalogs(catalogs), catalogs, strict=True))
 
@@ -43,32 +43,58 @@ async def named_workloads(catalog: Catalog) -> list[tuple[str, Workload]]:
 
 
 async def named_versions(catalog: Catalog, workload: Workload) -> list[tuple[str, Version]]:
-    """Same idea as ``named_catalogs``, one level down from
-    ``named_workloads``."""
+    """Same idea as ``named_catalogs``, for a workload's versions."""
     versions = await catalog.versions(workload)
     return list(zip(disambiguate_versions(versions), versions, strict=True))
 
 
-@dataclasses.dataclass(frozen=True)
+class NodeJsonFields(TypedDict, total=False):
+    """The ``--json`` keys ``NodeFields.write_json_fields`` sets; only those
+    that apply are present."""
+
+    ref: str
+    file_state: str
+    diagnostic: bool
+
+
+@dataclasses.dataclass(frozen=True, slots=True)
 class NodeFields:
     """One resolved ``Node``'s printable ``kind``/``ref``/``file_state``/
-    ``diagnostic`` fields, shared by ``ls``'s row-builder and ``tree``'s
-    entry-builders."""
+    ``diagnostic`` fields."""
 
     kind: str
     ref: str | None
     file_state: FileState
     diagnostic: bool
 
+    def write_json_fields(self, target: NodeJsonFields) -> None:
+        """Set ``ref``/``file_state``/``diagnostic`` in a ``--json`` payload,
+        each left out when it doesn't apply rather than written as
+        ``None``/``False``."""
+        if self.ref is not None:
+            target["ref"] = self.ref
+        if self.file_state is not FileState.NORMAL:
+            target["file_state"] = self.file_state.value
+        if self.diagnostic:
+            target["diagnostic"] = True
+
+
+def node_suffix(*, ref: str | None, file_state: str, diagnostic: bool) -> str:
+    """What a human-readable listing line shows after an entry's name: its
+    ref (only present under ``--ref``/``--verbose``), then the file-state and
+    diagnostic markers, which show by default as user-facing
+    backup-completeness information (ARCHITECTURE.md's Presentation
+    section). ``ref`` is content-derived, so it goes through ``safe()``."""
+    ref_suffix = f"  [dim]{safe(ref)}[/dim]" if ref is not None else ""
+    return f"{ref_suffix}{file_state_suffix(file_state)}{diagnostic_suffix(diagnostic)}"
+
 
 def node_fields(node: Node, *, show_ref: bool, fs_path: str) -> NodeFields:
-    """``kind``/``ref``/``file_state``/``diagnostic`` for one resolved
-    item-tree ``Node`` — shared by ``ls``'s row-builder and ``tree``'s
-    entry-builders, so their ``--json`` output can't disagree on the same
-    node's fields."""
+    """The ``NodeFields`` of one item-tree ``Node``; ``ref`` only when
+    ``show_ref``."""
     return NodeFields(
         kind=node_kind_label(node),
         ref=display_ref(node, fs_path) if show_ref else None,
-        file_state=node_file_state(node),
-        diagnostic=node_is_diagnostic(node),
+        file_state=node.file_state,
+        diagnostic=node.is_diagnostic,
     )

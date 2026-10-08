@@ -1,36 +1,37 @@
-"""``FsProvider``: FS workloads. Unlike VM/PC/PS, an FS
-version has no per-file ``object_table`` rows — the whole version is
-one shared virtual image, ``<snapshotUuid>/<versionId>/dedup.img``, and
-every file is a ``[content_dedup_id, content_dedup_id + file_size)``
-byte range within it (FORMAT-SPEC.md: fs-addressing). This is also the
-cheapest tree in the project: ``entry_table.dirname`` is a full
-absolute path string, so ``children()`` is one indexed equality query
-per level — no recursion, no parent-id chain (FORMAT-SPEC.md: fs-addressing).
+"""``FsProvider``: FS workloads. The whole version is one shared virtual
+image, ``<snapshotUuid>/<versionId>/dedup.img``, and every file is a
+``[content_dedup_id, content_dedup_id + file_size)`` byte range within it
+(FORMAT-SPEC.md: Workload-specific addressing, FS). ``entry_table.dirname`` is a full absolute path,
+so ``children()`` is one indexed equality query per level.
 
-Locating ``dedup.img`` itself goes through the same ``target.db``
-mechanism as ``units.device`` (FORMAT-SPEC.md: fs-addressing): FS lands a ``target.db``
-too, purely to register ``version.db.zst`` as a ``dedup_object=false``
-object and give up its ``version_table.version_id``, which combines
-with ``Version.target_id`` (the ``snapshotUuid``) to look ``dedup.img`` up
-in ``db/file_map``.
+``dedup.img`` is located through the version's ``target.db``: its
+``version_table.version_id`` combined with ``Version.target_id`` (the
+``snapshotUuid``) is the path looked up in ``db/file_map``.
 """
 
 from __future__ import annotations
 
-import asyncio
-from types import TracebackType
-from typing import Any, Self
+import dataclasses
+from typing import Any, override
 
 import aiosqlite
 
-from ..catalog.version import Version, open_target_db, resolve_copy_meta_dir
+from .._util.closing import AsyncClosing
+from .._util.once import AsyncOnce
+from ..catalog.version import Version, open_target_db, resolve_copy_meta_dir, target_version_id
 from ..dedup.dedup_file import DedupFile
 from ..dedup.repository import DedupRepo
 from ..errors import NotFoundError
 from ..storage.sqlite import apply_index_hint
-from ..storage.sqlite_source import SqliteSource, peel
-from .base import Node, RestorableUnit, UnitKind, dir_first_order_by, mtime_attrs, not_restorable
+from ..storage.sqlite_source import SqliteSource
+from ..units.provider_kit import dir_first_order_by, mtime_from_epoch, not_restorable
+from .base import Node, RestorableUnit, UnitKind
 from .node_ref import NodeRef, canonical_ref_for
+
+#: Fallback ceiling on ``version.db.zst``'s decompressed size, used only
+#: when its zstd frame declares none (a declared size is enforced instead —
+#: see ``format.compression.iter_decompressed_zstd``).
+_MAX_VERSION_DB_DECOMPRESS_SIZE_FALLBACK = 2 << 30  # 2 GiB
 
 _FILE_TYPE_FILE = 1
 _FILE_TYPE_DIR = 2
@@ -40,56 +41,76 @@ def _join_path(dirname: str, basename: str) -> str:
     return f"/{basename}" if dirname == "/" else f"{dirname}/{basename}"
 
 
-class FsProvider:
-    """``UnitProvider`` for one FS workload version."""
+@dataclasses.dataclass(frozen=True, slots=True)
+class _Dir:
+    """``Node.handle`` of a directory: its ``entry_table.dirname``."""
+
+    dirname: str
+
+
+@dataclasses.dataclass(frozen=True, slots=True)
+class _File:
+    """``Node.handle`` of a file: its offset in the version's dedup image."""
+
+    content_dedup_id: int
+
+
+class FsProvider(AsyncClosing):
+    """``ClosableUnitProvider`` for one FS workload version."""
 
     def __init__(self, repo: DedupRepo, version: Version) -> None:
         self._repo = repo
         self._version = version
-        self._meta_dir: str | None = None
-        self._entry_db: SqliteSource | None = None
-        self._dedup_img_file: DedupFile | None = None
+        self._entry_db: AsyncOnce[SqliteSource] = AsyncOnce(self._open_entry_db)
+        self._dedup_img: AsyncOnce[DedupFile] = AsyncOnce(self._open_dedup_img)
 
     # -- location resolution ------------------------------------------
 
     def _resolve_meta_dir(self) -> str:
-        if self._meta_dir is None:
-            self._meta_dir = resolve_copy_meta_dir(self._version, self._repo.layout.repo_root)
-        return self._meta_dir
+        """This version's ``copy_meta_file/<dir>``; pure, so not cached.
+
+        Raises:
+            NotFoundError: No usable ``copy_target_version_meta`` row.
+        """
+        return resolve_copy_meta_dir(self._version, self._repo.layout.repo_root)
 
     async def _entry_table_connection(self) -> aiosqlite.Connection:
-        if self._entry_db is not None:
-            return self._entry_db.connection
-        meta_dir = self._resolve_meta_dir()  # raises NotFoundError if this version has no meta at all
+        return (await self._entry_db.get()).connection
+
+    async def _open_entry_db(self) -> SqliteSource:
+        meta_dir = self._resolve_meta_dir()
         meta = self._version.meta
-        assert meta is not None  # guaranteed by the successful _resolve_meta_dir() call above
+        assert meta is not None  # _resolve_meta_dir() succeeded
         version_db_rel = next((f for f in meta.meta_filenames if f.endswith("version.db.zst")), None)
         if version_db_rel is None:
             raise NotFoundError(f"version {self._version.version_uid} has no version.db.zst in meta_filenames")
         raw = await self._repo.store.read(f"{meta_dir}/{version_db_rel}")
-        # to_thread: peel() is pure CPU work, but version.db.zst can be
-        # the largest single payload this project decrypts+decompresses --
-        # left on the event loop it would stall every other Task.
-        payload, _envelopes = await asyncio.to_thread(peel, raw, vault_key=self._repo.vault_key)
-        self._entry_db = await SqliteSource.from_bytes(payload)
-        return self._entry_db.connection
+        entry_db, _envelopes = await SqliteSource.from_enveloped_bytes(
+            raw,
+            vault_key=self._repo.vault_key,
+            max_output_size=_MAX_VERSION_DB_DECOMPRESS_SIZE_FALLBACK,
+            what="version.db.zst",
+        )
+        return entry_db
 
-    async def _dedup_img(self) -> DedupFile:
-        if self._dedup_img_file is not None:
-            return self._dedup_img_file
+    async def dedup_img(self) -> DedupFile:
+        """The version's shared ``dedup.img`` composition, opened once and
+        cached — the content every file node's ``(offset, size)`` indexes.
+
+        Raises:
+            NotFoundError: The version's meta directory, ``target.db``'s
+                ``version_table`` row, or ``dedup.img`` itself is missing.
+            ResourceLimitExceededError: ``target.db``'s temporary copy
+                doesn't fit with the free-space reserve left.
+        """
+        return await self._dedup_img.get()
+
+    async def _open_dedup_img(self) -> DedupFile:
         meta_dir = self._resolve_meta_dir()
         async with await open_target_db(self._repo, self._version, meta_dir) as target_db:
-            cursor = await target_db.connection.execute("SELECT version_id FROM version_table")
-            row = await cursor.fetchone()
-        if row is None:
-            raise NotFoundError("target.db has no version_table row", ref=meta_dir)
-        version_id = row[0]
+            version_id = await target_version_id(target_db, meta_dir)
         path = f"{self._version.target_id}/{version_id}/dedup.img"
-        location = await self._repo.locate_file(path)
-        self._dedup_img_file = self._repo.open_composition(
-            location.stream_id, location.session_id, location.comp_offset, size=location.file_size
-        )
-        return self._dedup_img_file
+        return await self._repo.open_file(path)
 
     # -- UnitProvider -------------------------------------------------
 
@@ -97,38 +118,20 @@ class FsProvider:
         segments = [seg for seg in dirname.split("/") if seg]
         return canonical_ref_for(self._repo, self._version, segments)
 
+    @override
     async def close(self) -> None:
-        """Release the sqlite connection(s) this provider opened. Not
-        merely for tidiness: a leaked ``aiosqlite`` connection's own
-        background worker thread keeps the interpreter alive."""
-        if self._entry_db is not None:
-            await self._entry_db.close()
-            self._entry_db = None
-
-    async def __aenter__(self) -> Self:
-        return self
-
-    async def __aexit__(
-        self,
-        exc_type: type[BaseException] | None,
-        exc: BaseException | None,
-        tb: TracebackType | None,
-    ) -> None:
-        await self.close()
+        """Close the entry-table connection, if opened."""
+        await self._entry_db.close(SqliteSource.close)
 
     def root(self) -> Node:
-        """Pure construction — no I/O, so this stays synchronous (see
-        ``UnitProvider``)."""
-        return Node(ref=self._ref_for_dir("/"), name="/", is_leaf=False, attrs={"dirname": "/"})
+        """The ``/`` directory node. No I/O."""
+        return Node(ref=self._ref_for_dir("/"), name="/", is_leaf=False, handle=_Dir("/"))
 
     async def children(self, node: Node, offset: int = 0, limit: int | None = None) -> list[Node]:
-        dirname = node.attrs.get("dirname")
-        if dirname is None:
+        if not isinstance(node.handle, _Dir):
             return []
+        dirname = node.handle.dirname
         conn = await self._entry_table_connection()
-        # Safe to call unconditionally: a cheap prefix check skips it if
-        # already indexed, and a read-only connection just makes CREATE
-        # INDEX raise, caught as a no-op.
         await apply_index_hint(conn, "entry_table", ["dirname"])
         order_by = dir_first_order_by(f"file_type = {_FILE_TYPE_DIR}", "basename, rowid")
         cursor = await conn.execute(
@@ -141,13 +144,20 @@ class FsProvider:
         for basename, file_size, file_mtime, file_type, content_dedup_id, xattr in rows:
             is_dir = file_type == _FILE_TYPE_DIR
             child_path = _join_path(dirname, basename)
-            attrs: dict[str, Any] = {"xattr": xattr, "path": child_path}
-            attrs.update(mtime_attrs(file_mtime))
+            details: dict[str, Any] = {"xattr": xattr, "path": child_path}
+            mtime = mtime_from_epoch(file_mtime)
             if is_dir:
-                attrs["dirname"] = child_path
-                nodes.append(Node(ref=self._ref_for_dir(child_path), name=basename, is_leaf=False, attrs=attrs))
+                nodes.append(
+                    Node(
+                        ref=self._ref_for_dir(child_path),
+                        name=basename,
+                        is_leaf=False,
+                        mtime=mtime,
+                        details=details,
+                        handle=_Dir(child_path),
+                    )
+                )
             else:
-                attrs["content_dedup_id"] = content_dedup_id
                 nodes.append(
                     Node(
                         ref=self._ref_for_dir(child_path),
@@ -155,17 +165,16 @@ class FsProvider:
                         is_leaf=True,
                         kind=UnitKind.FILE,
                         size=file_size,
-                        attrs=attrs,
+                        mtime=mtime,
+                        details=details,
+                        handle=None if content_dedup_id is None else _File(int(content_dedup_id)),
                     )
                 )
         return nodes
 
     async def unit(self, node: Node) -> RestorableUnit:
-        content_dedup_id = node.attrs.get("content_dedup_id")
-        if content_dedup_id is None:
+        if not isinstance(node.handle, _File):
             not_restorable("node", node.name)
-        dedup_img = await self._dedup_img()
-        view = dedup_img.view(int(content_dedup_id), node.size or 0)
-        return RestorableUnit(
-            ref=node.ref, name=node.name, is_leaf=True, kind=node.kind, size=node.size, attrs=node.attrs, content=view
-        )
+        dedup_img = await self.dedup_img()
+        view = dedup_img.view(node.handle.content_dedup_id, node.size or 0)
+        return RestorableUnit.of(node, view)

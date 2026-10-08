@@ -1,6 +1,5 @@
-"""Content Layer — Teams/Chat's HTML rendering. Pure ``rows -> HTML string``
-formatting, no I/O; the tree-navigation and message/sticker-fetching logic
-that calls this lives in ``units/saas/teams_chat.py``.
+"""Content Layer — Teams/Chat's HTML rendering: pure ``rows -> HTML
+string`` formatting, no I/O. ``units/saas/teams_chat.py`` calls it.
 """
 
 from __future__ import annotations
@@ -9,8 +8,9 @@ import dataclasses
 import html as html_module
 from collections.abc import Mapping, Sequence
 from datetime import UTC, datetime
-from html.parser import HTMLParser
-from json import loads as json_loads
+
+from ..._util.jsonparse import try_parse_json_object
+from .saas_teams_html_sanitizer import render_message_body_html
 
 _SYSTEM_EVENT_LABEL = "(system event)"
 # A deleted message's content_preview is literally "<The message is
@@ -18,39 +18,22 @@ _SYSTEM_EVENT_LABEL = "(system event)"
 _DELETED_MESSAGE_LABEL = "(this message has been deleted)"
 
 
-@dataclasses.dataclass(frozen=True)
+@dataclasses.dataclass(frozen=True, slots=True)
 class _RenderedMessage:
-    created: str | None  # already a display string (ISO or formatted) — no further parsing needed downstream
+    created: str | None  # a display string (ISO or formatted)
     sender: str
     is_system: bool
     is_deleted: bool
     msg_id: str | None
     reply_to_id: str | None
     content: str
-    preview: str  # plain-text (never HTML), for the reply-quote line — never the already-rendered ``content``
+    preview: str  # plain text, for the reply-quote line
     attachments: tuple[Mapping[str, object], ...]
 
 
-def _parse_json_object(value: object) -> dict[str, object]:
-    """``value`` decoded as a JSON object, or ``{}`` for anything that
-    isn't valid JSON or isn't an object at the top level. Never raises:
-    ``metadata``/``author`` are themselves JSON strings inside
-    ``msg_info_table`` rows, but a future connector version drifting
-    their shape shouldn't crash rendering."""
-    if not isinstance(value, str) or not value:
-        return {}
-    try:
-        parsed = json_loads(value)
-    except ValueError:
-        return {}
-    return parsed if isinstance(parsed, dict) else {}
-
-
 def _sender_from_row(metadata: Mapping[str, object], row: Mapping[str, object]) -> str:
-    # Primary: metadata.from.user.displayName (Microsoft Graph chatMessage
-    # shape). Fallback: the row's own ``author`` JSON column (populated
-    # even for some rows where ``from`` is present too — kept as a
-    # fallback for schema drift, not redundancy).
+    # metadata.from.user.displayName (Graph chatMessage), else the row's
+    # ``author`` JSON column.
     from_field = metadata.get("from")
     if isinstance(from_field, dict):
         user = from_field.get("user")
@@ -58,7 +41,8 @@ def _sender_from_row(metadata: Mapping[str, object], row: Mapping[str, object]) 
             name = user.get("displayName")
             if isinstance(name, str) and name:
                 return name
-    author = _parse_json_object(row.get("author"))
+    # metadata/author are JSON strings inside msg_info_table rows; a drifted shape renders as empty.
+    author = try_parse_json_object(row.get("author")) or {}
     name = author.get("name")
     if isinstance(name, str) and name:
         return name
@@ -66,10 +50,8 @@ def _sender_from_row(metadata: Mapping[str, object], row: Mapping[str, object]) 
 
 
 def _created_from_row(metadata: Mapping[str, object], row: Mapping[str, object]) -> str | None:
-    # Primary: metadata.createdDateTime (ISO 8601 UTC — used as-is, no
-    # re-parsing/re-formatting, to stay maximally faithful to the
-    # source). Fallback: the row's own create_time (Unix epoch seconds),
-    # for a metadata shape that ever drifts.
+    # metadata.createdDateTime (ISO 8601 UTC) as-is, else the row's
+    # create_time (epoch seconds) formatted.
     created = metadata.get("createdDateTime")
     if isinstance(created, str) and created:
         return created
@@ -81,10 +63,7 @@ def _created_from_row(metadata: Mapping[str, object], row: Mapping[str, object])
 
 def _content_from_row(metadata: Mapping[str, object], row: Mapping[str, object], *, is_system: bool) -> str:
     if is_system:
-        # A system-message body is the literal, content-free XML-ish tag
-        # "<systemEventMessage/>" — showing that verbatim to a human
-        # reader is noise, not information, so it's replaced with a
-        # generic label instead of escaped and displayed as-is.
+        # The body is a content-free "<systemEventMessage/>" tag.
         return _SYSTEM_EVENT_LABEL
     body = metadata.get("body")
     if isinstance(body, dict):
@@ -102,177 +81,10 @@ def _attachments_from_row(metadata: Mapping[str, object]) -> tuple[Mapping[str, 
     return tuple(a for a in attachments if isinstance(a, dict))
 
 
-# Structural/inline markup that appears inside an "html" contentType
-# body. Rendered bare —
-# every attribute (including Teams' own inline ``style=``) is dropped, not
-# just whitelisted, so this page's own CSS controls the look consistently
-# rather than trusting per-message inline styling; only ``<a href>`` (see
-# _MessageBodyRenderer.handle_starttag) keeps one attribute, and even
-# that only after scheme-validating it.
-_ALLOWED_STRUCTURAL_TAGS = frozenset(
-    {
-        "div",
-        "p",
-        "blockquote",
-        "h1",
-        "h2",
-        "h3",
-        "h4",
-        "ul",
-        "ol",
-        "li",
-        "table",
-        "thead",
-        "tbody",
-        "tr",
-        "td",
-        "th",
-        "colgroup",
-        "col",
-        "hr",
-        "br",
-        "b",
-        "strong",
-        "i",
-        "em",
-        "u",
-        "s",
-        "sup",
-        "sub",
-        "span",
-    }
-)
-# Void — rendered fully from their own start tag (or dropped), never
-# pushed onto the open-tag stack and never paired with a close tag.
-_VOID_STRUCTURAL_TAGS = frozenset({"br", "hr", "col"})
-_LINK_SCHEMES = ("http://", "https://")
-
-
-class _MessageBodyRenderer(HTMLParser):
-    """Renders one message's raw ``"html"`` contentType body through a
-    fixed, closed allowlist of safe tags (``_ALLOWED_STRUCTURAL_TAGS``
-    plus ``img``/``emoji``/``at``/``a``) — arbitrary source markup is
-    never interpreted or re-emitted verbatim, and every attribute except
-    a scheme-validated ``<a href>`` is dropped so this page's own CSS,
-    not per-message inline styling, controls the look."""
-
-    def __init__(self, stickers: Mapping[str, str]) -> None:
-        super().__init__(convert_charrefs=True)
-        self._stickers = stickers
-        self.parts: list[str] = []
-        # Tags this instance actually emitted an opening for, in order —
-        # a matching close only fires (and only emits ``</tag>``) when it's
-        # the top of this stack; anything else (an end tag for a tag we
-        # dropped, or genuinely mismatched source markup) is a no-op,
-        # never an exception. Exact top-of-stack matching is a safety
-        # margin against malformed markup, not a mechanism real
-        # Teams-generated HTML is expected to exercise.
-        self._open: list[str] = []
-
-    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
-        if tag == "img":
-            self._handle_img(dict(attrs))
-            return
-        if tag == "emoji":
-            # <emoji id="..." alt="🙂"> is how Teams' own emoji picker
-            # inserts an emoji — never a plain Unicode character in the
-            # raw body. Render its alt (the actual character) directly.
-            alt = dict(attrs).get("alt")
-            if alt:
-                self.parts.append(html_module.escape(alt))
-            return
-        if tag == "at":
-            # <at id="0">display name</at> is a genuine Microsoft Graph
-            # @mention; render as a styled @name span. metadata.mentions[]
-            # is redundant with this tag's own inner text and isn't
-            # consulted separately.
-            self.parts.append('<span class="mention">@')
-            self._open.append("at")
-            return
-        if tag == "a":
-            href = dict(attrs).get("href") or ""
-            if href.lower().startswith(_LINK_SCHEMES):
-                escaped_href = html_module.escape(href, quote=True)
-                self.parts.append(f'<a href="{escaped_href}" target="_blank" rel="noopener noreferrer">')
-            else:
-                self.parts.append("<a>")  # real href missing/unsafe — keep the text, drop the link
-            self._open.append("a")
-            return
-        if tag in _VOID_STRUCTURAL_TAGS:
-            self.parts.append(f"<{tag}>")
-            return
-        if tag in _ALLOWED_STRUCTURAL_TAGS:
-            self.parts.append(f"<{tag}>")
-            self._open.append(tag)
-            return
-        # Unrecognized tag (includes the real <attachment> marker) —
-        # dropped structurally; its own text content still comes through
-        # handle_data.
-
-    def handle_startendtag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
-        # A self-closed void tag (e.g. real ``<attachment id="..."/>``-
-        # style or ``<br/>``) — the parser wouldn't otherwise call
-        # handle_endtag for these, so route through the same start-tag
-        # logic and skip pushing anything onto the open stack.
-        if tag == "img":
-            self._handle_img(dict(attrs))
-        elif tag == "emoji":
-            alt = dict(attrs).get("alt")
-            if alt:
-                self.parts.append(html_module.escape(alt))
-        elif tag in _VOID_STRUCTURAL_TAGS:
-            self.parts.append(f"<{tag}>")
-        # <at>/<a>/other allowed tags never appear genuinely self-closed
-        # in real data (they always have real inner text); a self-closed
-        # occurrence of one has no text to preserve either way, so it's
-        # simply dropped rather than opening a tag with no matching close.
-
-    def handle_endtag(self, tag: str) -> None:
-        if not self._open or self._open[-1] != tag:
-            return
-        self._open.pop()
-        self.parts.append("</span>" if tag == "at" else f"</{tag}>")
-
-    def _handle_img(self, attrs: Mapping[str, str | None]) -> None:
-        # A sticker's <img src> matches one of this message's own
-        # sticker_info_table rows by URL and becomes a real,
-        # base64-embedded <img>. Any other <img> (e.g. a live Graph/giphy
-        # URL this offline tool can't fetch) becomes a text placeholder
-        # built from its own alt instead of silently vanishing.
-        src = attrs.get("src")
-        base64_content = self._stickers.get(src) if src is not None else None
-        if base64_content is not None:
-            # Hardcoded to JPEG, not a general image-type sniff — Teams
-            # stickers are JPEG, identifiable by their "/9j/" base64 prefix.
-            self.parts.append(f'<img class="sticker" alt="[sticker]" src="data:image/jpeg;base64,{base64_content}">')
-            return
-        alt = attrs.get("alt")
-        label = html_module.escape(alt) if alt else "image"
-        self.parts.append(f'<span class="inline-media">🖼 {label}</span>')
-
-    def handle_data(self, data: str) -> None:
-        if data.strip():
-            self.parts.append(html_module.escape(data))
-
-
-def _render_message_body_html(raw_content: str, stickers: Mapping[str, str]) -> str:
-    """Renders one message's raw body content safely: plain ``"text"``
-    contentType (no tags) returns escaped text unchanged; a real
-    ``"html"`` contentType body is parsed through
-    ``_MessageBodyRenderer``'s closed tag allowlist, never re-emitting
-    arbitrary source markup verbatim."""
-    if "<" not in raw_content:
-        return html_module.escape(raw_content)
-    renderer = _MessageBodyRenderer(stickers)
-    renderer.feed(raw_content)
-    renderer.close()
-    return "".join(renderer.parts)
-
-
 def _message_from_row(
     row: Mapping[str, object], stickers_by_msg_id: Mapping[str, Mapping[str, str]]
 ) -> _RenderedMessage:
-    metadata = _parse_json_object(row.get("metadata"))
+    metadata = try_parse_json_object(row.get("metadata")) or {}
     is_system = bool(row.get("is_sys_message"))
     is_deleted = bool(row.get("is_deleted"))
     reply_to = row.get("reply_to_id")
@@ -280,20 +92,15 @@ def _message_from_row(
     preview_raw = row.get("content_preview")
     preview = preview_raw if isinstance(preview_raw, str) else ""
     raw_content = _content_from_row(metadata, row, is_system=is_system)
-    # System messages stay raw here — _render_message_html's own system
-    # branch does its own escaping of message.content directly (a
-    # separate code path from the regular-message body below, entirely
-    # unchanged); pre-rendering them here too would double-escape.
-    # Deleted messages show the placeholder instead of the emptied real
-    # body — metadata.body.content is emptied to "" by the connector for
-    # a deleted row, which would otherwise render as a blank message with
-    # no indication anything was ever there.
+    # A system message's content stays raw: _render_message_html escapes
+    # it. A deleted message's body is emptied by the connector, so it
+    # shows the placeholder.
     if is_deleted:
         content = _DELETED_MESSAGE_LABEL
     elif is_system:
         content = raw_content
     else:
-        content = _render_message_body_html(raw_content, stickers_by_msg_id.get(str(msg_id), {}))
+        content = render_message_body_html(raw_content, stickers_by_msg_id.get(str(msg_id), {}))
     return _RenderedMessage(
         created=_created_from_row(metadata, row),
         sender=_sender_from_row(metadata, row),
@@ -313,12 +120,8 @@ def _render_attachment_html(attachment: Mapping[str, object]) -> str:
     label = html_module.escape(name) if isinstance(name, str) and name else "attachment"
     ctype = html_module.escape(content_type) if isinstance(content_type, str) and content_type else "unknown type"
     content = attachment.get("content")
-    # An Adaptive Card attachment's content is a JSON string sitting
-    # directly in this same metadata — no separate object fetch needed,
-    # so it's shown in full, not treated as unavailable. The *other*
-    # real Microsoft Graph shape is an ``attachmentType: "reference"``
-    # attachment (content left out, only ``contentUrl`` pointing at a live
-    # web resource this offline tool cannot follow).
+    # Inline content (e.g. an Adaptive Card's JSON) is shown in full; a
+    # "reference" attachment only has a live contentUrl, unreachable offline.
     if isinstance(content, str) and content:
         return (
             f'<div class="attachment"><div class="attachment-hdr">📎 {label} ({ctype})</div>'
@@ -332,9 +135,7 @@ _REPLY_PREVIEW_LENGTH = 80
 
 
 def _avatar_class(sender: str) -> str:
-    # Deterministic across runs (unlike the builtin hash() on str, which
-    # is randomized per-process) — a cosmetic per-sender color pick, not
-    # a reproduction of any real avatar the source data carries.
+    # Not hash(): str hashing is randomized per process.
     bucket = sum(ord(c) for c in sender) % _AVATAR_COLOR_COUNT
     return f"avatar-{bucket}"
 
@@ -354,10 +155,6 @@ def _reply_note_html(message: _RenderedMessage, by_msg_id: Mapping[str, _Rendere
         return ""
     parent = by_msg_id.get(message.reply_to_id)
     if parent is None:
-        # The parent isn't in this same export (a real, if rare,
-        # possibility — e.g. it belongs to a version this page wasn't
-        # built from) — reply_to_id itself is a real link, just not one
-        # this page can resolve.
         return '<div class="reply">&#8618; replying to a message not included in this export</div>'
     if parent.is_deleted:
         snippet = html_module.escape(_DELETED_MESSAGE_LABEL)
@@ -378,20 +175,10 @@ def _render_message_html(message: _RenderedMessage, by_msg_id: Mapping[str, _Ren
     reply_note = _reply_note_html(message, by_msg_id)
     css_class = "msg deleted" if message.is_deleted else "msg"
     if message.is_deleted:
-        # The placeholder text itself (_DELETED_MESSAGE_LABEL) is plain,
-        # trusted text this module wrote, not source content — still
-        # escaped for uniformity/defense in depth, not because it could
-        # ever actually contain markup.
         body = f'<div class="body">{html_module.escape(message.content)}</div>'
         attachments_html = ""
     else:
-        # message.content is already safe HTML by the time it gets
-        # here — _message_from_row built it via _render_message_body_html,
-        # which either escaped the raw content outright (plain "text"
-        # contentType) or ran it through _MessageBodyRenderer's own safe
-        # tag allowlist. Escaping it *again* here would turn every real
-        # structural tag/sticker/mention/emoji it already rendered back
-        # into visible, useless markup text.
+        # Already safe HTML from render_message_body_html; not re-escaped.
         body = f'<div class="body">{message.content}</div>'
         attachments_html = "".join(_render_attachment_html(a) for a in message.attachments)
     return (
@@ -446,20 +233,12 @@ def render_channel_html(
     channel_name: str,
     stickers_by_msg_id: Mapping[str, Mapping[str, str]] | None = None,
 ) -> str:
-    """One self-contained HTML page (no external resources/JS) for a
-    Teams channel/chat's messages. ``rows`` are ``msg_info_table``
-    records already read from the decompressed message DB; this
-    function itself does no I/O. ``stickers_by_msg_id`` —
-    ``{msg_id: {sticker_url: base64_content}}`` from
-    ``_read_stickers`` — defaults to ``{}``. Messages sort by
-    timestamp (undated rows first), group under a date separator, and
-    resolve a real ``reply_to_id`` to its parent's sender/preview
-    rather than a bare id.
-
-    Known limitation: ``rows`` is the caller's entire channel/chat
-    history (no cap), held in memory at once as one string inside a
-    ``LazyArtifact`` — not the "small" blob that class assumes, for a
-    genuinely large channel's transcript."""
+    """One self-contained HTML page (no external resources or JS) for a
+    Teams channel/chat's ``msg_info_table`` rows. ``stickers_by_msg_id``
+    is ``{msg_id: {sticker_url: base64_content}}``. Messages sort by
+    timestamp (undated first), group under date separators, and show a
+    reply's parent sender and preview. The whole history is rendered into
+    one string."""
     stickers_by_msg_id = stickers_by_msg_id or {}
     messages = sorted((_message_from_row(row, stickers_by_msg_id) for row in rows), key=lambda m: m.created or "")
     by_msg_id = {m.msg_id: m for m in messages if m.msg_id is not None}

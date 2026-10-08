@@ -1,15 +1,11 @@
-"""``Session``/``Repository``/``Catalog``: the Repository Layer, the SDK's
-outward-facing door for CLI/TUI code — see ``ARCHITECTURE.md``'s
-"Repository Layer" section for the split and what each covers. Every
-public name from all three is re-exported here, plus the value types
-their methods hand back (``Connection``, ``Version``/``Workload``,
-``ExportResult``, ``KeyVerification``, ``RepositoryLayout``) and the
-``Finding``-rendering helpers (``group_findings``/``sort_key``/
-``AugmentedFinding``/``group_count_label``, from ``dedup.verify_report``).
-Everything below this layer is an implementation detail this package
-hides; CLI/TUI code otherwise imports only ``units.base``,
-``units.node_ref``, ``presentation``, ``storage``, ``errors``,
-``identifiers``, and ``profiles``.
+"""The Repository Layer, the SDK's facade (see ``ARCHITECTURE.md``'s
+"Repository Layer"): ``Session``/``Repository``/``Catalog`` and every
+public name they need, gathered from below — the value types their methods
+return.
+The export surface is gathered separately, in ``synology_apm_repo.sdk.export``.
+
+Internal: the top-level ``synology_apm_repo.sdk`` package re-exports all of
+it, and consumers import from there.
 """
 
 from __future__ import annotations
@@ -17,33 +13,36 @@ from __future__ import annotations
 from ..catalog.connection import Connection
 from ..catalog.version import Version
 from ..catalog.workload import Workload
-from ..dedup.dedup_file import ExportResult
 from ..dedup.keys import KeyVerification
-from ..dedup.verify_report import AugmentedFinding, group_count_label, group_findings, sort_key
+from ..findings import Finding, Stage, Symptom, VerifyLevel
 from ..storage.layout import RepositoryLayout
-from .catalog import Catalog, Frame
-from .repository import Finding, KeyStatus, Repository, Stage, Symptom, VerifyLevel
+from ..units.resolve import find_path_with_children
+from .catalog import Catalog, CatalogFrame, Frame, NodeFrame, RawView, RootFrame, VersionLocation, WorkloadFrame
+from .repository import KeyStatus, Repository, SetKeyResult
 from .session import Session, TraceEvent
 
 __all__ = [
-    "AugmentedFinding",
     "Catalog",
+    "CatalogFrame",
     "Connection",
-    "ExportResult",
     "Finding",
     "Frame",
     "KeyStatus",
     "KeyVerification",
+    "NodeFrame",
+    "RawView",
     "Repository",
     "RepositoryLayout",
+    "RootFrame",
     "Session",
+    "SetKeyResult",
     "Stage",
     "Symptom",
     "TraceEvent",
-    "Version",
     "VerifyLevel",
+    "Version",
+    "VersionLocation",
     "Workload",
-    "group_count_label",
-    "group_findings",
-    "sort_key",
+    "WorkloadFrame",
+    "find_path_with_children",
 ]

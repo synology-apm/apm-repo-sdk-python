@@ -4,30 +4,29 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "synology-apm-repo-browser"
-version = "0.2.0"
+version = "0.3.0"
 description = "Textual TUI browser/exporter for Synology APM/APV/Object-Storage dedup repositories, built on synology-apm-repo-sdk"
 readme = "README.md"
 license = "Apache-2.0"
 authors = [
     { name = "Synology Inc." },
 ]
-requires-python = ">=3.11"
+requires-python = ">=3.12"
 keywords = ["synology", "activeprotect", "backup", "apm", "dedup", "tui"]
 classifiers = [
     "Environment :: Console :: Curses",
     "Intended Audience :: System Administrators",
     "Programming Language :: Python :: 3",
-    "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
     "Programming Language :: Python :: 3.14",
     "Topic :: System :: Systems Administration",
 ]
 dependencies = [
-    "synology-apm-repo-sdk==0.2.0",
-    "textual>=0.60",
-    "rich>=13.0",
-    "icalendar>=5.0",
+    "synology-apm-repo-sdk==0.3.0",
+    "textual>=2.1",
+    "rich>=13.8",
+    "icalendar>=5.0.2,!=6.1.0,!=6.1.1,!=6.1.2",
 ]
 
 [project.urls]

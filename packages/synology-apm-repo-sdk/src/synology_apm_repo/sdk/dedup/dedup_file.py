@@ -2,80 +2,90 @@
 
 Any workload — VM disk image, FS file, SaaS raw object — ultimately
 reduces to a ``(stream_id, session_id, comp_offset)`` triple plus a size.
-Once you have that, everything above this module (catalog, units, CLI,
-TUI) only ever calls ``read()``/``stream()``/``export_to()`` — never
-touches a bucket, chunk, or composition record directly. ``ByteRangeView``
-is the second shared primitive: FS's ``content_dedup_id`` + ``file_size``
-and SaaS's ``object_table.(offset, length)`` are the same concept (a named
-sub-range of a bigger dedup file), so they share this one class instead of
-each workload reinventing it.
+Everything above this module (catalog, units, CLI, TUI) reads content
+through ``read()``/``stream()``/``export_range()``, never a bucket or
+chunk. ``ByteRangeView`` is the second shared
+primitive: FS's ``content_dedup_id`` + ``file_size`` and SaaS's
+``object_table.(offset, length)`` are both a named sub-range of a bigger
+dedup file.
 
-Performance-critical property: every ``read()``/``extents()`` call
-resolves its starting chunk-map record via ``CompositionRecord.entries``'s
-binary search — over already-known page boundaries, page-sized reads for
-anything not yet cached — never a linear, one-entry-at-a-time scan.
+Every ``read()`` locates its starting chunk-map record by
+``CompositionRecord.entries``'s binary search, never a linear scan.
 """
 
 from __future__ import annotations
 
-import dataclasses
-import enum
-from collections.abc import AsyncIterator, Awaitable, Callable
-from concurrent.futures import ProcessPoolExecutor
-from pathlib import Path
-from typing import Protocol, runtime_checkable
+from collections.abc import AsyncIterator, Iterable
+from typing import Protocol, override, runtime_checkable
 
+from ..errors import ResourceLimitExceededError
 from ..format.addressing import ChunkAddress
 from ..format.chunkmap import ChunkMapKind
 from ..format.const import FIXED_CHUNK_LENGTH
-from ..identifiers import BucketId, ChunkIdx, StreamId
+from ..identifiers import BucketId, ChunkIdx, SessionId, StreamId
+from . import export_scheduler
+from .chunk_walk import (
+    ascending_runs,
+    count_planned_bytes,
+    data_extent_k_bounds,
+    decode_bucket_chunks,
+    iter_chunk_runs,
+    merge_overlapping_ranges,
+)
 from .composition_reader import CompositionReader, CompositionRecord
-from .pool import BucketReaderCache, Pool
+from .export_sink import ExportWriter, WrittenBytesCallback
+from .extent import DataExtent, ExportResult, Extent, ExtentKind, GapExtent
+from .pool import Pool
+from .pool_descriptor import PoolDescriptor
 
 DEFAULT_STREAM_BLOCK = 8 << 20  # 8 MiB
-"""Shared by every real ``stream_via_read`` caller across this
-project's own ``ContentSource`` implementers (``DedupFile``,
-``ByteRangeView``, and — one layer up, in ``units/`` —
-``VirtualDiskContentSource``/``DissectFileContentSource``/
-``_LocalFileContentSource``) as their own ``stream()``'s default block
-size, so the literal is defined once instead of independently redeclared
-per module."""
+"""Default block size of every ``ContentSource`` implementer's ``stream()``."""
+
+#: Ceiling on one ``DedupFile.read()``/``ByteRangeView.read()`` call's
+#: ``bytearray(length)`` allocation, since ``length`` traces back to
+#: repository-declared metadata with no bound of its own. A caller needing
+#: more uses ``stream()``, which allocates at most one
+#: ``DEFAULT_STREAM_BLOCK`` at a time.
+MAX_SINGLE_READ_SIZE = 1 << 30  # 1 GiB
 
 
 @runtime_checkable
-class _Readable(Protocol):
-    """The two members ``stream_via_read`` needs — a subset of
-    ``ContentSource`` redeclared here (not imported) to avoid a circular
-    import, since ``dedup/`` sits below ``units/`` in this project's
-    layering. Every real ``ContentSource`` implementer already satisfies
-    this shape structurally."""
+class _Readable[B: bytes | bytearray](Protocol):
+    """The structural subset of ``ContentSource`` ``stream_via_read`` needs
+    (redeclared because ``dedup/`` sits below ``units/``), generic in what
+    ``read`` returns so a ``bytes`` source streams ``bytes``."""
 
     @property
     def size(self) -> int | None: ...
 
-    async def read(self, offset: int = 0, length: int | None = None) -> bytes: ...
+    async def read(self, offset: int = 0, length: int | None = None) -> B: ...
 
 
-async def stream_via_read(source: _Readable, block: int = DEFAULT_STREAM_BLOCK) -> AsyncIterator[tuple[int, bytes]]:
+async def stream_via_read[B: bytes | bytearray](
+    source: _Readable[B], block: int = DEFAULT_STREAM_BLOCK
+) -> AsyncIterator[tuple[int, B]]:
     """Yield ``(offset, bytes)`` blocks front-to-back via repeated
-    ``source.read(offset, block)`` calls, so any implementer whose
-    ``read()`` already handles its own chunking/extents/fragments gets a
-    correct ``stream()`` for free. Not used by every ``ContentSource``
-    implementer: ``LazyArtifact`` (assembled ``.eml``/``.ics`` content)
-    has its own ``stream()`` instead, since its ``size`` is ``None`` until
-    its buffer is built.
+    ``source.read(offset, block)`` calls.
 
     Raises:
         ValueError: ``source.size`` is ``None``.
     """
     if source.size is None:
         raise ValueError("stream() requires a known size")
-    size = source.size
-    offset = 0
-    while offset < size:
-        n = min(block, size - offset)
-        yield offset, await source.read(offset, n)
-        offset += n
+    async for item in read_blocks(source, 0, source.size, block):
+        yield item
+
+
+def validate_read_args(offset: int, length: int | None) -> None:
+    """Rejects a negative ``offset``/``length`` — the ``ValueError`` half of
+    ``ContentSource.read``'s contract, shared by every implementer that
+    doesn't need ``DedupFile``'s own per-argument messages.
+
+    Raises:
+        ValueError: ``offset`` or ``length`` is negative.
+    """
+    if offset < 0 or (length is not None and length < 0):
+        raise ValueError(f"read(offset={offset}, length={length}): offset/length must be non-negative")
 
 
 def clamp_read_length(offset: int, length: int | None, size: int) -> int:
@@ -86,6 +96,9 @@ def clamp_read_length(offset: int, length: int | None, size: int) -> int:
     reading past the end returns fewer bytes, never an error — only a
     negative ``offset``/``length`` is left for the caller to reject before
     calling this.
+
+    Returns:
+        The byte count to read, ``>= 0``.
     """
     available = size - offset
     if length is None:
@@ -93,230 +106,198 @@ def clamp_read_length(offset: int, length: int | None, size: int) -> int:
     return max(0, min(length, available))
 
 
-class ExtentKind(enum.Enum):
-    """A file, as seen through ``DedupFile.extents()``, is a sequence of
-    these three kinds. ``ZERO`` (an explicit ``ChunkMapKind.ZERO``
-    chunk-map record) and ``HOLE`` (no record at all, i.e. a gap between
-    records) are deliberately distinct even though both read back as
-    zero bytes — a ``HOLE`` is a real sparse gap worth preserving as one
-    on export; a ``ZERO`` record is zero data explicitly recorded as
-    such, not merely absent.
+def validate_export_range(start: int, end: int, size: int) -> None:
+    """Checks ``0 <= start <= end <= size`` — the range a
+    ``ContentSource.export_range`` call may ask for.
+
+    Raises:
+        ValueError: The range is not inside ``[0, size]``.
     """
-
-    DATA = 1
-    ZERO = 2
-    HOLE = 3
+    if not 0 <= start <= end <= size:
+        raise ValueError(f"export range [{start}, {end}) is not inside [0, {size})")
 
 
-@dataclasses.dataclass(frozen=True)
-class Extent:
-    """One contiguous span of a ``DedupFile``. ``addr``/``map_num``/
-    ``repeat`` are populated only for ``ExtentKind.DATA`` — the
-    template starting address and its ``1 + repeat`` repetitions the
-    span's chunks are drawn from (``ChunkAddress.advance``'s carry
-    semantics)."""
-
-    offset: int
-    length: int
-    kind: ExtentKind
-    addr: ChunkAddress | None = None
-    map_num: int = 0
-    repeat: int = 0
-
-    @property
-    def end(self) -> int:
-        return self.offset + self.length
+def _require_chunk_aligned(offset: int) -> None:
+    if offset % FIXED_CHUNK_LENGTH:
+        raise ValueError(f"export range must start at a multiple of {FIXED_CHUNK_LENGTH}, got {offset}")
 
 
-@dataclasses.dataclass(frozen=True)
-class ExportResult:
-    """The outcome of one ``export_to()`` call.
-
-    Attributes:
-        bytes_written: Actual bytes written to the destination.
-        logical_size: The exported file's full logical size.
-        holes: Byte count skipped via a sparse hole instead of writing zeros.
-        zeros: Byte count written as explicit zero bytes (not sparse).
-    """
-
-    bytes_written: int
-    logical_size: int
-    holes: int
-    zeros: int
+async def read_blocks[B: bytes | bytearray](
+    source: _Readable[B], start: int, end: int, block: int = DEFAULT_STREAM_BLOCK
+) -> AsyncIterator[tuple[int, B]]:
+    """Yield ``(offset, bytes)`` blocks of ``source``'s ``[start, end)`` via
+    repeated ``source.read(start + offset, block)`` calls, with ``offset``
+    counted from ``start``. The offset advances by the requested length, not
+    the returned one, so a short read cannot stall the loop."""
+    offset = 0
+    while start + offset < end:
+        n = min(block, end - start - offset)
+        yield offset, await source.read(start + offset, n)
+        offset += n
 
 
 async def _resolve_bucket_group(
-    pool: Pool,
-    stream_id: StreamId,
-    bucket_id: BucketId,
-    items: list[tuple[ChunkIdx, list[int]]],
+    pool: Pool, stream_id: StreamId, bucket_id: BucketId, chunk_indices: Iterable[int]
 ) -> dict[int, bytes | memoryview]:
-    """Resolve every ``chunk_idx`` in ``items`` (one ``_fill_data_extent``
-    call's own ``(stream_id, bucket_id)`` group) to its plaintext.
+    """Resolve every ``chunk_idx`` in ``chunk_indices`` (one ``(stream_id,
+    bucket_id)`` group of ``_fill_data_extent``) to its plaintext.
 
-    Splits into already-cached (``Pool.cached_chunk``) and not-yet-cached
-    first — only not-yet-cached chunks go through
-    ``BucketReader.read_chunks()``'s merged fetch, then backfill
-    (``Pool.backfill_chunk``) only what was actually fetched (skipped if
-    ``Pool.release_epoch`` moved mid-fetch). Both groups are folded into
-    one ``verify_fingerprints()`` call, so a cache hit here is still
-    checked, matching ``Pool.read_chunk()``'s own contract.
-
-    Deliberately not full in-flight de-duplication: two concurrent
-    callers that both miss the same chunk here fetch and backfill it
-    independently (harmless — same key, same plaintext). Unlike
-    ``Pool.read_chunk()``'s ``AsyncKeyedCache.resolve()``-backed path,
-    routing each chunk through ``resolve()`` individually would restore
-    that guarantee but costs ``read_chunks()``'s read-merging benefit.
+    Cached chunks (``Pool.cached_chunks``) are reused; the rest are decoded
+    through ``Pool``'s own bucket cache (``chunk_walk.decode_bucket_chunks``)
+    and backfilled (``Pool.backfill_chunks``) unless ``Pool.release_epoch``
+    moved mid-fetch. All are fingerprint-verified, cache hits included, as in
+    ``Pool.read_chunk()``.
     """
-    already_cached: dict[int, bytes | memoryview] = {}
-    still_needed: list[ChunkIdx] = []
-    for chunk_idx, _ks in items:
-        cached = pool.cached_chunk(ChunkAddress(stream_id, bucket_id, chunk_idx))
-        if cached is not None:
-            already_cached[chunk_idx] = cached
-        else:
-            still_needed.append(chunk_idx)
-
+    already_cached, still_needed = pool.cached_chunks(stream_id, bucket_id, chunk_indices)
     decoded: dict[int, bytes | memoryview] = {}
     if still_needed:
         release_epoch = pool.release_epoch
         reader = await pool.bucket(stream_id, bucket_id)
-        requests = sorted((chunk_idx, ChunkAddress(stream_id, bucket_id, chunk_idx)) for chunk_idx in still_needed)
-        decoded = await reader.read_chunks(requests)
-        # This fetch never registered with Pool._chunks's own
-        # AsyncKeyedCache, so nothing else stops a backfill from
-        # resurrecting an entry into a Pool a concurrent release_caches()
-        # just emptied.
+        decoded = await decode_bucket_chunks(reader, stream_id, bucket_id, ascending_runs(still_needed), pool=pool)
+        # The epoch check stops a backfill from refilling a Pool that a
+        # concurrent release_caches() just emptied.
         if pool.release_epoch == release_epoch:
-            for chunk_idx in still_needed:
-                pool.backfill_chunk(ChunkAddress(stream_id, bucket_id, chunk_idx), bytes(decoded[chunk_idx]))
-
-    resolved = {**already_cached, **decoded}
-    # read_chunks() bypasses Pool.read_chunk() entirely, so its own
-    # fingerprint-verification policy doesn't apply here unless applied
-    # explicitly, via this call.
-    await pool.verify_fingerprints(stream_id, bucket_id, resolved)
-    return resolved
+            pool.backfill_chunks(stream_id, bucket_id, decoded)
+    if already_cached:
+        # decode_bucket_chunks() verified what it decoded; cache hits are checked here.
+        await pool.verify_fingerprints(stream_id, bucket_id, already_cached)
+    return {**already_cached, **decoded}
 
 
 async def _fill_data_extent(
     pool: Pool,
-    extent: Extent,
+    extent: DataExtent,
     seg_start: int,
     seg_end: int,
-    out: bytearray,
+    out: memoryview,
     out_base: int,
 ) -> None:
     """Fill ``out[seg_start - out_base : seg_end - out_base]`` with the
-    plaintext bytes ``extent`` describes for ``[seg_start, seg_end)`` — a
-    sub-range of ``extent``'s own span, never assumed to be the whole
-    thing (callers intersect with their own requested window first).
+    plaintext bytes ``extent`` describes for ``[seg_start, seg_end)``, a
+    sub-range of the extent's span; a chunk shorter than
+    ``FIXED_CHUNK_LENGTH`` leaves the rest of its slot zero.
 
-    Exactly one distinct chunk needed goes through ``Pool.read_chunk``
-    unchanged, staying covered by ``Pool``'s own cross-call cache. More
-    than one distinct chunk is grouped by ``(stream_id, bucket_id)`` (a
-    single extent can still straddle a bucket boundary) and resolved via
-    ``_resolve_bucket_group``, which still consults/backfills ``Pool``'s
-    cache for this case, unlike ``BucketReader.read_chunks()`` on its own.
-
-    Implements this bucket-grouped fetch independently, not via
-    ``chunk_walk.py``'s plan/execute engine — that would cost the
-    single-chunk case's ``Pool.read_chunk`` cache reuse for no benefit,
-    since this function's range is already caller-bounded, never a
-    whole-file sweep.
-
-    Free function (not a method) so both ``DedupFile`` and
-    ``ByteRangeView`` can share it.
+    A single chunk goes through ``Pool.read_chunk``; several are grouped by
+    ``(stream_id, bucket_id)`` and resolved via ``_resolve_bucket_group``.
+    Both paths use ``Pool``'s chunk cache.
     """
-    assert extent.kind is ExtentKind.DATA
-    assert extent.addr is not None and extent.map_num > 0
-    first_k = (seg_start - extent.offset) // FIXED_CHUNK_LENGTH
-    last_k = (seg_end - 1 - extent.offset) // FIXED_CHUNK_LENGTH
+    assert extent.map_num > 0
+    first_k, last_k = data_extent_k_bounds(extent, seg_start, seg_end)
 
-    # Grouped by the *physical* chunk each k resolves to — a
-    # repeat/template region can have several k's collapse onto the same
-    # (stream_id, bucket_id, chunk_idx).
-    fetched: dict[int, bytes | memoryview] = {}
-    needed: dict[tuple[StreamId, BucketId, ChunkIdx], list[int]] = {}
-    for k in range(first_k, last_k + 1):
-        addr_k = extent.addr.advance(k % extent.map_num)
-        needed.setdefault((addr_k.stream_id, addr_k.bucket_id, addr_k.chunk_idx), []).append(k)
+    # (chunk_idx_start, length, k_start) runs per bucket; a repeat region
+    # maps several k's onto one physical chunk.
+    runs_by_bucket: dict[tuple[StreamId, BucketId], list[tuple[int, int, int]]] = {}
+    for start_addr, run_len, k_start in iter_chunk_runs(extent.addr, extent.map_num, first_k, last_k):
+        runs_by_bucket.setdefault((start_addr.stream_id, start_addr.bucket_id), []).append(
+            (start_addr.chunk_idx, run_len, k_start)
+        )
 
-    if len(needed) == 1:
-        (stream_id, bucket_id, chunk_idx), ks = next(iter(needed.items()))
-        addr = ChunkAddress(stream_id, bucket_id, chunk_idx)
-        plain: bytes | memoryview = await pool.read_chunk(addr)
-        for k in ks:
-            fetched[k] = plain
-    else:
-        by_bucket: dict[tuple[StreamId, BucketId], list[tuple[ChunkIdx, list[int]]]] = {}
-        for (stream_id, bucket_id, chunk_idx), ks in needed.items():
-            by_bucket.setdefault((stream_id, bucket_id), []).append((chunk_idx, ks))
-        for (stream_id, bucket_id), items in by_bucket.items():
-            resolved = await _resolve_bucket_group(pool, stream_id, bucket_id, items)
-            for chunk_idx, ks in items:
-                plain = resolved[chunk_idx]
-                for k in ks:
-                    fetched[k] = plain
-
-    for k in range(first_k, last_k + 1):
-        chunk = fetched[k]
-        chunk_start = extent.offset + k * FIXED_CHUNK_LENGTH
-        lo = max(seg_start, chunk_start) - chunk_start
-        hi = min(seg_end, chunk_start + FIXED_CHUNK_LENGTH) - chunk_start
-        dest = max(seg_start, chunk_start) - out_base
-        out[dest : dest + (hi - lo)] = chunk[lo:hi]
-
-
-async def _run_export_to(
-    file_like: DedupFile | ByteRangeView,
-    dst: Path,
-    *,
-    sparse: bool,
-    progress: Callable[[int, int], Awaitable[None]] | None,
-    window_entries: int | None,
-    max_concurrent_opens: int | None,
-    max_concurrent_reads: int,
-    export_cache: BucketReaderCache | None,
-    dst_offset: int,
-    create: bool,
-    executor: ProcessPoolExecutor | None,
-) -> ExportResult:
-    """Shared body of ``DedupFile.export_to()``/``ByteRangeView.export_to()``
-    — both are already the same call into ``export_to``
-    (which itself branches on ``isinstance(file_like, ByteRangeView)``),
-    so keyword semantics are documented once, on ``DedupFile.export_to()``,
-    rather than kept in a second, driftable copy here."""
-    # Deferred, not module-level: chunk_walk.py/export_scheduler.py both
-    # import DedupFile from this module at their own module level, so a
-    # module-level import back from either of them here would close the
-    # loop into a real circular import.
-    from .chunk_walk import DEFAULT_WINDOW_ENTRIES
-    from .export_scheduler import export_to as _export_to
-
-    return await _export_to(
-        file_like,
-        dst,
-        sparse=sparse,
-        progress=progress,
-        window_entries=DEFAULT_WINDOW_ENTRIES if window_entries is None else window_entries,
-        max_concurrent_opens=max_concurrent_opens,
-        max_concurrent_reads=max_concurrent_reads,
-        export_cache=export_cache,
-        dst_offset=dst_offset,
-        create=create,
-        executor=executor,
-    )
+    for (stream_id, bucket_id), runs in runs_by_bucket.items():
+        merged = merge_overlapping_ranges((start, length) for start, length, _ in runs)
+        if len(runs_by_bucket) == 1 and len(merged) == 1 and merged[0][1] == 1:
+            chunk_idx = merged[0][0]
+            plain: dict[int, bytes | memoryview] = {
+                chunk_idx: await pool.read_chunk(ChunkAddress(stream_id, bucket_id, ChunkIdx(chunk_idx)))
+            }
+        else:
+            indices = [idx for start, length in merged for idx in range(start, start + length)]
+            plain = await _resolve_bucket_group(pool, stream_id, bucket_id, indices)
+        for chunk_idx_start, length, k_start in runs:
+            chunk_start = extent.offset + k_start * FIXED_CHUNK_LENGTH
+            for chunk_idx in range(chunk_idx_start, chunk_idx_start + length):
+                chunk = plain[chunk_idx]
+                chunk_end = chunk_start + len(chunk)
+                if seg_start <= chunk_start and chunk_end <= seg_end:
+                    # The whole chunk lies inside the segment: the common case.
+                    dest = chunk_start - out_base
+                    out[dest : dest + len(chunk)] = chunk
+                else:
+                    lo = max(seg_start - chunk_start, 0)
+                    hi = min(seg_end - chunk_start, len(chunk))
+                    if hi > lo:
+                        dest = chunk_start + lo - out_base
+                        out[dest : dest + hi - lo] = chunk[lo:hi]
+                chunk_start += FIXED_CHUNK_LENGTH
 
 
-class DedupFile:
+class DedupContent:
+    """The content methods ``DedupFile`` and ``ByteRangeView`` share, in
+    the coordinates of the window ``_window()`` names within its base file:
+    the whole file for a ``DedupFile``, the view's range for a
+    ``ByteRangeView``."""
+
+    size: int | None
+
+    def _window(self) -> tuple[DedupFile, int]:
+        """``(base file, window start)``."""
+        raise NotImplementedError
+
+    async def read(self, offset: int = 0, length: int | None = None) -> bytes | bytearray:
+        raise NotImplementedError
+
+    def stream(self, block: int = DEFAULT_STREAM_BLOCK) -> AsyncIterator[tuple[int, bytes | bytearray]]:
+        """Yield ``(offset, bytes)`` blocks front-to-back via ``read``; needs
+        a known ``size``."""
+        return stream_via_read(self, block)
+
+    def export_window(self) -> tuple[DedupFile, int, int]:
+        """``(base file, window start, size)`` — the range an export of this
+        content covers.
+
+        Raises:
+            ValueError: The size is unknown.
+        """
+        if self.size is None:
+            raise ValueError("exporting requires a known size")
+        base, window_start = self._window()
+        return base, window_start, self.size
+
+    async def export_range(
+        self,
+        writer: ExportWriter,
+        start: int,
+        end: int,
+        *,
+        sparse: bool = True,
+        progress: WrittenBytesCallback | None = None,
+        tuning: export_scheduler.ExportTuning | None = None,
+    ) -> ExportResult:
+        """Write this content's ``[start, end)`` into ``writer``, at offsets
+        relative to ``start``; ``start`` must fall on a 4096-byte boundary of
+        the base file. Keywords and errors: see
+        ``export_scheduler.export_to_writer``.
+
+        Raises:
+            ValueError: The range is not inside this content, ``start`` is
+                not chunk-aligned, or the size is unknown.
+        """
+        base, window_start, size = self.export_window()
+        validate_export_range(start, end, size)
+        _require_chunk_aligned(window_start + start)
+        target = self if (start, end) == (0, size) else base.view(window_start + start, end - start)
+        return await export_scheduler.export_to_writer(target, writer, sparse=sparse, progress=progress, tuning=tuning)
+
+    async def planned_bytes(self, start: int, end: int) -> int:
+        """The real ``DATA`` bytes an export of ``[start, end)`` writes, which
+        is what its progress counts."""
+        base, window_start = self._window()
+        return await count_planned_bytes(base, window_start + start, window_start + end)
+
+    def pool_descriptor(self) -> PoolDescriptor | None:
+        """How a worker process rebuilds the base file's ``Pool``, or ``None``
+        when its store cannot be rebuilt in another process."""
+        base, _ = self._window()
+        return PoolDescriptor.from_pool(base.pool)
+
+
+class DedupFile(DedupContent):
     """A logical, byte-addressable file backed by one composition record.
 
     ``size`` is supplied by the caller (``file_meta.file_size``,
-    ``object_table.file_size``, ...) — this layer never infers it from the
-    composition record's own coverage, since a record's last byte is not
-    necessarily the file's declared end (trailing ``HOLE``).
+    ``object_table.file_size``, ...), never inferred from the composition
+    record, which may end before the file does (trailing ``HOLE``). ``None``
+    means unknown: ``read`` then needs an explicit ``length`` and exports
+    raise ``ValueError``.
     """
 
     def __init__(
@@ -334,11 +315,11 @@ class DedupFile:
         self._record: CompositionRecord | None = None
 
     @property
-    def stream_id(self) -> int:
+    def stream_id(self) -> StreamId:
         return self._comp_reader.stream_id
 
     @property
-    def session_id(self) -> int:
+    def session_id(self) -> SessionId:
         return self._comp_reader.session_id
 
     @property
@@ -347,32 +328,15 @@ class DedupFile:
 
     @property
     def pool(self) -> Pool:
-        """The ``Pool`` this file's
-        chunks resolve through — needed by ``export_scheduler.py``'s
-        bucket-major planning, which schedules against a shared ``Pool``/
-        ``BucketReaderCache`` rather than one read at a time."""
+        """The ``Pool`` this file's chunks resolve through."""
         return self._pool
 
     async def cached_record(self) -> CompositionRecord:
-        """This file's own ``CompositionRecord``, fetched once and cached
-        for its life — cold on first call, cached after.
-
-        Exposed (not private) because ``CompositionRecord`` is a shared
-        unit other modules need direct access to (``units/device_pcps.py``,
-        ``units/verify_reachable.py``) rather than an implementation
-        detail confined to this class.
-        """
+        """This file's own ``CompositionRecord``, fetched on first call and
+        cached for this file's life."""
         if self._record is None:
             self._record = await self._comp_reader.record(self._comp_offset)
         return self._record
-
-    def seed_record(self, record: CompositionRecord) -> None:
-        """Sets this file's cached ``CompositionRecord`` directly, skipping
-        the fetch ``cached_record()`` would make — for a caller that
-        already resolved the same composition's record via a different
-        ``DedupFile`` sharing the same key, so every ``DedupFile``
-        addressing it reuses one instance."""
-        self._record = record
 
     async def _extents(self, start: int = 0, end: int | None = None) -> AsyncIterator[Extent]:
         """Yield ``Extent``\\ s covering ``[start, end)`` (default: the
@@ -380,16 +344,12 @@ class DedupFile:
         explicit ``HOLE`` extents and, if ``size`` extends past the last
         record, a trailing ``HOLE``.
 
-        Yielded extents are **not truncated** to ``[start, end)`` at
-        their own edges — a boundary entry may start before ``start`` or
-        run past ``end``; callers needing an exact window (e.g. ``read``)
-        intersect it themselves.
+        Extents are **not truncated** to ``[start, end)``: a boundary entry
+        may start before ``start`` or run past ``end``, so callers intersect
+        it with their window.
 
-        **Private**: this un-truncated boundary contract is easy to
-        misuse. The only legitimate reason to walk records directly is
-        needing ``addr``/``map_num``/``repeat`` for physical-chunk
-        selection (``chunk_walk.py``); everything else wants
-        ``read``/``stream``/``export_to``.
+        Private; ``chunk_walk``'s module docstring covers its one outside
+        caller.
         """
         record = await self.cached_record()
         cursor = start
@@ -397,31 +357,42 @@ class DedupFile:
             if entry.length == 0:
                 continue
             if entry.file_offset > cursor:
-                yield Extent(offset=cursor, length=entry.file_offset - cursor, kind=ExtentKind.HOLE)
-            kind = ExtentKind.ZERO if entry.kind is ChunkMapKind.ZERO else ExtentKind.DATA
-            yield Extent(
-                offset=entry.file_offset,
-                length=entry.length,
-                kind=kind,
-                addr=entry.addr if kind is ExtentKind.DATA else None,
-                map_num=entry.map_num if kind is ExtentKind.DATA else 0,
-                repeat=entry.repeat if kind is ExtentKind.DATA else 0,
-            )
+                yield GapExtent(cursor, entry.file_offset - cursor, ExtentKind.HOLE)
+            if entry.kind is ChunkMapKind.ZERO:
+                yield GapExtent(entry.file_offset, entry.length, ExtentKind.ZERO)
+            else:
+                assert entry.addr is not None, "a non-ZERO chunk-map entry always carries its address"
+                yield DataExtent(entry.file_offset, entry.length, entry.addr, entry.map_num, entry.repeat)
             cursor = max(cursor, entry.end_offset)
 
         stop = end if end is not None else self.size
         if stop is not None and stop > cursor:
-            yield Extent(offset=cursor, length=stop - cursor, kind=ExtentKind.HOLE)
+            yield GapExtent(cursor, stop - cursor, ExtentKind.HOLE)
 
-    async def read(self, offset: int = 0, length: int | None = None) -> bytes:
+    @override
+    async def read(self, offset: int = 0, length: int | None = None) -> bytes | bytearray:
         """Read ``length`` bytes starting at ``offset`` (default: from
-        ``offset`` to ``size``). ``ZERO``/``HOLE`` extents read back as
-        zero bytes for free (``bytearray``'s own zero-fill). A request
-        extending past ``size`` is clamped to the bytes that actually
-        exist (see ``clamp_read_length``), never zero-padded past it.
+        ``offset`` to ``size``). ``ZERO``/``HOLE`` ranges read as zero
+        bytes. A request extending past ``size`` is clamped to the bytes
+        that exist (see ``clamp_read_length``), never zero-padded.
+
+        Args:
+            offset: Start offset in the file.
+            length: Byte count; ``None`` reads to ``size`` (required when
+                ``size`` is unknown).
+
+        Returns:
+            The bytes read, possibly fewer than ``length``.
 
         Raises:
-            ValueError: ``offset`` or ``length`` is negative.
+            ValueError: ``offset`` or ``length`` is negative, or ``length``
+                is ``None`` while ``size`` is unknown.
+            ResourceLimitExceededError: the resolved read size exceeds
+                ``MAX_SINGLE_READ_SIZE`` — use ``stream()`` instead for a
+                legitimately large read.
+            NotFoundError: A composition sub-file or bucket is missing.
+            ChunkCompactedError: A chunk in range was reclaimed by compaction.
+            DataCorruptError: The record or a chunk fails to decode or verify.
         """
         if offset < 0:
             raise ValueError(f"offset must be non-negative, got {offset}")
@@ -434,79 +405,40 @@ class DedupFile:
         assert length is not None  # size is known whenever length was None (checked above)
         if length <= 0:
             return b""
+        if length > MAX_SINGLE_READ_SIZE:
+            raise ResourceLimitExceededError(
+                f"read() resolved to {length} bytes, exceeding the {MAX_SINGLE_READ_SIZE}-byte "
+                "single-read safety ceiling — use stream() instead for a legitimately large read"
+            )
         end = offset + length
         out = bytearray(length)
+        view = memoryview(out)
         async for extent in self._extents(offset, end):
             seg_start = max(extent.offset, offset)
             seg_end = min(extent.end, end)
             if seg_end <= seg_start:  # pragma: no cover - defensive: _extents() invariants rule this out
                 continue
             if extent.kind is ExtentKind.DATA:
-                await _fill_data_extent(self._pool, extent, seg_start, seg_end, out, offset)
-        return bytes(out)
+                await _fill_data_extent(self._pool, extent, seg_start, seg_end, view, offset)
+        # Handed over, not copied: nothing else holds ``out``.
+        return out
 
-    def stream(self, block: int = DEFAULT_STREAM_BLOCK) -> AsyncIterator[tuple[int, bytes]]:
-        """Yield ``(offset, bytes)`` blocks front-to-back — a
-        ``read(offset, block)`` loop, inheriting ``read()``'s
-        bucket-merged reads for free."""
-        return stream_via_read(self, block)
-
-    async def export_to(
-        self,
-        dst: Path,
-        *,
-        sparse: bool = True,
-        progress: Callable[[int, int], Awaitable[None]] | None = None,
-        window_entries: int | None = None,
-        max_concurrent_opens: int | None = None,
-        max_concurrent_reads: int = 1,
-        export_cache: BucketReaderCache | None = None,
-        dst_offset: int = 0,
-        create: bool = True,
-        executor: ProcessPoolExecutor | None = None,
-    ) -> ExportResult:
-        """Write this file to ``dst``. ``sparse=True`` (default) never
-        writes ``ZERO``/``HOLE`` bytes — the output reads back as zero via
-        the filesystem's sparse-hole support; use ``sparse=False`` when
-        the on-disk allocation must match the logical size. See
-        ``export_scheduler.export_to`` for what the remaining keyword
-        args do.
-
-        No ``verify_map_crc`` option here — that's ``verify --level
-        full``'s job; export re-running it would double that cost for no
-        new information."""
-        return await _run_export_to(
-            self,
-            dst,
-            sparse=sparse,
-            progress=progress,
-            window_entries=window_entries,
-            max_concurrent_opens=max_concurrent_opens,
-            max_concurrent_reads=max_concurrent_reads,
-            export_cache=export_cache,
-            dst_offset=dst_offset,
-            create=create,
-            executor=executor,
-        )
+    @override
+    def _window(self) -> tuple[DedupFile, int]:
+        return self, 0
 
     def view(self, offset: int, length: int) -> ByteRangeView:
+        """A ``ByteRangeView`` of ``length`` bytes at ``offset``."""
         return ByteRangeView(self, offset, length)
 
-    @property
-    def supports_concurrent_export(self) -> bool:
-        """Always ``True`` — a bucket-backed read has a real bucket concept
-        to spread reads across (see
-        ``ContentSource.supports_concurrent_export``)."""
-        return True
 
-
-class ByteRangeView:
-    """A named sub-range of a ``DedupFile`` — the same read-contract
-    shape (``size``/``read``/``stream``/``export_to``), coordinates
-    translated, for a workload whose "file" is really just an
-    offset+length window into a bigger dedup file rather than its own
-    composition record.
+class ByteRangeView(DedupContent):
+    """An offset+length window into a ``DedupFile``, with the same read
+    contract (``size``/``read``/``stream``/``export_range``) in window-relative
+    coordinates, for a workload whose "file" has no composition record of its own.
     """
+
+    size: int
 
     def __init__(self, base: DedupFile, offset: int, length: int) -> None:
         self._base = base
@@ -515,9 +447,7 @@ class ByteRangeView:
 
     @property
     def base(self) -> DedupFile:
-        """The ``DedupFile`` this view windows into — needed by
-        ``export_scheduler.py``'s bucket-major planning, which schedules
-        against the base file's own ``DedupFile.pool``."""
+        """The ``DedupFile`` this view windows into."""
         return self._base
 
     @property
@@ -525,50 +455,14 @@ class ByteRangeView:
         """This view's start offset within ``base``."""
         return self._offset
 
-    async def read(self, offset: int = 0, length: int | None = None) -> bytes:
-        """See ``units.base.ContentSource.read``'s EOF contract — a
-        request extending past this view's own ``size`` is clamped, never
-        an error."""
-        if offset < 0 or (length is not None and length < 0):
-            raise ValueError(f"read(offset={offset}, length={length}): offset/length must be non-negative")
+    @override
+    def _window(self) -> tuple[DedupFile, int]:
+        return self._base, self._offset
+
+    @override
+    async def read(self, offset: int = 0, length: int | None = None) -> bytes | bytearray:
+        """See ``units.base.ContentSource.read``: a request past this view's
+        ``size`` is clamped, never an error."""
+        validate_read_args(offset, length)
         length = clamp_read_length(offset, length, self.size)
         return await self._base.read(self._offset + offset, length)
-
-    def stream(self, block: int = DEFAULT_STREAM_BLOCK) -> AsyncIterator[tuple[int, bytes]]:
-        return stream_via_read(self, block)
-
-    async def export_to(
-        self,
-        dst: Path,
-        *,
-        sparse: bool = True,
-        progress: Callable[[int, int], Awaitable[None]] | None = None,
-        window_entries: int | None = None,
-        max_concurrent_opens: int | None = None,
-        max_concurrent_reads: int = 1,
-        export_cache: BucketReaderCache | None = None,
-        dst_offset: int = 0,
-        create: bool = True,
-        executor: ProcessPoolExecutor | None = None,
-    ) -> ExportResult:
-        """Same as ``DedupFile.export_to``, windowed to this view's
-        own range."""
-        return await _run_export_to(
-            self,
-            dst,
-            sparse=sparse,
-            progress=progress,
-            window_entries=window_entries,
-            max_concurrent_opens=max_concurrent_opens,
-            max_concurrent_reads=max_concurrent_reads,
-            export_cache=export_cache,
-            dst_offset=dst_offset,
-            create=create,
-            executor=executor,
-        )
-
-    @property
-    def supports_concurrent_export(self) -> bool:
-        """Always ``True`` — same bucket-backed shape as the base
-        ``DedupFile`` it windows into."""
-        return True

@@ -5,70 +5,82 @@ first — layering, presentation, and the facade contract are all there,
 not repeated here. This document covers CLI-specific command
 conventions and the "adding a new command" recipe.
 
-The CLI talks to the SDK's `Session`/`Repository`/`Catalog` facade
-(`api/`) — never to `storage`/`dedup`/`catalog`/`units` directly, with one
-explicitly-named exception: `dump.py` reaches into `sdk.diagnostics`
-directly for raw-file forensics outside any discovered repository, work
-the catalog-based facade has no way to do. See `ARCHITECTURE.md` for the
-facade contract and `NodeRef` format.
+`dump` is the CLI's one user of `sdk.diagnostics`: it inspects a raw file
+outside any discovered repository, which the catalog-based facade can't do.
 
 ## Development Conventions
 
 - **Every command is `async def`, decorated with `@typer_async`
-  (`asyncio_support.py`).** Typer has no native async support, so this
-  decorator is the one place `asyncio.run()` lives — never re-add a nested
-  `async def _run(): ...; asyncio.run(_run())` wrapper inside a command
-  module. `export.py`'s own `_do_export()` inner `Task` (for its
-  Ctrl-C-cancellable body) is unrelated to this and stays as-is.
+  (`asyncio_support.py`)**, the one place `asyncio.run()` lives, since Typer
+  calls each callback synchronously. `export.py` additionally runs its body
+  as its own `Task` so Ctrl-C can cancel it.
 - **`ls`/`tree`/`cat`/`export` take exactly one `NodeRef` positional argument**
-  (human or canonical form) — never add a `--catalog`/`--workload`/`--version`
-  style mutually-exclusive flag set; that's the problem `NodeRef` exists to
-  avoid.
-- **`--profile <name>` selects the *store*, not a node inside it** — orthogonal
-  to `NodeRef`'s job and not a violation of the rule above (same seam
-  `Session.open` vs `open_remote` already draws one layer down; `--key` is
-  the same kind of separate option for the same reason). Under `--profile`,
-  `ls`/`tree`/`cat`/`export`'s ref argument's path portion, and `dump
-  bucket`/`composition`/`chunkmap`'s `path` argument, are both
-  store-relative — never a filesystem path. `doctor`/`key`/`verify` each
-  take `--profile` as a standalone alternative to a `repo` argument;
-  `dump`'s own `path` stays required either way, since `dump` has no
-  root-only form. `dump` is also the one command that closes a
-  `--profile`-resolved store itself, via `AsyncCloseable`, since — unlike
-  `ls`/`tree`/`cat`/`export` — it never opens a `Session`.
-- **`--verbose` gates internal identifiers and the `raw/` fallback axis**,
-  per `ARCHITECTURE.md`'s Presentation section — purely presentational,
-  nothing in this CLI refuses to run based on it.
-- **`--json` output keys off stable internal identifiers, with `display_name`
-  as a separate field** — never make a script-consumable `--json` field's key
-  be a human display string that can change with disambiguation rules.
-- **Progress goes to stderr, always** — `synology-apm-repo-cli cat <ref> > out.bin` must
-  produce clean stdout. `--progress auto|always|never` and the `--json`
-  NDJSON progress-event stream are both stderr-only.
-- **Exports write `<dst>.part` and rename on success** — a cancelled or
-  crashed export must never leave something that looks like a complete file.
-- **`--keep-partial`** governs whether a cancelled export's `.part` file is
-  kept or removed; don't add a new mutating/export-adjacent command without
-  deciding this explicitly.
+  (human or canonical form) to say which node they act on, rather than a set
+  of `--catalog`/`--workload`/`--version`-style flags.
+- **`--profile <name>` selects the *store*, not a node inside it**, so it sits
+  beside the `NodeRef` argument rather than inside it, like `--key`. Under
+  `--profile`, the path portion of `ls`/`tree`/`cat`/`export`'s ref and `dump
+  bucket`/`composition`/`chunkmap`'s `path` argument are store-relative.
+  `doctor`/`key`/`verify` take `--profile` as an alternative to their `repo`
+  argument (`opened_repo_or_profile`); `dump`'s `path` stays required, and
+  `dump`, which opens no `Session`, closes the store itself.
+- **A script keys `--json` output off stable identifiers, not display
+  strings that disambiguation can change**: `doctor` gives each catalog and
+  workload its internal id with `display_name` as a separate field;
+  `ls`/`tree` print the disambiguated `name`, and under `--ref` add each
+  item's `ref` (`ls` also adds a catalog/workload/version row's `id`).
+- **Every exit status a command sets is an `errors.ExitCode`** (a usage
+  error is Click's own 2), so a script can tell the outcomes apart; the
+  package README's "Exit status" table is the user-facing list.
+- **Progress goes to stderr, always**, so `synology-apm-repo-cli cat <ref> >
+  out.bin` produces clean stdout. `--progress auto|always|never`, the
+  `--json` NDJSON progress events and `--trace` are all stderr-only. Rich
+  output goes through `consoles.py`'s shared `console` (stdout) and
+  `err_console` (stderr).
+- **Exports write `<dst>.part` and rename on success**, so a cancelled or
+  failed export never leaves something that looks like a complete file.
+  `LocalFileSink(staged=True)` owns that, through the SDK's `run_export`,
+  the same entry point the TUI's export worker uses.
+- **A folder REF exports its items to `-o <dir>`, one file at a time**,
+  through the SDK's `plan_tree_export`, `preflight_tree` and
+  `run_tree_export`. A name that isn't one safe path component here, or a
+  path another item already takes, is skipped and reported and the command
+  exits 1; only a file name the SDK synthesizes (a mail's subject plus
+  `.eml`) is made safe and numbered on repeat. The first failure stops the
+  run and files already finished stay.
+- **An item the backup holds only partly** (its `RestorableUnit.degraded`
+  is set, e.g. a PC/PS disk with missing fragments, read back as zeros) is
+  still exported, with an `incomplete` line on stderr that `--quiet` does
+  not hide.
+- **`--keep-partial`** governs whether a cancelled or failed export's `.part`
+  file is kept; decide this explicitly for any new export-adjacent command.
 
 ## Adding a New Command
 
-1. Add a new module under `commands/`, following the `@typer_async` shape
-   above.
-2. Give it the same `--json`/`--verbose`/`--progress` global flags as the
-   existing commands if it does anything non-trivial or long-running — see
-   `progress_render.py` for the shared `ProgressMeter`-driven rendering, which
-   the SDK's `presentation/` module backs (CLI and TUI must render identically
-   — see `ARCHITECTURE.md`).
-3. Register it in `main.py`.
-4. Add unit tests (`tests/unit/cli/test_cli_*.py`) and, if it's meaningfully
-   different against real data, an integration test
-   (`tests/integration/cli/test_cli_*.py`, backed by a recorded fixture —
-   see [`tests/CLAUDE.md`](../../../../../tests/CLAUDE.md)'s "RecordingStore
-   / ReplayStore" section).
-5. If the command's long-running work should be cancellable, confirm SIGINT
-   behavior matches the existing "first Ctrl-C cancels cleanly, second forces
-   exit" pattern (`export.py`) rather than inventing a new cancellation UX.
+1. Add a module under `commands/` with an `async def` callback decorated
+   with `@typer_async`. Its docstring is its `--help` text; option help goes
+   in `strings.py`. Every parameter is declared
+   `name: Annotated[T, typer.Option(...)] = default` (no default for a
+   required one), and the shared `--key`/`--profile`/`--object-db-id`/`REPO`
+   parameters use `options.py`'s aliases.
+2. Read the global flags from `ctx.obj` (`state.py`'s `CliState`). Open the
+   repository through `repo_session.py` (`opened_repo`,
+   `opened_repo_or_profile`, or `open_repo` inside your own `cli_session`) or, for a
+   REF that `ls`/`tree` would walk, `browse.py`'s `walked_ref`: these turn an
+   `ApmRepoError` into the CLI error exit and wire in `--progress`/`--trace`.
+   Get any other progress meter from `progress_render.build_progress_meter`.
+3. Print the final result through `paging.render()` (`--json` or human,
+   `page=True` when the output scales with item-tree content), escaping
+   repository-derived text with `sdk.presentation`'s `safe()`.
+4. Register it in `main.py` (`app.command(...)`, or `app.add_typer(...)` for
+   a sub-command group).
+5. Add unit tests (`tests/unit/cli/test_cli_commands_<command>.py`) and,
+   if it's meaningfully different against real data, an integration test
+   (`tests/integration/cli/test_cli_commands_<command>.py`, backed by a
+   recorded fixture — see [`tests/CLAUDE.md`](../../../../../tests/CLAUDE.md)'s "`RecordingStore`
+   / `ReplayStore`" section).
+6. If its long-running work should be cancellable, follow `export.py`'s
+   "first Ctrl-C cancels cleanly, second forces exit" pattern.
 
 ## Commands and Package Layout
 
@@ -78,8 +90,9 @@ and global flags (`--verbose`, `--json`, `--progress`, `--trace`,
 `--quiet`/`-q`, `--no-input`, `--version`) — run
 `synology-apm-repo-cli <command> --help` rather than consulting a listing
 here that could drift from it. Shared infrastructure
-(`asyncio_support.py`'s `typer_async`, `browse.py`'s `NodeRef`-walking,
-`repo_session.py`'s repo-open lifecycle, `naming.py`'s disambiguation/
-display helpers, `errors.py`, `options.py`, `paging.py`, `profile_store.py`,
-`progress_render.py`, `state.py`, `strings.py`,
-`trace_render.py`) sits alongside `commands/` at the package root.
+(`asyncio_support.py`'s `typer_async`, `browse.py`'s ref parsing and `walked_ref`,
+`repo_session.py`'s session and repo-open lifecycle, `naming.py`'s
+disambiguation helpers and `ls`/`tree`'s shared `NodeFields`, `consoles.py`,
+`errors.py`, `options.py`, `paging.py`, `progress_render.py`, `state.py`,
+`strings.py`, `trace_render.py`) sits alongside `commands/` at the package
+root.

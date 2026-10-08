@@ -88,11 +88,8 @@ async def _children_matching(
     return exact, children, candidates
 
 
-async def _all_children(provider: UnitProvider, node: Node) -> list[Node]:
-    """Every child of ``node``, paginated to exhaustion — used only to
-    rebuild an ancestor's full sibling list on the
-    ``SupportsDirectRefLookup`` path, where the ancestor is already known
-    and no prefix match is needed."""
+async def all_children(provider: UnitProvider, node: Node) -> list[Node]:
+    """Every child of ``node``, paginated to exhaustion."""
     children: list[Node] = []
     async for page in _iter_pages(provider, node):
         children.extend(page)
@@ -161,7 +158,7 @@ async def find_path_with_children(
         if node is None:
             return None
         chain = await _direct_ancestor_chain(provider, node)
-        children_by_step = [await _all_children(provider, ancestor) for ancestor in chain[:-1]]
+        children_by_step = [await all_children(provider, ancestor) for ancestor in chain[:-1]]
         return chain, children_by_step
     result = await _descend(provider, provider.root(), target, need_full_list=True)
     if result is None:

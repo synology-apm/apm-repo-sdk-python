@@ -1,56 +1,50 @@
-"""Unit tests for ``synology_apm_repo.sdk.storage.smb`` — the pieces
-specific to ``SmbStore`` itself (lazy-import guard, connection-pool
-lifecycle, per-instance ``connection_cache`` isolation, error-code mapping)
-rather than the generic ``ObjectStore`` contract, which lives in
-``test_storage_object_store_contract.py`` alongside ``LocalFsStore``/
-``S3Store``/``AzureStore``. Backed by a fake ``smbclient`` module — no
-real network access.
-"""
+"""Unit tests for ``synology_apm_repo.sdk.storage.smb``: what is specific to
+``SmbStore`` (lazy-import guard, connection-pool lifecycle, per-instance
+``connection_cache`` isolation, connect/operation retries, error-code
+mapping, UNC paths). The generic ``ObjectStore``
+contract is in ``test_storage_object_store_contract.py``. Backed by a fake
+``smbclient`` module, no network."""
 
 from __future__ import annotations
 
 import asyncio
 import errno
 import sys
-import time
+import threading
 from typing import Any
 
 import pytest
 import smbclient
-from smbprotocol.exceptions import SMBException
+from smbprotocol.exceptions import SMBAuthenticationError, SMBException
 
-from synology_apm_repo.sdk.errors import NotFoundError, PermissionDeniedError
+from support.fakes import unchecked_fake
+from synology_apm_repo.sdk.errors import NotFoundError, PermissionDeniedError, StorageBackendError
 from synology_apm_repo.sdk.storage import smb as smb_module
+from synology_apm_repo.sdk.storage.base import NETWORK_CONNECT_TIMEOUT, Entry
 from synology_apm_repo.sdk.storage.smb import SmbStore
 
 
 class TestLazyImportPropagatesImportError:
     def test_construction_does_not_import_smbclient(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        """Like ``LocalFsStore``, building a ``SmbStore`` does no I/O and
-        needs no import at all — only a method that actually touches the
-        share does."""
+        """Building a ``SmbStore`` does no I/O and imports nothing; only a method
+        that touches the share does."""
         monkeypatch.setitem(sys.modules, "smbclient", None)
         store = SmbStore("share", server="host", username="user", password="pw")
         assert store._share == "share"
 
     async def test_raises_importerror_when_smbclient_is_missing(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        """``sys.modules["smbclient"] = None`` makes a subsequent ``import
-        smbclient`` raise ``ImportError`` (a real, documented CPython
-        import system behavior — not a mock), simulating a broken/partial
-        install without needing to actually uninstall smbprotocol from
-        this dev environment."""
+        """``sys.modules["smbclient"] = None`` makes ``import smbclient`` raise
+        ``ImportError``, simulating a missing install."""
         monkeypatch.setitem(sys.modules, "smbclient", None)
         store = SmbStore("share", server="host")
-        with pytest.raises(ImportError):
+        with pytest.raises(ImportError, match="import of smbclient halted"):
             await store.size("f.txt")
 
 
+@unchecked_fake("the smbclient module")
 class _FakeSmbClientModule:
-    """Minimal fake mirroring the subset of the real ``smbclient`` module's
-    functions ``SmbStore`` calls — see
-    ``test_storage_object_store_contract.py``'s own, more complete fake of
-    the same shape for why a real class rather than ``MagicMock``: these
-    functions are synchronous, so plain methods already match."""
+    """The subset of the real ``smbclient`` module's functions ``SmbStore`` calls,
+    as plain methods (they are synchronous)."""
 
     def __init__(
         self,
@@ -59,9 +53,10 @@ class _FakeSmbClientModule:
         fail_with: OSError | None = None,
         register_fail_count: int = 0,
         register_fail_exc: Exception | None = None,
-        slow_seconds: float = 0.0,
-        slow_only_on_first_connection: bool = False,
+        stuck: bool = False,
+        stuck_only_on_first_connection: bool = False,
         credit_exhaustion_fail_count: int = 0,
+        rendezvous: int = 0,
     ) -> None:
         self._files = files or {}
         self._fail_with = fail_with
@@ -73,12 +68,17 @@ class _FakeSmbClientModule:
         self._register_fail_exc = register_fail_exc or OSError("simulated connect failure")
         self._register_attempts = 0
         # -- operation-timeout/retry knobs (TestOperationTimeoutAndRetry) --
-        self._slow_seconds = slow_seconds
-        self._slow_only_on_first_connection = slow_only_on_first_connection
+        self._stuck = stuck
+        self._stuck_only_on_first_connection = stuck_only_on_first_connection
+        #: Releases every stuck call; a test sets it before it ends.
+        self.unstick = threading.Event()
         self._first_connection_cache: object | None = None
         # -- concurrency-tracking knob (TestConnectionPool) --
         self._current_concurrent = 0
         self.max_concurrent_seen = 0
+        self._rendezvous = threading.Barrier(rendezvous) if rendezvous else None
+        self._rendezvous_left = rendezvous
+        self._rendezvous_lock = threading.Lock()
         # -- credit-exhaustion knob (TestCreditExhaustionRetry) --
         self._credit_exhaustion_fail_remaining = credit_exhaustion_fail_count
 
@@ -90,25 +90,31 @@ class _FakeSmbClientModule:
         if self._first_connection_cache is None:
             self._first_connection_cache = kwargs.get("connection_cache")
 
-    def _maybe_sleep(self, connection_cache: object) -> None:
-        """Blocks the calling (worker) thread for ``_slow_seconds`` — every
-        call when ``slow_only_on_first_connection`` is false, or only calls
-        still using the *first* registered connection when it's true (so a
-        test can prove a retry against a freshly reconnected session
-        succeeds fast instead of hanging again). Also tracks how many calls
-        are ever sleeping at once (``max_concurrent_seen``), for
-        ``TestConnectionPool``'s own assertions — a plain, unsynchronized
-        counter is good enough here since CPython's GIL serializes each
-        increment/decrement, and the test only needs a high-water mark, not
-        perfect concurrent bookkeeping."""
-        if self._slow_seconds <= 0:
+    def _maybe_block(self, connection_cache: object) -> None:
+        """With ``stuck``, parks the calling (worker) thread until ``unstick``
+        is set: every call, or with ``stuck_only_on_first_connection`` only
+        calls still on the first registered connection (so a retry on a fresh
+        session succeeds at once).
+
+        With ``rendezvous=N``, the first ``N`` calls each wait until all ``N``
+        are in flight at once; ``max_concurrent_seen`` is the high-water mark
+        of calls in flight. If the store serializes them instead, the barrier
+        times out and the call raises."""
+        if self._stuck and not (
+            self._stuck_only_on_first_connection and connection_cache is not self._first_connection_cache
+        ):
+            self.unstick.wait(30)
+        if self._rendezvous is None:
             return
-        if self._slow_only_on_first_connection and connection_cache is not self._first_connection_cache:
-            return
-        self._current_concurrent += 1
-        self.max_concurrent_seen = max(self.max_concurrent_seen, self._current_concurrent)
-        time.sleep(self._slow_seconds)
-        self._current_concurrent -= 1
+        with self._rendezvous_lock:
+            self._current_concurrent += 1
+            self.max_concurrent_seen = max(self.max_concurrent_seen, self._current_concurrent)
+            meet = self._rendezvous_left > 0
+            self._rendezvous_left -= 1
+        if meet:
+            self._rendezvous.wait(timeout=10)
+        with self._rendezvous_lock:
+            self._current_concurrent -= 1
 
     def delete_session(self, server: str, **kwargs: Any) -> None:
         self.delete_calls.append({"server": server, **kwargs})
@@ -144,7 +150,7 @@ class _FakeSmbClientModule:
         if self._credit_exhaustion_fail_remaining > 0:
             self._credit_exhaustion_fail_remaining -= 1
             raise SMBException("Request requires 1 credits but only 0 credits are available")
-        self._maybe_sleep(kwargs.get("connection_cache"))
+        self._maybe_block(kwargs.get("connection_cache"))
         content = self._content_or_raise(unc)
 
         class _Stat:
@@ -152,16 +158,28 @@ class _FakeSmbClientModule:
 
         return _Stat()
 
-    def listdir(self, unc: str, **kwargs: Any) -> list[str]:
+    def scandir(self, unc: str, **kwargs: Any) -> list[Any]:
         if self._fail_with is not None:
             raise self._fail_with
-        return sorted(self._files)
+        files = self._files
+
+        class _Entry:
+            def __init__(self_inner, name: str) -> None:
+                self_inner.name = name
+
+            def is_dir(self_inner) -> bool:
+                return self_inner.name.endswith("/")
+
+            def stat(self_inner) -> Any:
+                class _Stat:
+                    st_size = len(files[self_inner.name])
+
+                return _Stat()
+
+        return [_Entry(name) for name in files]
 
     def exists(self, unc: str, **kwargs: Any) -> bool:
-        # Mirrors real smbclient.path.exists()'s os.path.exists()-like
-        # tolerance for a missing path (never raises for that); any other
-        # OSError (e.g. permission denied) does propagate, exercising
-        # SmbStore._exists_sync's own handling of that case.
+        # Like smbclient.path.exists(): False for a missing path, any other OSError propagates.
         if self._fail_with is None:
             return True
         if self._fail_with.errno == errno.ENOENT:
@@ -174,7 +192,7 @@ def _patch_smbclient(monkeypatch: pytest.MonkeyPatch, fake: _FakeSmbClientModule
     monkeypatch.setattr(smbclient, "delete_session", fake.delete_session)
     monkeypatch.setattr(smbclient, "open_file", fake.open_file)
     monkeypatch.setattr(smbclient, "stat", fake.stat)
-    monkeypatch.setattr(smbclient, "listdir", fake.listdir)
+    monkeypatch.setattr(smbclient, "scandir", fake.scandir)
     monkeypatch.setattr(smbclient.path, "exists", fake.exists)
 
 
@@ -192,25 +210,23 @@ class TestSessionLifecycle:
         assert fake.register_calls[0]["username"] == "user"
         assert fake.register_calls[0]["password"] == "pw"
 
-    async def test_aclose_is_idempotent_and_a_no_op_before_any_use(self, monkeypatch: pytest.MonkeyPatch) -> None:
+    async def test_close_is_idempotent_and_a_no_op_before_any_use(self, monkeypatch: pytest.MonkeyPatch) -> None:
         fake = _FakeSmbClientModule({"f.txt": b"hello"})
         _patch_smbclient(monkeypatch, fake)
         store = SmbStore("share", server="host")
 
-        await store.aclose()  # never used - must not register/delete anything
+        await store.close()  # never used - must not register/delete anything
         assert fake.register_calls == []
         assert fake.delete_calls == []
 
         await store.size("f.txt")
-        await store.aclose()
-        await store.aclose()  # idempotent
+        await store.close()
+        await store.close()  # idempotent
         assert len(fake.delete_calls) == 1
 
     async def test_each_store_uses_its_own_private_connection_cache(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        """See the module docstring: ``smbclient``'s own session cache is
-        process-wide by default, so every call must pass this store's own
-        ``connection_cache`` dict rather than relying on the global one -
-        proven here by two stores' caches never being the same object."""
+        """``smbclient``'s session cache is process-wide by default, so every call
+        passes this store's own ``connection_cache``."""
         fake = _FakeSmbClientModule({"f.txt": b"hello"})
         _patch_smbclient(monkeypatch, fake)
         a = SmbStore("share", server="host")
@@ -238,7 +254,7 @@ class TestConnectRetry:
 
         await store.size("f.txt")
 
-        assert fake.register_calls[0]["connection_timeout"] == smb_module._DEFAULT_CONNECTION_TIMEOUT
+        assert fake.register_calls[0]["connection_timeout"] == NETWORK_CONNECT_TIMEOUT
 
     async def test_a_transient_connect_failure_is_retried_and_then_succeeds(
         self, monkeypatch: pytest.MonkeyPatch
@@ -255,71 +271,128 @@ class TestConnectRetry:
         _patch_smbclient(monkeypatch, fake)
         store = SmbStore("share", server="host")
 
-        with pytest.raises(OSError, match="simulated connect failure"):
+        with pytest.raises(StorageBackendError, match="simulated connect failure") as excinfo:
             await store.size("f.txt")
+        assert isinstance(excinfo.value.__cause__, OSError)
         assert len(fake.register_calls) == smb_module._DEFAULT_MAX_ATTEMPTS
+
+    async def test_a_rejected_logon_is_a_permission_denied_error_without_a_retry(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        rejected = SMBAuthenticationError("bad credentials")
+        fake = _FakeSmbClientModule(
+            {"f.txt": b"hello"}, register_fail_count=smb_module._DEFAULT_MAX_ATTEMPTS, register_fail_exc=rejected
+        )
+        _patch_smbclient(monkeypatch, fake)
+        store = SmbStore("share", server="host")
+
+        with pytest.raises(PermissionDeniedError, match="bad credentials") as excinfo:
+            await store.size("f.txt")
+        assert excinfo.value.__cause__ is rejected
+        assert len(fake.register_calls) == 1
+
+
+_STUCK_TIMEOUT = 0.5
+"""The operation timeout a retry test patches in when a later attempt
+succeeds: long enough that a fast fake operation (a thread round-trip)
+beats it on a heavily loaded machine."""
+
+_ALWAYS_STUCK_TIMEOUT = 0.01
+"""The operation timeout when every attempt is stuck: no fast call has to
+beat it."""
 
 
 class TestOperationTimeoutAndRetry:
-    """``_call_with_retry()`` — every operation past the initial connect is
-    bounded by ``_DEFAULT_OPERATION_TIMEOUT`` and retried up to
-    ``_DEFAULT_MAX_ATTEMPTS`` times, since ``smbprotocol`` gives a caller no
-    way to bound (or retry) a single ``open_file``/``stat``/``listdir``
-    call once a session is established."""
+    """``_call_with_retry()``: every operation past the initial connect is
+    bounded by ``NETWORK_READ_TIMEOUT`` and retried up to ``_DEFAULT_MAX_ATTEMPTS``
+    times, since ``smbprotocol`` can't bound or retry a single call itself."""
 
     async def test_a_stuck_operation_times_out_reconnects_and_then_succeeds(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        monkeypatch.setattr(smb_module, "_DEFAULT_OPERATION_TIMEOUT", 0.05)
-        fake = _FakeSmbClientModule({"f.txt": b"hello"}, slow_seconds=0.2, slow_only_on_first_connection=True)
+        monkeypatch.setattr(smb_module, "NETWORK_READ_TIMEOUT", _STUCK_TIMEOUT)
+        fake = _FakeSmbClientModule({"f.txt": b"hello"}, stuck=True, stuck_only_on_first_connection=True)
         _patch_smbclient(monkeypatch, fake)
         store = SmbStore("share", server="host")
 
-        assert await store.size("f.txt") == 5  # 1st attempt times out; 2nd (fresh connection) succeeds fast
+        try:
+            assert await store.size("f.txt") == 5  # 1st attempt times out; 2nd (fresh connection) succeeds fast
+        finally:
+            fake.unstick.set()
         assert len(fake.register_calls) == 2
 
     async def test_a_stuck_operation_drops_the_old_connection_cache_before_retrying(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        monkeypatch.setattr(smb_module, "_DEFAULT_OPERATION_TIMEOUT", 0.05)
-        fake = _FakeSmbClientModule({"f.txt": b"hello"}, slow_seconds=0.2, slow_only_on_first_connection=True)
+        monkeypatch.setattr(smb_module, "NETWORK_READ_TIMEOUT", _STUCK_TIMEOUT)
+        fake = _FakeSmbClientModule({"f.txt": b"hello"}, stuck=True, stuck_only_on_first_connection=True)
         _patch_smbclient(monkeypatch, fake)
         store = SmbStore("share", server="host")
         used_slot = store._slots[-1]  # the only slot a sequential, non-concurrent call ever checks out
         original_cache = used_slot.connection_cache
 
-        await store.size("f.txt")
+        try:
+            await store.size("f.txt")
+        finally:
+            fake.unstick.set()
 
         assert used_slot.connection_cache is not original_cache
 
     async def test_a_persistently_stuck_operation_raises_timeout_after_exhausting_retries(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        monkeypatch.setattr(smb_module, "_DEFAULT_OPERATION_TIMEOUT", 0.05)
-        fake = _FakeSmbClientModule({"f.txt": b"hello"}, slow_seconds=0.2)
+        monkeypatch.setattr(smb_module, "NETWORK_READ_TIMEOUT", _ALWAYS_STUCK_TIMEOUT)
+        fake = _FakeSmbClientModule({"f.txt": b"hello"}, stuck=True)
         _patch_smbclient(monkeypatch, fake)
         store = SmbStore("share", server="host")
 
-        with pytest.raises(TimeoutError):
-            await store.size("f.txt")
+        try:
+            with pytest.raises(StorageBackendError, match="SMB request failed") as excinfo:
+                await store.size("f.txt")
+        finally:
+            fake.unstick.set()
+        assert isinstance(excinfo.value.__cause__, TimeoutError)
         assert len(fake.register_calls) == smb_module._DEFAULT_MAX_ATTEMPTS
+
+    async def test_a_stuck_operation_holds_a_thread_of_the_stores_own_pool_not_the_default_executor(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A timed-out thread keeps running; on the loop's default executor it
+        would starve every other ``to_thread()`` caller."""
+        monkeypatch.setattr(smb_module, "NETWORK_READ_TIMEOUT", _ALWAYS_STUCK_TIMEOUT)
+        fake = _FakeSmbClientModule({"f.txt": b"hello"}, stuck=True)
+        _patch_smbclient(monkeypatch, fake)
+        thread_names: list[str] = []
+        real_stat = fake.stat
+
+        def recording_stat(unc: str, **kwargs: Any) -> Any:
+            thread_names.append(threading.current_thread().name)
+            return real_stat(unc, **kwargs)
+
+        monkeypatch.setattr(smbclient, "stat", recording_stat)
+        store = SmbStore("share", server="host")
+
+        try:
+            with pytest.raises(StorageBackendError, match="SMB request failed"):
+                await store.size("f.txt")
+            await store.close()
+        finally:
+            fake.unstick.set()
+
+        assert len(thread_names) == smb_module._DEFAULT_MAX_ATTEMPTS  # one stuck stat() per attempt
+        assert all(name.startswith("SmbStore") for name in thread_names)
+        assert store._executor is None
 
 
 class TestConnectionPool:
-    """The connection *pool* (``_DEFAULT_CONNECTION_POOL_SIZE`` independent
-    ``_ConnectionSlot``s) that replaced the single shared session — see the
-    module docstring for why: SMB2's own client-side credit window starts
-    at 1, so any two requests genuinely in flight at once on *one*
-    connection would race for it. Bounding each slot to one caller at a
-    time, while allowing up to the pool size real concurrent slots, is
-    what makes both guarantees below true at once."""
+    """The connection pool (``_DEFAULT_CONNECTION_POOL_SIZE`` independent
+    ``_ConnectionSlot`` instances): an SMB2 connection's credit window starts at 1, so
+    each slot serves one caller at a time, with up to the pool size concurrently."""
 
     async def test_concurrent_calls_use_independent_slots_and_sessions(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        """Two genuinely overlapping calls (forced via ``slow_seconds``)
-        must not be serialized onto one shared session — each gets its own
-        slot, with its own ``connection_cache``, and its own
+        """Two overlapping calls each get their own slot, ``connection_cache`` and
         ``register_session`` call."""
-        fake = _FakeSmbClientModule({"f.txt": b"hello"}, slow_seconds=0.05)
+        fake = _FakeSmbClientModule({"f.txt": b"hello"}, rendezvous=2)
         _patch_smbclient(monkeypatch, fake)
         store = SmbStore("share", server="host")
 
@@ -332,12 +405,10 @@ class TestConnectionPool:
         assert fake.max_concurrent_seen == 2
 
     async def test_pool_bounds_real_concurrency_and_queues_the_rest(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        """More concurrent callers than the pool has slots must still all
-        complete — the extra ones simply wait for a slot to free up,
-        never exceeding the pool size's worth of real concurrent
-        operations against the shared server."""
+        """More concurrent callers than slots all complete, never more than the
+        pool size at once."""
         monkeypatch.setattr(smb_module, "_DEFAULT_CONNECTION_POOL_SIZE", 2)
-        fake = _FakeSmbClientModule({"f.txt": b"hello"}, slow_seconds=0.05)
+        fake = _FakeSmbClientModule({"f.txt": b"hello"}, rendezvous=2)
         _patch_smbclient(monkeypatch, fake)
         store = SmbStore("share", server="host")
 
@@ -349,11 +420,9 @@ class TestConnectionPool:
 
 
 class TestCreditExhaustionRetry:
-    """``_call_with_retry()``'s second retryable condition, alongside a
-    timeout — a raised ``smbprotocol.exceptions.SMBException`` matching the
-    SMB2 credit-window-exhaustion message (see ``_is_credit_exhaustion``).
-    Unlike a timeout, this must *not* drop/reconnect the session: the
-    connection itself is healthy, just momentarily out of credit."""
+    """``_call_with_retry()``'s second retryable condition: an ``SMBException``
+    matching the SMB2 credit-exhaustion message (``_is_credit_exhaustion``).
+    Unlike a timeout it does not reconnect: the connection is healthy."""
 
     async def test_a_credit_exhaustion_error_is_retried_and_then_succeeds(
         self, monkeypatch: pytest.MonkeyPatch
@@ -364,7 +433,6 @@ class TestCreditExhaustionRetry:
         store = SmbStore("share", server="host")
 
         assert await store.size("f.txt") == 5
-        # No reconnect for this exception -- only ever the one session.
         assert len(fake.register_calls) == 1
 
     async def test_a_persistent_credit_exhaustion_error_raises_after_exhausting_retries(
@@ -375,51 +443,55 @@ class TestCreditExhaustionRetry:
         _patch_smbclient(monkeypatch, fake)
         store = SmbStore("share", server="host")
 
-        with pytest.raises(SMBException, match="credits are available"):
+        with pytest.raises(StorageBackendError, match="credits are available") as excinfo:
             await store.size("f.txt")
+        assert isinstance(excinfo.value.__cause__, SMBException)
         assert len(fake.register_calls) == 1
 
     async def test_an_unrelated_exception_is_not_treated_as_credit_exhaustion(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """A plain ``SMBException`` with an unrelated message (or any
-        other exception) must still propagate immediately, not get
-        swallowed into a retry loop meant for one specific condition."""
+        """An unrelated ``SMBException`` (or any other exception) fails immediately."""
         fake = _FakeSmbClientModule(fail_with=OSError(errno.EBUSY, "device or resource busy"))
         _patch_smbclient(monkeypatch, fake)
         store = SmbStore("share", server="host")
 
-        with pytest.raises(OSError, match="device or resource busy"):
+        with pytest.raises(StorageBackendError, match="device or resource busy"):
             await store.size("f.txt")
 
 
-class TestAcloseTearsDownEverySlot:
-    async def test_aclose_tears_down_every_slot_actually_used(self, monkeypatch: pytest.MonkeyPatch) -> None:
+class TestCloseTearsDownEverySlot:
+    async def test_close_tears_down_every_slot_actually_used(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setattr(smb_module, "_DEFAULT_CONNECTION_POOL_SIZE", 2)
-        fake = _FakeSmbClientModule({"f.txt": b"hello"}, slow_seconds=0.05)
+        fake = _FakeSmbClientModule({"f.txt": b"hello"}, rendezvous=2)
         _patch_smbclient(monkeypatch, fake)
         store = SmbStore("share", server="host")
 
         await asyncio.gather(store.size("f.txt"), store.size("f.txt"))
         assert len(fake.register_calls) == 2  # both slots now in use
 
-        await store.aclose()
+        await store.close()
 
         assert len(fake.delete_calls) == 2
         assert all(not slot.ready for slot in store._slots)
 
-    async def test_aclose_waits_for_an_in_flight_call_before_tearing_down_its_slot(
+    async def test_close_waits_for_an_in_flight_call_before_tearing_down_its_slot(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """``aclose()`` must never tear a slot's session down while a
-        caller is still mid ``_ensure_slot_session``/read on it — proven
-        here by a slow, already-in-flight ``size()`` call finishing
-        (and being recorded) strictly before ``aclose()`` does, even
-        though ``aclose()`` is invoked while that call still holds its
-        slot checked out."""
+        """A ``size()`` already holding its slot finishes before ``close()`` tears
+        that slot's session down."""
         events: list[str] = []
-        fake = _FakeSmbClientModule({"f.txt": b"hello"}, slow_seconds=0.1)
+        fake = _FakeSmbClientModule({"f.txt": b"hello"})
         _patch_smbclient(monkeypatch, fake)
+        in_stat, release = threading.Event(), threading.Event()
+        real_stat = fake.stat
+
+        def gated_stat(unc: str, **kwargs: Any) -> Any:
+            in_stat.set()
+            release.wait(10)
+            return real_stat(unc, **kwargs)
+
+        monkeypatch.setattr(smbclient, "stat", gated_stat)
         store = SmbStore("share", server="host")
 
         async def slow_call() -> None:
@@ -427,13 +499,21 @@ class TestAcloseTearsDownEverySlot:
             events.append("call_done")
 
         async def close_call() -> None:
-            await asyncio.sleep(0.01)  # let slow_call acquire its slot and start sleeping first
-            await store.aclose()
-            events.append("aclose_done")
+            await store.close()
+            events.append("close_done")
 
-        await asyncio.gather(slow_call(), close_call())
+        try:
+            calling = asyncio.create_task(slow_call())
+            assert await asyncio.to_thread(in_stat.wait, 10)  # slow_call holds its slot
+            closing = asyncio.create_task(close_call())
+            await asyncio.sleep(0)  # close takes every free slot without suspending, then waits on the held one
+            assert not closing.done()
+            assert fake.delete_calls == []
+        finally:
+            release.set()
+        await asyncio.wait_for(asyncio.gather(calling, closing), 10)
 
-        assert events.index("call_done") < events.index("aclose_done")
+        assert events == ["call_done", "close_done"]
         assert len(fake.delete_calls) == 1  # the one slot slow_call actually used
 
 
@@ -443,89 +523,76 @@ class TestErrorMapping:
         fake = _FakeSmbClientModule(fail_with=OSError(code, "not found"))
         _patch_smbclient(monkeypatch, fake)
         store = SmbStore("share", server="host")
-        with pytest.raises(NotFoundError):
+        with pytest.raises(NotFoundError, match="no such path"):
             await store.read("f.txt")
-        with pytest.raises(NotFoundError):
+        with pytest.raises(NotFoundError, match="no such path"):
             await store.size("f.txt")
-        with pytest.raises(NotFoundError):
+        with pytest.raises(NotFoundError, match="no such path"):
             await store.listdir("f.txt")
 
     async def test_eacces_maps_to_permission_denied(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        """``EACCES`` is the one permission-denied errno smbclient's own
-        mapping table actually produces (from ``STATUS_PRIVILEGE_NOT_HELD``)."""
+        """``EACCES`` is the one permission-denied errno smbclient's mapping table
+        produces (from ``STATUS_PRIVILEGE_NOT_HELD``)."""
         fake = _FakeSmbClientModule(fail_with=OSError(errno.EACCES, "permission denied"))
         _patch_smbclient(monkeypatch, fake)
         store = SmbStore("share", server="host")
-        with pytest.raises(PermissionDeniedError):
+        with pytest.raises(PermissionDeniedError, match="permission denied"):
             await store.read("f.txt")
-        with pytest.raises(PermissionDeniedError):
+        with pytest.raises(PermissionDeniedError, match="permission denied"):
             await store.size("f.txt")
-        with pytest.raises(PermissionDeniedError):
+        with pytest.raises(PermissionDeniedError, match="permission denied"):
             await store.listdir("f.txt")
 
     async def test_status_access_denied_with_no_errno_mapping_maps_to_permission_denied(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """``smbclient``'s own ``SMBOSError`` has no errno mapping at all
-        for ``STATUS_ACCESS_DENIED`` (the actual NT status a real SMB
-        server sends for a plain access-denied failure), so it comes back
-        as plain ``errno=0`` with the raw NT status on ``.ntstatus``
-        instead — recognized here via ``.ntstatus``, not ``errno`` alone
-        (see ``_is_permission_denied``)."""
+        """smbclient has no errno mapping for ``STATUS_ACCESS_DENIED``, so it
+        arrives as ``errno=0`` with the NT status on ``.ntstatus``
+        (``_is_permission_denied`` checks both)."""
         exc = OSError(0, "Unknown NtStatus error returned 'STATUS_ACCESS_DENIED'")
         exc.ntstatus = 0xC0000022  # type: ignore[attr-defined]
         fake = _FakeSmbClientModule(fail_with=exc)
         _patch_smbclient(monkeypatch, fake)
         store = SmbStore("share", server="host")
-        with pytest.raises(PermissionDeniedError):
+        with pytest.raises(PermissionDeniedError, match="permission denied"):
             await store.read("f.txt")
-        with pytest.raises(PermissionDeniedError):
+        with pytest.raises(PermissionDeniedError, match="permission denied"):
             await store.size("f.txt")
-        with pytest.raises(PermissionDeniedError):
+        with pytest.raises(PermissionDeniedError, match="permission denied"):
             await store.listdir("f.txt")
         assert await store.exists("f.txt") is False
 
     async def test_eperm_sharing_violation_is_not_reinterpreted_as_permission_denied(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """``EPERM`` is smbclient's own mapping for ``STATUS_SHARING_VIOLATION``
-        (a file locked open by another client) — a transient conflict, not
-        an access-control failure, and must not be folded into
-        ``PermissionDeniedError``."""
+        """``EPERM`` is smbclient's mapping for ``STATUS_SHARING_VIOLATION`` (a file
+        locked by another client): a transient conflict, not an access failure."""
         fake = _FakeSmbClientModule(fail_with=OSError(errno.EPERM, "sharing violation"))
         _patch_smbclient(monkeypatch, fake)
         store = SmbStore("share", server="host")
-        with pytest.raises(OSError, match="sharing violation") as excinfo:
+        with pytest.raises(StorageBackendError, match="sharing violation"):
             await store.read("f.txt")
-        assert not isinstance(excinfo.value, PermissionDeniedError)
 
-    async def test_an_unmapped_oserror_propagates_unchanged(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        """A share-full-of-open-handles conflict, say, must never be
-        silently swallowed or reinterpreted as a missing path or a
-        permission failure — checked against every method with its own
-        ``except OSError`` block."""
+    async def test_an_unmapped_oserror_is_a_storage_backend_error(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Checked against every method with its own ``except OSError`` block."""
         fake = _FakeSmbClientModule(fail_with=OSError(errno.EBUSY, "device or resource busy"))
         _patch_smbclient(monkeypatch, fake)
         store = SmbStore("share", server="host")
-        with pytest.raises(OSError, match="device or resource busy"):
-            await store.read("f.txt")
-        with pytest.raises(OSError, match="device or resource busy"):
-            await store.size("f.txt")
-        with pytest.raises(OSError, match="device or resource busy"):
-            await store.listdir("f.txt")
-        with pytest.raises(OSError, match="device or resource busy"):
-            await store.exists("f.txt")
+        for method in ("read", "size", "listdir", "exists"):
+            with pytest.raises(StorageBackendError, match="device or resource busy") as excinfo:
+                await getattr(store, method)("f.txt")
+            assert isinstance(excinfo.value.__cause__, OSError)
 
-    async def test_exists_never_raises(self, monkeypatch: pytest.MonkeyPatch) -> None:
+    async def test_exists_is_false_for_a_missing_path(self, monkeypatch: pytest.MonkeyPatch) -> None:
         fake = _FakeSmbClientModule(fail_with=OSError(errno.ENOENT, "not found"))
         _patch_smbclient(monkeypatch, fake)
         store = SmbStore("share", server="host")
         assert await store.exists("nope.txt") is False
 
     async def test_exists_returns_false_on_permission_denied(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        """Unlike ``read``/``size``/``listdir``, ``exists()`` never raises:
-        callers probe many candidate paths per real hit, and raising on
-        access-denied would abort that search over one bad sibling."""
+        """``exists()`` reports access denied as ``False``: callers probe many
+        candidate paths per real hit, and raising on it would abort that
+        search."""
         fake = _FakeSmbClientModule(fail_with=OSError(errno.EACCES, "permission denied"))
         _patch_smbclient(monkeypatch, fake)
         store = SmbStore("share", server="host")
@@ -533,17 +600,19 @@ class TestErrorMapping:
 
 
 class TestUncPathBuilding:
-    def test_root_path_has_no_trailing_separator(self) -> None:
+    @pytest.mark.parametrize(
+        ("path", "expected"),
+        [
+            pytest.param("", "\\\\host\\share", id="root_path_has_no_trailing_separator"),
+            pytest.param("sub/dir/file.txt", "\\\\host\\share\\sub\\dir\\file.txt", id="nested_path_uses_backslashes"),
+            pytest.param(
+                "/sub/file.txt/", "\\\\host\\share\\sub\\file.txt", id="stray_leading_and_trailing_slashes_are_stripped"
+            ),
+        ],
+    )
+    def test_unc(self, path: str, expected: str) -> None:
         store = SmbStore("share", server="host")
-        assert store._unc("") == "\\\\host\\share"
-
-    def test_nested_path_uses_backslashes(self) -> None:
-        store = SmbStore("share", server="host")
-        assert store._unc("sub/dir/file.txt") == "\\\\host\\share\\sub\\dir\\file.txt"
-
-    def test_stray_leading_and_trailing_slashes_are_stripped(self) -> None:
-        store = SmbStore("share", server="host")
-        assert store._unc("/sub/file.txt/") == "\\\\host\\share\\sub\\file.txt"
+        assert store._unc(path) == expected
 
 
 class TestRepr:
@@ -552,3 +621,28 @@ class TestRepr:
         assert "SmbStore" in repr(store)
         assert "host" in repr(store)
         assert "share" in repr(store)
+
+
+class TestListdirSizes:
+    async def test_files_carry_their_size_and_a_directory_none_sorted(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        fake = _FakeSmbClientModule({"b.bin": b"12345", "a.bin": b"", "sub/": b""})
+        _patch_smbclient(monkeypatch, fake)
+        store = SmbStore("share", server="host")
+
+        assert await store.listdir("d") == [Entry("a.bin", 0), Entry("b.bin", 5), Entry("sub/", None)]
+
+    async def test_an_entry_whose_stat_fails_reports_no_size(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        class _Entry:
+            name = "gone.bin"
+
+            def is_dir(self) -> bool:
+                return False
+
+            def stat(self) -> object:
+                raise OSError(errno.ENOENT, "vanished")
+
+        fake = _FakeSmbClientModule({"f.txt": b"x"})
+        _patch_smbclient(monkeypatch, fake)
+        monkeypatch.setattr(smbclient, "scandir", lambda unc, **kw: [_Entry()])
+
+        assert await SmbStore("share", server="host").listdir("d") == [Entry("gone.bin", None)]

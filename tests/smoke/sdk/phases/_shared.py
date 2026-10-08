@@ -1,8 +1,5 @@
-"""Shared browse/read/export helper for the ``device``/``fs``/``saas``
-domains -- the same bounded read-then-export shape all three need, once a
-leaf has already been picked (``pick_workload``/``find_leaf`` now live in
-``../.._shared_refs.py``, shared with ``cli/``/``browser/`` too).
-"""
+"""The bounded read-then-export check the ``device``/``fs``/``saas`` domains
+run on a picked leaf."""
 
 from __future__ import annotations
 
@@ -10,6 +7,8 @@ import tempfile
 from pathlib import Path
 
 from synology_apm_repo.sdk import ApmRepoError, ContentSource
+from synology_apm_repo.sdk.api.export import run_export
+from synology_apm_repo.sdk.dedup.local_file_sink import LocalFileSink
 
 from .._context import SmokeContext
 
@@ -17,9 +16,8 @@ from .._context import SmokeContext
 #: header-sized prefix, never the whole file/disk image.
 HEADER_READ_CAP = 64 * 1024
 
-#: Above this size, the real export_to() round trip is skipped rather than
-#: attempted -- keeps the one disk-touching check in this tool fast and
-#: bounded regardless of how large the real content is.
+#: Above this size the export round trip is skipped, keeping the one
+#: disk-touching check fast and bounded.
 EXPORT_SIZE_CAP = 4 * 1024 * 1024
 
 
@@ -31,16 +29,9 @@ async def bounded_read_and_export(
     *,
     degrade_on: tuple[type[ApmRepoError], ...],
 ) -> None:
-    """The two bounded, content-level checks every leaf item gets, both
-    in-memory-safe except the export step, which is capped and cleaned up
-    immediately:
-
-    - ``read(0, min(size, HEADER_READ_CAP))`` -- pure in-memory.
-    - If ``size <= EXPORT_SIZE_CAP``: a real ``export_to()`` round trip
-      into a ``tempfile.TemporaryDirectory()`` (auto-cleaned on exit),
-      checked against ``content.size``. Otherwise skipped with a reason --
-      this is the one place this tool ever touches disk.
-    """
+    """Reads ``min(size, HEADER_READ_CAP)`` bytes in memory, then, if
+    ``size <= EXPORT_SIZE_CAP``, exports to a temporary file and checks its
+    size against ``content.size``; otherwise the export step is skipped."""
     size = content.size
 
     async def _read() -> int:
@@ -64,7 +55,7 @@ async def bounded_read_and_export(
         dst = Path(tmp_dir) / "export.bin"
 
         async def _export() -> int:
-            await content.export_to(dst)
+            await run_export(content, LocalFileSink(dst, staged=False))
             return dst.stat().st_size
 
         exported_size = await ctx.call(domain, f"{step_prefix}.export", _export, degrade_on=degrade_on)

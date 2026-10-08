@@ -1,9 +1,6 @@
-"""Unit tests for ``browser.core.remote_data`` — plain value-object
-behavior (construction, equality, defaults) plus exhaustive ``match``
-dispatch over all four ``RemoteData`` variants, since that's the whole
-reason this module exists: a selector reading a model's ``RemoteData``
-field is expected to ``match`` over exactly these four cases, ending in
-``case _: assert_never(data)``."""
+"""Unit tests for ``browser.core.remote_data``. ``_describe`` matches the
+four ``RemoteData`` variants exhaustively, ending in ``assert_never``, as a
+selector reading a ``RemoteData`` field does."""
 
 from __future__ import annotations
 
@@ -63,17 +60,13 @@ def test_failure_info_defaults_to_kind_other() -> None:
 
 
 def test_failure_info_can_carry_key_required_kind() -> None:
-    """The one failure kind ``update()`` reacts to structurally (pushing
-    ``KeyDialog``) rather than just rendering the message like every other
-    failure kind does."""
     failure = FailureInfo(message="key needed", kind=FailureKind.KEY_REQUIRED)
     assert failure.kind is FailureKind.KEY_REQUIRED
 
 
 def test_equal_variants_compare_equal() -> None:
-    """Frozen-dataclass field-wise equality -- what lets an ``update()``
-    branch that returns an untouched slice compare cheaply against a
-    freshly-selected one (Store._notify's own slice-diffing)."""
+    """``Store._notify`` re-renders a subscriber only when its selected slice
+    compares unequal."""
     assert Success(value=1) == Success(value=1)
     assert Success(value=1) != Success(value=2)
     assert NotAsked() == NotAsked()
@@ -114,8 +107,6 @@ def test_value_or_stale_falls_back_to_a_real_previous_value() -> None:
 
 
 def test_value_or_stale_distinguishes_a_none_valued_success_from_no_value() -> None:
-    """The exact hazard a bare-``None`` sentinel would get wrong: a ``T``
-    that legitimately includes ``None`` as a resolved value."""
     state: RemoteData[str | None] = Success(value=None)
     value = value_or_stale(state)
     assert value is None  # the real value, not NoValue()

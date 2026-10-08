@@ -1,13 +1,11 @@
 """Entry point: ``uv run python -m tests.smoke.cli [--group ...]``.
 
-Drives the real, installed ``synology-apm-repo-cli`` console script as a
-subprocess against whatever real sample repositories
-``smoke_samples.toml`` configures (see ``.._samples``), writing Markdown
-reports to ``tests/smoke/reports/cli/<UTC timestamp>/``. Ref selection
-(``_bootstrap``) uses the SDK in-process, once, purely to pick a real,
-representative ``NodeRef`` per sample/workload-type -- every actual check
-after that goes through the real subprocess CLI (see ``.._shared_refs.
-list_representative_refs``).
+Drives the installed ``synology-apm-repo-cli`` console script as a
+subprocess against the samples ``smoke_samples.toml`` configures, writing
+Markdown reports to ``tests/smoke/reports/cli/<UTC timestamp>/``. The SDK
+runs in-process only to pick ``main_ref``/``encrypted_ref`` from the
+``[[local]]`` samples (``list_representative_refs``/``pick_session_refs``);
+remote samples are reached only by ``remote_connect``.
 """
 
 from __future__ import annotations
@@ -16,21 +14,21 @@ import argparse
 import asyncio
 from datetime import UTC, datetime
 
-from synology_apm_repo.sdk import Session
-
-from .._report import make_report_dir, write_index
-from .._samples import load_smoke_samples
-from .._shared_refs import RepresentativeRef, list_representative_refs
+from .._report import make_report_dir, resource_usage, write_index
+from .._samples import LocalSample, RemoteStorageSample, SampleEntry, load_smoke_samples
+from .._shared_refs import list_representative_refs, pick_session_refs
 from ._context import DOMAINS, SmokeContext
-from .phases import _commands, _errors, _export_lifecycle, _global_flags, _profile
+from ._remote_profiles import remote_profiles
+from .phases import _commands, _errors, _export_lifecycle, _global_flags, _profile, _remote_connect
 
-_ORDER = ("commands", "global_flags", "export_lifecycle", "profile", "errors")
+_ORDER = ("commands", "global_flags", "export_lifecycle", "profile", "errors", "remote_connect")
 _PHASES = {
     "commands": _commands,
     "global_flags": _global_flags,
     "export_lifecycle": _export_lifecycle,
     "profile": _profile,
     "errors": _errors,
+    "remote_connect": _remote_connect,
 }
 
 
@@ -41,23 +39,26 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "repositories configured in tests/smoke/smoke_samples.toml.",
     )
     parser.add_argument("--group", choices=("all", *_ORDER), default="all", help="Run one domain only (default: all)")
+    parser.add_argument(
+        "--sample",
+        action="append",
+        default=[],
+        metavar="NAME",
+        help="Run only the named sample (repeatable; default: every configured sample)",
+    )
     return parser.parse_args(argv)
 
 
-async def _bootstrap() -> tuple[int, list[RepresentativeRef], list[str]]:
+def _load_entries(names: list[str]) -> list[SampleEntry]:
     entries = load_smoke_samples()
-    if not entries:
-        return 0, [], []
-    async with Session() as session:
-        # exclude_unreopenable_by_cli=True: a RemoteStorageSample-derived
-        # ref has no --profile to reopen it with, and the real CLI has no
-        # raw-credential flag either -- sdk/ and browser/ still cover it fully.
-        refs, skip_reasons = await list_representative_refs(session, entries, exclude_unreopenable_by_cli=True)
-    return len(entries), refs, skip_reasons
+    if names:
+        entries = [entry for entry in entries if entry.name in names]
+    return entries
 
 
 def _run(args: argparse.Namespace) -> int:
-    sample_count, refs, bootstrap_skips = asyncio.run(_bootstrap())
+    entries = _load_entries(args.sample)
+    sample_count = len(entries)
     report_dir = make_report_dir("cli")
     started_at = datetime.now(UTC)
 
@@ -69,18 +70,25 @@ def _run(args: argparse.Namespace) -> int:
             for domain in _ORDER:
                 ctx.skip(domain, f"{domain}.no_samples_configured", reason)
         else:
-            # Recorded here, not inside list_representative_refs() itself
-            # (this SmokeContext doesn't exist yet at that point) -- a bare
-            # print() alone would leave a real cli-specific coverage gap
-            # invisible in index.md, visible only in whatever terminal
-            # happened to run the tool.
-            for i, reason in enumerate(bootstrap_skips):
-                ctx.skip("commands", f"commands.bootstrap_skip[{i}]", reason)
-            ctx.data["refs"] = refs
-            phases = _ORDER if args.group == "all" else (args.group,)
-            for phase in phases:
-                print(f"[smoke] running phase: {phase}")
-                _PHASES[phase].run(ctx)
+            refs, bootstrap_skips = asyncio.run(list_representative_refs(entries))
+            remote = [entry for entry in entries if not isinstance(entry, LocalSample)]
+            # The real CLI reopens a remote target only via --profile, so each
+            # [[remote_storage]] sample gets a throwaway profile for this run.
+            with remote_profiles(ctx, [e for e in remote if isinstance(e, RemoteStorageSample)]) as profiles:
+                # Recorded as steps; a bare print() would leave the gap out of index.md.
+                for i, reason in enumerate(bootstrap_skips):
+                    ctx.skip("commands", f"commands.bootstrap_skip[{i}]", reason)
+                main_ref, encrypted_ref = pick_session_refs(refs)
+                # main_ref first (global_flags/export_lifecycle run on refs[0]);
+                # it can be the same ref as encrypted_ref.
+                picked = [r for r in (main_ref, encrypted_ref) if r is not None]
+                ctx.data["refs"] = picked if len(picked) < 2 or picked[0] is not picked[1] else picked[:1]
+                ctx.data["remote_entries"] = remote
+                ctx.data["remote_profiles"] = profiles
+                phases = _ORDER if args.group == "all" else (args.group,)
+                for phase in phases:
+                    print(f"[smoke] running phase: {phase}")
+                    _PHASES[phase].run(ctx)
     finally:
         finished_at = datetime.now(UTC)
         write_index(
@@ -93,6 +101,7 @@ def _run(args: argparse.Namespace) -> int:
             finished_at=finished_at,
             stats=ctx.stats,
             step_results=ctx.step_results,
+            resources=resource_usage(children=True),
         )
         ctx.close()
 

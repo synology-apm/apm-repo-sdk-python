@@ -27,13 +27,8 @@ def test_wrapped_function_forwards_args_and_kwargs() -> None:
 
 
 def test_wrapped_function_turns_an_unexpected_exception_into_a_clean_exit(capsys: pytest.CaptureFixture[str]) -> None:
-    # Intentional behavior change: a bug the wrapped call doesn't resolve
-    # into a typer.Exit itself no longer propagates as a raw exception —
-    # fail_unexpected() turns it into a typer.Exit(code=1), the same clean
-    # failure shape every *expected* command error already produces via
-    # fail()/unwrap(). It's the last-resort handler wired in at
-    # typer_async, the one chokepoint every command callback passes
-    # through, so a bug never surfaces as a bare, unexplained traceback.
+    # typer_async is the one chokepoint every command passes through, so it
+    # is where fail_unexpected() turns a bug into a reported exit 1.
     @typer_async
     async def raises() -> None:
         raise ValueError("boom")
@@ -48,9 +43,8 @@ def test_wrapped_function_turns_an_unexpected_exception_into_a_clean_exit(capsys
 
 
 def test_wrapped_function_lets_a_typer_exit_pass_through_unchanged() -> None:
-    # A command's own fail()/unwrap() already raises typer.Exit — that
-    # must reach the caller exactly as raised, never get rewrapped as an
-    # "internal error".
+    # A command's own fail() raises typer.Exit; it must not be rewrapped as
+    # an "internal error".
     @typer_async
     async def exits() -> None:
         raise typer.Exit(code=3)
@@ -60,11 +54,22 @@ def test_wrapped_function_lets_a_typer_exit_pass_through_unchanged() -> None:
     assert exc_info.value.exit_code == 3
 
 
+def test_an_unhandled_ctrl_c_exits_cancelled(capsys: pytest.CaptureFixture[str]) -> None:
+    # asyncio.run surfaces a SIGINT as KeyboardInterrupt; any command that
+    # doesn't handle its own cancellation must still exit 130, not Click's
+    # generic "Aborted!" with status 1.
+    @typer_async
+    async def interrupted() -> None:
+        raise KeyboardInterrupt
+
+    with pytest.raises(typer.Exit) as exc_info:
+        interrupted()
+    assert exc_info.value.exit_code == 130
+    assert "cancelled" in capsys.readouterr().err
+
+
 def test_signature_is_preserved_for_typer_introspection() -> None:
-    # Typer inspects a command's signature to build --options/arguments —
-    # functools.wraps must keep the original async function's signature
-    # visible through the sync wrapper, not the wrapper's own (*args,
-    # **kwargs).
+    # Typer builds a command's options/arguments from this signature.
     async def original(x: int, *, y: str = "default") -> None:
         pass
 

@@ -1,296 +1,161 @@
 """``VirtualDiskContentSource`` reassembles a PC/PS physical disk's
-independently-registered per-region dedup objects ("fragments") into one
-``ContentSource`` that reads/exports/streams like a single disk image,
-matching VM's own ``disk_image`` model.
+per-region dedup objects ("fragments", FORMAT-SPEC.md: PC/PS disk fragments) into one
+``ContentSource`` that behaves like a single disk image.
 
-Unlike VM (one disk = one ``object_table`` row = one composition),
-PC/PS's disk-analyzer segments one physical disk into several regions
-at backup time, each its own independently-registered dedup object
-(FORMAT-SPEC.md: pcps-fragments). Two facts this class depends on: a fragment's
-chunk-map offsets are disk-absolute, not relative to its own start, so
-opening its ``DedupFile`` with the whole disk's size already gives a
-complete, correctly-sparse view of the entire disk on its own; and
-``db/file_meta.file_size`` is the whole disk's capacity (identical across
-every sibling fragment), never one fragment's own real length — that has
-to be asked of its own composition directly
-(``CompositionRecord.extent``).
-
-This class's only real job is routing a read to whichever fragment
-covers it, and driving a whole-disk export fragment-by-fragment through
-``export_scheduler.export_to``'s ``dst_offset`` mechanism — never through
-``VirtualDiskContentSource.read``, which stays a browsing/preview path
-only.
+Two facts it depends on: a fragment's chunk-map offsets are
+disk-absolute, so its ``DedupFile`` opened with the whole disk's size is
+already a correctly-sparse whole-disk view; and ``db/file_meta.file_size``
+is the whole disk's capacity, not one fragment's length (that comes from
+``CompositionRecord.extent``).
 """
 
 from __future__ import annotations
 
-import asyncio
 import dataclasses
-import os
-import sys
-from collections.abc import AsyncIterator, Awaitable, Callable
-from pathlib import Path
+import heapq
+import itertools
+from collections.abc import AsyncIterator
 
+from ...dedup import export_scheduler
+from ...dedup.chunk_walk import count_planned_bytes
 from ...dedup.dedup_file import (
     DEFAULT_STREAM_BLOCK,
     DedupFile,
-    ExportResult,
     clamp_read_length,
     stream_via_read,
+    validate_export_range,
+    validate_read_args,
 )
-from ...dedup.export_scheduler import build_export_executor
-from ...dedup.pool import DEFAULT_BUCKET_CACHE_SIZE, BucketReaderCache
+from ...dedup.export_scheduler import ExportTuning
+from ...dedup.export_sink import ExportWriter, WrittenBytesCallback
+from ...dedup.extent import ExportResult
 from ...dedup.pool_descriptor import PoolDescriptor
-from ...dedup.presized_file import create_presized, open_destination
-
-_ZERO_FILL_BLOCK = 1 << 20
 
 
-def _pwrite(fd: int, data: bytes, offset: int) -> None:
-    """Same shape as ``export_scheduler.py``'s own private helper —
-    ``os.pwrite()`` where available (POSIX); Windows has no positional
-    write, so this falls back to ``lseek``+``write``, safe here because
-    every call is awaited sequentially against this one fd (see the
-    caller below)."""
-    if sys.platform != "win32":
-        os.pwrite(fd, data, offset)
-    else:
-        os.lseek(fd, offset, os.SEEK_SET)
-        os.write(fd, data)
-
-
-def _write_zeros_at(fd: int, offset: int, length: int) -> None:
-    """Same shape as ``export_scheduler.py``'s own private helper — used
-    here only for the gaps *between*/around fragments (never covered by
-    any fragment's own composition at all), which no per-fragment
-    ``export_to`` call ever writes to."""
-    block = bytes(_ZERO_FILL_BLOCK)
-    remaining = length
-    pos = offset
-    while remaining > 0:
-        take = min(remaining, len(block))
-        _pwrite(fd, block[:take], pos)
-        pos += take
-        remaining -= take
-
-
-def _gaps(fragments: list[DiskFragment], size: int) -> list[tuple[int, int]]:
-    """``[start, end)`` ranges of the disk not covered by any fragment's
-    own extent — a leading gap, any gap between fragments, and a
-    trailing gap. ``fragments`` must already be sorted by ``start`` (as
-    ``VirtualDiskContentSource`` always keeps its own list). Correct
-    even when fragments overlap (real ones do)."""
-    gaps = []
-    pos = 0
-    for frag in fragments:
-        if frag.start > pos:
-            gaps.append((pos, frag.start))
-        # max(), not frag.end directly: an overlapping fragment's start
-        # can fall inside territory an earlier fragment already covered,
-        # and a gap must never be re-opened there once it's covered.
-        pos = max(pos, frag.end)
-    if pos < size:
-        gaps.append((pos, size))
-    return gaps
-
-
-@dataclasses.dataclass(frozen=True)
+@dataclasses.dataclass(frozen=True, slots=True)
 class DiskFragment:
-    """One PC/PS per-region object, already resolved down to a
-    ready-to-read ``DedupFile`` and the disk-absolute ``[start, end)``
-    range its own composition actually covers (``CompositionRecord.extent``)."""
+    """One PC/PS per-region object, resolved to a ready-to-read
+    ``DedupFile`` and the disk-absolute ``[start, end)`` its composition
+    covers (``CompositionRecord.extent``)."""
 
     fid: int
     start: int
     end: int
     dedup_file: DedupFile
     src_file_path: str
-    """Kept for diagnostics/``attrs`` display only — never consulted for
-    addressing (that's what ``start``/``end`` are for)."""
+    """For diagnostics only, never for addressing."""
 
 
-def _make_progress(
-    progress: Callable[[int, int], Awaitable[None]], base: int, total: int
-) -> Callable[[int, int], Awaitable[None]]:
-    """A fragment-scoped ``progress`` callback that reports against the
-    combined whole-disk total, offset by every earlier fragment's own
-    already-completed share (``base``). A plain closure over a loop
-    variable would suffer the usual late-binding bug across fragments —
-    this factory binds ``base``/``total`` at construction time instead."""
-
-    async def _inner(done: int, _fragment_total: int) -> None:
-        await progress(base + done, total)
-
-    return _inner
+def _winning_segments(fragments: list[DiskFragment]) -> list[tuple[DiskFragment, int, int]]:
+    """Splits the disk into disjoint ``(fragment, start, end)`` segments,
+    ascending, each owned by the fragment that wins there: where fragments
+    overlap, the one with the higher ``start`` (a later one wins a tie).
+    Empty fragments own nothing. ``fragments`` must be sorted by ``start``."""
+    bounds = sorted({point for f in fragments for point in (f.start, f.end)})
+    # Fragments starting at or before the current interval, the winner on top;
+    # one that ended (an empty one included) is discarded when it surfaces.
+    active: list[tuple[int, int]] = []
+    upcoming = 0
+    segments: list[tuple[DiskFragment, int, int]] = []
+    for start, end in itertools.pairwise(bounds):
+        while upcoming < len(fragments) and fragments[upcoming].start <= start:
+            heapq.heappush(active, (-fragments[upcoming].start, -upcoming))
+            upcoming += 1
+        while active and fragments[-active[0][1]].end <= start:
+            heapq.heappop(active)
+        if not active:
+            continue
+        winner = fragments[-active[0][1]]
+        if segments and segments[-1][0] is winner and segments[-1][2] == start:
+            segments[-1] = (winner, segments[-1][1], end)
+        else:
+            segments.append((winner, start, end))
+    return segments
 
 
 class VirtualDiskContentSource:
-    """Reassembles a PC/PS physical disk's independently-addressed
-    fragments into one ``ContentSource`` spanning the whole disk
-    (``[0, size)``), with the same ``size``/``read``/``stream``/
-    ``export_to`` shape as a VM's single-composition ``disk_image`` —
-    so nothing above this layer needs a PC/PS-specific branch.
+    """A PC/PS physical disk's fragments as one ``ContentSource`` spanning
+    ``[0, size)``.
 
-    Fragments genuinely overlap in real data — a fragment's own
-    composition covers whatever whole 4096-byte chunks its capture
-    touched, and the chunk straddling two regions' boundary can carry
-    real data in the later region while the earlier region pads the
-    same range with a ``ZERO`` declaration (its capture stopped at the
-    true, unaligned boundary). The rule this class applies: when more
-    than one fragment covers a byte, the fragment with the higher
-    ``start`` wins — a later region's real capture takes precedence
-    over an earlier region's boundary-padding zero declaration.
-    ``read``/``export_to`` both get this "for free" by writing/exporting
-    fragments in ascending-``start`` order, so a later fragment's write
-    naturally overwrites an earlier one's in any shared range.
+    Fragments overlap in real data: a fragment's composition covers whole
+    4096-byte chunks, so the chunk straddling a region boundary can hold
+    real data in the later region while the earlier one pads it with a
+    ``ZERO`` declaration. Where more than one fragment covers a byte, the
+    one with the higher ``start`` wins. The disk is split once into
+    disjoint winning segments (``_winning_segments``) that ``read`` and
+    ``export_range`` both use, so neither depends on write order.
     """
 
     def __init__(self, size: int, fragments: list[DiskFragment]) -> None:
         self.size = size
         self.fragments = sorted(fragments, key=lambda f: f.start)
+        self._segments = _winning_segments(self.fragments)
 
-    async def read(self, offset: int = 0, length: int | None = None) -> bytes:
-        """See ``units.base.ContentSource.read``'s EOF contract — a
-        request extending past this disk's own ``size`` is clamped, never
-        an error."""
-        if offset < 0 or (length is not None and length < 0):
-            raise ValueError(f"read(offset={offset}, length={length}): offset/length must be non-negative")
+    async def read(self, offset: int = 0, length: int | None = None) -> bytes | bytearray:
+        """``ContentSource.read``; a request past ``size`` is clamped."""
+        validate_read_args(offset, length)
         length = clamp_read_length(offset, length, self.size)
         end = offset + length
         if end == offset:
             return b""
-        touching = [f for f in self.fragments if f.start < end and f.end > offset]
+        touching = [segment for segment in self._segments if segment[1] < end and segment[2] > offset]
         if not touching:
             # Fast path: nothing registered here at all -- a pure hole.
             return bytes(end - offset)
-        if len(touching) == 1 and touching[0].start <= offset and end <= touching[0].end:
-            # Fast path: exactly one fragment overlaps this request at
-            # all, and it fully covers it -- delegate straight through,
-            # no bytearray/copy of our own. Only safe when nothing else
-            # touches this range: fragments can genuinely overlap in real
-            # data (a later region's real capture can share a chunk with
-            # an earlier region's zero-padded boundary), so a fragment
-            # fully covering the request is *not* enough on its own if a
-            # second, higher-precedence fragment also overlaps some
-            # sub-range of it -- that case must go through the assembly
-            # path below to apply the real precedence rule correctly.
-            return await touching[0].dedup_file.read(offset, end - offset)
+        frag, seg_start, seg_end = touching[0]
+        if len(touching) == 1 and seg_start <= offset and end <= seg_end:
+            # Fast path: one segment covers the whole range, so skip assembly.
+            return await frag.dedup_file.read(offset, end - offset)
         out = bytearray(end - offset)
-        # ``touching`` keeps fragments' ascending-start order, so a later
-        # fragment's write below naturally overwrites an earlier one's in
-        # any shared range ("higher start wins"). Known, accepted cost: a
-        # lower-precedence fragment's read can still cover bytes a later
-        # fragment overwrites — redundant, bounded in real data to about
-        # one 4096-byte chunk per fragment seam.
-        for frag in touching:
-            seg_start, seg_end = max(frag.start, offset), min(frag.end, end)
-            chunk = await frag.dedup_file.read(seg_start, seg_end - seg_start)
-            out[seg_start - offset : seg_end - offset] = chunk
-        return bytes(out)
+        for frag, seg_start, seg_end in touching:
+            start, stop = max(seg_start, offset), min(seg_end, end)
+            out[start - offset : stop - offset] = await frag.dedup_file.read(start, stop - start)
+        return out
 
-    def stream(self, block: int = DEFAULT_STREAM_BLOCK) -> AsyncIterator[tuple[int, bytes]]:
+    def stream(self, block: int = DEFAULT_STREAM_BLOCK) -> AsyncIterator[tuple[int, bytes | bytearray]]:
         return stream_via_read(self, block)
 
-    @property
-    def supports_concurrent_export(self) -> bool:
-        """Always ``True`` — ``export_to()`` accepts and forwards
-        ``max_concurrent_reads``/``max_concurrent_opens`` to each of its
-        own fragments."""
-        return True
-
-    async def export_to(
+    async def export_range(
         self,
-        dst: Path,
+        writer: ExportWriter,
+        start: int,
+        end: int,
         *,
         sparse: bool = True,
-        progress: Callable[[int, int], Awaitable[None]] | None = None,
-        max_concurrent_opens: int | None = None,
-        max_concurrent_reads: int = 1,
+        progress: WrittenBytesCallback | None = None,
+        tuning: ExportTuning | None = None,
     ) -> ExportResult:
-        """Export the whole disk by walking fragments in order and handing
-        each to ``export_scheduler.export_to``'s own bucket-major writer,
-        landing at its disk-absolute ``dst_offset`` inside one pre-sized
-        ``dst`` file — never through ``read``. Fragments export
-        sequentially, one at a time; ``max_concurrent_opens``/
-        ``max_concurrent_reads`` only add concurrency *within* each
-        fragment's own bucket-major walk (the same two knobs a VM's
-        ``disk_image`` exposes — see ``chunk_walk.py``). Gaps
-        between/around fragments (``_gaps``) are real holes: left
-        unwritten in the pre-sized destination when ``sparse=True``
-        (``presized_file.create_presized``), explicitly zero-filled
-        otherwise. Every fragment shares one ``BucketReaderCache`` for
-        this call, bounded to ``DEFAULT_BUCKET_CACHE_SIZE`` (16, the same
-        bound ``chunk_walk.py``/``export_scheduler.py`` share so the three
-        don't each drift with a separately hardcoded copy).
+        """Exports the disk's ``[start, end)`` into ``writer`` at offsets
+        relative to ``start``, one winning segment at a time, so overlaps
+        are neither written nor counted twice. Gaps between fragments are
+        holes: left unwritten when ``sparse=True`` and the writer allows
+        it, zero-filled otherwise.
 
-        ``ExportResult.holes``/``zeros``/``bytes_written`` are summed
-        across fragments independently, so a byte range more than one
-        fragment declares (adjacent regions' ``ZERO`` tails agreeing) is
-        counted more than once — the written file is still byte-correct,
-        only the reported totals can run slightly ahead of the disk's
-        true size.
-
-        Shares **one** multiprocess executor across every fragment's own
-        ``export_to()`` call, the same "one executor per logical export"
-        contract ``Repository.verify()``'s multi-catalog fan-out follows.
-        Built only when every fragment resolves to the identical
-        ``PoolDescriptor`` (same store/``pool_root``/vault key) — checked,
-        not assumed.
+        Raises:
+            ValueError: The range is not inside the disk.
         """
-        await asyncio.to_thread(create_presized, dst, self.size, sparse=sparse)
-        gaps = _gaps(self.fragments, self.size)
-        gap_total = sum(end - start for start, end in gaps)
+        validate_export_range(start, end, self.size)
+        segments = [
+            (frag.dedup_file, max(seg_start, start), min(seg_end, end))
+            for frag, seg_start, seg_end in self._segments
+            if seg_start < end and seg_end > start
+        ]
+        return await export_scheduler.export_fragments_to_writer(
+            segments, writer, span=(start, end), sparse=sparse, progress=progress, tuning=tuning
+        )
 
-        export_cache = BucketReaderCache(maxsize=DEFAULT_BUCKET_CACHE_SIZE)
-        planned_total = sum(f.end - f.start for f in self.fragments) if progress else 0
-        bytes_written = holes = zeros = 0
-        done_before = 0
+    def pool_descriptor(self) -> PoolDescriptor | None:
+        """How a worker process rebuilds the fragments' ``Pool``: ``None``
+        unless every fragment's file is backed by the same rebuildable one."""
+        descriptors = {frag.dedup_file.pool_descriptor() for frag in self.fragments}
+        return descriptors.pop() if len(descriptors) == 1 else None
 
-        descriptors = [PoolDescriptor.from_pool(frag.dedup_file.pool) for frag in self.fragments]
-        first = descriptors[0] if descriptors else None
-        share_one_executor = first is not None and all(d == first for d in descriptors)
-        executor = build_export_executor(first, str(dst)) if share_one_executor and first is not None else None
-        try:
-            # Fragments are walked sequentially, one fully finishing before
-            # the next starts, to preserve the "higher start wins" overlap
-            # precedence (class docstring) under concurrent writes -- the
-            # real parallelism happens inside each fragment's own bucket-
-            # group dispatch once `executor` is set. `max_concurrent_opens`
-            # left None auto-derives from `max_concurrent_reads`, same as
-            # every other `export_scheduler.export_to()` caller.
-            for frag in self.fragments:
-                frag_progress = _make_progress(progress, done_before, planned_total) if progress is not None else None
-                view = frag.dedup_file.view(frag.start, frag.end - frag.start)
-                result = await view.export_to(
-                    dst,
-                    sparse=sparse,
-                    progress=frag_progress,
-                    export_cache=export_cache,
-                    dst_offset=frag.start,
-                    create=False,
-                    max_concurrent_opens=max_concurrent_opens,
-                    max_concurrent_reads=max_concurrent_reads,
-                    executor=executor,
-                )
-                bytes_written += result.bytes_written
-                holes += result.holes
-                zeros += result.zeros
-                done_before += frag.end - frag.start
-        finally:
-            if executor is not None:
-                # A plain blocking call -- see export_scheduler.py's own
-                # equivalent teardown for why this must go through
-                # to_thread() rather than freeze this whole process's
-                # event loop for however long a still-running worker takes.
-                await asyncio.to_thread(executor.shutdown, wait=True, cancel_futures=True)
-
-        if not sparse and gap_total:
-            fd = await asyncio.to_thread(open_destination, dst)
-            try:
-                for start, end in gaps:
-                    await asyncio.to_thread(_write_zeros_at, fd, start, end - start)
-            finally:
-                await asyncio.to_thread(os.close, fd)
-        holes += gap_total
-
-        return ExportResult(bytes_written=bytes_written, logical_size=self.size, holes=holes, zeros=zeros)
+    async def planned_bytes(self, start: int, end: int) -> int:
+        validate_export_range(start, end, self.size)
+        return sum(
+            [
+                await count_planned_bytes(frag.dedup_file, max(seg_start, start), min(seg_end, end))
+                for frag, seg_start, seg_end in self._segments
+                if seg_start < end and seg_end > start
+            ]
+        )

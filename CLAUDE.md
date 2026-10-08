@@ -27,9 +27,11 @@ here. The rest are dev/internal-only and don't appear there:
 | [`packages/synology-apm-repo-cli/src/synology_apm_repo/cli/README.md`](packages/synology-apm-repo-cli/src/synology_apm_repo/cli/README.md) | CLI-specific command conventions and "adding a new command" recipe. | required when touching the CLI |
 | [`packages/synology-apm-repo-browser/src/synology_apm_repo/browser/README.md`](packages/synology-apm-repo-browser/src/synology_apm_repo/browser/README.md) | TUI-specific screen/worker conventions and "adding a new screen" recipe. | required when touching the TUI |
 | [`scripts/check_version_consistency.py`](scripts/check_version_consistency.py) | Checks the three packages' `project.version` fields and their cross-package dependency pins stay in lockstep. Run by `make test`, not invoked directly in normal workflow. | consult when a version bump or dependency pin edit isn't caught by `make test` |
-| [`scripts/check_sdk_import_boundary.py`](scripts/check_sdk_import_boundary.py) | Verifies the CLI/browser packages import only the SDK's documented public surface. Run by `make test`, not invoked directly in normal workflow. | consult when a new SDK-facing import isn't caught by `make test` |
+| [`scripts/check_sdk_import_boundary.py`](scripts/check_sdk_import_boundary.py) | Verifies the CLI/browser packages and `examples/` import the SDK only through its public modules, and that neither frontend (nor `examples/`) imports the other. Run by `make test`, not invoked directly in normal workflow. | consult when a new SDK-facing import isn't caught by `make test` |
+| [`scripts/check_sdk_layers.py`](scripts/check_sdk_layers.py) | Verifies SDK-internal imports only point downward through `ARCHITECTURE.md`'s layers (leaf packages import no layered package) and form no import cycle (for cycles only, `TYPE_CHECKING` imports are excluded). Run by `make test`, not invoked directly in normal workflow. | consult when a new cross-layer import or cycle isn't caught by `make test` |
+| [`scripts/check_browser_layers.py`](scripts/check_browser_layers.py) | Verifies each browser layer below `screens/` imports only what it builds on (the browser README's "MVU" section), `TYPE_CHECKING` imports included. Run by `make test`, not invoked directly in normal workflow. | consult when a new cross-layer browser import isn't caught by `make test` |
 | [`.github/CLAUDE.md`](.github/CLAUDE.md) | GitHub Actions conventions: action-pin verification, what `make github-act-simulation` covers (build/test jobs, not deploy/publish), the PyPI trusted-publishing setup `release.yml` needs. | required when touching `.github/workflows/` |
-| `docs/` | Sphinx build of `synology-apm-repo-sdk`'s API reference from its own Google-style docstrings (`make -C docs html`). See the SDK README's "Docstring Conventions" before adding an SDK module or docstring. | required when adding an SDK module |
+| `docs/` | Sphinx build of `synology-apm-repo-sdk`'s API reference from its own Google-style docstrings (`make docs`). See the SDK README's "Docstring Conventions" before adding an SDK module or docstring. | required when adding an SDK module |
 
 New details belong in the closest document, not here — implementation
 rationale goes in source docstrings/comments, layer conventions in
@@ -47,8 +49,8 @@ adding a convention that applies to more than one package, it belongs in
 them, and dependencies only point downward.** See `ARCHITECTURE.md` for the
 full layer breakdown. New modules are placed and reasoned about using
 `ARCHITECTURE.md`'s layer names (Codec/Storage/Dedup/Catalog/Content/Unit/
-Repository) — don't re-embed layering rationale in source comments; a
-comment at a specific boundary crossing can still explain *why that one
+Repository); layering rationale lives in `ARCHITECTURE.md`, and a source
+comment at a specific boundary crossing explains only *why that one
 crossing exists*.
 
 ---
@@ -66,34 +68,38 @@ that ships in source.
 
 The whole SDK/CLI/TUI is `async def` end to end. Use `asyncio.to_thread()`
 only to get a *single* blocking call off the event loop — see
-`ARCHITECTURE.md`'s Async-native-by-design section for that boundary.
+`ARCHITECTURE.md`'s "Async-native, by design" section for that boundary.
 Concurrency added for throughput rather than responsiveness needs measuring
 against a real sample first.
 
 ### Pythonic conventions
 
-Every model/data class is `@dataclass(frozen=True)` — `Connection`,
-`Workload`, `Version`, `RepoLayout`, `Node`, `RestorableUnit`, `Extent`,
+Every model/data class is `@dataclass(frozen=True, slots=True)` — `Connection`,
+`Workload`, `Version`, `RepoLayout`, `Node`, `RestorableUnit`, `DataExtent`,
 and so on; a plain `@dataclass` without `frozen=True` is usually one of
 these instead. Computed/derived attributes are exposed via `@property`.
 
-Import the SDK's public surface from the top-level package
-(`from synology_apm_repo.sdk import Session, ...`), never a submodule
-path — except the CLI and TUI packages themselves, which import
-exclusively via submodule paths (e.g. `from synology_apm_repo.sdk.api
-import Repository`) as their own established convention, not a pattern
-to extend elsewhere. `__all__` marks a genuine aggregation point — a
-module that gathers names imported from elsewhere into one surface
-(`sdk/__init__.py`, `sdk/api/__init__.py`, `sdk/storage/__init__.py`,
-`sdk/profiles/__init__.py` today, also the one case mypy's
-`no_implicit_reexport` requires it for); a module's own locally-defined
+Code outside the SDK — the CLI, the TUI, `examples/`, any third party —
+imports it only through the public modules `ARCHITECTURE.md`'s "The SDK's
+public surface" lists. The CLI and TUI are the SDK's reference consumers,
+so a name they need is exported there rather than reached through an
+internal module; tests are white-box and exempt.
+`scripts/check_sdk_import_boundary.py` enforces it. `__all__` marks a
+genuine aggregation point — a module that gathers names imported from
+elsewhere into one surface (`sdk/__init__.py`, `sdk/api/__init__.py`,
+`sdk/export.py`, `sdk/presentation/__init__.py`, `sdk/storage/__init__.py`,
+`sdk/profiles/__init__.py`, `sdk/dedup/pool/__init__.py`,
+`sdk/units/content/disk_fs/__init__.py`,
+`sdk/units/saas/tree_strategy/__init__.py`,
+`browser/screens/_shared/__init__.py` and `browser/content_preview/__init__.py`
+today, also the one case mypy's `no_implicit_reexport` requires it for); a module's own locally-defined
 names are already public without one, and a lone pass-through name in a
 module that doesn't otherwise aggregate anything uses the narrower `from
 x import Y as Y` idiom instead (`api/repository.py`'s
-`Finding`/`VerifyLevel`).
+`KeyStatus`).
 
-Don't add a wrapper whose only job is to route through a convention with
-no actual transformation happening.
+A wrapper earns its place by transforming something; code with nothing to
+transform calls the underlying function directly.
 
 `raw.get(key) or default` for nested-JSON fields (e.g.
 `catalog/workload.py`'s `workload_spec`, `units/content/saas_calendar.py`/
@@ -113,8 +119,9 @@ several call sites, state it once at each, trimmed to what that site
 needs — never a shared essay one has to chase through another docstring.
 
 SDK docstrings are Google-style (Napoleon), document the public surface
-only, and must pass `make -C docs html O=-n`'s nitpick build; see the SDK
-README's "Docstring Conventions" for the full rules.
+only, and must pass `make docs`'s nitpick build (`-n -W`: any warning
+fails it, locally and in CI); see the SDK README's "Docstring Conventions"
+for the full rules.
 
 ### Presentation: users see backups, not a dedup repository
 

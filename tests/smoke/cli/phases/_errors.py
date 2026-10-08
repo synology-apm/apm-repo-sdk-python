@@ -1,14 +1,6 @@
-"""``errors`` domain: a handful of deliberately-bad invocations against
-the real CLI, checking exit code 1 and a clean, single-line error --
-never a leaked internal method name (``KeyRequiredError``/
-``KeyMismatchError``'s wording) or a raw traceback. A wrong
-key surfaces from ``Repository.catalogs()`` itself (each catalog's own
-``DedupRepo.open()`` raises ``KeyMismatchError`` when the supplied key
-fails its GCM-tag check, rather than handing back a repository that would
-silently decrypt every chunk into garbage later -- AES-CTR has no
-integrity check of its own), rendered by
-the CLI's ``friendly_message()`` as "the key given was rejected", not a
-raw traceback or the whole-repository-browsing gate's own wording.
+"""``errors`` domain: deliberately bad invocations (a missing path, a wrong
+key), checking exit code 1 and a clean error on stderr -- no traceback, no
+leaked SDK method name.
 """
 
 from __future__ import annotations
@@ -17,11 +9,8 @@ import base64
 
 from ..._shared_refs import RepresentativeRef
 from .._context import SmokeContext
-from ._shared import profile_args
 
-#: An obviously-synthetic, all-zero key -- syntactically valid but not
-#: derived from any real sample, same shape as
-#: ``sdk/phases/_catalog.py``'s own negative-key check.
+#: A well-formed, all-zero key no real sample uses.
 _DUMMY_KEY = "DUMMYKEYID12@" + base64.b64encode(bytes(32)).decode()
 
 
@@ -39,7 +28,7 @@ def run(ctx: SmokeContext) -> None:
 
     ref = encrypted[0]
     wrong_key_result = ctx.run(
-        "errors", "errors.wrong_key", "doctor", ref.repo_path, "--key", _DUMMY_KEY, *profile_args(ref), expect_exit=1
+        "errors", "errors.wrong_key", "doctor", ref.repo_path, "--key", _DUMMY_KEY, expect_exit=1
     )
     ctx.check("errors", "errors.wrong_key.no_internal_method_leak", "set_key(" not in wrong_key_result.stderr)
     ctx.check(

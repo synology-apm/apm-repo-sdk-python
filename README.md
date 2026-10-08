@@ -17,7 +17,7 @@ Pick whichever matches the install method you use below — you don't need both:
 
 - `uv` — provisions Python automatically and powers the `uvx`/`uv tool`/`uv add` commands below; see the [installation instructions](https://docs.astral.sh/uv/getting-started/installation/) for macOS, Windows, and Linux
 - `pip` — usually bundled with your Python installation; see the [installation instructions](https://pip.pypa.io/en/stable/installation/) if you need to install it separately
-- Python 3.11 or later (provisioned automatically when using `uv`/`uvx`; required on your own interpreter for a plain `pip install`)
+- Python 3.12 or later (provisioned automatically when using `uv`/`uvx`; required on your own interpreter for a plain `pip install`)
 
 ---
 
@@ -155,7 +155,6 @@ is generated from source with Sphinx and published at:
 To build it locally instead (e.g. to preview docstring changes):
 
 ```bash
-uv sync --group docs   # first time only
 make docs
 ```
 
@@ -169,10 +168,12 @@ Then open `docs/_build/html/index.html` in your browser.
 |----------|-------------|
 | [`ARCHITECTURE.md`](ARCHITECTURE.md) | The layering contract (Codec/Storage/Dedup/Catalog/Content/Unit/Repository), packaging/distribution shape, async-native design, presentation principles |
 | [`FORMAT-SPEC.md`](FORMAT-SPEC.md) | The on-disk format specification this project decodes |
-| [`CONTRIBUTING.md`](CONTRIBUTING.md) | Commit message convention, the pre-commit gate, sample-data handling, release/publish-channel status |
+| [`CONTRIBUTING.md`](CONTRIBUTING.md) | Commit message convention, sample-data handling, debugging a backend's logging, the pre-commit gate and CI, the release/publish channel |
 | [`packages/synology-apm-repo-sdk/README.md`](packages/synology-apm-repo-sdk/README.md) | SDK install and usage example |
 | [`packages/synology-apm-repo-cli/README.md`](packages/synology-apm-repo-cli/README.md) | CLI install and full command list |
 | [`packages/synology-apm-repo-browser/README.md`](packages/synology-apm-repo-browser/README.md) | Browser (TUI) install, usage, and flags |
+| [`examples/restore_to_nutanix_ahv.py`](examples/restore_to_nutanix_ahv.py) | Example: restore the disks of a VM, PC or PS version into a new Nutanix AHV VM through a custom `RandomAccessExportSink` (Nutanix Volumes over iSCSI) |
+| [`examples/export_disk_to_zip.py`](examples/export_disk_to_zip.py) | Example: export the disks of a VM, PC or PS version into one zip file, compressed on the fly, through a `BufferedExportSink` (a destination that takes bytes in order only) |
 | [API Reference](https://synology-apm.github.io/apm-repo-sdk-python/) | Full SDK API reference — every public class, method, and type signature (Sphinx, hosted on GitHub Pages) |
 | [`tests/CLAUDE.md`](tests/CLAUDE.md) | Testing conventions: synthetic vs real-data-replay tests, fixture recording/replay mechanisms |
 | [`CLAUDE.md`](CLAUDE.md) | Development guide — code conventions and the Post-change Checklist |

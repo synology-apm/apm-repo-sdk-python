@@ -1,8 +1,6 @@
 """``export_worklist`` domain: a real background export end to end --
 ``ExportScreen`` -> backgrounded (``b``) -> ``WorklistScreen`` lists it ->
-real file lands on disk with the right content. The one check that's
-genuinely TUI-worker-specific (``@work`` scheduling, not
-thread-marshaled) -- ``export_to()``'s own correctness is already
+a non-empty file lands on disk. The export pipeline's own correctness is
 ``sdk/``'s job.
 """
 
@@ -34,7 +32,11 @@ async def run(ctx: SmokeContext, app: Any, pilot: Any) -> None:
 
             assert isinstance(app.screen, UnitScreen), app.screen
             await pilot.press("e")
-            await wait_until(pilot, lambda: isinstance(app.screen, ExportScreen), message="ExportScreen never appeared")
+            await wait_until(
+                pilot,
+                lambda: isinstance(app.screen, ExportScreen) and app.screen.is_mounted,
+                message="ExportScreen never appeared",
+            )
             app.screen.query_one("#export-dst", Input).value = str(dst)
             app.screen.query_one("#export-start", Button).press()
             await pilot.pause(0)
@@ -46,18 +48,20 @@ async def run(ctx: SmokeContext, app: Any, pilot: Any) -> None:
             from synology_apm_repo.browser.screens.unit_screen import UnitScreen
             from synology_apm_repo.browser.screens.worklist_screen import WorklistScreen
 
-            # A real, tiny leaf can finish before this coroutine even gets
-            # scheduled -- background only when there's still a live job to
-            # background (real ExportScreen._job_id, white-box, allowed for
-            # tests -- pyproject.toml's per-file-ignores).
+            # A tiny leaf can finish before this runs: background only a
+            # still-live job (ExportScreen._job_id).
             if isinstance(app.screen, ExportScreen) and app.screen._job_id is not None:
                 await pilot.press("b")
                 await wait_until(
-                    pilot, lambda: isinstance(app.screen, UnitScreen), message="never returned after backgrounding"
+                    pilot,
+                    lambda: isinstance(app.screen, UnitScreen) and app.screen.is_mounted,
+                    message="never returned after backgrounding",
                 )
                 await pilot.press("t")
                 await wait_until(
-                    pilot, lambda: isinstance(app.screen, WorklistScreen), message="WorklistScreen never appeared"
+                    pilot,
+                    lambda: isinstance(app.screen, WorklistScreen) and app.screen.is_mounted,
+                    message="WorklistScreen never appeared",
                 )
                 return "backgrounded"
             if isinstance(app.screen, ExportScreen):
@@ -72,11 +76,7 @@ async def run(ctx: SmokeContext, app: Any, pilot: Any) -> None:
             if table.row_count >= 1:
                 ctx.check("export_worklist", f"export_worklist.{ref.sample_name}.worklist_shows_job", True)
             else:
-                # A real, tiny leaf can also finish in the gap between
-                # pressing b and WorklistScreen's own on_mount refresh --
-                # the same race _background_if_still_running already
-                # accounts for one step earlier, just caught slightly
-                # later here.
+                # It can also finish between b and WorklistScreen's mount.
                 ctx.skip(
                     "export_worklist",
                     f"export_worklist.{ref.sample_name}.worklist_shows_job",

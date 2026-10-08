@@ -1,50 +1,28 @@
-"""``RecursiveGroupFlatTree``: M365 Mail's real folder hierarchy —
-groups (folders) recurse via parent-pointer, like ``RecursiveTree``, but
-each group's leaves (messages) live in a separate, flat, non-recursive
-table instead of recursing themselves, combining the two schema shapes
-every service-level DB in this project expands into (parent-pointer
-recursion; a flat list optionally grouped by one key).
+"""``RecursiveGroupFlatTree``: a recursive folder table whose folders hold
+flat leaves from another table (M365 Mail).
 """
 
 from __future__ import annotations
 
 from collections.abc import Callable, Sequence
-from typing import TYPE_CHECKING
 
 from ....storage.table import Column, Table
-from ...base import paginate
-from ._base import _flat_leaf_entries, _Key, _LazyTable, _resolve_order_by, _Row
-
-if TYPE_CHECKING:
-    from ..provider import SaasWorkloadProvider
+from ....units.provider_kit import paginate
+from ._base import Key, Row, SupportsTable, TreeEntry, _flat_leaf_entries, _LazyTable, _resolve_order_by
 
 
 class RecursiveGroupFlatTree:
-    """M365 Mail's real folder hierarchy: ``mail_folder_table`` is a
-    real, self-referencing table (``folder_id``/``folder_name``/
-    ``parent_folder_id``, rooted at a synthetic anchor id like
-    ``RecursiveTree``'s ``root_id``) whose rows are always folders, so no
-    ``is_folder()`` check is needed. Leaves (messages) live in a
-    separate, flat, non-recursive table keyed by its own group-fk
-    column, sharing one id-space with the folder table's own recursion
-    key.
+    """Folders are ``group_table`` rows recursing by
+    ``group_parent_column`` from ``group_root_id``; a folder's leaves are
+    the ``leaf_table`` rows whose ``leaf_group_column`` is its id.
 
-    Every key is a growing-prefix chain, one real folder id per level
-    (e.g. ``("inbox",)``, ``("inbox", "haha")``), not a bare id: Mail
-    stays a plain ``SaasWorkloadProvider`` (not
-    ``RecursiveTreeSaasProvider``), so ``units/resolve.py``'s generic
-    ref-descent needs every non-leaf child's key to be a genuine prefix
-    of any deeper target's key.
-
-    ``children_of()`` lists a folder's real subfolders before its own
-    leaves, even with zero backed-up messages. A leaf's own key returns
-    ``[]`` with no explicit guard: a leaf's id never appears as a
-    ``parent_folder_id``, and a ``NULL`` ``leaf_group_column`` never
-    matches ``WHERE ... = ?``."""
+    Keys are the path of folder ids (``("inbox", "sub")``), a leaf adding
+    its own id, so ``units/resolve.py`` can descend by prefix. A leaf's
+    key has no children."""
 
     def __init__(
         self,
-        provider: SaasWorkloadProvider,
+        provider: SupportsTable,
         *,
         group_table: str,
         group_columns: list[Column],
@@ -56,7 +34,7 @@ class RecursiveGroupFlatTree:
         leaf_columns: list[Column],
         leaf_id_column: str,
         leaf_group_column: str,
-        display_name: Callable[[_Row], str],
+        display_name: Callable[[Row], str],
         order_by: Sequence[str],
         descending: bool = False,
     ) -> None:
@@ -75,44 +53,23 @@ class RecursiveGroupFlatTree:
         self._leaf_lazy_table = _LazyTable(
             provider, table=leaf_table, columns=leaf_columns, index_hints=[[leaf_group_column]]
         )
-        #: Leaf rows only — a folder key is never inserted here, so
-        #: row_for()'s "None for a folder" contract holds with no
-        #: explicit is_folder filtering at all, unlike
-        #: RecursiveTree/NamedGroupRecursiveTree's shared row cache.
-        self._rows: dict[_Key, _Row] = {}
 
-    async def children_of(
-        self, key: _Key, *, offset: int = 0, limit: int | None = None
-    ) -> list[tuple[_Key, str, bool]]:
-        """One folder's real subfolders (always, even with zero backed-up
-        messages) before that folder's own leaves. A folder's own
-        subfolder count is small (this mailbox's own folder fan-out, never
-        its message count), so ``_list_subfolders`` fully materializes and
-        paginates it in Python, the same small-bounded-scan precedent
-        ``_NamedGroupTable.list_top_level`` already establishes; only the
-        leaf half issues a real ``WHERE``/``ORDER BY``/``LIMIT``/``OFFSET``
-        query, windowed to cover only whatever part of
-        ``[offset, offset+limit)`` the subfolders didn't already satisfy."""
+    async def children_of(self, key: Key, *, offset: int = 0, limit: int | None = None) -> list[TreeEntry]:
+        """One folder's subfolders, then its leaves. Subfolders are read in
+        full and paginated in Python; leaves are paged in SQL for the rest
+        of the window."""
         folder_id = key[-1] if key else self._group_root_id
         group_table = await self._group_lazy_table.get()
         subfolders = await self._list_subfolders(group_table, key, folder_id)
 
-        # Folders always sort before leaves. paginate() on the folders
-        # list alone already gives the exact right slice for however
-        # much of [offset, offset+limit) folders can satisfy — Python
-        # slicing on a list stops at its own length, so this is correct
-        # even when offset/limit run past the end of `subfolders`.
+        # Folders sort before leaves, so this slice is already exact.
         folder_entries = paginate(subfolders, offset, limit)
         remaining = None if limit is None else max(limit - len(folder_entries), 0)
         if limit is not None and remaining == 0:
-            # A full page came entirely from folders — never query
-            # leaves at all for this call.
+            # A full page from folders alone: skip the leaf query.
             return folder_entries
 
-        # How far into the *leaf* rows this window reaches: 0 while any
-        # part of [offset, offset+limit) still overlaps the folder list
-        # (folder_entries already covers that part), else however far
-        # past every folder this window starts.
+        # How far into the leaf rows this window starts.
         leaf_offset = max(offset - len(subfolders), 0)
         leaf_table = await self._leaf_lazy_table.get()
         leaf_entries = await _flat_leaf_entries(
@@ -126,18 +83,14 @@ class RecursiveGroupFlatTree:
             offset=leaf_offset,
             limit=remaining,
             key_prefix=key,
-            rows=self._rows,
         )
         return folder_entries + leaf_entries
 
-    async def _list_subfolders(self, group_table: Table, key: _Key, folder_id: str) -> list[tuple[_Key, str, bool]]:
+    async def _list_subfolders(self, group_table: Table, key: Key, folder_id: str) -> list[TreeEntry]:
         order_by = _resolve_order_by(group_table, [self._group_name_column])
-        entries: list[tuple[_Key, str, bool]] = []
+        entries: list[TreeEntry] = []
         async for row in group_table.select(f"{self._group_parent_column} = ?", (folder_id,), order_by=order_by):
             sub_id = str(row[self._group_id_column])
             name = str(row[self._group_name_column]) or sub_id
-            entries.append((key + (sub_id,), name, False))
+            entries.append(TreeEntry((*key, sub_id), name, False))
         return entries
-
-    def row_for(self, key: _Key) -> _Row | None:
-        return self._rows.get(key)

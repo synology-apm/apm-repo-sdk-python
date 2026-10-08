@@ -220,7 +220,7 @@ def _evaluate(
         )
 
     if resolved_sha == pin.sha:
-        return None  # same commit already pinned, regardless of which tag label resolves to it
+        return None
 
     if best_tag != pin.tag:
         return Discrepancy(

@@ -1,112 +1,83 @@
-"""Structural coverage for busy-indicator wraps: ``work``/
-``run_worker_with_progress``/``run_worker_no_progress`` below make
-showing a ``DebouncedProgress`` while a worker runs the default,
-opt-out behavior instead of something a call site has to remember to
-add. ``tests/unit/browser/
-test_browser_screens_use_tracked_work.py`` and
-``test_browser_effects_use_progress_helpers.py`` enforce that every
-``screens/*.py`` worker and every ``runtime/*_effects.py`` dispatch goes
-through one of these three, mirroring ``test_browser_core_no_textual_import.py``'s
-own ast-walk technique for a different rule.
-
-``work`` is for a ``@work``-decorated method on a real ``Widget``/
-``Screen``/``App`` (``self`` provides the timer host ``DebouncedProgress``
-needs). ``run_worker_with_progress``/``run_worker_no_progress`` are the
-``runtime/*_effects.py`` counterpart: an ``Effects`` instance's own
-``self`` is a plain object, never a ``Widget`` (this package's own
-``runtime`` -> ``screens`` layering ban), so ``textual.work`` doesn't
-apply there at all -- these wrap the same ``host.run_worker(...)`` call
-those classes already made by hand.
-
-*Where* a wrap's sink should point (which column, which tree node, the
-screen-wide breadcrumb) is a placement judgment left to each call site --
-neither this module nor its enforcement tests can check that a sink
-points at the right widget, only that a sink-shaped wrap exists at all.
+"""Worker launchers that show a ``DebouncedProgress`` busy indicator by
+default: ``work`` for a ``@work`` method on a ``Widget``/``Screen``/``App``
+(its ``self`` hosts the indicator's timers), ``run_worker_with_progress``/
+``run_worker_no_progress`` for ``runtime/*_effects.py``, whose ``self`` is a
+plain object. Ruff's ``TID251`` bans ``textual.work`` outside this module,
+and an ast-walk test (``test_browser_runtime_effects_use_progress_helpers.py``)
+makes every ``runtime/*_effects.py`` dispatch use one of the other two;
+where the sink points is each call site's choice.
 """
 
 from __future__ import annotations
 
 import functools
 from collections.abc import Callable, Coroutine
-from typing import TYPE_CHECKING, Any, ParamSpec, TypeVar, cast, overload
+from typing import TYPE_CHECKING, Any, cast, overload
 
 from textual import work as _textual_work
 
-from synology_apm_repo.browser.widgets.progress_hint import DebouncedProgress, _LoadingSink
+from synology_apm_repo.browser.widgets.progress_hint import DebouncedProgress, LoadingSink
 
 if TYPE_CHECKING:
     from textual.dom import DOMNode
     from textual.worker import Worker
 
-_P = ParamSpec("_P")
-_R = TypeVar("_R")
 
-#: Called with the same ``(self, *args, **kwargs)`` the decorated method
-#: itself receives, evaluated fresh on every call -- needed for a sink
-#: like ``TreeNodeLoadingSink`` whose target isn't known until call time
-#: (e.g. which tree node is being expanded). ``None`` (the default) uses
-#: ``DebouncedProgress``'s own default (the screen's breadcrumb).
-SinkFactory = Callable[..., "_LoadingSink | None"]
+#: Called with the decorated method's ``(self, *args, **kwargs)`` on every
+#: call, for a sink whose target is known only then (e.g. the tree node
+#: being expanded).
+SinkFactory = Callable[..., "LoadingSink | None"]
 
 
 @overload
-def work(func: Callable[_P, Coroutine[Any, Any, _R]]) -> Callable[_P, Worker[_R]]: ...
+def work[**P, R](func: Callable[P, Coroutine[Any, Any, R]]) -> Callable[P, Worker[R]]: ...
 
 
 @overload
-def work(
+def work[**P, R](
     *,
     sink: SinkFactory | None = None,
     busy: bool = True,
-    delay: float | None = None,
     **work_kwargs: Any,
-) -> Callable[[Callable[_P, Coroutine[Any, Any, _R]]], Callable[_P, Worker[_R]]]: ...
+) -> Callable[[Callable[P, Coroutine[Any, Any, R]]], Callable[P, Worker[R]]]: ...
 
 
-def work(
-    func: Callable[_P, Coroutine[Any, Any, _R]] | None = None,
+def work[**P, R](
+    func: Callable[P, Coroutine[Any, Any, R]] | None = None,
     *,
     sink: SinkFactory | None = None,
     busy: bool = True,
-    delay: float | None = None,
     **work_kwargs: Any,
 ) -> Any:
     """Drop-in replacement for ``textual.work``: same bare (``@work``) and
     parameterized (``@work(group=..., ...)``) call shapes, every other
     kwarg forwarded to ``textual.work`` unchanged. Additionally wraps the
-    decorated coroutine's own body in ``DebouncedProgress`` by default,
-    using ``sink(self, *args, **kwargs)`` (or the breadcrumb default when
-    ``sink`` is ``None``) as where it renders.
+    decorated coroutine's body in ``DebouncedProgress``, rendering to
+    ``sink(self, *args, **kwargs)`` (the breadcrumb when ``sink`` is
+    ``None``).
 
-    ``busy=False`` is the one explicit, visible opt-out — for a worker
-    that delegates its entire body to an already-wrapped helper (so
-    wrapping again would double the same breadcrumb's own debounce/
-    animation state for no benefit). Every use needs a comment at the
-    call site explaining why; that's a convention this module's own
-    enforcement test can't check (it only checks *that* a worker goes
-    through ``work``, never *whether* ``busy=False`` was the right call).
+    ``busy=False`` is the explicit opt-out, for a worker that delegates its
+    entire body to an already-wrapped helper; explain it in a comment at
+    the call site.
 
-    Rejects ``thread=True`` outright: ``DebouncedProgress`` arms Textual
-    timers, which must only ever be touched from the app's own event
-    loop — a thread worker could never drive one safely, so this turns a
-    latent race into a loud, immediate error at decoration time instead."""
+    Raises:
+        ValueError: ``thread=True`` was passed -- ``DebouncedProgress``
+            arms Textual timers, which only the app's event loop may touch.
+    """
     if work_kwargs.get("thread"):
         raise ValueError("work(): thread=True can't be combined with a DebouncedProgress wrap (busy=True default)")
 
-    def decorator(inner: Callable[_P, Coroutine[Any, Any, _R]]) -> Callable[_P, Worker[_R]]:
+    def decorator(inner: Callable[P, Coroutine[Any, Any, R]]) -> Callable[P, Worker[R]]:
         if not busy:
             target = inner
         else:
 
             @functools.wraps(inner)
-            async def target(*args: _P.args, **kwargs: _P.kwargs) -> _R:
-                # args[0] is the bound `self` -- every use here decorates an
-                # instance method; ParamSpec.args has no way to say that
-                # statically, so this one boundary crossing needs Any.
+            async def target(*args: P.args, **kwargs: P.kwargs) -> R:
+                # args[0] is the bound `self`; ParamSpec can't say so.
                 host = cast(Any, args[0])
                 actual_sink = sink(*args, **kwargs) if sink is not None else None
-                progress_kwargs = {} if delay is None else {"delay": delay}
-                with DebouncedProgress(host, actual_sink, **progress_kwargs):
+                with DebouncedProgress(host, actual_sink):
                     return await inner(*args, **kwargs)
 
         # textual.work ships without inline type stubs for this call shape.
@@ -121,32 +92,25 @@ def run_worker_with_progress(
     host: DOMNode,
     factory: Callable[[], Coroutine[Any, Any, None]],
     *,
-    sink: _LoadingSink | None = None,
-    delay: float | None = None,
+    sink: LoadingSink | None = None,
     group: str = "",
     name: str = "",
+    exclusive: bool = False,
 ) -> Worker[None]:
-    """``Effects.perform()``'s replacement for a bare
-    ``host.run_worker(functools.partial(...))`` call, for a coroutine
-    whose own ``self`` (a ``BrowseEffects``/``UnitEffects`` instance) is
-    never a ``Widget`` — wraps ``factory()``'s own body in
-    ``DebouncedProgress(host, sink)`` before launching it."""
-    progress_kwargs = {} if delay is None else {"delay": delay}
+    """``host.run_worker(factory)`` with ``factory()`` wrapped in
+    ``DebouncedProgress(host, sink)`` (the breadcrumb when ``sink`` is
+    ``None``)."""
 
     async def wrapped() -> None:
-        with DebouncedProgress(host, sink, **progress_kwargs):
+        with DebouncedProgress(host, sink):
             await factory()
 
-    return host.run_worker(wrapped, group=group, name=name)
+    return host.run_worker(wrapped, group=group, name=name, exclusive=exclusive)
 
 
 def run_worker_no_progress(
     host: DOMNode, factory: Callable[[], Coroutine[Any, Any, None]], *, group: str = "", name: str = ""
 ) -> Worker[None]:
-    """The explicit opt-out twin of ``run_worker_with_progress`` — a
-    plain, undecorated ``host.run_worker(...)`` call by another name, so
-    a dispatch that deliberately shows no busy feedback (background
-    cleanup that outlives any one screen, never user-visible) is a
-    visible, greppable choice rather than code that merely looks like
-    every other case forgot the wrap."""
+    """``host.run_worker(factory)`` with no busy indicator, for a dispatch
+    with its own progress UI or background cleanup."""
     return host.run_worker(factory, group=group, name=name)

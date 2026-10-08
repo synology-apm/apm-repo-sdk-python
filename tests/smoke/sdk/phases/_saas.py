@@ -1,16 +1,6 @@
-"""``saas`` domain: GW/M365 workloads, looped over whatever
-``Workload.sub_type``s are actually present (``MAIL``/``CONTACT``/
-``CALENDAR``/``DRIVE``/``SITE``/``TEAMS``/...) rather than a fixed list --
-absent sub_types are skipped by name instead of assumed present.
-
-Any leaf kind counts as "meaningful" here (unlike device/fs): a SaaS
-provider's leaves are always one of ``MAIL``/``CONTACT``/
-``CALENDAR_EVENT``/``DRIVE_ITEM``/``SITE_ITEM``/``FILE`` (Teams-chat
-messages assemble to an HTML ``FILE``, per ``ARCHITECTURE.md``'s Content
-Layer section) or the ``RAW_OBJECT`` degrade fallback -- the
-sample/sub_type grouping already tells the report which content family a
-step covers, so this phase doesn't also need to guess an exact
-sub_type-to-kind mapping.
+"""``saas`` domain: GWS/M365 workloads, one pass per ``Workload.sub_type``
+present in the repository. Any leaf kind counts (unlike device/fs): the
+sub_type in the step name already says which content family it covers.
 """
 
 from __future__ import annotations
@@ -34,7 +24,7 @@ from ..._shared_refs import close_if_closable, pick_workload_with_retry, prefer_
 from .._context import RepoInfo, SmokeContext
 from ._shared import bounded_read_and_export
 
-_SAAS_TYPES = (TargetType.GW, TargetType.M365)
+_SAAS_TYPES = (TargetType.GWS, TargetType.M365)
 _ANY_LEAF = frozenset(UnitKind)
 _DEGRADE_ON = (NotFoundError, DataCorruptError, ChunkCompactedError, UnsupportedDataFormatError)
 
@@ -48,13 +38,10 @@ async def run_for_repo(ctx: SmokeContext, ri: RepoInfo) -> None:
     ]
     sub_types = sorted({w.sub_type for _r, _c, w, _v in own if w.sub_type is not None})
     if not sub_types:
-        # Purely per-repo judgment: this sample alone lacking a GW/M365
-        # workload with a known sub_type is reported here, not deferred
-        # to a once-per-run aggregate.
         ctx.skip(
             "saas",
             f"saas.{ri.sample_name}.workload_present",
-            f"no GW/M365 workload with a known sub_type in {ri.sample_name}",
+            f"no GWS/M365 workload with a known sub_type in {ri.sample_name}",
         )
         return
 
@@ -81,13 +68,8 @@ async def run_for_repo(ctx: SmokeContext, ri: RepoInfo) -> None:
             continue
         _ri, _workload, _version, picked_provider, picked_leaf = picked
 
-        # The winning candidate is this call's own to close once done --
-        # pick_workload_with_retry closes every rejected candidate's provider
-        # immediately as it searches, but returns the winner still open for
-        # its caller to use (and close). A SaaS-rich sample can have a dozen-plus distinct
-        # sub_types in one turn, each its own provider materializing its
-        # own SqliteSource, so leaving these open across iterations adds
-        # up fast.
+        # pick_workload_with_retry leaves the winner's provider open for us;
+        # closed per sub_type, since each holds its own SqliteSource.
         try:
 
             async def _get_provider(provider: UnitProvider = picked_provider) -> UnitProvider:
@@ -103,7 +85,7 @@ async def run_for_repo(ctx: SmokeContext, ri: RepoInfo) -> None:
             unit = await ctx.call("saas", f"{step_prefix}.unit", _get_unit, degrade_on=_DEGRADE_ON)
             if unit is None:
                 continue
-            content = unit.open()
+            content = unit.content
             await bounded_read_and_export(ctx, "saas", step_prefix, content, degrade_on=_DEGRADE_ON)
         finally:
             await close_if_closable(picked_provider)

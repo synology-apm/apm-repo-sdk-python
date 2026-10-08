@@ -1,14 +1,11 @@
 """S3/Azure ``db/<name>.<N>`` generation selection (FORMAT-SPEC.md:
-generation-selection). The single place this rule lives; ``dircache.py``, ``seqid.py``,
-``s3.py`` and ``dedup/repository.py``'s ``db()`` all point here rather than
-restating it.
+Multi-generation selection). The single place this rule lives;
+``dedup/repository.py`` uses it for ``db/<name>`` and ``repo_info``.
 
-**Why the naive "largest ``.<N>`` suffix" rule** (``resolve_seq_file``)
-**is not enough here**, unlike every other per-generation file this SDK
-reads: a ``db/<name>`` generation can be written to S3/Azure *before* the
-transaction that references it is actually committed, so the largest
-suffix present can be a not-yet-committed or long-superseded generation.
-The correct answer needs the transaction log:
+The naive "largest ``.<N>`` suffix" rule (``resolve_seq_file``) is not enough
+here: a ``db/<name>`` generation can be written to S3/Azure before its
+transaction commits, so the largest suffix can be uncommitted or superseded.
+The answer needs the transaction log:
 
 1. **``latest_txn``** (``latest_transaction_id``): the largest
    ``repo_transactions/repo_transaction.<N>`` filename, opened and
@@ -24,24 +21,22 @@ The correct answer needs the transaction log:
    matching ``suppl_transaction_ids/<N>`` marker file — a numbering
    completely unrelated to ``repo_transactions/``'s own.
 
-A logical name with **no** ``.<N>`` variant at all falls back to the
-bare, unsuffixed name — the same file the naive rule would have picked
-anyway.
+A logical name with no ``.<N>`` variant falls back to the bare name.
 """
 
 from __future__ import annotations
 
+import functools
+from collections.abc import Awaitable, Callable
+
 from ..errors import NotFoundError
 from ..format.repo_transaction import parse_repo_transaction
-from .base import ObjectStore, join_path
+from .base import ObjectStore, join_path, list_names
 
-#: This project's supplemental-table set — resolved by the
-#: ``suppl_transaction_ids/`` marker rule, not the transaction-log rule.
-#: See FORMAT-SPEC.md: generation-selection.
-#: ``copy_target_file`` shares its physical file with ``copy_target_version``
-#: (same on-disk name) but is listed here anyway for completeness — see
-#: ``PHYSICAL_NAME_ALIASES`` for where that sharing is actually enforced,
-#: not just documented.
+#: The supplemental tables, resolved by the ``suppl_transaction_ids/`` marker
+#: rule, not the transaction-log rule (FORMAT-SPEC.md: Multi-generation
+#: selection). ``copy_target_file`` is listed for completeness; it shares
+#: ``copy_target_version``'s physical file (see ``PHYSICAL_NAME_ALIASES``).
 SUPPLEMENTAL_TABLES = frozenset(
     {
         "agent_connection",
@@ -56,20 +51,21 @@ SUPPLEMENTAL_TABLES = frozenset(
     }
 )
 
-#: Logical ``db/<name>`` names with no on-disk object of their own —
-#: ``copy_target_file`` has no ``copy_target_file[.N]`` object; that table
-#: lives inside whichever generation ``copy_target_version[.N]`` resolves
-#: to (same physical sqlite file). Consulted by ``DedupRepo.db`` before any
-#: generation resolution, on both ``VAULT`` and ``OBJECT_STORE`` layouts.
+#: Logical ``db/<name>`` names with no on-disk object of their own:
+#: ``copy_target_file`` lives inside the ``copy_target_version[.N]`` file.
+#: ``DedupRepo.db`` applies it before generation resolution, on both layouts.
 PHYSICAL_NAME_ALIASES: dict[str, str] = {"copy_target_file": "copy_target_version"}
+
+Listdir = Callable[[str], Awaitable[list[str]]]
+"""A function returning a directory's entry names, such as ``DirCache.listdir``."""
 
 REPO_TRANSACTIONS_DIR = "repo_transactions"
 SUPPL_TRANSACTION_IDS_DIR = "suppl_transaction_ids"
 
 
 def _numeric_suffixes(names: list[str], base: str) -> list[int]:
-    """Every ``<base>.<N>`` entry in ``names`` with a purely-numeric
-    ``<N>`` — ``<base>`` itself (bare, no suffix) never matches."""
+    """The ``<N>`` of every ``<base>.<N>`` entry in ``names`` with a numeric
+    ``<N>``; bare ``<base>`` never matches."""
     prefix = base + "."
     result = []
     for name in names:
@@ -80,9 +76,23 @@ def _numeric_suffixes(names: list[str], base: str) -> list[int]:
     return result
 
 
-async def latest_transaction_id(store: ObjectStore, transactions_dir: str) -> int:
-    """The latest *committed* transaction id, per FORMAT-SPEC.md: generation-selection."""
-    names = await store.listdir(transactions_dir)
+async def latest_transaction_id(store: ObjectStore, transactions_dir: str, *, listdir: Listdir | None = None) -> int:
+    """The latest *committed* transaction id, per FORMAT-SPEC.md:
+    Multi-generation selection: the ``transaction_id`` embedded in the
+    highest-numbered ``repo_transaction.<N>`` file.
+
+    Args:
+        store: The repository's store.
+        transactions_dir: The ``repo_transactions`` directory.
+        listdir: How to list ``transactions_dir``; defaults to listing
+            ``store`` directly (pass a ``DirCache.listdir`` to share the
+            listing).
+
+    Raises:
+        NotFoundError: ``transactions_dir`` holds no ``repo_transaction.<N>``.
+        DataCorruptError: That file is corrupt (see ``parse_repo_transaction``).
+    """
+    names = await listdir(transactions_dir) if listdir is not None else await list_names(store, transactions_dir)
     suffixes = _numeric_suffixes(names, "repo_transaction")
     if not suffixes:
         raise NotFoundError("no repo_transaction.<N> files found", ref=transactions_dir)
@@ -99,27 +109,42 @@ async def resolve_generation(
     *,
     transactions_dir: str,
     suppl_dir: str,
+    listdir: Listdir | None = None,
 ) -> str:
     """The correct ``db/<name>[.<N>]`` logical path for ``name`` on an
     ``OBJECT_STORE`` layout: the largest ``.<N>`` strictly less than the
     latest *committed* transaction for most tables, or the largest ``.<N>``
     with a matching ``suppl_transaction_ids`` marker for the 9 supplemental
-    tables (FORMAT-SPEC.md: generation-selection). ``db_dir``/``transactions_dir``/
-    ``suppl_dir`` are already joined with ``layout.repo_root`` by the
-    caller.
+    tables (FORMAT-SPEC.md: Multi-generation selection). A name with no
+    ``.<N>`` variant resolves to the bare name.
 
-    Raises ``NotFoundError`` if ``name`` has ``.<N>`` variants present but
-    none of them is actually valid per the rule that applies to it (a
-    genuinely inconsistent/partial repository copy, not something this
-    function should silently paper over).
+    Args:
+        store: The repository's store.
+        db_dir: The ``db`` directory, joined with ``layout.repo_root``.
+        name: Logical ``db/<name>``.
+        transactions_dir: ``repo_transactions`` directory, likewise joined.
+        suppl_dir: ``suppl_transaction_ids`` directory, likewise joined.
+        listdir: How to list the three directories; defaults to listing
+            ``store`` directly (pass a ``DirCache.listdir`` to share listings
+            across the several ``db/<name>`` resolutions one repository does).
+
+    Returns:
+        The store-relative path of the chosen generation.
+
+    Raises:
+        NotFoundError: ``.<N>`` variants exist but none is valid under the
+            applicable rule (an inconsistent or partial repository copy), or
+            ``transactions_dir`` holds no ``repo_transaction.<N>``.
+        DataCorruptError: The latest ``repo_transaction.<N>`` is corrupt.
     """
-    entries = await store.listdir(db_dir)
+    list_dir: Listdir = listdir if listdir is not None else functools.partial(list_names, store)
+    entries = await list_dir(db_dir)
     suffixes = _numeric_suffixes(entries, name)
     if not suffixes:
         return join_path(db_dir, name)
 
     if name in SUPPLEMENTAL_TABLES:
-        suppl_ids = {int(n) for n in await store.listdir(suppl_dir) if n.isdigit()}
+        suppl_ids = {int(n) for n in await list_dir(suppl_dir) if n.isdigit()}
         valid = [s for s in suffixes if s in suppl_ids]
         if not valid:
             raise NotFoundError(
@@ -128,7 +153,7 @@ async def resolve_generation(
             )
         chosen = max(valid)
     else:
-        latest_txn = await latest_transaction_id(store, transactions_dir)
+        latest_txn = await latest_transaction_id(store, transactions_dir, listdir=list_dir)
         valid = [s for s in suffixes if s < latest_txn]
         if not valid:
             raise NotFoundError(

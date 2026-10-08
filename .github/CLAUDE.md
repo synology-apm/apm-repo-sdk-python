@@ -6,30 +6,29 @@ This file provides context for Claude Code when working with files under `.githu
 
 ## Pinning Conventions
 
-Every `uses:` in `.github/workflows/*.yml` must reference a full commit SHA with a trailing
-`# vX.Y.Z` comment (e.g. `uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 #
-v7.0.1`), never a mutable version tag or branch. Pin a new action to its commit SHA in the same
+Every `uses:` in `.github/workflows/*.yml` references a full commit SHA with a trailing
+comment naming the tag it resolves (e.g. `uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 #
+v7.0.1`), so the pin can't move the way a version tag or branch can. Pin a new action to its commit SHA in the same
 commit that adds it — resolve the SHA via `git ls-remote <repo-url> refs/tags/<tag>` (for an
 annotated tag, use the dereferenced `<tag>^{}` commit SHA, not the tag object SHA). A local
 reusable-workflow reference (`uses: ./.github/workflows/ci.yml`) is not an external action and
 is exempt from this rule.
 
-There is no `.github/dependabot.yml` in this repository — pins are kept current only reactively, when a
-CVE/advisory is filed against the currently-pinned version, resolved by hand the same way a new
-pin is added. There is no proactive/scheduled freshness pass; a human decides when to re-check.
-`make bump-external-versions` (`scripts/check_actions_versions.py --write`) automates that
-resolution/rewrite step — for every pinned action, it resolves the highest upstream version tag
-via `git ls-remote` and rewrites the pin's SHA/tag comment in place — but it's still only ever
-run manually, not on a schedule.
+Pins are refreshed by hand, when an advisory is filed against a pinned version or a human
+decides to re-check: `make bump-external-versions` (`scripts/check_actions_versions.py
+--write`) resolves every pinned action's highest upstream version tag via `git ls-remote`
+and rewrites its SHA/tag comment in place. The repository has no `.github/dependabot.yml`
+(no scheduled version updates), which "Dependabot Auto-Merge" below relies on.
 
 > **Warning:** `make github-act-simulation` runs `docs.yml`'s
 > `build` job, then `release.yml`'s `verify-dist` job (which pulls in `test` — the
 > reusable call into `ci.yml` — and `build` as `needs:` dependencies, so all three run).
-> Never point it at `docs.yml`'s `deploy` job or `release.yml`'s
-> `publish-sdk`/`publish-cli`/`publish-browser`/`github-release` — those publish to GitHub
+> `act` has no Windows/macOS runners, so `ci.yml`'s `pytest` legs on those two only ever run
+> on GitHub itself.
+> Keep it to those build/test jobs: `docs.yml`'s `deploy` and `release.yml`'s
+> `publish-sdk`/`publish-cli`/`publish-browser`/`github-release` publish to GitHub
 > Pages / PyPI via OIDC (`pages: write` / `id-token: write`, PyPI Trusted Publishing) or
-> create a real GitHub Release (`contents: write`), which a local `act` run can not and
-> should not exercise.
+> create a real GitHub Release (`contents: write`), which only a real GitHub run should do.
 >
 > `.github/workflows/dependabot-auto-merge.yml` has no local `act` simulation target —
 > its entire logic is a one-line author check gating a real `gh pr merge --auto` call
@@ -58,6 +57,12 @@ update. This applies uniformly regardless of semver bump size, including to
 This depends on manual, non-committable repository Settings: Code security (Dependabot alerts +
 security updates), General → Pull Requests (Allow auto-merge, Allow squash merging), and a
 branch protection rule on `main` requiring the `test` status check.
+
+`test` is `ci.yml`'s aggregating job: it needs `lint`, every `pytest` matrix leg (each leg
+reports under its own matrix name, which no rule requires) and `coverage`, and fails unless all
+of them succeeded. It runs under `if: always()` because a job skipped after a failed dependency
+reports as skipped, and a skipped required check counts as passing. Keep that name and that
+condition when changing the workflow's jobs.
 
 ## Release / publish channel
 

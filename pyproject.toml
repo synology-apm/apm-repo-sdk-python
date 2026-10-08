@@ -13,6 +13,8 @@ dev = [
     "pytest-asyncio>=0.24",
     "pyyaml>=6.0",
     "types-pyyaml>=6.0",
+    "pytest-timeout>=2.3",
+    "inline-snapshot>=0.23",
 ]
 # Separate from dev so `uv sync` doesn't pull Sphinx for ordinary test/lint
 # work — building the docs requires `uv sync --group docs` explicitly.
@@ -23,19 +25,38 @@ docs = [
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
-# importlib (not the default "prepend") mode: dropping every
-# tests/integration/**/test_*_replay.py file's now-redundant `_replay` suffix
-# (see tests/CLAUDE.md) makes many of them share a basename with their
-# tests/unit/ counterpart (e.g. both trees get a test_units_saas_drive.py) --
-# importlib mode identifies each test file by its own path instead of
-# inserting it into sys.path under its bare module name, so same-basename
-# files in different directories collect without an "import file mismatch"
-# error. mypy needs its own, separate fix for the same collision -- see
-# mypy_path below.
-addopts = ["--import-mode=importlib"]
+# importlib (not the default "prepend") mode: tests/unit/ and
+# tests/integration/ share basenames (both have a test_units_device.py), and
+# importlib mode identifies each test file by its own path rather than its
+# bare module name, so they collect without an "import file mismatch" error.
+# mypy needs its own fix for the same collision -- see mypy_path below.
+# --dist=worksteal: with -n, idle workers steal queued tests from busy ones.
+# The default "load" pre-splits the queue and leaves workers idle behind the
+# slow Textual Pilot tests (full suite on 8 cores: ~73 s with load, ~37 s with
+# worksteal). Without -n it has no effect.
+addopts = ["--import-mode=importlib", "--strict-markers", "--dist=worksteal"]
+markers = [
+    "pilot: drives a Textual Pilot (applied by tests/conftest.py; `make test-quick` deselects it)",
+]
+xfail_strict = true
+# Every warning fails its test, except ResourceWarning: raised as an
+# exception inside aiosqlite.Connection.__del__ it skips the stop() that
+# follows, and the connection's non-daemon thread then blocks interpreter
+# exit. It still prints.
+filterwarnings = ["error", "default::ResourceWarning"]
+# Shared test modules import by their path under tests/ (support.pilot, unit.sdk.api_fakes).
+pythonpath = ["tests"]
+# A deadlocked test fails instead of hanging the run (pytest-timeout). Generous:
+# the slowest Textual pilot test takes ~28 s on a heavily loaded machine.
+timeout = 180
+
+[tool.inline-snapshot]
+# A snapshot is rewritten only by an explicit `pytest --inline-snapshot=fix`
+# (or review/create) run without -n; a plain run, xdist or CI, fails on a mismatch.
+format-command = "ruff format --stdin-filename {filename}"
 
 [tool.mypy]
-python_version = "3.11"
+python_version = "3.12"
 # No `platform` pin here: mypy only type-checks one sys.platform per run, and
 # this project ships to Windows/Linux/macOS, so `make test` runs mypy three
 # times (--platform linux/win32/darwin) instead of picking one default here.
@@ -43,21 +64,20 @@ python_version = "3.11"
 # gated with `sys.platform ==`/`!=` comparisons, not `hasattr()` -- mypy's
 # reachability analysis skips the non-matching branch entirely under each of
 # the three --platform runs, so no `# type: ignore` is needed at any of those
-# call sites (see storage/local.py's `_pread`/`_hint_willneed` for the
-# pattern to follow for new platform-conditional code).
+# call sites (see positional_io.py and storage/local.py's `_hint_willneed`
+# for the pattern to follow for new platform-conditional code).
 strict = true
+enable_error_code = ["ignore-without-code", "redundant-expr", "truthy-bool", "possibly-undefined", "redundant-self"]
 explicit_package_bases = true
 namespace_packages = true
 mypy_path = [
     "packages/synology-apm-repo-sdk/src",
     "packages/synology-apm-repo-cli/src",
     "packages/synology-apm-repo-browser/src",
-    # Namespace-package root for tests/ -- explicit_package_bases/
-    # namespace_packages above aren't sufficient by themselves once
-    # tests/unit/ and tests/integration/ share basenames (see addopts'
-    # own comment above): without a common root to derive a dotted path
-    # from, mypy still reports "Duplicate module named". Listing "tests"
-    # here resolves each file to unit.<pkg>.test_x / integration.<pkg>.test_x.
+    # Namespace-package root for tests/: tests/unit/ and tests/integration/
+    # share basenames (see addopts' comment above), and without a common root
+    # mypy reports "Duplicate module named". Listing "tests" resolves each
+    # file to unit.<pkg>.test_x / integration.<pkg>.test_x.
     "tests",
 ]
 # The Makefile invokes bare `uv run mypy` (no command-line path argument), so
@@ -69,13 +89,30 @@ files = [
     "packages/synology-apm-repo-browser/src",
     "tests",
     "scripts",
+    "examples",
     "docs/conf.py",
 ]
 
 # lz4/boto3/botocore/aioboto3/aiobotocore/dissect.*/smbprotocol/smbclient
-# ship no type stubs or py.typed marker — the standard mypy escape hatch,
-# not a project-wide relaxation (azure-storage-blob, by contrast, ships
-# its own stubs).
+# and examples/'s ntnx_*_py_client/iscsi ship no type stubs or py.typed
+# marker — the standard mypy escape hatch, not a project-wide relaxation
+# (azure-storage-blob, by contrast, ships its own stubs).
+[[tool.mypy.overrides]]
+# Production code only: in tests, mypy narrows Textual's mutable
+# `app.screen` across Pilot steps and reports the later screen as unreachable.
+# Every override is marked @override, so renaming a base method can't leave a
+# subclass's version silently defining a new method instead.
+module = ["synology_apm_repo.*"]
+warn_unreachable = true
+enable_error_code = ["explicit-override"]
+
+[[tool.mypy.overrides]]
+# `preallocate` checks sys.platform at call time so its tests can patch it and
+# run the posix_fallocate path on any host; under --platform darwin that path
+# is unreachable by design.
+module = ["synology_apm_repo.sdk.dedup.local_file_io"]
+warn_unreachable = false
+
 [[tool.mypy.overrides]]
 module = [
     "lz4.*",
@@ -86,14 +123,19 @@ module = [
     "dissect.*",
     "smbprotocol.*",
     "smbclient.*",
+    "ntnx_vmm_py_client.*",
+    "ntnx_volumes_py_client.*",
+    "ntnx_prism_py_client.*",
+    "iscsi",
 ]
 ignore_missing_imports = true
 
 [tool.ruff]
-target-version = "py311"
+target-version = "py312"
 line-length = 120
 src = [
     ".",
+    "tests",
     "packages/synology-apm-repo-sdk/src",
     "packages/synology-apm-repo-cli/src",
     "packages/synology-apm-repo-browser/src",
@@ -101,19 +143,114 @@ src = [
 
 [tool.ruff.lint]
 # SLF001 enforces the cross-module private-access boundary (the layering
-# contract in ARCHITECTURE.md); RUF100 keeps "# noqa" comments honest as
-# rule selection changes over time.
-select = ["E", "F", "I", "UP", "B", "ASYNC", "SIM", "PERF", "SLF001", "RUF100"]
+# contract in ARCHITECTURE.md). BLE001 makes every `except Exception` carry an
+# explicit `# noqa: BLE001` next to its reason; RUF006 catches a dangling
+# asyncio task; T20 keeps stray print() out of the packages.
+select = [
+    "E", "F", "I", "UP", "B", "ASYNC", "SIM", "PERF", "SLF001",
+    "A", "BLE", "C4", "FURB", "G", "LOG", "PGH", "PIE", "PT", "RET", "RUF", "T20", "TID251",
+]
+# PT018: splitting every composite assert is churn with no bug class behind it.
+# RET503: it can't see that a helper such as not_restorable() never returns.
+# PT012: testing a context manager's exit path needs the raise inside its block.
+ignore = ["PT012", "PT018", "RET503"]
+# Typographic characters used on purpose in user-visible text.
+allowed-confusables = ["›", "×", "−"]
 
 [tool.ruff.lint.flake8-bugbear]
-# Typer's convention is to write typer.Option()/typer.Argument() calls directly as
-# parameter defaults; this is not the mutable-default-argument pattern B008 targets.
-extend-immutable-calls = ["typer.Argument", "typer.Option"]
+extend-immutable-calls = [
+    # NewType constructors: an identity call returning an int.
+    "synology_apm_repo.browser.core.keys.Epoch",
+    "synology_apm_repo.browser.core.keys.RequestId",
+    "synology_apm_repo.browser.core.keys.JobId",
+]
+
+[tool.ruff.lint.flake8-pytest-style]
+# OSError left out: these tests check `.errno`, which a message match can't.
+# Ruff matches the qualified name a test imports, so each project error is
+# listed under every module that exports it.
+raises-require-match-for = [
+    "BaseException", "Exception", "ValueError", "IOError", "EnvironmentError",
+    "KeyError", "LookupError", "RuntimeError", "NotImplementedError", "TypeError", "AssertionError",
+    "synology_apm_repo.sdk.errors.ApmRepoError",
+    "synology_apm_repo.sdk.errors.FormatError",
+    "synology_apm_repo.sdk.errors.DataCorruptError",
+    "synology_apm_repo.sdk.errors.UnsupportedVersionError",
+    "synology_apm_repo.sdk.errors.ChunkCompactedError",
+    "synology_apm_repo.sdk.errors.KeyMaterialError",
+    "synology_apm_repo.sdk.errors.KeyRequiredError",
+    "synology_apm_repo.sdk.errors.KeyMismatchError",
+    "synology_apm_repo.sdk.errors.NotFoundError",
+    "synology_apm_repo.sdk.errors.ContentUnavailableError",
+    "synology_apm_repo.sdk.errors.NotRestorableError",
+    "synology_apm_repo.sdk.errors.PermissionDeniedError",
+    "synology_apm_repo.sdk.errors.StorageBackendError",
+    "synology_apm_repo.sdk.errors.UnsupportedDataFormatError",
+    "synology_apm_repo.sdk.errors.ResourceLimitExceededError",
+    "synology_apm_repo.sdk.errors.WorkerProcessError",
+    "synology_apm_repo.sdk.ApmRepoError",
+    "synology_apm_repo.sdk.FormatError",
+    "synology_apm_repo.sdk.DataCorruptError",
+    "synology_apm_repo.sdk.UnsupportedVersionError",
+    "synology_apm_repo.sdk.ChunkCompactedError",
+    "synology_apm_repo.sdk.KeyMaterialError",
+    "synology_apm_repo.sdk.KeyRequiredError",
+    "synology_apm_repo.sdk.KeyMismatchError",
+    "synology_apm_repo.sdk.NotFoundError",
+    "synology_apm_repo.sdk.ContentUnavailableError",
+    "synology_apm_repo.sdk.NotRestorableError",
+    "synology_apm_repo.sdk.PermissionDeniedError",
+    "synology_apm_repo.sdk.StorageBackendError",
+    "synology_apm_repo.sdk.UnsupportedDataFormatError",
+    "synology_apm_repo.sdk.ResourceLimitExceededError",
+    "synology_apm_repo.sdk.WorkerProcessError",
+    "synology_apm_repo.sdk.profiles.errors.ProfileNotFoundError",
+    "synology_apm_repo.sdk.profiles.errors.ProfileConfigCorruptError",
+    "synology_apm_repo.sdk.profiles.errors.ProfileFieldError",
+    "synology_apm_repo.sdk.profiles.errors.ProfileSecretBackendUnavailableError",
+    "synology_apm_repo.sdk.profiles.ProfileNotFoundError",
+    "synology_apm_repo.sdk.profiles.ProfileConfigCorruptError",
+    "synology_apm_repo.sdk.profiles.ProfileFieldError",
+    "synology_apm_repo.sdk.profiles.ProfileSecretBackendUnavailableError",
+    "synology_apm_repo.sdk.units.content.disk_fs.DiskFilesystemUnavailableError",
+    "synology_apm_repo.sdk.units.content.disk_fs._disk_filesystem.DiskFilesystemUnavailableError",
+    "synology_apm_repo.browser.core.connect.validate.ConnectValidationError",
+]
+
+[tool.ruff.lint.flake8-tidy-imports.banned-api]
+# A screen worker goes through the tracked wrapper, which makes an omitted
+# busy indicator (busy=False) an explicit choice at the decorator.
+"textual.work".msg = "use synology_apm_repo.browser.widgets.worker_progress.work"
 
 [tool.ruff.lint.per-file-ignores]
 # SLF001/ASYNC240 are legitimate in white-box tests (private-state assertions,
 # blocking-I/O postcondition checks), not real production layering violations.
 "tests/**" = ["E501", "SLF001", "ASYNC240"]
+# Command-line tools whose output is their purpose.
+"{scripts,examples,tests/smoke}/**" = ["T20"]
+"tests/support/recording/anonymize_catalog_metadata.py" = ["T20"]
+# Sphinx reads the module-level name `copyright`.
+"docs/conf.py" = ["A001"]
+# The tracked wrapper itself.
+"packages/synology-apm-repo-browser/src/synology_apm_repo/browser/widgets/worker_progress.py" = ["TID251"]
+
+[tool.coverage.run]
+# Relative paths, so CI can combine the Linux, macOS and Windows data files.
+relative_files = true
+branch = true
+
+[tool.coverage.paths]
+source = ["packages/", "packages\\"]
 
 [tool.coverage.report]
 fail_under = 95
+# Lines that exist for the type checker or as a guard against a broken
+# invariant, never run by a passing suite.
+exclude_also = [
+    "case _:\\n\\s*assert_never\\(",
+    "assert_never\\(",
+    "raise AssertionError",
+    "raise NotImplementedError",
+    "if TYPE_CHECKING:",
+    "if __name__ == .__main__.:",
+]

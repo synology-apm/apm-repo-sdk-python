@@ -7,9 +7,8 @@ from synology_apm_repo.sdk.units.base import FileState
 
 
 def test_file_state_icon_has_an_entry_for_every_file_state_member() -> None:
-    """Catches the day a new ``FileState`` member is added without a
-    matching icon — ``file_state_suffix``'s own ``.get(value, "")``
-    would otherwise silently render no icon for it forever."""
+    """``file_state_suffix``'s ``.get(value, "")`` would silently render no
+    icon for a ``FileState`` member added without one."""
     assert set(FILE_STATE_ICON) == {state.value for state in FileState}
 
 

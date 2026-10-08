@@ -1,9 +1,5 @@
-"""Pure unit tests for ``core/unit/select.py`` -- ``UnitModel`` ->
-``NodeSpec``/``FileRow`` translation, no Textual/App/Pilot involved at all.
-The disk-fs-sibling top-level-entry case mirrors
-``tests/unit/browser/test_browser_unit_screen_disk_fs_nesting.py``'s
-own real-provider fixtures, proven here at the pure selector level
-instead of through a full Pilot run."""
+"""Unit tests for ``core/unit/select.py``: ``UnitModel`` ->
+``NodeSpec``/``FileRow`` translation, without Textual."""
 
 from __future__ import annotations
 
@@ -33,10 +29,9 @@ from synology_apm_repo.browser.core.unit.select import (
     prefers_recent_content,
     preview_renderer_for,
 )
-from synology_apm_repo.sdk.units.base import FileState, Node, UnitKind, diagnostic_node
-from synology_apm_repo.sdk.units.device_disk_fs import DISK_FS_SIBLING_REF_ATTR
+from synology_apm_repo.sdk.units.base import FileState, ItemColumns, Node, NodeRole, UnitKind
 from synology_apm_repo.sdk.units.node_ref import NodeRef
-from synology_apm_repo.sdk.units.saas.site import SITE_FLAT_CATEGORY_ATTR, SITE_LIST_OVERVIEW_ATTR
+from synology_apm_repo.sdk.units.provider_kit import diagnostic_node
 
 
 def _leaf(name: str, ref: NodeRef | None = None) -> Node:
@@ -48,25 +43,17 @@ def _container(name: str, ref: NodeRef | None = None) -> Node:
 
 
 def test_node_label_escapes_rich_markup_in_the_real_name() -> None:
-    """``node.name`` is real backup-derived content -- both ``Tree`` and
-    ``DataTable`` re-parse a plain ``str`` label/cell as Rich markup
-    (``Tree.process_label``/``DataTable``'s own ``default_cell_formatter``),
-    so an unescaped name containing a bare closing tag like ``"a[/]b"``
-    crashes the render with ``rich.errors.MarkupError`` instead of just
-    showing oddly. ``safe()`` must have already run by the time this
-    reaches either widget."""
+    """A backup-derived name is markup-escaped: ``Tree`` and ``DataTable``
+    parse a plain ``str`` as Rich markup, and a bare closing tag like
+    ``"a[/]b"`` raises ``MarkupError``."""
     node = _leaf("a[/]b.txt")
     assert node_label(node) == r"a\[/]b.txt"
 
 
 def test_node_label_appends_the_diagnostic_marker_for_a_diagnostic_node_placeholder() -> None:
-    """A ``diagnostic_node()`` placeholder is indistinguishable from a
-    real file by ``kind``/``is_leaf`` alone -- ``node_label()`` is the
-    one place a caller sees a distinguishing marker, the same way it
-    already does for ``FileState``."""
-    node = diagnostic_node(
-        NodeRef("repo", ("root", "x")), "(no filesystem recognized on this disk)", {"diagnostic": "x"}
-    )
+    """``node_label()`` marks a ``diagnostic_node()`` placeholder, which
+    ``kind``/``is_leaf`` can't tell apart from a real file."""
+    node = diagnostic_node(NodeRef("repo", ("root", "x")), "(no filesystem recognized on this disk)", "x")
     assert node_label(node) == "(no filesystem recognized on this disk) ⚠"
 
 
@@ -75,17 +62,13 @@ def test_node_label_shows_both_the_file_state_and_diagnostic_markers_together() 
         ref=NodeRef("repo", ("root", "x")),
         name="x",
         is_leaf=True,
-        attrs={"file_state": FileState.CLOUD_ONLY, "diagnostic": "x"},
+        file_state=FileState.CLOUD_ONLY,
+        diagnostic="x",
     )
     assert node_label(node) == "x ☁ ⚠"
 
 
 def test_node_label_isolates_rtl_text_in_the_real_name() -> None:
-    """``node.name`` can be real RTL text (a calendar event title, a
-    contact name, ...) reaching the same ``Tree``/``DataTable`` label
-    the sibling escaping test above covers --
-    ``synology_apm_repo.sdk.presentation.markup``'s ``safe()`` wraps it
-    in a bidi isolate."""
     node = _leaf("הזמנה לאירוע")
     assert node_label(node) == "\u2068הזמנה לאירוע\u2069"
 
@@ -114,13 +97,10 @@ def test_folder_tree_spec_for_an_unloaded_container_root_is_expandable_with_no_c
     spec = folder_tree_spec(UnitModel(root=root))
     assert spec is not None
     assert spec.allow_expand is True
-    assert spec.children is None  # not yet modeled -- the screen hasn't dispatched ChildrenRequested
+    assert spec.children is None
 
 
 def test_folder_tree_spec_omits_ordinary_leaves_from_a_loaded_level() -> None:
-    """An ordinary leaf never appears in the folder tree -- only in
-    file_table_rows() under the same parent (see the sibling test
-    below)."""
     root = _container("root")
     folder = _container("folder")
     leaf_a, leaf_b = _leaf("a"), _leaf("b")
@@ -182,7 +162,7 @@ def test_filter_on_one_level_does_not_affect_an_unrelated_already_loaded_level()
 
     folder_spec = spec.children[0]
     assert folder_spec.children is not None
-    assert [c.label for c in folder_spec.children] == ["apple", "banana"]  # untouched by root's own filter
+    assert [c.label for c in folder_spec.children] == ["apple", "banana"]
 
 
 def _disk_image_and_fs_sibling() -> tuple[Node, Node]:
@@ -194,16 +174,13 @@ def _disk_image_and_fs_sibling() -> tuple[Node, Node]:
         name="disk-1.img (filesystem)",
         is_leaf=False,
         kind=UnitKind.DISK_FILESYSTEM,
-        attrs={DISK_FS_SIBLING_REF_ATTR: image_ref},
     )
     return image, fs_root
 
 
 def test_disk_fs_sibling_appears_as_an_ordinary_top_level_folder_not_nested_under_its_image() -> None:
-    """The folder tree shows only containers, so the (leaf) disk-image
-    node is excluded entirely and the "(filesystem)" sibling renders as
-    an ordinary top-level folder-tree entry, under its own real name --
-    never nested under its own disk-image node."""
+    """The ``"(filesystem)"`` sibling is a top-level tree entry under its
+    own name; the disk-image leaf is not in the tree."""
     root = _container("root")
     image, fs_root = _disk_image_and_fs_sibling()
     model = UnitModel(root=root, loaded={root.ref: LoadedLevel(children=(image, fs_root), exhausted=True)})
@@ -213,7 +190,7 @@ def test_disk_fs_sibling_appears_as_an_ordinary_top_level_folder_not_nested_unde
     assert [c.key for c in spec.children] == [fs_root.ref]
     fs_spec = spec.children[0]
     assert fs_spec.payload is fs_root
-    assert fs_spec.label == node_label(fs_root)  # its own real name, not a relabeled wrapper
+    assert fs_spec.label == node_label(fs_root)
     assert fs_spec.allow_expand is True
 
 
@@ -227,9 +204,7 @@ def test_disk_image_leaf_appears_as_an_ordinary_file_table_row() -> None:
 
 def test_list_overview_node_is_tree_visible_but_not_expandable() -> None:
     root = _container("root")
-    overview = Node(
-        ref=NodeRef("repo", ("root", "list")), name="MyList", is_leaf=False, attrs={SITE_LIST_OVERVIEW_ATTR: True}
-    )
+    overview = Node(ref=NodeRef("repo", ("root", "list")), name="MyList", is_leaf=False, role=NodeRole.LIST_OVERVIEW)
     model = UnitModel(root=root, loaded={root.ref: LoadedLevel(children=(overview,), exhausted=True)})
     spec = folder_tree_spec(model)
     assert spec is not None and spec.children is not None
@@ -241,9 +216,7 @@ def test_list_overview_node_is_tree_visible_but_not_expandable() -> None:
 
 def test_list_overview_node_yields_no_file_table_rows_of_its_own() -> None:
     root = _container("root")
-    overview = Node(
-        ref=NodeRef("repo", ("root", "list")), name="MyList", is_leaf=False, attrs={SITE_LIST_OVERVIEW_ATTR: True}
-    )
+    overview = Node(ref=NodeRef("repo", ("root", "list")), name="MyList", is_leaf=False, role=NodeRole.LIST_OVERVIEW)
     item = _leaf("item-1")
     model = UnitModel(
         root=root,
@@ -258,9 +231,7 @@ def test_list_overview_node_yields_no_file_table_rows_of_its_own() -> None:
 
 def test_a_failed_children_fetch_renders_as_a_single_synthetic_error_leaf() -> None:
     root = _container("root")
-    # A bracketed substring in the error's own str() (an exception message
-    # is arbitrary, provider-dependent text) must be escaped -- same
-    # reasoning as node_label()'s own escaping, see its sibling test.
+    # An exception message is arbitrary text, so it is markup-escaped.
     model = UnitModel(root=root, errors={root.ref: "boom [/] bang"})
     spec = folder_tree_spec(model)
     assert spec is not None
@@ -280,10 +251,8 @@ def test_error_leaf_ref_never_collides_with_a_real_sibling_ref() -> None:
 
 
 def test_a_loaded_level_takes_priority_over_a_stale_error_entry() -> None:
-    """update.py's own ChildrenLoaded case clears a ref's error entry on
-    success -- this proves the selector would render correctly even if
-    it somehow didn't (loaded wins), rather than depending only on that
-    invariant holding elsewhere."""
+    """A loaded level wins over an error entry for the same ref, even though
+    ``update()``'s ``ChildrenLoaded`` case already clears it."""
     root = _container("root")
     child = _container("recovered")
     model = UnitModel(
@@ -297,14 +266,11 @@ def test_a_loaded_level_takes_priority_over_a_stale_error_entry() -> None:
 
 
 def test_flat_category_node_is_tree_visible_but_not_expandable() -> None:
-    """The SharePoint List *category* node gets the same tree treatment
-    as an individual List's own is_list_overview group -- but for a
-    different reason (its own children belong in the file table, not a
-    detail-pane spreadsheet dump)."""
+    """The SharePoint List category node is in the tree but not expandable,
+    like a ``NodeRole.LIST_OVERVIEW`` group; its children belong in the file
+    table."""
     root = _container("root")
-    category = Node(
-        ref=NodeRef("repo", ("root", "list")), name="List", is_leaf=False, attrs={SITE_FLAT_CATEGORY_ATTR: True}
-    )
+    category = Node(ref=NodeRef("repo", ("root", "list")), name="List", is_leaf=False, role=NodeRole.FLAT_CATEGORY)
     model = UnitModel(root=root, loaded={root.ref: LoadedLevel(children=(category,), exhausted=True)})
     spec = folder_tree_spec(model)
     assert spec is not None and spec.children is not None
@@ -315,21 +281,22 @@ def test_flat_category_node_is_tree_visible_but_not_expandable() -> None:
 
 
 def test_flat_category_nodes_own_children_are_ordinary_file_table_rows() -> None:
-    """Unlike is_list_overview, is_flat_category does NOT blank the file
-    table -- the category's own children (the site's individual Lists)
-    are meant to be browsed there, exactly like any other folder's."""
+    """Unlike ``NodeRole.LIST_OVERVIEW``, ``NodeRole.FLAT_CATEGORY`` keeps the file table:
+    the category's children (the site's Lists) are browsed there."""
     root = _container("root")
     category = Node(
         ref=NodeRef("repo", ("root", "list")),
         name="List",
         is_leaf=False,
-        attrs={SITE_FLAT_CATEGORY_ATTR: True, "leaf_kind": UnitKind.CATEGORY_GROUP},
+        role=NodeRole.FLAT_CATEGORY,
+        leaf_kind=UnitKind.CATEGORY_GROUP,
     )
     individual_list = Node(
         ref=NodeRef("repo", ("root", "list", "l1")),
         name="Access Requests",
         is_leaf=False,
-        attrs={SITE_LIST_OVERVIEW_ATTR: True, "mtime": datetime.fromtimestamp(0, UTC)},
+        role=NodeRole.LIST_OVERVIEW,
+        mtime=datetime.fromtimestamp(0, UTC),
     )
     model = UnitModel(
         root=root,
@@ -348,49 +315,40 @@ class TestColumnHeadersFor:
     def test_defaults_to_name_size_modified(self) -> None:
         root = _container("root")
         model = UnitModel(root=root)
-        # The blank header between Name and Size holds the file-state
-        # glyph in its own fixed-width column, kept separate so a long
-        # name never shifts Size/Modified over.
+        # The blank header is the file-state glyph's own fixed-width column.
         assert column_headers_for(model, root.ref) == ("Name", "", "Size", "Modified")
 
     def test_none_ref_defaults_too(self) -> None:
         assert column_headers_for(UnitModel(), None) == ("Name", "", "Size", "Modified")
 
     def test_mail_folder(self) -> None:
-        root = Node(ref=NodeRef("repo", ()), name="Mail", is_leaf=False, attrs={"leaf_kind": UnitKind.MAIL})
+        root = Node(ref=NodeRef("repo", ()), name="Mail", is_leaf=False, leaf_kind=UnitKind.MAIL)
         model = UnitModel(root=root)
         assert column_headers_for(model, root.ref) == ("Sender", "Subject", "Date")
 
     def test_contact_folder(self) -> None:
-        root = Node(ref=NodeRef("repo", ()), name="Contacts", is_leaf=False, attrs={"leaf_kind": UnitKind.CONTACT})
+        root = Node(ref=NodeRef("repo", ()), name="Contacts", is_leaf=False, leaf_kind=UnitKind.CONTACT)
         model = UnitModel(root=root)
         assert column_headers_for(model, root.ref) == ("Full Name", "Email")
 
     def test_calendar_folder(self) -> None:
-        root = Node(
-            ref=NodeRef("repo", ()), name="Calendars", is_leaf=False, attrs={"leaf_kind": UnitKind.CALENDAR_EVENT}
-        )
+        root = Node(ref=NodeRef("repo", ()), name="Calendars", is_leaf=False, leaf_kind=UnitKind.CALENDAR_EVENT)
         model = UnitModel(root=root)
         assert column_headers_for(model, root.ref) == ("Title", "Start Time", "End Time", "Recurrence")
 
     def test_site_item_folder_defaults_like_a_file_folder(self) -> None:
-        # A Document Library's own items -- SITE_ITEM shares the default
-        # spec, distinguished from a List only by is_flat_category, never
-        # by leaf_kind alone.
-        root = Node(ref=NodeRef("repo", ()), name="Documents", is_leaf=False, attrs={"leaf_kind": UnitKind.SITE_ITEM})
+        root = Node(ref=NodeRef("repo", ()), name="Documents", is_leaf=False, leaf_kind=UnitKind.SITE_ITEM)
         model = UnitModel(root=root)
         assert column_headers_for(model, root.ref) == ("Name", "", "Size", "Modified")
 
     def test_category_group_kind_gets_name_created_columns(self) -> None:
-        # Site's own "List" category (SITE_FLAT_CATEGORY_ATTR, read for
-        # tree-expansion purposes elsewhere) declares
-        # leaf_kind=CATEGORY_GROUP itself -- the column dispatch reads
-        # only that, with no separate marker check.
+        # The column dispatch reads only leaf_kind, not the role.
         root = Node(
             ref=NodeRef("repo", ()),
             name="List",
             is_leaf=False,
-            attrs={"leaf_kind": UnitKind.CATEGORY_GROUP, SITE_FLAT_CATEGORY_ATTR: True},
+            leaf_kind=UnitKind.CATEGORY_GROUP,
+            role=NodeRole.FLAT_CATEGORY,
         )
         model = UnitModel(root=root)
         assert column_headers_for(model, root.ref) == ("Name", "Created")
@@ -400,25 +358,20 @@ class TestColumnHeadersFor:
             ref=NodeRef("repo", ()),
             name="Standard Channels",
             is_leaf=False,
-            attrs={"leaf_kind": UnitKind.TEAMS_CHAT_MESSAGE},
+            leaf_kind=UnitKind.TEAMS_CHAT_MESSAGE,
         )
         model = UnitModel(root=root)
         assert column_headers_for(model, root.ref) == ("Name", "Created")
 
     def test_raw_object_defaults_like_a_file_folder(self) -> None:
-        # RawObjectProvider's own raw diagnostic listing -- not
-        # TEAMS_CHAT_MESSAGE/CATEGORY_GROUP, so it stays on the default
-        # spec, matching its own real Size (and no Created time).
-        root = Node(ref=NodeRef("repo", ()), name="raw", is_leaf=False, attrs={"leaf_kind": UnitKind.RAW_OBJECT})
+        root = Node(ref=NodeRef("repo", ()), name="raw", is_leaf=False, leaf_kind=UnitKind.RAW_OBJECT)
         model = UnitModel(root=root)
         assert column_headers_for(model, root.ref) == ("Name", "", "Size", "Modified")
 
     def test_empty_folder_still_resolves_from_its_own_node_not_a_child(self) -> None:
-        """The empty-folder edge case this mechanism is specifically
-        designed to avoid: a folder with zero children still resolves
-        correctly, since the answer comes from the folder's own node,
-        never from inspecting a child."""
-        root = Node(ref=NodeRef("repo", ()), name="Mail", is_leaf=False, attrs={"leaf_kind": UnitKind.MAIL})
+        """An empty folder still gets its kind's headers: they come from the
+        folder's own ``leaf_kind``, not from a child."""
+        root = Node(ref=NodeRef("repo", ()), name="Mail", is_leaf=False, leaf_kind=UnitKind.MAIL)
         model = UnitModel(root=root, loaded={root.ref: LoadedLevel(children=(), exhausted=True)})
         assert column_headers_for(model, root.ref) == ("Sender", "Subject", "Date")
         assert file_table_rows(model, root.ref) == ()
@@ -440,76 +393,69 @@ class TestColumnWidthValidation:
 
 class TestPerKindCells:
     def test_mail_cells(self) -> None:
-        root = Node(ref=NodeRef("repo", ()), name="Mail", is_leaf=False, attrs={"leaf_kind": UnitKind.MAIL})
+        root = Node(ref=NodeRef("repo", ()), name="Mail", is_leaf=False, leaf_kind=UnitKind.MAIL)
         mail = Node(
             ref=NodeRef("repo", ("m1",)),
             name="Hello",
             is_leaf=True,
             kind=UnitKind.MAIL,
-            attrs={"sender": "Alice", "mtime": datetime.fromtimestamp(0, UTC)},
+            mtime=datetime.fromtimestamp(0, UTC),
+            columns=ItemColumns(sender="Alice"),
         )
         model = UnitModel(root=root, loaded={root.ref: LoadedLevel(children=(mail,), exhausted=True)})
         rows = file_table_rows(model, root.ref)
         assert rows[0].cells == ("Alice", "Hello", "1970-01-01 08:00:00")
 
     def test_mail_cells_blank_when_sender_and_date_are_unset(self) -> None:
-        root = Node(ref=NodeRef("repo", ()), name="Mail", is_leaf=False, attrs={"leaf_kind": UnitKind.MAIL})
+        root = Node(ref=NodeRef("repo", ()), name="Mail", is_leaf=False, leaf_kind=UnitKind.MAIL)
         mail = Node(ref=NodeRef("repo", ("m1",)), name="Hello", is_leaf=True, kind=UnitKind.MAIL)
         model = UnitModel(root=root, loaded={root.ref: LoadedLevel(children=(mail,), exhausted=True)})
         rows = file_table_rows(model, root.ref)
         assert rows[0].cells == ("", "Hello", "")
 
     def test_mail_sender_with_a_literal_bracket_is_escaped(self) -> None:
-        """Regression test: ``sender`` is read straight off the backup's
-        own mail row, untouched by this code -- a value shaped like a real
-        tag (``"[MVP-1] Alice"``) must not reach ``DataTable`` unescaped,
-        or Textual's own markup tokenizer crashes the whole file table
-        with ``MarkupError`` the moment this folder is opened."""
-        root = Node(ref=NodeRef("repo", ()), name="Mail", is_leaf=False, attrs={"leaf_kind": UnitKind.MAIL})
+        """A backup-derived ``sender`` like ``"[MVP-1] Alice"`` is
+        markup-escaped, or ``DataTable`` raises ``MarkupError``."""
+        root = Node(ref=NodeRef("repo", ()), name="Mail", is_leaf=False, leaf_kind=UnitKind.MAIL)
         mail = Node(
             ref=NodeRef("repo", ("m1",)),
             name="Hello",
             is_leaf=True,
             kind=UnitKind.MAIL,
-            attrs={"sender": "[MVP-1] Alice"},
+            columns=ItemColumns(sender="[MVP-1] Alice"),
         )
         model = UnitModel(root=root, loaded={root.ref: LoadedLevel(children=(mail,), exhausted=True)})
         rows = file_table_rows(model, root.ref)
         assert rows[0].cells == (r"\[MVP-1] Alice", "Hello", "")
 
     def test_contact_cells(self) -> None:
-        root = Node(ref=NodeRef("repo", ()), name="Contacts", is_leaf=False, attrs={"leaf_kind": UnitKind.CONTACT})
+        root = Node(ref=NodeRef("repo", ()), name="Contacts", is_leaf=False, leaf_kind=UnitKind.CONTACT)
         contact = Node(
             ref=NodeRef("repo", ("c1",)),
             name="Ada Lovelace",
             is_leaf=True,
             kind=UnitKind.CONTACT,
-            attrs={"email": "ada@example.com"},
+            columns=ItemColumns(email="ada@example.com"),
         )
         model = UnitModel(root=root, loaded={root.ref: LoadedLevel(children=(contact,), exhausted=True)})
         rows = file_table_rows(model, root.ref)
         assert rows[0].cells == ("Ada Lovelace", "ada@example.com")
 
     def test_contact_with_no_name_is_blank_not_a_raw_id(self) -> None:
-        """The bug fix this whole feature grew out of: an unnamed
-        contact's own Name column must never fall back to a raw
-        resource-id-shaped string."""
-        root = Node(ref=NodeRef("repo", ()), name="Contacts", is_leaf=False, attrs={"leaf_kind": UnitKind.CONTACT})
+        root = Node(ref=NodeRef("repo", ()), name="Contacts", is_leaf=False, leaf_kind=UnitKind.CONTACT)
         contact = Node(
             ref=NodeRef("repo", ("c1",)),
-            name="",  # the SDK's own _display_name() already returns "" for this case
+            name="",
             is_leaf=True,
             kind=UnitKind.CONTACT,
-            attrs={"email": "unnamed@example.com"},
+            columns=ItemColumns(email="unnamed@example.com"),
         )
         model = UnitModel(root=root, loaded={root.ref: LoadedLevel(children=(contact,), exhausted=True)})
         rows = file_table_rows(model, root.ref)
         assert rows[0].cells == ("", "unnamed@example.com")
 
     def test_calendar_event_cells(self) -> None:
-        root = Node(
-            ref=NodeRef("repo", ()), name="Calendars", is_leaf=False, attrs={"leaf_kind": UnitKind.CALENDAR_EVENT}
-        )
+        root = Node(ref=NodeRef("repo", ()), name="Calendars", is_leaf=False, leaf_kind=UnitKind.CALENDAR_EVENT)
         start = datetime.fromtimestamp(0, UTC)
         end = datetime.fromtimestamp(3600, UTC)
         event = Node(
@@ -517,16 +463,14 @@ class TestPerKindCells:
             name="Standup",
             is_leaf=True,
             kind=UnitKind.CALENDAR_EVENT,
-            attrs={"event_start": start, "event_end": end, "recurrence": "Weekly"},
+            columns=ItemColumns(event_start=start, event_end=end, recurrence="Weekly"),
         )
         model = UnitModel(root=root, loaded={root.ref: LoadedLevel(children=(event,), exhausted=True)})
         rows = file_table_rows(model, root.ref)
         assert rows[0].cells == ("Standup", "1970-01-01 08:00:00", "1970-01-01 09:00:00", "Weekly")
 
     def test_calendar_event_cells_blank_when_unset(self) -> None:
-        root = Node(
-            ref=NodeRef("repo", ()), name="Calendars", is_leaf=False, attrs={"leaf_kind": UnitKind.CALENDAR_EVENT}
-        )
+        root = Node(ref=NodeRef("repo", ()), name="Calendars", is_leaf=False, leaf_kind=UnitKind.CALENDAR_EVENT)
         event = Node(ref=NodeRef("repo", ("e1",)), name="Standup", is_leaf=True, kind=UnitKind.CALENDAR_EVENT)
         model = UnitModel(root=root, loaded={root.ref: LoadedLevel(children=(event,), exhausted=True)})
         rows = file_table_rows(model, root.ref)
@@ -537,29 +481,26 @@ class TestPerKindCells:
             ref=NodeRef("repo", ()),
             name="Standard Channels",
             is_leaf=False,
-            attrs={"leaf_kind": UnitKind.TEAMS_CHAT_MESSAGE},
+            leaf_kind=UnitKind.TEAMS_CHAT_MESSAGE,
         )
         channel = Node(
             ref=NodeRef("repo", ("ch1",)),
             name="General",
             is_leaf=True,
             kind=UnitKind.TEAMS_CHAT_MESSAGE,
-            attrs={"mtime": datetime.fromtimestamp(0, UTC)},
+            mtime=datetime.fromtimestamp(0, UTC),
         )
         model = UnitModel(root=category, loaded={category.ref: LoadedLevel(children=(channel,), exhausted=True)})
         rows = file_table_rows(model, category.ref)
         assert rows[0].cells == ("General", "1970-01-01 08:00:00")
 
     def test_teams_channel_cells_blank_when_create_time_is_unavailable(self) -> None:
-        # Chat's rendering is implemented generically from the format
-        # docs rather than an observed instance, so create_time may be
-        # absent -- a channel/chat with no create_time must still
-        # render, just with a blank Created cell.
+        # A chat may lack create_time; its Created cell is then blank.
         category = Node(
             ref=NodeRef("repo", ()),
             name="Chats",
             is_leaf=False,
-            attrs={"leaf_kind": UnitKind.TEAMS_CHAT_MESSAGE},
+            leaf_kind=UnitKind.TEAMS_CHAT_MESSAGE,
         )
         chat = Node(ref=NodeRef("repo", ("c1",)), name="Alice", is_leaf=True, kind=UnitKind.TEAMS_CHAT_MESSAGE)
         model = UnitModel(root=category, loaded={category.ref: LoadedLevel(children=(chat,), exhausted=True)})
@@ -578,8 +519,6 @@ class TestFileTableRows:
         model = UnitModel(root=root, loaded={root.ref: LoadedLevel(children=(folder, leaf), exhausted=True)})
         rows = file_table_rows(model, root.ref)
         assert [row.node for row in rows] == [folder, leaf]
-        # Neither folder nor leaf carries a node_leaf_kind here -- the
-        # default ColumnSpec applies, whose own first column is the name.
         assert [row.cells[0] for row in rows] == [node_label(folder), node_label(leaf)]
 
     def test_nothing_loaded_yet_yields_no_rows(self) -> None:
@@ -593,9 +532,7 @@ class TestFileTableRows:
         rows = file_table_rows(model, root.ref)
         assert len(rows) == 1
         assert rows[0].node is None
-        # Padded to the default ColumnSpec's own column count (Name/[file
-        # state]/Size/Modified) -- the real message in the first cell,
-        # every other column blank.
+        # Padded to the default spec's column count.
         assert rows[0].cells == (r"error: boom \[/] bang", "", "", "")
 
     def test_filter_narrows_rows_by_substring(self) -> None:
@@ -611,7 +548,7 @@ class TestFileTableRows:
 
     def test_size_text_is_blank_for_a_node_with_no_size(self) -> None:
         root = _container("root")
-        folder = _container("folder")  # containers never carry a size
+        folder = _container("folder")
         model = UnitModel(root=root, loaded={root.ref: LoadedLevel(children=(folder,), exhausted=True)})
         rows = file_table_rows(model, root.ref)
         assert str(rows[0].cells[2]) == ""
@@ -624,8 +561,7 @@ class TestFileTableRows:
         assert str(rows[0].cells[2]) == "1.0 KiB"
 
     def test_size_is_a_right_justified_text_value(self) -> None:
-        # Textual's own DataTable.add_column has no justify parameter --
-        # the Size cell itself must carry the alignment.
+        # DataTable.add_column has no justify parameter; the cell carries it.
         root = _container("root")
         leaf = Node(ref=NodeRef("repo", ("root", "f")), name="f", is_leaf=True, size=1024)
         model = UnitModel(root=root, loaded={root.ref: LoadedLevel(children=(leaf,), exhausted=True)})
@@ -642,7 +578,7 @@ class TestFileTableRows:
     def test_modified_text_formats_a_real_mtime(self) -> None:
         root = _container("root")
         dt = datetime.fromtimestamp(0, UTC)
-        leaf = Node(ref=NodeRef("repo", ("root", "f")), name="f", is_leaf=True, attrs={"mtime": dt})
+        leaf = Node(ref=NodeRef("repo", ("root", "f")), name="f", is_leaf=True, mtime=dt)
         model = UnitModel(root=root, loaded={root.ref: LoadedLevel(children=(leaf,), exhausted=True)})
         rows = file_table_rows(model, root.ref)
         assert rows[0].cells[3] == "1970-01-01 08:00:00"
@@ -660,13 +596,11 @@ class TestFileTableRows:
             ref=NodeRef("repo", ("root", "f")),
             name="f",
             is_leaf=True,
-            attrs={"file_state": FileState.CLOUD_ONLY},
+            file_state=FileState.CLOUD_ONLY,
         )
         model = UnitModel(root=root, loaded={root.ref: LoadedLevel(children=(leaf,), exhausted=True)})
         rows = file_table_rows(model, root.ref)
-        # Unlike node_label() (the folder tree's own single-column label,
-        # still inline), the default file-table spec's Name cell is bare
-        # -- the glyph moved to its own untitled column instead.
+        # Unlike node_label(), the Name cell carries no inline glyph.
         assert rows[0].cells[0] == "f"
         assert rows[0].cells[1] == "☁"
 
@@ -676,53 +610,45 @@ class TestFileTableRows:
             ref=NodeRef("repo", ("root", "f")),
             name="f",
             is_leaf=True,
-            attrs={"file_state": FileState.ENCRYPTED},
+            file_state=FileState.ENCRYPTED,
         )
         model = UnitModel(root=root, loaded={root.ref: LoadedLevel(children=(leaf,), exhausted=True)})
         rows = file_table_rows(model, root.ref)
         assert rows[0].cells[1] == "🔒"
 
     def test_mail_folder_hides_its_own_subfolders_from_the_file_table(self) -> None:
-        # A subfolder is still reachable in the folder tree -- only the
-        # file table (whose columns here are Sender/Subject/Date, meaningless
-        # for a subfolder) drops it.
-        root = Node(ref=NodeRef("repo", ("root",)), name="root", is_leaf=False, attrs={"leaf_kind": UnitKind.MAIL})
-        subfolder = Node(
-            ref=NodeRef("repo", ("root", "sub")), name="sub", is_leaf=False, attrs={"leaf_kind": UnitKind.MAIL}
-        )
+        root = Node(ref=NodeRef("repo", ("root",)), name="root", is_leaf=False, leaf_kind=UnitKind.MAIL)
+        subfolder = Node(ref=NodeRef("repo", ("root", "sub")), name="sub", is_leaf=False, leaf_kind=UnitKind.MAIL)
         mail = _leaf("hello.eml", ref=NodeRef("repo", ("root", "mail")))
         model = UnitModel(root=root, loaded={root.ref: LoadedLevel(children=(subfolder, mail), exhausted=True)})
         rows = file_table_rows(model, root.ref)
         assert [row.node for row in rows] == [mail]
+        spec = folder_tree_spec(model)
+        assert spec is not None and spec.children is not None
+        assert [c.key for c in spec.children] == [subfolder.ref]
 
     def test_calendar_category_hides_its_own_calendars_from_the_file_table(self) -> None:
-        # "My Calendars"/"Other Calendars" and each individual calendar
-        # are containers too, all sharing CALENDAR_EVENT as their
-        # leaf_kind -- only an actual event belongs in this file table.
+        # A CALENDAR_EVENT folder (leaves_only) drops container children.
         category = Node(
             ref=NodeRef("repo", ("root",)),
             name="My Calendars",
             is_leaf=False,
-            attrs={"leaf_kind": UnitKind.CALENDAR_EVENT},
+            leaf_kind=UnitKind.CALENDAR_EVENT,
         )
         calendar = Node(
             ref=NodeRef("repo", ("root", "cal")),
             name="台灣假日",
             is_leaf=False,
-            attrs={"leaf_kind": UnitKind.CALENDAR_EVENT},
+            leaf_kind=UnitKind.CALENDAR_EVENT,
         )
         model = UnitModel(root=category, loaded={category.ref: LoadedLevel(children=(calendar,), exhausted=True)})
         assert file_table_rows(model, category.ref) == ()
 
     def test_default_spec_still_lists_a_document_librarys_subfolders(self) -> None:
-        # leaves_only is scoped to Mail/Contact/Calendar Event only --
-        # Document Library/File/Drive folders keep mixing subfolders and
-        # leaves in the same file table (test_lists_both_files_and_subfolders
-        # already covers the no-leaf_kind-at-all case above).
-        root = Node(ref=NodeRef("repo", ("root",)), name="root", is_leaf=False, attrs={"leaf_kind": UnitKind.SITE_ITEM})
-        subfolder = Node(
-            ref=NodeRef("repo", ("root", "sub")), name="sub", is_leaf=False, attrs={"leaf_kind": UnitKind.SITE_ITEM}
-        )
+        # leaves_only applies to Mail/Contact/Calendar Event only; other
+        # folders list subfolders in the file table too.
+        root = Node(ref=NodeRef("repo", ("root",)), name="root", is_leaf=False, leaf_kind=UnitKind.SITE_ITEM)
+        subfolder = Node(ref=NodeRef("repo", ("root", "sub")), name="sub", is_leaf=False, leaf_kind=UnitKind.SITE_ITEM)
         model = UnitModel(root=root, loaded={root.ref: LoadedLevel(children=(subfolder,), exhausted=True)})
         rows = file_table_rows(model, root.ref)
         assert [row.node for row in rows] == [subfolder]
@@ -752,11 +678,8 @@ class TestFindNodeInModel:
         assert find_node_in_model(model, leaf.ref) is leaf
 
     def test_a_ref_present_only_in_loaded_but_not_the_index_is_not_found(self) -> None:
-        """Guards the O(1) lookup's own invariant: ``find_node_in_model``
-        never falls back to scanning ``loaded`` -- a child missing from
-        ``node_index`` (a bug in one of ``update.py``'s own fetch-result
-        cases, say) must surface as "not found," not silently work anyway
-        via a slower path that would mask the drift."""
+        """``find_node_in_model`` reads only ``node_index``, never scanning
+        ``loaded``."""
         root = _container("root")
         leaf = _leaf("deep")
         model = UnitModel(root=root, loaded={root.ref: LoadedLevel(children=(leaf,), exhausted=True)})
@@ -775,9 +698,6 @@ class TestIsContentOnlyPreview:
             assert is_content_only_preview(node)
 
     def test_a_raw_object_leaf_is_not_content_only(self) -> None:
-        # RawObjectProvider's own raw diagnostic listing -- still wants
-        # the ordinary header, unlike a Teams/Chat message's dedicated
-        # UnitKind.TEAMS_CHAT_MESSAGE.
         node = Node(ref=NodeRef("repo", ("root", "x")), name="x", is_leaf=True, kind=UnitKind.RAW_OBJECT)
         assert not is_content_only_preview(node)
 
@@ -828,11 +748,5 @@ class TestPrefersRecentContent:
         assert not prefers_recent_content(node)
 
     def test_mail_does_not_prefer_recent_content(self) -> None:
-        # An ordinary mail/event/file's own most useful content is at
-        # its start, not its end -- only a Teams/Chat message page's
-        # chronological-transcript shape wants the opposite.
         node = Node(ref=NodeRef("repo", ("root", "x")), name="x", is_leaf=True, kind=UnitKind.MAIL)
         assert not prefers_recent_content(node)
-
-
-__all__: list[str] = []

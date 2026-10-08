@@ -1,49 +1,51 @@
-"""Unit tests for ``synology_apm_repo.sdk.storage.prefix_listing`` — the
-shared listing/probing shapes ``S3Store``/``AzureStore`` both build their
-own ``listdir``/``exists`` on top of, tested here as pure functions in
-isolation (``test_storage_s3.py``/``test_storage_azure.py`` cover
-``exists()`` end-to-end through a real backend).
-"""
+"""Unit tests for ``synology_apm_repo.sdk.storage.prefix_listing``: the
+listing/probing shapes ``S3Store``/``AzureStore`` build ``listdir``/``exists``
+on, as pure functions (``test_storage_s3.py``/``test_storage_azure.py`` cover
+``exists()`` end to end)."""
 
 from __future__ import annotations
 
 import pytest
 
-from synology_apm_repo.sdk.storage.prefix_listing import as_list_prefix, exists_via_prefix_probe, sorted_relative_names
+from synology_apm_repo.sdk.storage.base import Entry
+from synology_apm_repo.sdk.storage.prefix_listing import (
+    as_list_prefix,
+    exists_via_prefix_probe,
+    sorted_relative_entries,
+)
 
 
 class TestAsListPrefix:
-    def test_empty_key_stays_empty_not_a_bare_slash(self) -> None:
-        assert as_list_prefix("") == ""
+    @pytest.mark.parametrize(
+        ("key", "expected"),
+        [
+            pytest.param("", "", id="empty_key_stays_empty_not_a_bare_slash"),
+            pytest.param("dir", "dir/", id="non_empty_key_gets_a_trailing_slash"),
+            # Callers always pass a bare key; as_list_prefix() itself
+            # doesn't guard against an already slash-terminated one.
+            pytest.param("dir/", "dir//", id="a_key_already_ending_in_slash_gets_a_second_one"),
+        ],
+    )
+    def test_as_list_prefix(self, key: str, expected: str) -> None:
+        assert as_list_prefix(key) == expected
 
-    def test_non_empty_key_gets_a_trailing_slash(self) -> None:
-        assert as_list_prefix("dir") == "dir/"
 
-    def test_a_key_already_ending_in_slash_gets_a_second_one(self) -> None:
-        # Callers always pass a bare key/path component here, never one
-        # they've already slash-terminated themselves -- this documents
-        # that as_list_prefix() itself doesn't guard against it.
-        assert as_list_prefix("dir/") == "dir//"
-
-
-class TestSortedRelativeNames:
-    def test_trims_the_prefix_and_any_trailing_slash_then_sorts(self) -> None:
-        raw = ["dir/b/", "dir/a.txt", "dir/c/"]
-        assert sorted_relative_names(raw, "dir/") == ["a.txt", "b", "c"]
+class TestSortedRelativeEntries:
+    def test_trims_the_prefix_and_any_trailing_slash_then_sorts_keeping_each_size(self) -> None:
+        raw = [("dir/b/", None), ("dir/a.txt", 5), ("dir/c/", None)]
+        assert sorted_relative_entries(raw, "dir/") == [Entry("a.txt", 5), Entry("b", None), Entry("c", None)]
 
     def test_the_prefix_marker_itself_trims_to_empty_and_is_dropped(self) -> None:
-        # A real "directory placeholder" object (a zero-byte key/blob
-        # literally named "dir/") trims to "" -- listdir()'s own contract
-        # is real child names only, never a placeholder entry for the
-        # directory itself.
-        raw = ["dir/", "dir/a.txt"]
-        assert sorted_relative_names(raw, "dir/") == ["a.txt"]
+        # A "directory placeholder" object (a zero-byte key literally named "dir/")
+        # trims to "": listdir() lists child names only.
+        raw = [("dir/", 0), ("dir/a.txt", 3)]
+        assert sorted_relative_entries(raw, "dir/") == [Entry("a.txt", 3)]
 
     def test_empty_input_returns_empty_list(self) -> None:
-        assert sorted_relative_names([], "dir/") == []
+        assert sorted_relative_entries([], "dir/") == []
 
     def test_root_listing_uses_an_empty_prefix(self) -> None:
-        assert sorted_relative_names(["a.txt", "b/"], "") == ["a.txt", "b"]
+        assert sorted_relative_entries([("a.txt", 1), ("b/", None)], "") == [Entry("a.txt", 1), Entry("b", None)]
 
 
 class _NotFoundError(Exception):
@@ -99,7 +101,7 @@ class TestExistsViaPrefixProbe:
             probe_called = True
             return True
 
-        with pytest.raises(_NotFoundError):
+        with pytest.raises(_NotFoundError, match="not found"):
             await exists_via_prefix_probe(
                 head=_raise_not_found,
                 error_type=_NotFoundError,
@@ -112,7 +114,7 @@ class TestExistsViaPrefixProbe:
         async def head() -> object:
             raise _OtherError("unrelated failure")
 
-        with pytest.raises(_OtherError):
+        with pytest.raises(_OtherError, match="unrelated failure"):
             await exists_via_prefix_probe(
                 head=head,
                 error_type=_NotFoundError,  # _OtherError isn't this, so except clause never catches it

@@ -1,22 +1,12 @@
 """``RemoteData``: the state of one piece of data fetched from the SDK —
-``NotAsked`` (never requested), ``Loading`` (in flight, optionally
-carrying the last known-good value), ``Success``, or ``FailureInfo``. A
-single ``core.*`` model field holding one of these covers "is it loading",
-"is it an error", and "what's the error text" together, instead of three
-separate attributes per fetched value.
-
-``Loading.previous`` lets a reload render the slot's last-known value
-instead of blanking the screen while a refetch is in flight — see
-``value_or_stale``.
+``NotAsked``, ``Loading`` (optionally carrying the last known value, so a
+reload doesn't blank the screen), ``Success`` or ``FailureInfo``.
 """
 
 from __future__ import annotations
 
 import dataclasses
 import enum
-from typing import Generic, TypeAlias, TypeVar
-
-T = TypeVar("T")
 
 
 class FailureKind(enum.StrEnum):
@@ -33,9 +23,8 @@ class FailureKind(enum.StrEnum):
 
 @dataclasses.dataclass(frozen=True, slots=True)
 class FailureInfo:
-    """``message`` is already ``str(exc)`` — nothing downstream needs the
-    original exception object, and keeping it out of the model keeps a
-    model comparable and a failure assertable in a plain unit test."""
+    """A failed fetch; ``message`` is ``str(exc)``, so the model stays
+    comparable."""
 
     message: str
     kind: FailureKind = FailureKind.OTHER
@@ -48,14 +37,12 @@ class NotAsked:
 
 @dataclasses.dataclass(frozen=True, slots=True)
 class NoValue:
-    """The sentinel ``Loading.previous``/``value_or_stale`` use in place
-    of bare ``None``, so a ``T`` that's itself ``Optional`` doesn't get
-    confused with "nothing resolved yet." Checked with ``isinstance``,
-    never ``is``/``==`` against one particular instance."""
+    """ "No value yet", distinct from a ``T`` that is itself ``None``. Test
+    for it with ``isinstance``."""
 
 
 @dataclasses.dataclass(frozen=True, slots=True)
-class Loading(Generic[T]):
+class Loading[T]:
     """A fetch is in flight. ``previous`` is the last ``Success.value``
     this slot held, or a ``NoValue()`` on a first load."""
 
@@ -63,38 +50,30 @@ class Loading(Generic[T]):
 
 
 @dataclasses.dataclass(frozen=True, slots=True)
-class Success(Generic[T]):
+class Success[T]:
     value: T
 
 
-#: Every ``update()`` branch matches exhaustively on these four cases
-#: (``case _: assert_never(data)``), so a fifth case can never be added
-#: without every existing ``match`` block failing to type-check.
-RemoteData: TypeAlias = NotAsked | Loading[T] | Success[T] | FailureInfo
+type RemoteData[T] = NotAsked | Loading[T] | Success[T] | FailureInfo
 
 
-def loading_preserving(previous: RemoteData[T]) -> Loading[T]:
-    """Whether a fresh ``Loading()`` should carry the slot's last-known
-    value forward -- only when ``previous`` was a real ``Success``."""
+def loading_preserving[T](previous: RemoteData[T]) -> Loading[T]:
+    """A fresh ``Loading``, carrying ``previous``'s value forward when it
+    was a ``Success``."""
     if isinstance(previous, Success):
         return Loading(previous=previous.value)
     return Loading()
 
 
-def is_pending_or_done(data: RemoteData[T]) -> bool:
-    """Whether ``data`` must not be (re-)fetched: a ``Loading`` fetch is
-    already in flight, or a ``Success`` already has the answer.
-    Re-dispatching either duplicates a worker and its loading indicator
-    for no benefit."""
+def is_pending_or_done[T](data: RemoteData[T]) -> bool:
+    """Whether ``data`` must not be (re-)fetched: it is already ``Loading``
+    or a ``Success``."""
     return isinstance(data, Loading | Success)
 
 
-def value_or_stale(data: RemoteData[T]) -> T | NoValue:
-    """The value a selector should render: a real ``Success``'s value, or
-    a refreshing ``Loading``'s carried-forward ``previous`` -- both
-    rendered identically. ``NoValue()`` for ``NotAsked``, a first
-    ``Loading`` with nothing stale yet, or ``FailureInfo`` (rendered
-    separately via its own ``message``)."""
+def value_or_stale[T](data: RemoteData[T]) -> T | NoValue:
+    """The value to render: a ``Success``'s value or a reloading
+    ``Loading``'s ``previous``; otherwise ``NoValue()``."""
     if isinstance(data, Success):
         return data.value
     if isinstance(data, Loading) and not isinstance(data.previous, NoValue):
@@ -102,10 +81,8 @@ def value_or_stale(data: RemoteData[T]) -> T | NoValue:
     return NoValue()
 
 
-def has_ever_resolved(data: RemoteData[T]) -> bool:
-    """Whether ``value_or_stale(data)`` would return a real value rather
-    than a ``NoValue()`` -- for a caller rendering an explicit empty-state
-    placeholder, which needs to tell resolved-empty apart from
-    not-yet-resolved."""
+def has_ever_resolved[T](data: RemoteData[T]) -> bool:
+    """Whether ``value_or_stale(data)`` has a value, telling resolved-empty
+    from not-yet-resolved."""
     value = value_or_stale(data)
     return not isinstance(value, NoValue)

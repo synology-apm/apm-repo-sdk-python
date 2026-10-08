@@ -10,8 +10,8 @@ import sys
 
 import pytest
 
-from synology_apm_repo.sdk.errors import ProfileSecretBackendUnavailableError
 from synology_apm_repo.sdk.profiles import secrets
+from synology_apm_repo.sdk.profiles.errors import ProfileSecretBackendUnavailableError
 
 
 def test_set_then_get_round_trips(fake_keyring: None) -> None:
@@ -45,8 +45,7 @@ def test_set_secrets_merges_with_existing_fields(fake_keyring: None) -> None:
 
 
 def test_single_keyring_item_regardless_of_field_count(fake_keyring: None) -> None:
-    """The whole point of this scheme: every secret field for one profile
-    lands in one keyring item, not one item per field."""
+    """Every secret field of one profile lands in one keyring item."""
     import keyring
 
     secrets.set_secrets("demo", {"access_key": "AKIA", "secret_key": "shh"})
@@ -61,12 +60,15 @@ def test_delete_secrets_removes_the_stored_item(fake_keyring: None) -> None:
 
 
 def test_delete_secrets_never_set_is_not_an_error(fake_keyring: None) -> None:
+    secrets.set_secrets("other", {"access_key": "AKIA"})
     secrets.delete_secrets("never-saved")  # must not raise
+    assert secrets.get_secrets("never-saved") == {}
+    assert secrets.get_secrets("other") == {"access_key": "AKIA"}
 
 
 def test_partial_secret_set_only_stores_given_fields(fake_keyring: None) -> None:
-    """A blank/omitted secret means "use the ambient credential chain" —
-    it must not be stored as an empty string."""
+    """Only the fields passed are stored: an omitted secret stays absent,
+    which means "use the ambient credential chain"."""
     secrets.set_secrets("demo", {"credential": "sas-token"})
     assert secrets.get_secrets("demo") == {"credential": "sas-token"}
 
@@ -76,18 +78,16 @@ def test_no_backend_raises_profile_secret_backend_unavailable(monkeypatch: pytes
     import keyring.backends.fail
 
     monkeypatch.setattr(keyring, "get_keyring", lambda: keyring.backends.fail.Keyring())  # type: ignore[no-untyped-call]
-    with pytest.raises(ProfileSecretBackendUnavailableError):
+    with pytest.raises(ProfileSecretBackendUnavailableError, match="no usable OS keyring backend is available"):
         secrets.get_secrets("demo")
 
 
 def test_broken_keyring_install_raises_profile_secret_backend_unavailable(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """``sys.modules["keyring"] = None`` makes a subsequent ``import
-    keyring`` raise ``ImportError`` (a real, documented CPython import
-    system behavior), simulating a broken/partial install without actually
-    uninstalling keyring from this dev environment. A caller should see
-    this project's own exception, not a bare ``ImportError``."""
+    """``sys.modules["keyring"] = None`` makes ``import keyring`` raise
+    ``ImportError``, simulating a broken install; the caller sees this
+    project's exception instead."""
     monkeypatch.setitem(sys.modules, "keyring", None)
-    with pytest.raises(ProfileSecretBackendUnavailableError):
+    with pytest.raises(ProfileSecretBackendUnavailableError, match="keyring failed to import"):
         secrets.get_secrets("demo")

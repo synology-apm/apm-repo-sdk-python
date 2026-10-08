@@ -32,25 +32,25 @@ def test_valid_header_parses() -> None:
 
 def test_wrong_magic_raises_data_corrupt() -> None:
     data = _build(magic=b"XXXX")
-    with pytest.raises(DataCorruptError):
+    with pytest.raises(DataCorruptError, match="bad magic"):
         parse_index_header(data, expect_magic=b"bFiL")
 
 
 def test_bad_crc_raises_data_corrupt() -> None:
     data = bytearray(_build())
     data[10] ^= 0xFF  # corrupt a payload byte covered by the header CRC
-    with pytest.raises(DataCorruptError):
+    with pytest.raises(DataCorruptError, match="header CRC mismatch"):
         parse_index_header(bytes(data), expect_magic=b"bFiL")
 
 
 def test_too_short_raises_format_error() -> None:
-    with pytest.raises(FormatError):
+    with pytest.raises(FormatError, match="header too short"):
         parse_index_header(b"short", expect_magic=b"bFiL")
 
 
 def test_major_beyond_max_raises_unsupported_version() -> None:
     data = _build(major=5)
-    with pytest.raises(UnsupportedVersionError):
+    with pytest.raises(UnsupportedVersionError, match="major version"):
         parse_index_header(data, expect_magic=b"bFiL", max_major=3)
 
 
@@ -114,7 +114,7 @@ def test_parse_json_payload_header_payload_crc_mismatch_raises_data_corrupt() ->
     payload = json.dumps({"a": 1}).encode("utf-8")
     data = bytearray(_build_json_payload(payload))
     data[HEADER_LEN] ^= 0xFF  # corrupt a payload byte, header CRC untouched
-    with pytest.raises(DataCorruptError):
+    with pytest.raises(DataCorruptError, match="payload CRC mismatch"):
         parse_json_payload_header(bytes(data), expect_magic=b"RpiF")
 
 
@@ -137,5 +137,5 @@ def test_parse_json_payload_header_reuses_parse_index_header_shell_checks() -> N
     payload = json.dumps({}).encode("utf-8")
     data = bytearray(_build_json_payload(payload, magic=b"RpiF"))
     data[0:4] = b"XXXX"
-    with pytest.raises(DataCorruptError):
+    with pytest.raises(DataCorruptError, match="bad magic"):
         parse_json_payload_header(bytes(data), expect_magic=b"RpiF")

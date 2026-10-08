@@ -1,7 +1,4 @@
-"""Unit tests for ``synology_apm_repo.cli.trace_render``: the "off"
-short-circuit and the NDJSON payload shape are the parts that don't depend
-on a real terminal, so those are what's tested here.
-"""
+"""Unit tests for ``synology_apm_repo.cli.trace_render``'s ``build_trace_callback``."""
 
 from __future__ import annotations
 
@@ -51,4 +48,15 @@ def test_human_mode_does_not_touch_stdout() -> None:
     assert "listdir" in err.getvalue()
 
 
-__all__: list[str] = []
+def test_a_failed_call_shows_its_error_in_both_modes() -> None:
+    event = TraceEvent(method="read", path="Pool/0/0.buk", offset=0, length=64, elapsed=0.01, error="NotFoundError")
+    for json_mode in (True, False):
+        callback = build_trace_callback(CliState(trace=True, json=json_mode))
+        assert callback is not None
+        err = io.StringIO()
+        with redirect_stderr(err):
+            callback(event)
+        if json_mode:
+            assert json.loads(err.getvalue())["error"] == "NotFoundError"
+        else:
+            assert "!! NotFoundError" in err.getvalue()

@@ -1,6 +1,5 @@
 """``help_screen`` domain: ``?`` opens the real ``HelpScreen``, listing at
-least one binding from the active screen's real ``active_bindings`` --
-worth its own light phase since no other domain exercises this screen.
+least one binding from the active screen's ``active_bindings``.
 """
 
 from __future__ import annotations
@@ -17,7 +16,11 @@ async def run(ctx: SmokeContext, app: Any, pilot: Any) -> None:
 
         active_before = dict(app.screen.active_bindings)
         await pilot.press("question_mark")
-        await wait_until(pilot, lambda: isinstance(app.screen, HelpScreen), message="HelpScreen never appeared")
+        await wait_until(
+            pilot,
+            lambda: isinstance(app.screen, HelpScreen) and app.screen.is_mounted,
+            message="HelpScreen never appeared",
+        )
         return len(active_before)
 
     binding_count = await ctx.call("help_screen", "help_screen.opens", _open_help)

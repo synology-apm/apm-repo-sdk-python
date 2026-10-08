@@ -1,24 +1,22 @@
-"""``Session``: repository discovery, key material, and the store/repository
-lifetime it owns, part of the Repository Layer (see ``api/__init__.py``).
-Hands out
-``Repository`` instances (``api.repository``) it discovered/opened;
-never the other way around.
-"""
+"""``Session``: repository discovery, and the lifetime of the stores and
+``Repository`` instances it hands out."""
 
 from __future__ import annotations
 
 import asyncio
 import contextlib
-from collections.abc import AsyncIterator, Awaitable, Callable
+from collections.abc import AsyncGenerator, Callable
 from pathlib import Path
-from typing import Self
+from typing import override
 
+from .._util.closing import RESOURCE_CLOSE_TIMEOUT, AsyncClosing, close_each
 from ..dedup.keys import KeyMaterial, KeyVerification
 from ..dedup.keys import probe_encrypted as _probe_encrypted
-from ..errors import ApmRepoError, NotFoundError
-from ..presentation.progress import Progress
-from ..storage.base import ObjectStore, aclose_if_possible
+from ..errors import ApmRepoError, NotFoundError, StorageBackendError
+from ..presentation.progress import Progress, ProgressCallback
+from ..storage.base import ObjectStore
 from ..storage.layout import (
+    RepoKind,
     RepoLayout,
     RepositoryLayout,
     iter_repository_layouts,
@@ -27,8 +25,8 @@ from ..storage.layout import (
 from ..storage.local import LocalFsStore
 from ..storage.recording import TraceEvent as TraceEvent
 from ..storage.recording import TracingStore
-from ..units.base import Node, RestorableUnit
 from ..units.node_ref import NodeRef
+from .catalog import NodeFrame, RawView
 from .repository import Repository
 
 
@@ -41,74 +39,69 @@ async def _resolve_key_verification(
 
 
 def _backing_of(store: ObjectStore) -> object:
-    """The real store identity behind a possible ``TracingStore`` wrap —
-    two separate ``discover()``/``discover_remote()`` calls each get their
-    own ``TracingStore`` wrapper even for the same backing store, so
-    comparing wrapper identity alone would miss the shared connector."""
+    """The store behind a possible ``TracingStore`` wrapper: two traced
+    discoveries over one store get separate wrappers."""
     return store.backing if isinstance(store, TracingStore) else store
 
 
-class Session:
-    """Use as a context manager, or call ``close`` explicitly when done --
-    or ``close_repo`` to release just one repository (and its store, if
-    unshared) ahead of the rest of a longer-running session.
+class Session(AsyncClosing):
+    """Discovers repositories and owns every store and ``Repository`` it
+    hands out. Use as an async context manager or call ``close``;
+    ``close_repo`` releases one repository early.
     """
 
     def __init__(self) -> None:
-        self._repos: list[Repository] = []
-        # Every store this session constructed, so close() can ``aclose()``
-        # the ones that own an aiohttp connector (S3/Azure). Tracked here
-        # rather than reached through each Repository because one discover()
-        # call's store is shared by every repository it yields.
+        # Every repository handed out, with the store it reads through.
+        self._repos: dict[Repository, ObjectStore] = {}
+        # Tracked here, not per Repository: one discovery's store is shared
+        # by every repository it yields.
         self._stores: list[ObjectStore] = []
+        # How many discoveries are still running over each backing store, by
+        # identity: close_repo() leaves such a store open for the siblings
+        # those discoveries have yet to yield, and marks it in
+        # _close_when_idle for the last of them to close.
+        self._discovering: dict[int, int] = {}
+        self._close_when_idle: set[int] = set()
 
     async def discover(
         self,
-        path: Path | str,
-        key: str | None = None,
-        *,
-        progress: Callable[[Progress], Awaitable[None]] | None = None,
-        trace: Callable[[TraceEvent], None] | None = None,
-    ) -> AsyncIterator[Repository]:
-        """Walk ``path`` for repositories, yielding each as it's found —
-        an indeterminate-progress generator, not a blocking call; see
-        ``open`` for that convenience wrapper. A layout that fails
-        ``Repository._confirm_real()``'s check is skipped rather than
-        aborting the whole scan. Local paths only — see ``discover_remote``
-        for an already-constructed ``ObjectStore`` (S3/Azure/...).
-
-        Args:
-            key: When omitted, each yielded repository's encryption status
-                is still resolved eagerly via ``dedup.keys.probe_encrypted``;
-                skipped when a key *is* given.
-            trace: When given, every ``ObjectStore`` call any repository
-                found here ever makes, for its entire lifetime, is reported
-                as a ``TraceEvent``.
-        """
-        store: ObjectStore = LocalFsStore(Path(path))
-        async for repo in self._discover_from_store(store, key, progress=progress, trace=trace):
-            yield repo
-
-    async def discover_remote(
-        self,
-        store: ObjectStore,
+        source: Path | str | ObjectStore,
         key: str | None = None,
         *,
         root: str = "",
-        progress: Callable[[Progress], Awaitable[None]] | None = None,
+        progress: ProgressCallback | None = None,
         trace: Callable[[TraceEvent], None] | None = None,
-    ) -> AsyncIterator[Repository]:
-        """Same as ``discover``, against an already-constructed
-        ``ObjectStore`` (S3/Azure/...) instead of building a ``LocalFsStore``
-        from a filesystem path. This session takes ownership of ``store``,
-        released by ``close``.
+    ) -> AsyncGenerator[Repository]:
+        """Walk ``source`` for repositories, yielding each as it's opened
+        (``open`` collects them). A candidate with nothing to browse, or
+        whose key record is unreadable, is skipped.
 
-        ``root`` narrows the scan to a store-relative sub-path — needed
-        because an S3/Azure store is scoped to a whole bucket/container
-        with no "sub-root" constructor argument of its own.
+        Args:
+            source: A local directory, or an ``ObjectStore`` (S3/Azure/SMB/...)
+                this session takes ownership of.
+            key: ``"<userKeyID>@<base64 userKey>"``, verified against each
+                repository found. When omitted, each repository's
+                ``is_encrypted`` is probed instead.
+            root: The path within ``source`` to scan from.
+            progress: Receives an indeterminate ``Progress`` per candidate
+                found.
+            trace: Receives a ``TraceEvent`` for every ``ObjectStore`` call
+                the yielded repositories make, for their whole lifetime.
+
+        Raises:
+            KeyMaterialError: ``key`` is malformed.
+            StorageBackendError: The store failed while scanning.
+            ExceptionGroup: Closing the store failed after ``close_repo``
+                released its last repository mid-discovery.
         """
-        async for repo in self._discover_from_store(store, key, root=root, progress=progress, trace=trace):
-            yield repo
+        store = LocalFsStore(Path(source)) if isinstance(source, (Path, str)) else source
+        # aclosing: closing this generator early must also close the inner
+        # one now, not whenever it is garbage-collected.
+        async with contextlib.aclosing(
+            self._discover_from_store(store, key, root=root, progress=progress, trace=trace)
+        ) as repos:
+            async for repo in repos:
+                yield repo
 
     async def _discover_from_store(
         self,
@@ -116,19 +109,13 @@ class Session:
         key: str | None,
         *,
         root: str = "",
-        progress: Callable[[Progress], Awaitable[None]] | None,
+        progress: ProgressCallback | None,
         trace: Callable[[TraceEvent], None] | None,
-    ) -> AsyncIterator[Repository]:
-        """The shared body ``discover``/``discover_remote`` delegate to once
-        each has settled on which concrete ``ObjectStore`` to scan.
-
-        "Look for the next layout" and "finish opening an already-found
-        one" race via ``asyncio.wait(..., FIRST_COMPLETED)`` rather than
-        collecting every layout first: that would let a slow/hung later
-        layout block yielding repositories already opened. Completed opens
-        are yielded in the order they were started, as soon as they're
-        ready.
-        """
+    ) -> AsyncGenerator[Repository]:
+        """``discover``'s body. Finding the next layout and opening found
+        ones run concurrently, so a slow later layout never holds back a
+        repository already opened; repositories are yielded in the order
+        they were found."""
         if trace is not None:
             store = TracingStore(store, trace)
         self._stores.append(store)
@@ -137,8 +124,11 @@ class Session:
         found = 0
         layout_iter = iter_repository_layouts(store, root)
         pending_open: list[asyncio.Task[Repository | None]] = []
-        next_layout: asyncio.Task[RepositoryLayout] | None = asyncio.ensure_future(anext(layout_iter))
+        next_layout: asyncio.Task[RepositoryLayout] | None = None
+        backing = _backing_of(store)
+        self._discovering[id(backing)] = self._discovering.get(id(backing), 0) + 1
         try:
+            next_layout = asyncio.ensure_future(anext(layout_iter))
             while next_layout is not None or pending_open:
                 waiting: set[asyncio.Task[object]] = set(pending_open)
                 if next_layout is not None:
@@ -168,155 +158,136 @@ class Session:
                 while pending_open and pending_open[0].done():
                     repo = pending_open.pop(0).result()
                     if repo is not None:
-                        self._repos.append(repo)
+                        self._repos[repo] = store
                         yield repo
         finally:
             await _drain_and_close(next_layout, pending_open, layout_iter)
+            self._discovering[id(backing)] -= 1
+            if not self._discovering[id(backing)]:
+                del self._discovering[id(backing)]
+                if id(backing) in self._close_when_idle:
+                    self._close_when_idle.discard(id(backing))
+                    if errors := await self._close_unshared_store(backing):
+                        raise ExceptionGroup("closing a store close_repo() deferred failed", errors)
 
     async def open(
         self,
-        path: Path | str,
-        key: str | None = None,
-        *,
-        progress: Callable[[Progress], Awaitable[None]] | None = None,
-        trace: Callable[[TraceEvent], None] | None = None,
-    ) -> list[Repository]:
-        """``discover``, fully drained — the blocking convenience form for
-        callers that don't need incremental results but still want
-        progress/cancel support during a possibly slow scan."""
-        return [repo async for repo in self.discover(path, key, progress=progress, trace=trace)]
-
-    async def open_remote(
-        self,
-        store: ObjectStore,
+        source: Path | str | ObjectStore,
         key: str | None = None,
         *,
         root: str = "",
-        progress: Callable[[Progress], Awaitable[None]] | None = None,
+        progress: ProgressCallback | None = None,
         trace: Callable[[TraceEvent], None] | None = None,
     ) -> list[Repository]:
-        """``discover_remote``, fully drained — the blocking convenience
-        form for a caller that wants the final list but still needs
-        progress/cancel support during a possibly slow scan."""
-        return [repo async for repo in self.discover_remote(store, key, root=root, progress=progress, trace=trace)]
+        """``discover``, collected into a list."""
+        return [repo async for repo in self.discover(source, key, root=root, progress=progress, trace=trace)]
 
-    async def resolve(self, ref: str | NodeRef) -> Node | RestorableUnit:
-        """Turn a ``NodeRef`` (or its string form) back into a live node,
-        re-derived from cheap catalog lookups and provider tree calls
-        rather than stored anywhere.
+    async def resolve(self, ref: str | NodeRef, *, raw: RawView | None = None) -> NodeFrame:
+        """``Repository.resolve`` on whichever open repository owns
+        ``ref.repo_path``; a caller holding the repository already can call
+        that directly.
 
-        Two jobs stacked: which open ``Repository`` ``ref`` belongs to
-        (matches ``ref.repo_path`` via ``Repository.owns_repo_path``,
-        relevant once several repositories are open in one long-lived
-        ``Session``), then what node inside it names (``Repository.
-        resolve``'s job). A caller that already has the right
-        ``Repository`` in hand should call ``Repository.resolve`` directly
-        and skip this matching step.
+        Raises:
+            NotFoundError: No open repository owns the ref, or no node
+                matches it.
+            KeyRequiredError: See ``Repository.resolve``.
+            KeyMismatchError: See ``Repository.resolve``.
+            ValueError: The string is not a parseable ref.
         """
-        node_ref = ref if isinstance(ref, NodeRef) else NodeRef.parse(ref)
-        return await self._repo_for_ref(node_ref).resolve(node_ref)
+        node_ref = NodeRef.coerce(ref)
+        return await self._repo_for_ref(node_ref).resolve(node_ref, raw=raw)
 
     def _repo_for_ref(self, node_ref: NodeRef) -> Repository:
         for repo in self._repos:
-            if repo.owns_repo_path(node_ref.repo_path):
+            if repo._owns_repo_path(node_ref.repo_path):  # noqa: SLF001 -- Session dispatches refs among its own repositories
                 return repo
         raise NotFoundError(f"no open repository matches ref: {node_ref}", ref=str(node_ref))
 
     async def close_repo(self, repo: Repository) -> None:
-        """Close and forget one repository this session tracks, releasing
-        its own store too if no other still-tracked repository shares it —
-        for a caller that discards one repository at a time from a
-        longer-running session rather than tearing the whole session down.
+        """Close and forget one repository, and its store when no other
+        tracked repository shares it and no discovery over it is still
+        running.
 
-        The caller must have finished draining the ``discover()``/
-        ``discover_remote()`` call that yielded ``repo`` first: a
-        not-yet-yielded sibling sharing the same store isn't in
-        ``self._repos`` yet, so the shared-store check below would
-        false-negative and close the store out from under it.
+        Raises:
+            ExceptionGroup: The repository or its store failed to close.
         """
         errors: list[Exception] = []
         try:
-            await repo.close()
-        except Exception as exc:
+            await repo._close()  # noqa: SLF001 -- Session owns every Repository it hands out
+        except Exception as exc:  # noqa: BLE001
             errors.append(exc)
-        if repo in self._repos:
-            self._repos.remove(repo)
-        backing = _backing_of(repo._store)  # noqa: SLF001 - Session constructs and owns every Repository it yields, so reaching into its own _store here is an accepted crossing of the normal encapsulation boundary
-        if not any(_backing_of(r._store) is backing for r in self._repos):  # noqa: SLF001
-            for store in [s for s in self._stores if _backing_of(s) is backing]:
-                try:
-                    await aclose_if_possible(store)
-                except Exception as exc:
-                    errors.append(exc)
-                # Removed only after aclose_if_possible returns or raises,
-                # so a cancellation mid-close leaves it tracked for
-                # Session.close() to pick up later instead of orphaned.
-                self._stores.remove(store)
+        repo_store = self._repos.pop(repo, None)
+        if repo_store is not None:
+            backing = _backing_of(repo_store)
+            if id(backing) in self._discovering:
+                # A running discovery may still yield siblings over this
+                # store; the last one to finish closes it.
+                self._close_when_idle.add(id(backing))
+            else:
+                errors.extend(await self._close_unshared_store(backing))
         if errors:
             raise ExceptionGroup("Session.close_repo() failed to close every tracked resource", errors)
 
-    async def close(self) -> None:
-        """Close every repository this session opened, then release any
-        backend client it owns.
-
-        ``S3Store``/``AzureStore`` own an ``aiohttp`` connector that must be
-        released; local stores have no ``aclose()`` and are skipped.
-        """
-        # Same "attempt every item, then report" posture as
-        # Repository.close().
+    async def _close_unshared_store(self, backing: object) -> list[Exception]:
+        """Close every tracked wrap of ``backing`` unless a tracked repository
+        still reads through it; returns the close failures."""
+        if any(_backing_of(s) is backing for s in self._repos.values()):
+            return []
         errors: list[Exception] = []
-        for repo in self._repos:
+        for store in [s for s in self._stores if _backing_of(s) is backing]:
             try:
-                await repo.close()
-            except Exception as exc:
+                await store.close()
+            except Exception as exc:  # noqa: BLE001
                 errors.append(exc)
-        self._repos.clear()
-        for store in self._stores:
-            try:
-                await aclose_if_possible(store)
-            except Exception as exc:
-                errors.append(exc)
-        self._stores.clear()
+            # Removed only after the close attempt, so a cancellation
+            # mid-close leaves it for Session.close().
+            self._stores.remove(store)
+        return errors
+
+    @override
+    async def close(self) -> None:
+        """Close every repository this session handed out, then every store
+        it owns (the network clients of S3/Azure/SMB stores).
+
+        Raises:
+            ExceptionGroup: One or more resources failed to close (every one
+                was still attempted).
+        """
+        repos, self._repos = list(self._repos), {}
+        stores, self._stores = self._stores, []
+        # Repositories bound each of their own closes; a store's close is one network call.
+        errors = await close_each(r._close for r in repos)  # noqa: SLF001 -- as in close_repo
+        errors += await close_each((s.close for s in stores), per_close_timeout=RESOURCE_CLOSE_TIMEOUT)
         if errors:
             raise ExceptionGroup("Session.close() failed to close every tracked resource", errors)
 
-    async def __aenter__(self) -> Self:
-        return self
-
-    async def __aexit__(self, *exc: object) -> None:
-        await self.close()
-
 
 async def _open_repository(store: ObjectStore, keys: KeyMaterial | None, layout: RepositoryLayout) -> Repository | None:
-    """``Session._discover_from_store``'s per-layout open step — ``None``
-    for a false-positive layout match (``iter_repository_layouts`` found
-    something that doesn't actually open as a valid repository, or whose
-    key/encryption record can't be read), a real ``Repository`` otherwise.
-    The key/encryption probe is wrapped in the same ``ApmRepoError`` skip
-    as ``_confirm_real()``: a half-written layout can pass the cheap
-    marker check while its key/encryption record is genuinely unreadable.
-    """
+    """One found layout as a ``Repository``, or ``None`` to skip it: its
+    key/encryption record is unreadable (a half-written layout can pass
+    the marker check) or it has nothing to browse."""
+    if layout.kind is not RepoKind.VAULT and layout.catalog_ids == []:
+        # None (unenumerable) or non-empty is real; [] means nothing to browse.
+        # A catalog's corrupt repo_info surfaces later, when catalogs() opens it.
+        return None
     key_layout = key_probe_layout(layout)
     try:
         key_verification = await _resolve_key_verification(keys, store, key_layout)
         encrypted = None if keys is not None else await _probe_encrypted(store, key_layout)
+    except StorageBackendError:
+        raise
     except ApmRepoError:
         return None
-    repo = Repository(store, layout, keys, key_verification, encrypted=encrypted)
-    if not await repo._confirm_real():  # noqa: SLF001 - Session constructs every Repository via this factory, so calling its own _confirm_real() here before yielding it is an accepted crossing of the normal encapsulation boundary
-        return None
-    return repo
+    return Repository(store, layout, keys, key_verification, encrypted=encrypted)
 
 
 async def _drain_and_close(
     next_layout: asyncio.Task[RepositoryLayout] | None,
     pending_open: list[asyncio.Task[Repository | None]],
-    layout_iter: AsyncIterator[RepositoryLayout],
+    layout_iter: AsyncGenerator[RepositoryLayout, None],
 ) -> None:
-    """``Session._discover_from_store``'s teardown — cancel and *await*
-    every still-in-flight task before closing ``layout_iter``: calling
-    ``aclose()`` while its ``__anext__()`` is still technically in flight
-    raises "already running"."""
+    """Cancel and await every in-flight task, then close ``layout_iter``:
+    ``aclose()`` during a pending ``__anext__()`` raises "already running"."""
     if next_layout is not None:
         next_layout.cancel()
         with contextlib.suppress(asyncio.CancelledError, StopAsyncIteration):
@@ -326,9 +297,4 @@ async def _drain_and_close(
     for task in pending_open:
         with contextlib.suppress(asyncio.CancelledError):
             await task
-    # iter_repository_layouts() is declared AsyncIterator[RepositoryLayout]
-    # (the narrow interface callers need), but is always implemented as a
-    # real async generator (every concrete body uses ``yield``) —
-    # aclose() exists at runtime even though the declared type doesn't
-    # expose it.
-    await layout_iter.aclose()  # type: ignore[attr-defined]
+    await layout_iter.aclose()

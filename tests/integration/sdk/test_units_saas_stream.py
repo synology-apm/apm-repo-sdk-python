@@ -1,38 +1,18 @@
-"""Regression test for ``synology_apm_repo.sdk.units.saas.stream`` —
-replayed from committed fixtures recorded against real bytes, with **no
-external dependency**: this always runs, on CI or anywhere else, because
-it goes through ``ReplayStore`` instead of a real ``LocalFsStore``.
+"""Regression tests for ``synology_apm_repo.sdk.units.saas.stream``.
 
-The fixtures (``tests/fixtures/``, all recorded once against apv-sample-1
-unless noted, via each replay test's own ``record_target()`` call — see
-``tests/conftest.py`` and ``tests/CLAUDE.md``'s "Recording a fixture"
-section for the ``pytest --record-against=...`` workflow that
-(re-)records these; every test below is its own recording recipe):
-
-- ``units_saas_stream_apv1.json.gz`` — rooted at
-  ``apv-sample-1/@ActiveProtectVault``: the known version chain's real
-  ``file_map`` hit, real known-version ``stream_version`` resolution for
-  all 7 real streams, and ``open_saas_obj`` resolving (non-zero size) for
-  every real, non-deleted M365/GW version in the sample -- deliberately
-  narrow: it never reads any of these objects' real body content.
-- ``units_saas_stream_root_nonempty_apv1.json.gz`` — the same
-  known stream, but rooted at ``apv-sample-1`` itself (a non-empty
-  ``repo_root``, matching ``Session.discover()``'s real usage) rather
-  than directly at ``@ActiveProtectVault``.
-- ``units_saas_stream_agent_repo_{apv_sample_1,apv_sample_2_encrypted,
-  apv_sample_3,sample_2}.json.gz`` (~477 B each) — one per real sample
-  with a ``saas/agent_repo`` (4 of them, confirmed directly against the
-  sample tree — see the four ``test_replayed_*_agent_repo_is_always_empty_
-  of_restorable_content`` tests below), each just ``repo_info``
-  + a directory listing + three ``exists()`` checks, no key material
-  needed. Kept as four separate fixtures/tests rather than one merged
-  fixture/test — ``exists``/``listdirs``/``reads`` are keyed by
-  store-relative path only, and all four real roots share the same
-  relative paths (``repo_info``, ``@data``, ...), so merging would
-  silently overwrite one real sample's answers with another's (see
-  ``tests/CLAUDE.md``'s fixture-merging guidance); each fixture also
-  needs its own separate real backend, so one test per real root lets
-  each be recorded independently via ``--record-against`` + ``-k``.
+- ``units_saas_stream_vault_plain.json.gz`` — recorded against
+  ``vault-plain/@ActiveProtectVault``, shared by the tests using
+  ``_open_repo``; recipe:
+  ``test_replayed_open_saas_obj_resolves_a_real_object_for_every_non_deleted_version``
+  (a superset of the others' calls).
+- ``units_saas_stream_root_nonempty_vault_plain.json.gz`` — recorded against
+  ``vault-plain`` itself (a non-empty ``repo_root``); its one test.
+- ``units_saas_stream_agent_repo_{vault_plain,vault_encrypted,
+  vault_m365,vault_vm_m365_encrypted}.json.gz`` — one per sample with a
+  ``saas/agent_repo``, each recorded against
+  ``<sample>/@ActiveProtectVault/saas/agent_repo`` by its one test. The
+  four roots share store-relative paths, so one merged fixture couldn't
+  hold all four.
 """
 
 from __future__ import annotations
@@ -45,8 +25,8 @@ from synology_apm_repo.sdk.catalog.workload import workloads
 from synology_apm_repo.sdk.dedup.repository import DedupRepo
 from synology_apm_repo.sdk.format.repo_info import parse_repo_info
 from synology_apm_repo.sdk.identifiers import ConnectionConfigId, StreamUuid
-from synology_apm_repo.sdk.storage.base import ObjectStore
-from synology_apm_repo.sdk.storage.layout import detect_layout, iter_layouts
+from synology_apm_repo.sdk.storage.base import ObjectStore, list_names
+from synology_apm_repo.sdk.storage.layout import catalog_repo_layouts, detect_repository_layout, iter_repository_layouts
 from synology_apm_repo.sdk.units.saas.stream import SaasStream
 
 _KNOWN_STREAM_UUID = StreamUuid("DRMdjvEJPzoxQiUC")
@@ -67,8 +47,8 @@ _ALL_STREAMS: list[tuple[ConnectionConfigId, StreamUuid]] = [
 
 
 async def _open_repo(record_target: Callable[[str], Awaitable[ObjectStore]]) -> DedupRepo:
-    store = await record_target("units_saas_stream_apv1.json.gz")
-    layout = await detect_layout(store)
+    store = await record_target("units_saas_stream_vault_plain.json.gz")
+    (layout,) = catalog_repo_layouts(await detect_repository_layout(store))
     return await DedupRepo.open(store, layout)
 
 
@@ -96,19 +76,22 @@ async def test_replayed_version_chain_resolves_to_the_known_file_map_hit(
 async def test_replayed_stream_root_is_reachable_when_repo_root_is_non_empty(
     record_target: Callable[[str], Awaitable[ObjectStore]],
 ) -> None:
-    store = await record_target("units_saas_stream_root_nonempty_apv1.json.gz")
-    layout = await anext(layout async for layout in iter_layouts(store) if layout.repo_root)
+    store = await record_target("units_saas_stream_root_nonempty_vault_plain.json.gz")
+    layout = await anext(
+        layout
+        async for repo in iter_repository_layouts(store)
+        for layout in catalog_repo_layouts(repo)
+        if layout.repo_root
+    )
     assert layout.repo_root == "@ActiveProtectVault"
 
     async with (
         await DedupRepo.open(store, layout) as repo,
         SaasStream(repo, _KNOWN_CCID, _KNOWN_STREAM_UUID) as stream,
     ):
-        # _snapshot_connection() resolving at all (through the non-empty
-        # repo_root-prefixed stream path) is what "reachable" means here;
-        # the real, deterministic snapshot count this fixture recorded
-        # confirms it's the real db, not an empty/decoy one.
-        connection = await stream._snapshot_connection()
+        # The snapshot db resolves through the repo_root-prefixed path.
+        path = await anext(stream._candidate_paths("saas_snapshot"))
+        connection = (await stream._sources.resolve(path)).connection
         cursor = await connection.execute("SELECT COUNT(*) FROM snapshot_info")
         row = await cursor.fetchone()
         assert row is not None and row[0] == 6
@@ -117,6 +100,9 @@ async def test_replayed_stream_root_is_reachable_when_repo_root_is_non_empty(
 async def test_replayed_all_seven_streams_resolve_their_real_known_versions(
     record_target: Callable[[str], Awaitable[ObjectStore]],
 ) -> None:
+    """``stream_version_for`` (which raises on a miss) resolves every listed
+    M365/GWS version of each stream; ``LNJAQtstRVxciJWy`` has no catalog
+    version, so it contributes none."""
     async with await _open_repo(record_target) as repo:
         all_workloads = [w for c in await connections(repo) for w in await workloads(repo, c)]
         versions_by_stream: dict[tuple[int, str], list[Version]] = {}
@@ -131,15 +117,17 @@ async def test_replayed_all_seven_streams_resolve_their_real_known_versions(
                 for v in versions_by_stream.get((ccid, stream_uuid), []):
                     await stream.stream_version_for(v)
                     checked += 1
-        assert checked > 0
+        # Every listed version's stream is one of the seven, and every stream but LNJAQtstRVxciJWy has one.
+        no_version = (ConnectionConfigId(1), StreamUuid("LNJAQtstRVxciJWy"))
+        assert set(versions_by_stream) == set(_ALL_STREAMS) - {no_version}
+        assert checked == sum(len(vs) for vs in versions_by_stream.values()) == 97
 
 
 async def test_replayed_open_saas_obj_resolves_a_real_object_for_every_non_deleted_version(
     record_target: Callable[[str], Awaitable[ObjectStore]],
 ) -> None:
-    """Every real, non-deleted M365/GW version in this fixture resolves to
-    a real, non-empty ``saas_obj`` via ``open_saas_obj`` -- deliberately
-    narrow: it never reads any of these objects' real body content."""
+    """Every non-deleted M365/GWS version resolves to a non-empty
+    ``saas_obj``; no object's body is read."""
     async with await _open_repo(record_target) as repo:
         all_workloads = [w for c in await connections(repo) for w in await workloads(repo, c)]
         checked = 0
@@ -151,48 +139,40 @@ async def test_replayed_open_saas_obj_resolves_a_real_object_for_every_non_delet
                     f = await stream.open_saas_obj(v)
                     assert f.size is not None and f.size > 0
                     checked += 1
-        assert checked == 97  # the real, deterministic count of M365+GW non-deleted versions in this fixture
+        assert checked == 97  # M365+GWS non-deleted versions in this fixture
 
 
 async def _assert_agent_repo_is_empty(store: ObjectStore) -> None:
     info = parse_repo_info(await store.read("repo_info"))
     assert info.repo_type == 6  # SaasRetention
 
-    assert await store.listdir("@data") == ["trashbin"]
+    assert await list_names(store, "@data") == ["trashbin"]
     assert not await store.exists("db")
     assert not await store.exists("@data/Composition")
     assert not await store.exists("@data/Pool")
 
 
-#: One test per real sample with a ``saas/agent_repo`` -- these stay four
-#: separate tests/fixtures rather than one merged fixture read in a loop
-#: because each needs its own real backend root
-#: (``<sample_root>/@ActiveProtectVault/saas/agent_repo``), so each is
-#: independently recordable via ``--record-against`` + ``-k``.
-async def test_replayed_apv_sample_1_agent_repo_is_always_empty_of_restorable_content(
+async def test_replayed_vault_plain_agent_repo_is_always_empty_of_restorable_content(
     record_target: Callable[[str], Awaitable[ObjectStore]],
 ) -> None:
-    await _assert_agent_repo_is_empty(await record_target("units_saas_stream_agent_repo_apv_sample_1.json.gz"))
+    await _assert_agent_repo_is_empty(await record_target("units_saas_stream_agent_repo_vault_plain.json.gz"))
 
 
-async def test_replayed_apv_sample_2_encrypted_agent_repo_is_always_empty_of_restorable_content(
+async def test_replayed_vault_encrypted_agent_repo_is_always_empty_of_restorable_content(
+    record_target: Callable[[str], Awaitable[ObjectStore]],
+) -> None:
+    await _assert_agent_repo_is_empty(await record_target("units_saas_stream_agent_repo_vault_encrypted.json.gz"))
+
+
+async def test_replayed_vault_m365_agent_repo_is_always_empty_of_restorable_content(
+    record_target: Callable[[str], Awaitable[ObjectStore]],
+) -> None:
+    await _assert_agent_repo_is_empty(await record_target("units_saas_stream_agent_repo_vault_m365.json.gz"))
+
+
+async def test_replayed_vault_vm_m365_encrypted_agent_repo_is_always_empty_of_restorable_content(
     record_target: Callable[[str], Awaitable[ObjectStore]],
 ) -> None:
     await _assert_agent_repo_is_empty(
-        await record_target("units_saas_stream_agent_repo_apv_sample_2_encrypted.json.gz")
+        await record_target("units_saas_stream_agent_repo_vault_vm_m365_encrypted.json.gz")
     )
-
-
-async def test_replayed_apv_sample_3_agent_repo_is_always_empty_of_restorable_content(
-    record_target: Callable[[str], Awaitable[ObjectStore]],
-) -> None:
-    await _assert_agent_repo_is_empty(await record_target("units_saas_stream_agent_repo_apv_sample_3.json.gz"))
-
-
-async def test_replayed_sample_2_agent_repo_is_always_empty_of_restorable_content(
-    record_target: Callable[[str], Awaitable[ObjectStore]],
-) -> None:
-    await _assert_agent_repo_is_empty(await record_target("units_saas_stream_agent_repo_sample_2.json.gz"))
-
-
-__all__: list[str] = []

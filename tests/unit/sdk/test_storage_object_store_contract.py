@@ -1,25 +1,14 @@
-"""Cross-backend ``ObjectStore`` contract tests: the same test bodies, run
-against ``LocalFsStore``, ``S3Store`` (``_FakeS3Client`` below), ``AzureStore``
-(a mocked async ``BlobServiceClient``), and ``SmbStore`` (a mocked
-``smbclient`` module) — each backed by an in-memory fake rather than a live
-server or emulator. Four backends behaving differently
-here would be a bug, not an expected difference — **with one disclosed
-exception**: ``listdir`` on an absent "directory". Object storage has
-no directory entities to check for (a prefix with zero matches and one
-that was "never created" are the same observable state), so
-``S3Store``/``AzureStore`` return ``[]`` there while ``LocalFsStore``/
-``SmbStore`` (real filesystems, which *do* have directory entities) raise
-``NotFoundError`` — tested explicitly as a
-*difference*, not folded into the shared parametrized cases below.
+"""Cross-backend ``ObjectStore`` contract tests: the same test bodies run
+against ``LocalFsStore``, ``S3Store`` (``FakeS3Client``), ``AzureStore``
+(``_FakeAzureContainer``) and ``SmbStore`` (``_FakeSmbClientModule``), each
+over an in-memory fake. The backends must behave identically, except where a
+test below says otherwise: ``listdir`` on an absent directory returns ``[]``
+on object storage (a prefix with no matches is indistinguishable from one
+never created) but raises ``NotFoundError`` on the filesystem backends.
+``storage/base.py``'s ``join_path`` and ``list_names`` are tested here too.
 
-Backend-specific internals that aren't part of the generic ``ObjectStore``
-contract at all (``LocalFsStore``'s fd cache and ``..``-escape
-prevention; ``S3Store``'s pagination loop and lazy-import guard;
-``AzureStore``'s ``walk_blobs`` shape; ``SmbStore``'s per-instance
-``connection_cache`` isolation) stay in their own dedicated test
-files (``test_storage_local.py``, ``test_storage_s3.py``,
-``test_storage_azure.py``, ``test_storage_smb.py``) rather than being
-force-fit into this one.
+Backend-specific internals stay in ``test_storage_local.py``,
+``test_storage_s3.py``, ``test_storage_azure.py`` and ``test_storage_smb.py``.
 """
 
 from __future__ import annotations
@@ -34,14 +23,16 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 import smbclient
 
+from support.fakes import unchecked_fake
 from synology_apm_repo.sdk.errors import NotFoundError, PermissionDeniedError
 from synology_apm_repo.sdk.storage.azure import AzureStore
-from synology_apm_repo.sdk.storage.base import ObjectStore, join_path
+from synology_apm_repo.sdk.storage.base import Entry, ObjectStore, join_path, list_names
 from synology_apm_repo.sdk.storage.local import LocalFsStore
 from synology_apm_repo.sdk.storage.s3 import S3Store
 from synology_apm_repo.sdk.storage.smb import SmbStore
+from unit.sdk.storage_fakes import FakeS3Client
 
-# One fixed content tree, uploaded/written identically to every backend:
+# The content tree every backend serves.
 _FILES = {
     "a.txt": b"0123456789",
     "sub/b.txt": b"hello world",
@@ -56,132 +47,17 @@ def _make_local(tmp_path: Path) -> ObjectStore:
     return LocalFsStore(tmp_path)
 
 
-def _s3_parse_range(range_header: str, size: int) -> tuple[int, int]:
-    """``"bytes=X-Y"``/``"bytes=X-"`` -> ``(start, end)``, ``end`` already
-    clamped to ``size`` — duplicated byte-for-byte from
-    ``test_storage_s3.py`` per this project's "no test module imports
-    from another" convention."""
-    start_s, _, end_s = range_header.removeprefix("bytes=").partition("-")
-    start = int(start_s)
-    end = int(end_s) + 1 if end_s else size
-    return start, min(end, size)
-
-
-class _FakeS3Paginator:
-    """Mirrors ``test_storage_s3.py``'s fuller copy of this class (the
-    real 1000-key-page-limit rationale lives there) — this file's own
-    fixed two-file tree never needs a second page, but
-    ``S3Store.listdir()`` always drives this same paginator regardless
-    of dataset size."""
-
-    def __init__(self, client: _FakeS3Client) -> None:
-        self._client = client
-
-    async def paginate(self, **kwargs: Any) -> AsyncIterator[dict[str, Any]]:
-        token = None
-        while True:
-            page = await self._client.list_objects_v2(ContinuationToken=token, **kwargs)
-            yield page
-            if not page.get("IsTruncated"):
-                return
-            token = page["NextContinuationToken"]
-
-
-class _FakeS3Client:
-    """A minimal in-memory S3 stand-in for the client shape ``S3Store``
-    drives directly: ``get_object``/``head_object``/``list_objects_v2``/
-    ``get_paginator``, with the same ``NoSuchKey``/``404``/``InvalidRange``
-    error codes a real bucket would raise."""
-
-    _PAGE_SIZE = 1000
-
-    def __init__(self) -> None:
-        self._objects: dict[str, bytes] = {}
-
-    def put(self, key: str, content: bytes) -> None:
-        self._objects[key] = content
-
-    async def get_object(self, *, Bucket: str, Key: str, Range: str) -> dict[str, Any]:
-        from botocore.exceptions import ClientError
-
-        content = self._objects.get(Key)
-        if content is None:
-            raise ClientError({"Error": {"Code": "NoSuchKey", "Message": "not found"}}, "GetObject")
-        start, end = _s3_parse_range(Range, len(content))
-        if start >= len(content):
-            raise ClientError({"Error": {"Code": "InvalidRange", "Message": "range not satisfiable"}}, "GetObject")
-        chunk = content[start:end]
-
-        class _Body:
-            async def read(self) -> bytes:
-                return chunk
-
-        return {"Body": _Body()}
-
-    async def head_object(self, *, Bucket: str, Key: str) -> dict[str, Any]:
-        from botocore.exceptions import ClientError
-
-        content = self._objects.get(Key)
-        if content is None:
-            raise ClientError({"Error": {"Code": "404", "Message": "not found"}}, "HeadObject")
-        return {"ContentLength": len(content)}
-
-    async def list_objects_v2(
-        self,
-        *,
-        Bucket: str,
-        Prefix: str = "",
-        MaxKeys: int = _PAGE_SIZE,
-        Delimiter: str | None = None,
-        ContinuationToken: str | None = None,
-    ) -> dict[str, Any]:
-        keys = sorted(key for key in self._objects if key.startswith(Prefix))
-        start_index = keys.index(ContinuationToken) + 1 if ContinuationToken is not None else 0
-        page_size = min(MaxKeys, self._PAGE_SIZE)
-        page_keys = keys[start_index : start_index + page_size]
-
-        contents: list[str] = []
-        common_prefixes: list[str] = []
-        seen_prefixes: set[str] = set()
-        for key in page_keys:
-            rest = key[len(Prefix) :]
-            if Delimiter and Delimiter in rest:
-                prefix = Prefix + rest.split(Delimiter, 1)[0] + Delimiter
-                if prefix not in seen_prefixes:
-                    seen_prefixes.add(prefix)
-                    common_prefixes.append(prefix)
-            else:
-                contents.append(key)
-
-        is_truncated = start_index + len(page_keys) < len(keys)
-        result: dict[str, Any] = {
-            "Contents": [{"Key": key} for key in contents],
-            "CommonPrefixes": [{"Prefix": prefix} for prefix in common_prefixes],
-            "IsTruncated": is_truncated,
-        }
-        if is_truncated:
-            result["NextContinuationToken"] = page_keys[-1]
-        return result
-
-    def get_paginator(self, operation_name: str) -> _FakeS3Paginator:
-        assert operation_name == "list_objects_v2"
-        return _FakeS3Paginator(self)
-
-
 def _make_s3() -> ObjectStore:
-    client = _FakeS3Client()
+    client = FakeS3Client()
     for rel, content in _FILES.items():
-        client.put(rel, content)
+        client.seed("test-bucket", rel, content)
     return S3Store("test-bucket", client=client)
 
 
+@unchecked_fake("azure.storage.blob's async clients")
 class _FakeAzureBlob:
-    """A real class with ``async def`` methods, unlike
-    ``test_storage_azure.py``'s ``MagicMock``/``AsyncMock``-based fake for
-    the same ``BlobClient`` shape: both model ``azure.storage.blob.aio``,
-    where ``download_blob``/``get_blob_properties`` are themselves
-    coroutines.
-    """
+    """A ``BlobClient`` stand-in: in ``azure.storage.blob.aio``,
+    ``download_blob``/``get_blob_properties`` are coroutines."""
 
     def __init__(self, content: bytes | None) -> None:
         self._content = content
@@ -190,12 +66,8 @@ class _FakeAzureBlob:
         from azure.core.exceptions import ResourceNotFoundError
 
         if self._content is None:
-            # ResourceNotFoundError doesn't set .status_code to 404 on its
-            # own unless constructed with a real ``response`` object (which
-            # this fake has no reason to build) - set it explicitly so
-            # AzureStore's own ``exc.status_code == 404`` check, which is
-            # exactly what it does against the real SDK's exception too,
-            # has something to match against.
+            # Without a ``response`` object ResourceNotFoundError has no
+            # status_code; AzureStore checks ``exc.status_code == 404``.
             err = ResourceNotFoundError(message="blob not found")
             err.status_code = 404
             raise err
@@ -222,11 +94,11 @@ class _FakeAzureBlob:
         return props
 
 
+@unchecked_fake("azure.storage.blob's async clients")
 class _FakeAzureContainer:
-    """Container counterpart to ``_FakeAzureBlob`` over the same
-    ``_FILES`` tree — ``walk_blobs`` is a plain (non-``async def``) method
-    returning an async iterator, matching the real ``AsyncItemPaged``
-    ``walk_blobs()`` itself returns."""
+    """Container counterpart to ``_FakeAzureBlob``. ``walk_blobs`` is a
+    plain method returning an async iterator, as the real one returns an
+    ``AsyncItemPaged``."""
 
     def __init__(self, files: dict[str, bytes]) -> None:
         self._files = files
@@ -245,12 +117,13 @@ class _FakeAzureContainer:
                 sub_prefix = name_starts_with + rest.split(delimiter, 1)[0] + delimiter
                 if sub_prefix not in seen_prefixes:
                     seen_prefixes.add(sub_prefix)
-                    prefix_item = MagicMock()
+                    prefix_item = MagicMock(spec=["name"])  # a BlobPrefix has no size
                     prefix_item.name = sub_prefix
                     yield prefix_item
             else:
                 blob_item = MagicMock()
                 blob_item.name = name
+                blob_item.size = len(self._files[name])
                 yield blob_item
 
 
@@ -264,6 +137,7 @@ _FAKE_SMB_SERVER = "fakeserver"
 _FAKE_SMB_SHARE = "test-share"
 
 
+@unchecked_fake("the smbclient module")
 class _FakeSmbFile:
     """Stands in for the file object ``smbclient.open_file()`` returns —
     only the ``seek``/``read`` subset ``SmbStore`` actually calls."""
@@ -293,14 +167,11 @@ class _FakeSmbStat:
         self.st_size = size
 
 
+@unchecked_fake("the smbclient module")
 class _FakeSmbClientModule:
-    """A real class with plain methods, standing in for the ``smbclient``
-    module's own functions — unlike ``_FakeAzureBlob``/
-    ``_FakeAzureContainer``'s ``async def`` methods, ``smbclient``'s real
-    functions are synchronous, so this fake's methods are too, matching
-    its shape exactly. Every method accepts and ignores
-    ``connection_cache``/other keyword args ``SmbStore`` passes through,
-    the same way the real ``smbclient`` functions do."""
+    """Stands in for the ``smbclient`` module, whose functions are
+    synchronous. Every method ignores ``connection_cache`` and the other
+    keyword args ``SmbStore`` passes."""
 
     def __init__(self, files: dict[str, bytes]) -> None:
         self._files = files
@@ -337,7 +208,7 @@ class _FakeSmbClientModule:
             return True
         return any(name.startswith(rel + "/") for name in self._files)
 
-    def listdir(self, unc: str, **kwargs: Any) -> list[str]:
+    def _child_names(self, unc: str) -> list[str]:
         rel = self._rel(unc)
         prefix = "" if rel == "" else rel + "/"
         names: set[str] = set()
@@ -346,11 +217,31 @@ class _FakeSmbClientModule:
                 continue
             names.add(name[len(prefix) :].split("/", 1)[0])
         if not names and rel != "" and rel not in self._files:
-            # Every real directory in _FILES has >=1 entry, so a
-            # zero-match prefix here always means "never existed" -
-            # SmbStore's own contract-difference test relies on this.
+            # Every directory in _FILES has an entry, so no match means
+            # the directory doesn't exist.
             raise OSError(errno.ENOENT, "no such directory", unc)
         return sorted(names)
+
+    def scandir(self, unc: str, **kwargs: Any) -> list[Any]:
+        rel = self._rel(unc)
+        prefix = "" if rel == "" else rel + "/"
+
+        class _Entry:
+            def __init__(self_inner, name: str, size: int | None) -> None:
+                self_inner.name = name
+                self_inner._size = size
+
+            def is_dir(self_inner) -> bool:
+                return self_inner._size is None
+
+            def stat(self_inner) -> _FakeSmbStat:
+                assert self_inner._size is not None
+                return _FakeSmbStat(self_inner._size)
+
+        return [
+            _Entry(name, len(self._files[prefix + name]) if prefix + name in self._files else None)
+            for name in self._child_names(unc)
+        ]
 
 
 def _make_smb(monkeypatch: pytest.MonkeyPatch) -> ObjectStore:
@@ -359,7 +250,7 @@ def _make_smb(monkeypatch: pytest.MonkeyPatch) -> ObjectStore:
     monkeypatch.setattr(smbclient, "delete_session", fake.delete_session)
     monkeypatch.setattr(smbclient, "open_file", fake.open_file)
     monkeypatch.setattr(smbclient, "stat", fake.stat)
-    monkeypatch.setattr(smbclient, "listdir", fake.listdir)
+    monkeypatch.setattr(smbclient, "scandir", fake.scandir)
     monkeypatch.setattr(smbclient.path, "exists", fake.exists)
     return SmbStore(_FAKE_SMB_SHARE, server=_FAKE_SMB_SERVER, username="admin", password="secret")
 
@@ -379,37 +270,28 @@ async def store(
 
 
 async def test_satisfies_the_object_store_protocol(store: ObjectStore) -> None:
-    # ObjectStore is @runtime_checkable — this isinstance check is the
-    # actual proof the four-method shape matches, not just a docstring
-    # claim.
+    # ObjectStore is @runtime_checkable: this checks the five methods exist.
     assert isinstance(store, ObjectStore)
 
 
-async def test_read_whole_file(store: ObjectStore) -> None:
-    assert await store.read("a.txt") == b"0123456789"
-
-
-async def test_read_with_offset_and_length(store: ObjectStore) -> None:
-    assert await store.read("a.txt", offset=3, length=4) == b"3456"
-
-
-async def test_read_offset_only_reads_to_eof(store: ObjectStore) -> None:
-    assert await store.read("a.txt", offset=8) == b"89"
-
-
-async def test_read_short_at_eof_does_not_raise(store: ObjectStore) -> None:
-    """Every backend must treat an over-long read at/past EOF as a short
-    read, never an error — this is the exact contract line S3/Azure need
-    their own status-code translation (``InvalidRange``/416) for."""
-    assert await store.read("a.txt", offset=8, length=100) == b"89"
-
-
-async def test_read_nested_path(store: ObjectStore) -> None:
-    assert await store.read("sub/b.txt") == b"hello world"
+@pytest.mark.parametrize(
+    ("path", "kwargs", "expected"),
+    [
+        pytest.param("a.txt", {}, b"0123456789", id="whole_file"),
+        pytest.param("a.txt", {"offset": 3, "length": 4}, b"3456", id="with_offset_and_length"),
+        pytest.param("a.txt", {"offset": 8}, b"89", id="offset_only_reads_to_eof"),
+        # A read past EOF is short, never an error (S3/Azure translate
+        # InvalidRange/416 for it).
+        pytest.param("a.txt", {"offset": 8, "length": 100}, b"89", id="short_at_eof_does_not_raise"),
+        pytest.param("sub/b.txt", {}, b"hello world", id="nested_path"),
+    ],
+)
+async def test_read(store: ObjectStore, path: str, kwargs: dict[str, int], expected: bytes) -> None:
+    assert await store.read(path, **kwargs) == expected
 
 
 async def test_read_missing_raises_not_found(store: ObjectStore) -> None:
-    with pytest.raises(NotFoundError):
+    with pytest.raises(NotFoundError, match=r"no such (blob|file|object|path)"):
         await store.read("does/not/exist.txt")
 
 
@@ -419,7 +301,7 @@ async def test_size(store: ObjectStore) -> None:
 
 
 async def test_size_missing_raises(store: ObjectStore) -> None:
-    with pytest.raises(NotFoundError):
+    with pytest.raises(NotFoundError, match=r"no such (blob|object|path)"):
         await store.size("nope")
 
 
@@ -429,23 +311,30 @@ async def test_exists(store: ObjectStore) -> None:
     assert await store.exists("nope") is False
 
 
-async def test_listdir_sorted(store: ObjectStore) -> None:
-    assert await store.listdir("") == ["a.txt", "sub"]
-    assert await store.listdir("sub") == ["b.txt"]
+async def test_listdir_is_sorted_entries_with_each_file_sized_and_directories_unsized(store: ObjectStore) -> None:
+    root = await store.listdir("")
+    assert root == [Entry("a.txt", 10), Entry("sub", None)]
+    assert all(isinstance(entry, Entry) for entry in root)
+    assert await store.listdir("sub") == [Entry("b.txt", 11)]
 
 
-# -- the one disclosed, deliberate cross-backend difference --------------
+async def test_list_names_is_listdir_names_alone(store: ObjectStore) -> None:
+    assert await list_names(store, "") == ["a.txt", "sub"]
+    assert await list_names(store, "sub") == ["b.txt"]
+
+
+# -- listdir on an absent directory: object storage vs filesystems -------
 
 
 async def test_listdir_on_missing_directory_local_raises(tmp_path: Path) -> None:
     store = _make_local(tmp_path)
-    with pytest.raises(NotFoundError):
+    with pytest.raises(NotFoundError, match="no such directory"):
         await store.listdir("nope")
 
 
 async def test_listdir_on_missing_directory_smb_raises(monkeypatch: pytest.MonkeyPatch) -> None:
     store = _make_smb(monkeypatch)
-    with pytest.raises(NotFoundError):
+    with pytest.raises(NotFoundError, match="no such path"):
         await store.listdir("nope")
 
 
@@ -458,12 +347,9 @@ async def test_listdir_on_missing_prefix_azure_returns_empty() -> None:
     assert await store.listdir("nope") == []
 
 
-# A second disclosed, deliberate cross-backend difference: only the two
-# real-filesystem backends (local, SMB) have an OS-level permission concept
-# to translate at all — S3/Azure let every non-not-found ClientError/
-# HttpResponseError (e.g. AccessDenied) propagate unhandled, the same as
-# any other backend-specific exception their own methods let through, so
-# there's no equivalent case to test there.
+# OS-level permission errors exist only on the filesystem backends; S3's
+# and Azure's access-denied responses map to PermissionDeniedError too,
+# tested in test_storage_s3.py/test_storage_azure.py.
 
 
 async def test_listdir_on_permission_denied_directory_local_raises(
@@ -471,22 +357,22 @@ async def test_listdir_on_permission_denied_directory_local_raises(
 ) -> None:
     store = _make_local(tmp_path)
 
-    def raising_iterdir(self: Path) -> Any:
+    def raising_scandir(path: object) -> Any:
         raise PermissionError()
 
-    monkeypatch.setattr(Path, "iterdir", raising_iterdir)
-    with pytest.raises(PermissionDeniedError):
+    monkeypatch.setattr("os.scandir", raising_scandir)
+    with pytest.raises(PermissionDeniedError, match="permission denied"):
         await store.listdir("sub")
 
 
 async def test_listdir_on_permission_denied_directory_smb_raises(monkeypatch: pytest.MonkeyPatch) -> None:
     store = _make_smb(monkeypatch)
 
-    def raising_listdir(unc: str, **kwargs: Any) -> list[str]:
+    def raising_scandir(unc: str, **kwargs: Any) -> list[Any]:
         raise OSError(errno.EACCES, "permission denied", unc)
 
-    monkeypatch.setattr(smbclient, "listdir", raising_listdir)
-    with pytest.raises(PermissionDeniedError):
+    monkeypatch.setattr(smbclient, "scandir", raising_scandir)
+    with pytest.raises(PermissionDeniedError, match="permission denied"):
         await store.listdir("sub")
 
 
@@ -494,31 +380,50 @@ async def test_listdir_on_permission_denied_directory_smb_raises(monkeypatch: py
 
 
 class TestJoinPath:
-    def test_joins_plain_segments_with_a_slash(self) -> None:
-        assert join_path("repo", "sub", "file.txt") == "repo/sub/file.txt"
+    @pytest.mark.parametrize(
+        ("segments", "expected"),
+        [
+            pytest.param(("repo", "sub", "file.txt"), "repo/sub/file.txt", id="joins_plain_segments_with_a_slash"),
+            pytest.param(("only",), "only", id="a_single_segment_passes_through"),
+            pytest.param((), "", id="no_segments_yields_an_empty_string"),
+            # repo_root is often "" for an object-store bucket with no
+            # per-repository prefix.
+            pytest.param(("", "sub", "file.txt"), "sub/file.txt", id="an_empty_leading_segment_is_dropped"),
+            pytest.param(("", ""), "", id="every_segment_empty_yields_an_empty_string"),
+            pytest.param(
+                ("repo/", "/sub/", "/file.txt"),
+                "repo/sub/file.txt",
+                id="stray_leading_and_trailing_slashes_are_stripped_per_segment",
+            ),
+            # The emptiness check happens before stripping, so a
+            # slashes-only segment leaves an empty (not absent) element.
+            pytest.param(
+                ("repo", "/", "file.txt"),
+                "repo//file.txt",
+                id="a_segment_that_is_only_slashes_strips_to_empty_but_still_joins",
+            ),
+            # "." can't escape the root, so join_path leaves it alone.
+            pytest.param(("repo", ".", "file.txt"), "repo/./file.txt", id="a_lone_dot_segment_is_not_rejected"),
+        ],
+    )
+    def test_join_path(self, segments: tuple[str, ...], expected: str) -> None:
+        assert join_path(*segments) == expected
 
-    def test_a_single_segment_passes_through(self) -> None:
-        assert join_path("only") == "only"
-
-    def test_no_segments_yields_an_empty_string(self) -> None:
-        assert join_path() == ""
-
-    def test_an_empty_leading_segment_is_dropped(self) -> None:
-        # repo_root is often "" for an object-store bucket with no
-        # per-repository prefix.
-        assert join_path("", "sub", "file.txt") == "sub/file.txt"
-
-    def test_every_segment_empty_yields_an_empty_string(self) -> None:
-        assert join_path("", "") == ""
-
-    def test_stray_leading_and_trailing_slashes_are_stripped_per_segment(self) -> None:
-        assert join_path("repo/", "/sub/", "/file.txt") == "repo/sub/file.txt"
-
-    def test_a_segment_that_is_only_slashes_strips_to_empty_but_still_joins(self) -> None:
-        # the emptiness check happens before stripping, so a
-        # slashes-only segment is truthy going in and leaves a blank
-        # joined element behind (an empty, not an absent, segment).
-        assert join_path("repo", "/", "file.txt") == "repo//file.txt"
+    @pytest.mark.parametrize(
+        "segments",
+        [
+            pytest.param(("repo", "..", "secret"), id="a_bare_dotdot_segment"),
+            # One catalog-derived string (a target_meta_path basename, a
+            # saas_stream_uuid) can smuggle in several segments at once.
+            pytest.param(("repo", "copy_meta_file/../../secret"), id="a_dotdot_embedded_in_one_catalog_derived_part"),
+            pytest.param(("repo", "sub", ".."), id="a_trailing_dotdot_segment"),
+            # Not a separator here, but pathlib on Windows reads it as one.
+            pytest.param(("repo", "..\\..\\secret"), id="a_segment_containing_a_backslash"),
+        ],
+    )
+    def test_an_escaping_segment_is_rejected(self, segments: tuple[str, ...]) -> None:
+        with pytest.raises(NotFoundError, match=r"path segment .* (escapes the store root|contains a backslash)"):
+            join_path(*segments)
 
 
 # -- concurrency (ObjectStore's "safe under concurrent Tasks/threads"
@@ -526,10 +431,8 @@ class TestJoinPath:
 
 
 async def test_local_fs_store_concurrent_calls_return_correct_results(tmp_path: Path) -> None:
-    """Each ``read``/``exists``/``listdir`` call runs its own
-    ``asyncio.to_thread()`` — this drives many concurrent calls against
-    one ``LocalFsStore`` instance and checks every result is still
-    correct, not just that nothing raises."""
+    """Each ``LocalFsStore`` call runs in its own ``asyncio.to_thread()``;
+    many concurrent calls on one instance all return correct results."""
     store = _make_local(tmp_path)
 
     async def read_a() -> bytes:
@@ -544,7 +447,7 @@ async def test_local_fs_store_concurrent_calls_return_correct_results(tmp_path: 
     async def check_missing() -> bool:
         return await store.exists("does/not/exist")
 
-    async def list_root() -> list[str]:
+    async def list_root() -> list[Entry]:
         return await store.listdir("")
 
     calls = [read_a(), read_b(), check_exists(), check_missing(), list_root()] * 20
@@ -555,4 +458,4 @@ async def test_local_fs_store_concurrent_calls_return_correct_results(tmp_path: 
         assert results[i + 1] == b"hello world"
         assert results[i + 2] is True
         assert results[i + 3] is False
-        assert results[i + 4] == ["a.txt", "sub"]
+        assert results[i + 4] == [Entry("a.txt", 10), Entry("sub", None)]

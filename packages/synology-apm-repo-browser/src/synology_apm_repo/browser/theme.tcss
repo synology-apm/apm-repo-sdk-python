@@ -1,6 +1,5 @@
 /* Shared styling for the Miller-column and folder-tree/file-table browse
-   layouts — every screen that needs one of them or a status bar imports
-   this one stylesheet instead of redefining the same rules per screen. */
+   layouts, the breadcrumb/status bars, and the filter/goto inputs. */
 
 Screen {
     layout: vertical;
@@ -11,15 +10,9 @@ Screen {
     height: 1fr;
 }
 
-/* scrollbar-gutter: stable -- without it, the vertical scrollbar's own
-   column only exists while show_vertical_scrollbar is true, so the
-   instant a row count crosses the visible-height threshold (a filter, a
-   load-more, a tree expand/collapse), the rightmost content column --
-   right where this same rule's own border sits -- jumps by the
-   scrollbar's width. A terminal's incremental (diff-only) repaint isn't
-   guaranteed to fully clear the column being reassigned, which is what
-   surfaces as a skewed/leftover border segment right at that boundary.
-   Reserving the gutter unconditionally removes the trigger entirely. */
+/* scrollbar-gutter: stable reserves the scrollbar column permanently; when
+   it appears and disappears with the row count, a terminal's diff-only
+   repaint can leave a skewed border segment at the boundary. */
 #columns DataTable,
 #columns Tree {
     width: 1fr;
@@ -33,10 +26,8 @@ Screen {
     border: solid $accent;
 }
 
-/* UnitScreen's own folder-tree/file-table split -- unlike #columns'
-   three equal peer navigation levels, the tree pane here is
-   conventionally narrower than its content pane (folder names are
-   usually short; Name/Modified/Size needs the width). */
+/* UnitScreen's folder-tree/file-table split: the tree pane is narrower
+   than its content pane. */
 #browser {
     layout: horizontal;
     height: 3fr;
@@ -62,20 +53,15 @@ Screen {
     border: solid $accent;
 }
 
-/* BrowseScreen's own status line: a fixed one-line status, always
-   visible (unlike the filter/goto boxes below, which only appear on
-   demand). */
+/* BrowseScreen's fixed one-line status, always visible. */
 #open-status {
     height: 1;
     color: $text-muted;
     padding: 0 1;
 }
 
-/* UnitScreen's detail pane: wrapped in a VerticalScroll so an inline
-   mail/HTML content preview — potentially many lines — can be scrolled
-   with the mouse wheel rather than being clipped; #detail itself sizes
-   to its own full content height so there's something for the scroll
-   container to actually scroll through. */
+/* UnitScreen's detail pane: #detail sizes to its full content height
+   inside a VerticalScroll, so a long preview scrolls instead of clipping. */
 #detail-scroll {
     width: 1fr;
     height: 1fr;
@@ -92,16 +78,10 @@ Screen {
     height: auto;
 }
 
-/* A SharePoint List overview (unit_screen.py's _load_list_overview) is a
-   pre-rendered table, not prose — it must never be force-wrapped to the
-   pane's width the way #detail's default `width: 100%` wraps ordinary
-   preview text, or every already-fixed-width box-drawing row gets cut
-   mid-cell (misaligned, not gracefully reflowed). `_set_wide_preview()`
-   toggles this class only while a List overview is showing: `width:
-   auto` lets #detail size to the table's own real (possibly wider than
-   the pane) content width, `min-width: 100%` keeps a narrower table
-   filling the pane like today, and `overflow-x: auto` on the scroll
-   container is what actually lets the user pan right to see the rest. */
+/* A SharePoint List overview (DetailOverview) is a pre-rendered table that
+   must not wrap to the pane width. `DetailPane.render()` toggles this class
+   only while one is showing: #detail sizes to the table's width (at least
+   the pane's) and the scroll container pans horizontally. */
 #detail-scroll.wide-preview {
     overflow-x: auto;
 }
@@ -125,12 +105,8 @@ Screen {
     padding: 0 1;
 }
 
-/* Filter box (`/`) and goto-ref box (`g`) — both hidden until their own
-   action adds "active", then docked to the bottom so neither reflows
-   whatever table/tree is being filtered/navigated above it. Separate
-   widgets (independent modes with different Enter-key semantics: narrow
-   the current list vs. jump elsewhere entirely) but identical in shape,
-   so styled together. */
+/* Filter box (`/`) and goto-ref box (`g`): hidden until their action adds
+   "active", then docked to the bottom so nothing above reflows. */
 #filter-input,
 #goto-input {
     display: none;

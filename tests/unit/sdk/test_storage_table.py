@@ -41,9 +41,6 @@ class TestConstruction:
             await Table.create(conn, "no_such_table", [Column("a")])
 
     async def test_index_hints_are_forwarded_to_apply_index_hint(self, conn: aiosqlite.Connection) -> None:
-        # Each index_hints entry is passed straight to apply_index_hint --
-        # prove it actually reaches there and creates a real index, not
-        # just that construction accepts the kwarg without raising.
         await Table.create(conn, "t", [Column("a"), Column("b")], index_hints=[["a"], ["a", "b"]])
         cursor = await conn.execute("SELECT name FROM sqlite_master WHERE type = 'index' AND tbl_name = 't'")
         index_names = {row[0] for row in await cursor.fetchall()}
@@ -90,9 +87,7 @@ class TestSelectPagination:
         assert rows == [{"a": 1, "b": "x"}]
 
     async def test_offset_without_limit_skips_leading_rows(self, conn: aiosqlite.Connection) -> None:
-        # offset=1, limit=None: no cap requested, but OFFSET alone isn't
-        # valid SQL without some LIMIT present, so this exercises the
-        # documented ``LIMIT -1 OFFSET ?`` workaround.
+        # SQLite needs a LIMIT before OFFSET: the ``LIMIT -1 OFFSET ?`` form.
         table = await Table.create(conn, "t", [Column("a"), Column("b")])
         rows = [row async for row in table.select(order_by="a", offset=1)]
         assert rows == [{"a": 2, "b": "y"}]
@@ -110,8 +105,6 @@ class TestSelectPagination:
         assert rows == [{"a": 2, "b": "y"}, {"a": 1, "b": "x"}]
 
     async def test_no_limit_no_offset_omits_clause_entirely(self, conn: aiosqlite.Connection) -> None:
-        # limit=None, offset=0 (both defaults): every row comes back,
-        # exercising the branch that adds no LIMIT/OFFSET clause at all.
         table = await Table.create(conn, "t", [Column("a"), Column("b")])
         rows = [row async for row in table.select(order_by="a")]
         assert rows == [{"a": 1, "b": "x"}, {"a": 2, "b": "y"}]
@@ -122,22 +115,15 @@ class TestExistsIn:
         assert await Table.exists_in(conn, "t") is True
 
     async def test_false_for_a_missing_table(self, conn: aiosqlite.Connection) -> None:
-        # unlike Table.create, this is a non-raising presence check —
-        # callers use it *before* deciding whether to construct a Table
-        # at all.
         assert await Table.exists_in(conn, "no_such_table") is False
 
 
 class TestColumnsPresent:
     async def test_reflects_the_real_schema_regardless_of_what_was_declared(self, conn: aiosqlite.Connection) -> None:
-        # declared columns are a subset of the real ones on purpose, to
-        # prove columns_present isn't just echoing the declaration back.
         table = await Table.create(conn, "t", [Column("a")])
         assert table.columns_present == frozenset({"a", "b"})
 
     async def test_empty_declaration_still_reports_the_full_real_schema(self, conn: aiosqlite.Connection) -> None:
-        # the heuristic-column-matching use case: declare nothing,
-        # inspect what's really there.
         table = await Table.create(conn, "t", [])
         assert table.columns_present == frozenset({"a", "b"})
 
@@ -146,34 +132,30 @@ class TestAsInt:
     def test_returns_an_int_value_unchanged(self) -> None:
         assert as_int(5) == 5
 
-    def test_raises_for_a_non_int_value(self) -> None:
-        with pytest.raises(DataCorruptError):
-            as_int("5")
-
-    def test_raises_for_none(self) -> None:
-        with pytest.raises(DataCorruptError):
-            as_int(None)
+    @pytest.mark.parametrize("value", [pytest.param("5", id="non_int_value"), pytest.param(None, id="none")])
+    def test_raises_for_a_wrong_type(self, value: object) -> None:
+        with pytest.raises(DataCorruptError, match="expected an int column value, got"):
+            as_int(value)
 
 
 class TestAsStr:
     def test_returns_a_str_value_unchanged(self) -> None:
         assert as_str("hello") == "hello"
 
-    def test_raises_for_a_non_str_value(self) -> None:
-        with pytest.raises(DataCorruptError):
-            as_str(5)
-
-    def test_raises_for_none(self) -> None:
-        with pytest.raises(DataCorruptError):
-            as_str(None)
+    @pytest.mark.parametrize("value", [pytest.param(5, id="non_str_value"), pytest.param(None, id="none")])
+    def test_raises_for_a_wrong_type(self, value: object) -> None:
+        with pytest.raises(DataCorruptError, match="expected a str column value, got"):
+            as_str(value)
 
 
 class TestSqlPlaceholders:
-    def test_generates_one_placeholder_per_item(self) -> None:
-        assert sql_placeholders(3) == "?,?,?"
-
-    def test_single_item(self) -> None:
-        assert sql_placeholders(1) == "?"
-
-    def test_zero_items_yields_an_empty_string(self) -> None:
-        assert sql_placeholders(0) == ""
+    @pytest.mark.parametrize(
+        ("count", "expected"),
+        [
+            pytest.param(3, "?,?,?", id="generates_one_placeholder_per_item"),
+            pytest.param(1, "?", id="single_item"),
+            pytest.param(0, "", id="zero_items_yields_an_empty_string"),
+        ],
+    )
+    def test_sql_placeholders(self, count: int, expected: str) -> None:
+        assert sql_placeholders(count) == expected

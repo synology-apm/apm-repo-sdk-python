@@ -37,9 +37,19 @@ their own — run `synology-apm-repo-cli <command> --help` for that command's
 own options. Commands: `doctor`, `ls`, `tree`, `cat`, `export`, `key`,
 `verify`, `dump`, `profile`.
 
+## Exit status
+
+| Status | Meaning |
+|---|---|
+| 0 | Success. `verify` found nothing unresolved (findings repaired via parity alone still exit 0); `export` wrote everything it could, even an item the backup holds only partly (reported on stderr as `incomplete`). |
+| 1 | Error, including a folder export that skipped an item. |
+| 2 | Usage error (a bad option or argument). |
+| 3 | `verify` ran to completion and found at least one unresolved problem. |
+| 130 | Cancelled with Ctrl-C. |
+
 ## Requirements
 
-Python 3.11+.
+Python 3.12+.
 
 ## License
 

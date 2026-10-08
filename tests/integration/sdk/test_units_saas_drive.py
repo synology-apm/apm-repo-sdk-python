@@ -1,74 +1,49 @@
-"""Regression test for ``synology_apm_repo.sdk.units.saas.drive``,
-replayed from a committed fixture recorded against real bytes, with **no
-external dependency**: this always runs, on CI or anywhere else, because
-it goes through ``ReplayStore`` instead of a real ``LocalFsStore``.
+"""Regression tests for ``synology_apm_repo.sdk.units.saas.drive``,
+replayed from a committed fixture recorded against real bytes.
 
-The fixture (``tests/fixtures/units_saas_drive_apv1.json.gz``) was
-produced by ``RecordingStore`` wrapping a real store rooted at
-``apv-sample-1/@ActiveProtectVault`` via this module's own
-``record_target()`` call — see ``tests/conftest.py`` and
-``tests/CLAUDE.md``'s "Recording a fixture" section for the ``pytest
---record-against=...`` workflow that (re-)records this: recording
-apv-sample-1's real ``TEAM_DRIVE`` workload (``_TEAM_DRIVE_WORKLOAD_ID``
-below), both a direct ``DriveProvider(...)`` construction (pinned to
-stream ``XfGkaDjWyGhXVoRC``) and the workload's latest version resolved
-through the real ``dispatch.py`` routing.
+Fixture: ``units_saas_drive_vault_plain.json.gz``, recorded against
+``vault-plain/@ActiveProtectVault``: the ``TEAM_DRIVE`` workload
+(``_TEAM_DRIVE_WORKLOAD_ID``), both through a direct ``open_drive_provider(...)``
+pinned to stream ``XfGkaDjWyGhXVoRC`` and through ``dispatch.py`` for its
+latest version. Every test makes the same calls, so any one of them is
+the recording recipe.
 
-No real leaf's content is ever read — every real file, ``P/C.jpg``
-included, only has its ``kind``/``size``/``attrs`` checked against the
-index's own ``item_table`` metadata
-(``test_replayed_every_real_files_kind_and_size_match_item_table``
-below). Dedup content reconstruction itself (does a chunk/composition
-layout decode to the right plaintext at all) is proven synthetically,
-with zero real-sample dependency, by
-``tests/unit/sdk/test_dedup_dedup_file.py`` instead — the same idea
-``test_units_saas_teams_chat.py`` applies to sticker embedding (real
-image bytes, only provable against a real "many_stickers" Teams
-channel): push real-content-dependent proof to a synthetic test and
-keep the replay narrow, applied here because ``P/C.jpg``'s own real
-bytes are a third-party illustration, not inert sample data, and can't
-be committed to a public fixture at all.
-
-Every test below still needs ``record_target(..., allow_content=True)``:
-``SaasWorkloadProvider.create()``/``DriveProvider(...)`` itself resolves
-its own object-name index via a real ``dedup_file.read()`` (an internal
-routing table, not any leaf's own content) before any of the above even
-begins.
+No leaf's content is read: each file's ``kind``/``size`` comes from the
+index's ``item_table`` metadata; dedup content reconstruction is proven by
+``tests/unit/sdk/test_dedup_dedup_file.py``. Every test still passes
+``allow_content=True``: provider creation reads the object-name index (an
+internal routing table) through ``dedup_file.read()``.
 """
 
 from __future__ import annotations
 
 from collections.abc import Awaitable, Callable
+from typing import Any
 
 from synology_apm_repo.sdk.catalog.connection import connections
 from synology_apm_repo.sdk.catalog.version import versions
 from synology_apm_repo.sdk.catalog.workload import workloads
 from synology_apm_repo.sdk.dedup.repository import DedupRepo
 from synology_apm_repo.sdk.storage.base import ObjectStore
-from synology_apm_repo.sdk.storage.layout import detect_layout
+from synology_apm_repo.sdk.storage.layout import catalog_repo_layouts, detect_repository_layout
 from synology_apm_repo.sdk.units.base import Node, UnitKind
 from synology_apm_repo.sdk.units.dispatch import saas_provider_for
-from synology_apm_repo.sdk.units.saas.drive import DriveProvider
+from synology_apm_repo.sdk.units.saas.drive import open_drive_provider
 from synology_apm_repo.sdk.units.saas.provider import SaasWorkloadProvider
 from synology_apm_repo.sdk.units.saas.stream import SaasStreamCache
 
-#: Internal catalog identifier -- stable and non-identifying (never
-#: touched by catalog-metadata anonymization, so it resolves the same
-#: real workload whether replaying the anonymized fixture or recording
-#: fresh against the real backend). ``saas_stream_uuid`` alone isn't
-#: enough to pin this one down: apv-sample-1 reuses stream
-#: ``XfGkaDjWyGhXVoRC`` across several unrelated workloads/sub_types
-#: (MAIL, CONTACT, CALENDAR, DRIVE, TEAM_DRIVE).
+#: The stream alone doesn't pin the workload: vault-plain shares stream
+#: ``XfGkaDjWyGhXVoRC`` across several sub_types.
 _TEAM_DRIVE_WORKLOAD_ID = 10
 
 
 async def _open_repo(record_target: Callable[..., Awaitable[ObjectStore]]) -> DedupRepo:
-    store = await record_target("units_saas_drive_apv1.json.gz", allow_content=True)
-    layout = await detect_layout(store)
+    store = await record_target("units_saas_drive_vault_plain.json.gz", allow_content=True)
+    (layout,) = catalog_repo_layouts(await detect_repository_layout(store))
     return await DedupRepo.open(store, layout)
 
 
-async def _open_provider(repo: DedupRepo, saas_streams: SaasStreamCache) -> SaasWorkloadProvider:
+async def _open_provider(repo: DedupRepo, saas_streams: SaasStreamCache) -> SaasWorkloadProvider[Any]:
     all_workloads = [w for c in await connections(repo) for w in await workloads(repo, c)]
     version = await anext(
         v
@@ -76,7 +51,7 @@ async def _open_provider(repo: DedupRepo, saas_streams: SaasStreamCache) -> Saas
         for v in await versions(repo, w)
         if w.workload_id == _TEAM_DRIVE_WORKLOAD_ID and v.saas_stream_uuid == "XfGkaDjWyGhXVoRC" and not v.deleted
     )
-    return await DriveProvider(repo, version, saas_streams)
+    return await open_drive_provider(repo, version, saas_streams)
 
 
 async def test_replayed_root_and_nested_tree_match_known_real_layout(
@@ -86,9 +61,7 @@ async def test_replayed_root_and_nested_tree_match_known_real_layout(
         provider = await _open_provider(repo, saas_streams)
         try:
             top = await provider.children(provider.root())
-            # A folder/file name here is a real, backed-up filename choice
-            # (unlike a catalog identifier, this repository's anonymization
-            # never touches it) -- assert shape only, never a literal name.
+            # Backed-up file names aren't anonymized, so they're asserted literally.
             assert len(top) == 7
             leaf_names = {n.name for n in top if n.is_leaf}
             assert leaf_names == {"L.jpg", "B.zip", "test.docx", "Team_F.docx", "1.txt"}
@@ -107,30 +80,33 @@ async def test_replayed_root_and_nested_tree_match_known_real_layout(
 async def test_replayed_every_real_files_kind_and_size_match_item_table(
     record_target: Callable[..., Awaitable[ObjectStore]],
 ) -> None:
-    """Every real leaf's ``kind``/``size`` is checked against the catalog's
-    own ``item_table`` metadata; no leaf's content is ever read."""
+    """Every real leaf is a ``DRIVE_ITEM`` whose positive ``size`` is its
+    ``item_table`` row's, read from the same session's index; no leaf's
+    content is read."""
     async with await _open_repo(record_target) as repo, SaasStreamCache(repo) as saas_streams:
         provider = await _open_provider(repo, saas_streams)
         try:
-            checked = 0
+            listed: dict[str, int | None] = {}
 
             async def _walk(node: Node) -> None:
-                nonlocal checked
                 for child in await provider.children(node):
                     if child.is_leaf:
                         assert child.kind is UnitKind.DRIVE_ITEM
-                        assert child.size is not None and child.size > 0
-                        checked += 1
+                        listed[child.ref.extra_segments[-1]] = child.size
                     else:
                         await _walk(child)
 
             await _walk(provider.root())
-            assert checked == 6  # C.jpg, L.jpg, B.zip, test.docx, Team_F.docx, 1.txt
+            cursor = await provider.table("item_table").execute("SELECT item_id, size FROM item_table WHERE type = 1")
+            item_table_sizes = {str(item_id): size for item_id, size in await cursor.fetchall()}
+            assert listed == item_table_sizes
+            assert len(listed) == 6  # C.jpg, L.jpg, B.zip, test.docx, Team_F.docx, 1.txt
+            assert all(size is not None and size > 0 for size in listed.values())
         finally:
             await provider.close()
 
 
-async def test_replayed_team_drive_dispatches_and_resolves_real_content_via_the_catalog_index(
+async def test_replayed_team_drive_dispatches_via_the_object_name_index_and_lists_its_root(
     record_target: Callable[..., Awaitable[ObjectStore]],
 ) -> None:
     async with await _open_repo(record_target) as repo, SaasStreamCache(repo) as saas_streams:
@@ -145,6 +121,3 @@ async def test_replayed_team_drive_dispatches_and_resolves_real_content_via_the_
             assert {n.name for n in top if n.is_leaf} == {"L.jpg", "B.zip", "test.docx", "Team_F.docx", "1.txt"}
         finally:
             await provider.close()
-
-
-__all__: list[str] = []

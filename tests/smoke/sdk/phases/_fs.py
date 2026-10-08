@@ -42,9 +42,6 @@ async def run_for_repo(ctx: SmokeContext, ri: RepoInfo) -> None:
     entries = [(r, c, w, v) for r, c, w, v in workloads if r is ri and w.workload_type == TargetType.FS]
     step_prefix = f"fs.{ri.sample_name}"
     if not entries:
-        # Purely per-repo judgment: this sample alone lacking an FS
-        # workload is reported here, not deferred to a once-per-run
-        # aggregate.
         ctx.skip("fs", f"{step_prefix}.workload_present", f"no FS workload in {ri.sample_name}")
         return
     if not ri.readable:
@@ -65,10 +62,7 @@ async def run_for_repo(ctx: SmokeContext, ri: RepoInfo) -> None:
         return
     _ri, _workload, _version, picked_provider, picked_leaf = picked
 
-    # The winning candidate is this call's own to close once done --
-    # pick_workload_with_retry closes every rejected candidate's provider
-    # immediately as it searches, but returns the winner still open for its
-    # caller to use (and close).
+    # pick_workload_with_retry leaves the winner's provider open for us.
     try:
 
         async def _get_provider(provider: UnitProvider = picked_provider) -> UnitProvider:
@@ -84,7 +78,7 @@ async def run_for_repo(ctx: SmokeContext, ri: RepoInfo) -> None:
         unit = await ctx.call("fs", f"{step_prefix}.unit", _get_unit, degrade_on=_DEGRADE_ON)
         if unit is None:
             return
-        content = unit.open()
+        content = unit.content
         await bounded_read_and_export(ctx, "fs", step_prefix, content, degrade_on=_DEGRADE_ON)
     finally:
         await close_if_closable(picked_provider)

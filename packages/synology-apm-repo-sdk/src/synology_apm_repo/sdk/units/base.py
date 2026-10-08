@@ -7,17 +7,16 @@ from __future__ import annotations
 
 import dataclasses
 import enum
-from collections.abc import AsyncIterator, Awaitable, Callable, Sequence
-from datetime import UTC, datetime
-from pathlib import Path
+from collections.abc import AsyncIterator, Mapping
+from datetime import datetime
 from types import TracebackType
-from typing import Any, NoReturn, Protocol, Self, TypeVar, runtime_checkable
+from typing import Any, Protocol, Self, runtime_checkable
 
 from ..dedup.dedup_file import DEFAULT_STREAM_BLOCK
-from ..storage.table import as_int
+from ..dedup.export_scheduler import ExportTuning
+from ..dedup.export_sink import ExportWriter, WrittenBytesCallback
+from ..dedup.extent import ExportResult
 from .node_ref import NodeRef
-
-_T = TypeVar("_T")
 
 
 class UnitKind(enum.Enum):
@@ -25,9 +24,9 @@ class UnitKind(enum.Enum):
     drives the CLI/TUI's default icon/preview routing."""
 
     DISK_IMAGE = "disk_image"
-    # Cosmetic only (TUI icon/preview routing) — a disk-image node with a
-    # "(filesystem)" sibling, or a folder inside that sibling's own
-    # tree, still browses/exports identically without this.
+    # The "(filesystem)" sibling of a disk image and each partition/folder
+    # inside it; a tree export skips these containers (``plan_tree_export``),
+    # since their files are the disk image's own bytes.
     DISK_FILESYSTEM = "disk_filesystem"
     DISK_FILE = "disk_file"
     FILE = "file"
@@ -43,14 +42,13 @@ class UnitKind(enum.Enum):
     TEAMS_CHAT_MESSAGE = "teams_chat_message"
     #: A container whose children are always further containers, never a
     #: leaf — a SharePoint site's "List" category and a Calendar's
-    #: "My"/"Other Calendars" category. Shared since both share the same
-    #: shape: Name+Created columns, never ``ColumnSpec.leaves_only``.
+    #: "My"/"Other Calendars" category.
     CATEGORY_GROUP = "category_group"
 
 
 class FileState(enum.Enum):
     """A disk-fs file's cloud-sync/encryption state, carried as
-    ``Node.attrs["file_state"]`` — produced only by ``units/content/
+    ``Node.file_state`` — produced other than ``NORMAL`` only by ``units/content/
     disk_fs/``'s NTFS/APFS backends. ``CLOUD_ONLY`` always wins over
     ``ENCRYPTED`` when both apply: an evicted cloud placeholder has no
     local bytes to export regardless of EFS encryption."""
@@ -62,52 +60,106 @@ class FileState(enum.Enum):
 
 @runtime_checkable
 class ContentSource(Protocol):
-    """The one content-reading contract every restorable unit's ``open()``
-    returns — a ``DedupFile``/``ByteRangeView`` satisfies this shape already;
-    an ``ArtifactBuilder`` (assembled content — ``.eml``, ``.ics``, ...) can
-    implement it too without CLI/TUI ever needing to tell them apart."""
+    """The one content-reading contract every ``RestorableUnit.content``
+    satisfies — a ``DedupFile``/``ByteRangeView`` satisfies this shape already,
+    as does assembled content (``.eml``, ``.ics``, ...), so CLI/TUI never
+    need to tell them apart."""
 
     @property
     def size(self) -> int | None:
-        """Deliberately a ``@property`` — Protocol attributes are checked
-        invariantly, so a plain field would reject a narrower ``int``
-        attribute (e.g. ``ByteRangeView``'s ``size: int``). Synchronous;
-        ``LazyArtifact`` is the one implementer that reports ``None``
-        until its artifact is assembled."""
+        """Synchronous; ``None`` when the size isn't known up front (e.g.
+        ``LazyArtifact`` before its artifact is assembled). A ``@property``
+        because Protocol attributes are invariant, so a plain field would
+        reject a narrower ``int``."""
         ...
 
-    async def read(self, offset: int = 0, length: int | None = None) -> bytes:
+    async def read(self, offset: int = 0, length: int | None = None) -> bytes | bytearray:
         """Read ``length`` bytes starting at ``offset`` (default: from
         ``offset`` to the end). A request extending past the content's own
         end — including ``offset`` starting at or past it — returns only
-        the bytes that exist, never an error; a genuinely empty result is
-        a normal, valid read, not a failure.
+        the bytes that exist (possibly none), never an error. A
+        ``bytearray`` result belongs to the caller (dedup-backed content returns the buffer it filled
+        rather than copying it into ``bytes``).
 
         Raises:
             ValueError: ``offset`` or ``length`` is negative.
+            ResourceLimitExceededError: For a ``DedupFile``-backed
+                implementation, the resolved read size exceeds
+                ``MAX_SINGLE_READ_SIZE`` (1 GiB); use ``stream()`` for a
+                large read.
         """
         ...
 
-    def stream(self, block: int = DEFAULT_STREAM_BLOCK) -> AsyncIterator[tuple[int, bytes]]: ...
+    def stream(self, block: int = DEFAULT_STREAM_BLOCK) -> AsyncIterator[tuple[int, bytes | bytearray]]:
+        """Yield ``(offset, data)`` blocks of at most ``block`` bytes that
+        cover the content in order."""
+        ...
 
-    async def export_to(
+    async def export_range(
         self,
-        dst: Path,
+        writer: ExportWriter,
+        start: int,
+        end: int,
+        /,
         *,
         sparse: bool = True,
-        progress: Callable[[int, int], Awaitable[None]] | None = None,
-    ) -> object: ...
+        progress: WrittenBytesCallback | None = None,
+        tuning: ExportTuning | None = None,
+    ) -> ExportResult:
+        """Writes the content's ``[start, end)`` into ``writer``, which the
+        caller has already opened and will commit or abort itself
+        (``api.run_export`` does all of it), at offsets relative to
+        ``start``. ``sparse=True`` may leave ``ZERO``/``HOLE`` ranges
+        unwritten. ``progress`` receives each newly written byte count as it
+        is handed to ``writer`` (the counts add up to ``planned_bytes`` over
+        the range); ``tuning`` is for implementations backed by the dedup
+        layer and ignored by the others.
 
-    @property
-    def supports_concurrent_export(self) -> bool:
-        """Whether ``export_to()`` accepts ``max_concurrent_reads``/
-        ``max_concurrent_opens`` meaningfully — true only for a source
-        with a bucket concept to spread reads across (``DedupFile``/
-        ``ByteRangeView``, ``VirtualDiskContentSource``)."""
+        Raises:
+            ValueError: The range is not inside ``[0, size]``."""
+        ...
+
+    async def planned_bytes(self, start: int, end: int, /) -> int:
+        """The bytes ``export_range`` over ``[start, end)`` reports as
+        progress: the real ``DATA`` bytes for dedup-backed content, the
+        whole range for content without holes."""
         ...
 
 
-@dataclasses.dataclass(frozen=True)
+class NodeRole(enum.Enum):
+    """How a frontend presents a container node beyond listing its children."""
+
+    ORDINARY = "ordinary"
+    LIST_OVERVIEW = "list_overview"
+    """A plain SharePoint List's own group node, shown as a non-expandable
+    tree leaf whose items read as one spreadsheet-style overview
+    (``read_site_list_items``)."""
+    FLAT_CATEGORY = "flat_category"
+    """A site's "List" category node, whose Lists are listed as ordinary
+    rows but kept out of a folder tree."""
+
+
+@dataclasses.dataclass(frozen=True, slots=True)
+class ItemColumns:
+    """The per-kind fields of a listed item a frontend lays out as list
+    columns; each is ``None`` where it doesn't apply or isn't known.
+
+    Attributes:
+        sender: A mail's sender, as a display name.
+        email: A contact's primary email address.
+        event_start: A calendar event's start (timezone-aware).
+        event_end: A calendar event's end (timezone-aware).
+        recurrence: A calendar event's recurrence, as a short label.
+    """
+
+    sender: str | None = None
+    email: str | None = None
+    event_start: datetime | None = None
+    event_end: datetime | None = None
+    recurrence: str | None = None
+
+
+@dataclasses.dataclass(frozen=True, slots=True)
 class Node:
     """One entry in a provider's browsable tree; leaves additionally
     carry ``kind``/``size``.
@@ -119,11 +171,27 @@ class Node:
             container.
         kind: The kind of restorable unit, when known.
         size: Byte size, when known.
-        attrs: Display metadata (sender, mtime, path, ...) — CLI/TUI show
-            *only* ``name``/``attrs`` in the default, non-diagnostic mode;
-            internal identifiers a provider needs for its own bookkeeping
-            should go in a provider-private ``attrs`` key, not become part
-            of this public shape.
+        mtime: Last-modified time (timezone-aware), when known.
+        file_state: A disk-filesystem file's cloud-sync/encryption state.
+        leaf_kind: For a container, the kind of the restorable units below
+            it, when the provider knows it without listing them.
+        diagnostic: Set on a placeholder standing in for content that could
+            not be read: the user-facing reason. Such a node is not real
+            content (``is_diagnostic``).
+        role: How a frontend presents this container.
+        degraded: Set on real content that could only be partly resolved:
+            a short, user-facing reason. Unlike ``diagnostic``, the node is
+            still real content. On a listed node it means the listing is
+            partial (a Teams chat shown by its raw id, whose unit leaves it
+            unset); on a ``RestorableUnit`` it means the content itself is
+            incomplete (a PC/PS disk with missing fragments, known only once
+            ``unit()`` assembles it), which an export reports.
+        columns: Per-kind fields a frontend lays out as list columns.
+        details: Further display-only metadata (path, ids, ...), shown in a
+            frontend's verbose view and never read for behaviour.
+        export_name: The file name the SDK synthesizes for a leaf with no
+            file name of its own in the backup (a mail's subject plus
+            ``.eml``); ``None`` when ``name`` already is the file name.
     """
 
     ref: NodeRef
@@ -131,33 +199,24 @@ class Node:
     is_leaf: bool
     kind: UnitKind | None = None
     size: int | None = None
-    attrs: dict[str, Any] = dataclasses.field(default_factory=dict)
+    mtime: datetime | None = None
+    file_state: FileState = FileState.NORMAL
+    leaf_kind: UnitKind | None = None
+    diagnostic: str | None = None
+    role: NodeRole = NodeRole.ORDINARY
+    degraded: str | None = None
+    columns: ItemColumns = dataclasses.field(default_factory=ItemColumns)
+    details: Mapping[str, object] = dataclasses.field(default_factory=dict)
+    export_name: str | None = None
+    handle: object = dataclasses.field(default=None, repr=False, compare=False)
+    """What the provider that built this node needs to find its children or
+    content again (a tree key, a disk's fragments, ...). Opaque to every
+    other caller and never displayed; only that provider reads it."""
 
-
-def node_file_state(node: Node) -> FileState:
-    """``node.attrs["file_state"]`` narrowed to a real ``FileState``,
-    defaulting to ``NORMAL`` for a node with no such concept or a
-    malformed value."""
-    state = node.attrs.get("file_state")
-    return state if isinstance(state, FileState) else FileState.NORMAL
-
-
-def node_modified_time(node: Node) -> datetime | None:
-    """``node.attrs["mtime"]`` narrowed to a real, timezone-aware
-    ``datetime`` — ``None`` for a node with no such concept or a
-    malformed value."""
-    value = node.attrs.get("mtime")
-    return value if isinstance(value, datetime) else None
-
-
-def node_leaf_kind(node: Node) -> UnitKind | None:
-    """``node.attrs["leaf_kind"]`` narrowed to a real ``UnitKind`` —
-    ``None`` for a node with no such concept. Set on every container node
-    a ``SaasWorkloadProvider``-based provider builds; describes a
-    container's own children's kind, not the node itself (unlike
-    ``Node.kind``, which a leaf carries directly)."""
-    value = node.attrs.get("leaf_kind")
-    return value if isinstance(value, UnitKind) else None
+    @property
+    def is_diagnostic(self) -> bool:
+        """Whether this node is a placeholder rather than real content."""
+        return self.diagnostic is not None
 
 
 def node_kind_label(node: Node) -> str:
@@ -168,148 +227,61 @@ def node_kind_label(node: Node) -> str:
     return "folder" if not node.is_leaf else "item"
 
 
-def mtime_from_epoch(epoch: int | None) -> datetime | None:
-    """The write-side counterpart of ``node_modified_time`` — converts a
-    provider's raw epoch-seconds catalog value into what that accessor
-    reads back. ``None`` when ``epoch`` is ``None`` or outside
-    ``datetime``'s representable range."""
-    if epoch is None:
-        return None
-    try:
-        return datetime.fromtimestamp(epoch, UTC)
-    except (OverflowError, OSError, ValueError):
-        return None
-
-
-def mtime_attr(raw: object) -> datetime | None:
-    """``mtime_from_epoch(as_int(raw))``, narrowing a ``Table.select()``
-    row's untyped value first."""
-    return mtime_from_epoch(as_int(raw)) if raw is not None else None
-
-
-def mtime_attrs(raw: object, key: str = "mtime") -> dict[str, object]:
-    """``{key: mtime_attr(raw)}``, or ``{}`` when that's ``None``. ``key``
-    defaults to ``"mtime"``; Calendar's own ``event_start``/``event_end``
-    use something else."""
-    mtime = mtime_attr(raw)
-    return {key: mtime} if mtime is not None else {}
-
-
-@dataclasses.dataclass(frozen=True)
+@dataclasses.dataclass(frozen=True, slots=True, kw_only=True)
 class RestorableUnit(Node):
     """A leaf ``Node`` plus a way to actually read its content.
 
-    ``content`` is already-constructed (cheap for a ``DedupFile`` — it does no
-    I/O until first read) rather than a lazy thunk, keeping this a plain
-    dataclass instead of needing its own ``__post_init__`` wiring.
+    ``content`` is already constructed; building one does no I/O until the
+    first read.
     """
 
-    content: ContentSource | None = None
+    content: ContentSource
 
-    def open(self) -> ContentSource:
-        if self.content is None:
-            raise ValueError(f"RestorableUnit {self.name!r} has no content source")
-        return self.content
-
-
-def diagnostic_node(ref: NodeRef, name: str, attrs: dict[str, Any]) -> Node:
-    """One synthetic listing node standing in for a provider's own
-    degrade-instead-of-fail case — the ``Node(is_leaf=True,
-    kind=UnitKind.FILE, ...)`` shape every caller shares; only ``attrs``
-    differs between them.
-    """
-    return Node(ref=ref, name=name, is_leaf=True, kind=UnitKind.FILE, attrs=attrs)
-
-
-def node_is_diagnostic(node: Node) -> bool:
-    """Whether ``node`` is a ``diagnostic_node()`` placeholder rather than
-    a real, restorable file."""
-    return "diagnostic" in node.attrs
-
-
-def not_restorable(kind: str, ref: object) -> NoReturn:
-    """Raise the standard ``ValueError`` every ``UnitProvider.unit``
-    implementation raises for a resolved-but-contentless node/item.
-
-    Args:
-        kind: ``"node"`` or ``"item"``.
-        ref: That node's ``name`` or that item's ``key``.
-    """
-    raise ValueError(f"{kind} {ref!r} is not a restorable unit")
-
-
-def dir_first_sort_key(is_dir: bool, name: str) -> tuple[int, str]:
-    """The child-ordering policy every browsable file/folder-tree
-    ``UnitProvider`` applies: containers before leaves, then each group
-    alphabetically by name (byte/codepoint comparison, no case folding).
-    Use as a ``sorted(..., key=...)`` key for a provider that sorts in
-    Python; ``dir_first_order_by`` expresses the same policy as SQL for
-    a provider that pushes ordering down into its own query instead."""
-    return (0 if is_dir else 1, name)
-
-
-def dir_first_order_by(is_dir_sql: str, order_by: str) -> str:
-    """The same containers-before-leaves-then-name policy as
-    ``dir_first_sort_key``, expressed as a SQL ``ORDER BY`` expression.
-    ``is_dir_sql`` is a boolean SQL expression true for a container row;
-    ``order_by`` is the already-built name(+tiebreaker) clause ranking
-    rows within each group."""
-    return f"(CASE WHEN {is_dir_sql} THEN 0 ELSE 1 END), {order_by}"
-
-
-def disk_fs_containers_before_leaves(nodes: list[Node]) -> list[Node]:
-    """Stable-partitions an already-ordered node list into containers
-    (``is_leaf=False``) before leaves, each group keeping its incoming
-    relative order — for a disk-image node interleaved with its
-    "(filesystem)" sibling, whose meaningful order (a disk index, a
-    database ``ORDER BY``) ``dir_first_sort_key``'s alphabetical key
-    would undo."""
-    return sorted(nodes, key=lambda node: node.is_leaf)
-
-
-def paginate(items: Sequence[_T], offset: int, limit: int | None) -> list[_T]:
-    """Slice ``items[offset:offset+limit]`` (open-ended when ``limit`` is
-    ``None``) — for a provider whose listing is already a small,
-    fully-materialized sequence, rather than pushed down into a real SQL
-    ``LIMIT``/``OFFSET``. Shared so every provider family can reuse one
-    implementation."""
-    stop = offset + limit if limit is not None else None
-    return list(items[offset:stop])
+    @classmethod
+    def of(cls, node: Node, content: ContentSource, **changes: Any) -> Self:
+        """The unit for leaf ``node``: every ``Node`` field copied (``handle``
+        included), then ``changes`` applied, with ``content``."""
+        fields = {field.name: getattr(node, field.name) for field in dataclasses.fields(Node)}
+        return cls(**{**fields, **changes, "is_leaf": True, "content": content})
 
 
 @runtime_checkable
 class UnitProvider(Protocol):
     """One workload version's browsable tree.
 
-    ``root`` is sync (every implementation resolves its state up front, in
-    an async constructor); ``children`` and ``unit`` are async. This is a
-    property of the method, uniform across every implementation, even
-    ones that happen to do no I/O in a given body.
-
-    No ``close()`` here: providers that own sqlite sources expose their own
-    ``async def close()`` instead, without this Protocol requiring one of
-    every implementation.
+    ``root`` is sync and does no I/O; ``children`` and ``unit`` are async
+    in every implementation. Closing is ``ClosableUnitProvider``'s
+    contract.
     """
 
-    def root(self) -> Node: ...
+    def root(self) -> Node:
+        """The tree's root node."""
+        ...
 
-    async def children(self, node: Node, offset: int = 0, limit: int | None = None) -> list[Node]: ...
+    async def children(self, node: Node, offset: int = 0, limit: int | None = None) -> list[Node]:
+        """One page of ``node``'s children in a stable order: ``limit``
+        entries from ``offset``, or all remaining when ``limit`` is
+        ``None``. A leaf has none."""
+        ...
 
-    async def unit(self, node: Node) -> RestorableUnit: ...
+    async def unit(self, node: Node) -> RestorableUnit:
+        """Open ``node`` as a restorable unit.
+
+        Raises:
+            NotRestorableError: ``node`` has no restorable content.
+        """
 
 
 @runtime_checkable
 class ClosableUnitProvider(UnitProvider, Protocol):
-    """A ``UnitProvider`` that owns a real ``SqliteSource``/``aiosqlite``
-    connection and must be closed once done.
-
-    The ``__aenter__``/``__aexit__`` pair makes ``async with`` the
-    ordinary way to hold one, closing it on every exit path including an
-    exception; a caller that already holds an instance some other way can
-    still just ``await`` ``close`` directly.
+    """A ``UnitProvider`` that owns open resources (SQLite sources, dedup
+    files) and must be closed once done — with ``async with``, or by
+    awaiting ``close`` directly.
     """
 
-    async def close(self) -> None: ...
+    async def close(self) -> None:
+        """Release what this provider opened."""
+        ...
 
     async def __aenter__(self) -> Self: ...
 
@@ -330,9 +302,9 @@ class SupportsDirectRefLookup(Protocol):
     descent.
 
     ``resolve_extra`` looks a node up directly, without visiting any
-    other node in the tree. ``parent_of`` walks one step toward the root
-    (``None`` at the version root) — used to rebuild the ancestor chain a
-    caller like the TUI's goto-ref needs."""
+    other node in the tree (``None`` when absent). ``parent_of`` walks one
+    step toward the root (``None`` at the version root), for rebuilding
+    the ancestor chain."""
 
     async def resolve_extra(self, extra_segments: tuple[str, ...]) -> Node | None: ...
 

@@ -1,9 +1,6 @@
-"""Fingerprint lookup: locates the stored SHA-256 digest for one chunk in
-its group's ``.inf``/``.fgp`` files. Used by ``verify`` and by
-``Pool.read_chunk`` when ``verify_fingerprint`` is enabled. Correctly
-handles a chunk whose fingerprint straddles a ``.fgp`` 4 MiB segment
-boundary, across plaintext and encrypted, vault- and object-store-backed
-repositories.
+"""Fingerprint lookup: locates the stored SHA-256 digests of a bucket's chunks in
+its group's ``.inf``/``.fgp`` files (FORMAT-SPEC.md: Sidecar files), for a
+``Pool`` whose ``VerifyPolicy.fingerprint`` is on.
 
 **Group path indirection**: ``.inf``/``.fgp`` are shared by an entire
 1024-bucket *group*, keyed by the group's starting bucket id
@@ -13,31 +10,28 @@ paths. ``.fgp`` is further split into 4 MiB segments
 buckets * up to 8192 chunks * 32 bytes) would otherwise be one
 multi-hundred-MB file.
 
-**``AllocationTableCache``**: ``fingerprint()``/``fingerprints()``
-resolve a bucket's ``.inf`` header/allocation entry once per call, but
-every one of up to ``GROUP_BUCKET_NUM`` (1024) buckets sharing a group
-still re-resolves identical bytes, once per bucket, across separate
-calls. An optional ``AllocationTableCache`` (kept by ``Pool``, shared
-automatically by every caller reading fingerprints through one) resolves
-a group's whole allocation table once and answers every later bucket in
-it from memory.
+**``FingerprintIndex``** reads a group's whole ``.inf`` allocation table
+once and answers every later bucket in it from memory: up to
+``GROUP_BUCKET_NUM`` (1024) buckets share one group's table.
 """
 
 from __future__ import annotations
 
+import dataclasses
 from collections.abc import Iterable
 
-from ..asynccache import AsyncKeyedCache
+from ..asynccache import AsyncKeyedCache, CacheStats
+from ..cachemanager import DEFAULT_LIMITS
 from ..errors import DataCorruptError, FormatError
 from ..format.addressing import group_start_bucket_id, pool_layer_path, split_layer_leaf
 from ..format.const import GROUP_BUCKET_NUM
 from ..format.headers import HEADER_LEN, MAGIC, parse_index_header
-from ..identifiers import BucketId, ChunkIdx, StreamId
+from ..identifiers import BucketId, StreamId
 from ..storage.base import ObjectStore, join_path
 from ..storage.dircache import DirCache
 from ..storage.seqid import resolve_seq_path
 
-_SPEC = "FORMAT-SPEC.md: sidecar-files/chunk-pool-encryption"
+_SPEC = "FORMAT-SPEC.md: Sidecar files; Chunk pool encryption"
 
 # .inf's allocation table: 1024 8-byte entries starting at a
 # fixed offset within the (otherwise per-bucket-record) .inf file.
@@ -45,6 +39,7 @@ _ALLOC_TABLE_OFFSET = 12288
 _ALLOC_ENTRY_LENGTH = 8
 _ALLOC_TABLE_LENGTH = GROUP_BUCKET_NUM * _ALLOC_ENTRY_LENGTH
 _OFFSET4K_SHIFT = 15
+_OFFSET4K_UNIT = 4096  # the allocation entry's byte offset is in 4 KiB units
 _RECNUM_MASK = (1 << 15) - 1
 
 _FGP_RECORD_LENGTH = 32  # one SHA-256 digest per chunk
@@ -60,291 +55,144 @@ def _group_dir_and_prefix(pool_root: str, stream_id: StreamId, bucket_id: Bucket
     return join_path(pool_root, dir_part), leaf
 
 
-async def _read_full_allocation_table(
-    store: ObjectStore, dir_cache: DirCache, pool_root: str, stream_id: StreamId, bucket_id: BucketId
-) -> tuple[str, str, str, bytes]:
-    """Header-validate, then read the *whole* ``GROUP_BUCKET_NUM``-entry
-    allocation table for ``bucket_id``'s own group in one shot — the
-    once-per-group counterpart to ``_resolve_bucket_allocation``'s own
-    once-per-call single-entry read. Returns ``(full_dir, prefix, inf_path,
-    table)``, ``table`` being the tight ``_ALLOC_TABLE_LENGTH``-byte blob
-    every bucket in the group slices its own 8-byte entry out of."""
-    full_dir, prefix = _group_dir_and_prefix(pool_root, stream_id, bucket_id)
-    inf_path = await resolve_seq_path(dir_cache, full_dir, f"{prefix}.inf")
-    header_bytes = await store.read(inf_path, 0, HEADER_LEN)
-    parse_index_header(header_bytes, expect_magic=MAGIC["bucket_meta"], spec=_SPEC)
-    table = await store.read(inf_path, _ALLOC_TABLE_OFFSET, _ALLOC_TABLE_LENGTH)
-    return full_dir, prefix, inf_path, table
+@dataclasses.dataclass(frozen=True, slots=True)
+class _GroupTable:
+    """One group's header-validated ``.inf`` and its whole allocation table
+    (``_ALLOC_TABLE_LENGTH`` bytes, an 8-byte entry per bucket)."""
+
+    full_dir: str
+    prefix: str
+    inf_path: str
+    table: bytes
 
 
-class AllocationTableCache:
-    """Caches each distinct ``(stream_id, group's starting bucket id)``'s
-    whole, header-validated ``.inf`` allocation table for this cache
-    instance's lifetime — up to ``GROUP_BUCKET_NUM`` (1024) buckets share
-    one group's identical bytes. Pure in-memory bookkeeping on top of
-    ``AsyncKeyedCache``; owns no store/dir_cache/pool_root of its own,
-    since every call already has those in hand (mirrors
-    ``dedup.pool.BucketReaderCache``'s reason for the same shape)."""
+@dataclasses.dataclass(frozen=True, slots=True)
+class _BucketAllocation:
+    """Where one bucket's fingerprint records sit in its group's ``.fgp``
+    segments: ``rec_num`` records starting at byte ``byte_off``."""
 
-    def __init__(self) -> None:
-        self._tables: AsyncKeyedCache[tuple[int, int], tuple[str, str, str, bytes]] = AsyncKeyedCache()
-
-    def clear(self) -> None:
-        """Drop every cached allocation table — for a caller releasing a
-        whole ``Pool``'s memory (see ``Pool.release_caches``)."""
-        self._tables.invalidate()
-
-    async def resolve_entry(
-        self, store: ObjectStore, dir_cache: DirCache, pool_root: str, stream_id: StreamId, bucket_id: BucketId
-    ) -> tuple[str, str, str, int, int]:
-        """``_resolve_bucket_allocation``'s exact return shape
-        (``full_dir, prefix, inf_path, byte_off, rec_num``), backed by
-        this cache instead of a fresh per-call resolution."""
-        group_start = group_start_bucket_id(bucket_id)
-        key = (int(stream_id), int(group_start))
-
-        async def _load(_key: tuple[int, int]) -> tuple[str, str, str, bytes]:
-            return await _read_full_allocation_table(store, dir_cache, pool_root, stream_id, bucket_id)
-
-        full_dir, prefix, inf_path, table = await self._tables.resolve(key, _load)
-        entry_index = bucket_id & (GROUP_BUCKET_NUM - 1)
-        entry_off = entry_index * _ALLOC_ENTRY_LENGTH
-        entry = table[entry_off : entry_off + _ALLOC_ENTRY_LENGTH]
-        if len(entry) < 4:
-            raise FormatError(f"{inf_path!r} truncated: no allocation entry for bucket {bucket_id}", ref=inf_path)
-        raw_pos = int.from_bytes(entry[0:4], "big")
-        byte_off = (raw_pos >> _OFFSET4K_SHIFT) * 4096
-        rec_num = raw_pos & _RECNUM_MASK
-        return full_dir, prefix, inf_path, byte_off, rec_num
+    group: _GroupTable
+    byte_off: int
+    rec_num: int
 
 
-async def _resolve_bucket_allocation(
-    store: ObjectStore,
-    dir_cache: DirCache,
-    pool_root: str,
-    stream_id: StreamId,
-    bucket_id: BucketId,
-    *,
-    cache: AllocationTableCache | None = None,
-) -> tuple[str, str, str, int, int]:
-    """The ``.inf`` header/allocation-table half of a fingerprint lookup —
-    shared by every chunk in ``bucket_id``, so a caller checking more than
-    one chunk in the same bucket (``fingerprints()`` below) resolves this
-    exactly once instead of once per chunk. Returns ``(full_dir, prefix,
-    inf_path, byte_off, rec_num)`` — everything ``fingerprint()``'s own
-    per-chunk half (fingerprint offset, segment file, final read) needs.
+def _group_contiguous_runs(chunk_indices: Iterable[int], byte_off: int) -> list[tuple[int, int]]:
+    """Splits ``chunk_indices`` into maximal ``(chunk_idx_start, length)``
+    runs of consecutive integers that also stay within one ``.fgp`` segment
+    file. Does no I/O.
 
-    ``cache`` (default ``None``: every call resolves fresh) delegates
-    instead to an ``AllocationTableCache``, which resolves a group's whole
-    allocation table once and reuses it for every bucket sharing that
-    group instead of re-reading it per bucket.
-
-    Raises ``FormatError`` if the ``.inf`` file is truncated, or whatever
-    ``parse_index_header`` raises if its header fails validation.
+    Unlike ``BucketReader``'s run merging, tolerates no gap: ``.fgp``
+    records are tightly packed.
     """
-    if cache is not None:
-        return await cache.resolve_entry(store, dir_cache, pool_root, stream_id, bucket_id)
-
-    full_dir, prefix = _group_dir_and_prefix(pool_root, stream_id, bucket_id)
-    inf_path = await resolve_seq_path(dir_cache, full_dir, f"{prefix}.inf")
-
-    header_bytes = await store.read(inf_path, 0, HEADER_LEN)
-    parse_index_header(header_bytes, expect_magic=MAGIC["bucket_meta"], spec=_SPEC)
-
-    entry_index = bucket_id & (GROUP_BUCKET_NUM - 1)
-    entry_off = _ALLOC_TABLE_OFFSET + entry_index * _ALLOC_ENTRY_LENGTH
-    entry = await store.read(inf_path, entry_off, _ALLOC_ENTRY_LENGTH)
-    if len(entry) < 4:
-        raise FormatError(f"{inf_path!r} truncated: no allocation entry for bucket {bucket_id}", ref=inf_path)
-    raw_pos = int.from_bytes(entry[0:4], "big")
-    byte_off = (raw_pos >> _OFFSET4K_SHIFT) * 4096
-    rec_num = raw_pos & _RECNUM_MASK
-    return full_dir, prefix, inf_path, byte_off, rec_num
-
-
-async def _read_fingerprint(
-    store: ObjectStore,
-    dir_cache: DirCache,
-    *,
-    full_dir: str,
-    prefix: str,
-    inf_path: str,
-    byte_off: int,
-    rec_num: int,
-    bucket_id: BucketId,
-    chunk_idx: ChunkIdx,
-) -> bytes:
-    """The per-chunk half of a fingerprint lookup, given an already-resolved
-    bucket allocation (``_resolve_bucket_allocation``)."""
-    if chunk_idx >= rec_num:
-        raise DataCorruptError(
-            f"chunk_idx {chunk_idx} has no fingerprint recorded for bucket {bucket_id} (recNum={rec_num})",
-            ref=inf_path,
-            spec=_SPEC,
-        )
-
-    fp_offset = byte_off + chunk_idx * _FGP_RECORD_LENGTH
-    seg_idx = fp_offset // _FGP_SEGMENT_SIZE
-    sub_offset = fp_offset % _FGP_SEGMENT_SIZE
-    fgp_path = await resolve_seq_path(dir_cache, full_dir, f"{prefix}_{seg_idx}.fgp")
-    digest = await store.read(fgp_path, sub_offset, _FGP_RECORD_LENGTH)
-    if len(digest) != _FGP_RECORD_LENGTH:
-        raise FormatError(
-            f"{fgp_path!r} truncated: expected {_FGP_RECORD_LENGTH} bytes at offset {sub_offset}, got {len(digest)}",
-            ref=fgp_path,
-        )
-    return digest
-
-
-def _fgp_segment_for(byte_off: int, chunk_idx: ChunkIdx) -> int:
-    return (byte_off + chunk_idx * _FGP_RECORD_LENGTH) // _FGP_SEGMENT_SIZE
-
-
-def _group_contiguous_runs(chunk_indices: Iterable[ChunkIdx], byte_off: int) -> list[list[ChunkIdx]]:
-    """Splits ``chunk_indices`` into maximal runs of consecutive integers
-    that also stay within one ``.fgp`` segment file — the grouping
-    ``fingerprints()`` reads one run at a time instead of one chunk at a
-    time. Kept free of any I/O so it's trivial to reason about/test on
-    its own.
-
-    A deliberately different merge rule from
-    ``dedup.pool.BucketReader._fits_in_run``: that one tolerates a byte
-    gap up to ``_GAP_TOLERANCE`` since ``.buk`` data can be fragmented;
-    ``.fgp`` records are always tightly packed, so what matters here is
-    index adjacency plus never crossing a segment boundary.
-    """
-    ordered = sorted(set(chunk_indices))
-    runs: list[list[ChunkIdx]] = []
-    for idx in ordered:
-        if (
-            runs
-            and runs[-1][-1] == idx - 1
-            and _fgp_segment_for(byte_off, runs[-1][-1]) == _fgp_segment_for(byte_off, idx)
-        ):
-            runs[-1].append(idx)
-        else:
-            runs.append([idx])
+    runs: list[tuple[int, int]] = []
+    start = prev = segment_end = -1
+    for idx in sorted(set(chunk_indices)):
+        if idx == prev + 1 and idx < segment_end:
+            prev = idx
+            continue
+        if start >= 0:
+            runs.append((start, prev - start + 1))
+        start = prev = idx
+        # First index whose record lies in the next segment.
+        segment = (byte_off + idx * _FGP_RECORD_LENGTH) // _FGP_SEGMENT_SIZE
+        segment_end = -(-((segment + 1) * _FGP_SEGMENT_SIZE - byte_off) // _FGP_RECORD_LENGTH)
+    if start >= 0:
+        runs.append((start, prev - start + 1))
     return runs
 
 
-async def _read_fingerprint_run(
-    store: ObjectStore,
-    dir_cache: DirCache,
-    *,
-    full_dir: str,
-    prefix: str,
-    inf_path: str,
-    byte_off: int,
-    rec_num: int,
-    bucket_id: BucketId,
-    run: list[ChunkIdx],
-) -> dict[ChunkIdx, bytes]:
-    """One contiguous, same-segment run of ``chunk_idx``\\ s, satisfied by
-    a single ``store.read()`` spanning the whole run rather than one
-    32-byte read per chunk — the per-run batching ``fingerprints()``
-    needs to keep a bucket-wide sweep fast."""
-    last = run[-1]
-    if last >= rec_num:
-        raise DataCorruptError(
-            f"chunk_idx {last} has no fingerprint recorded for bucket {bucket_id} (recNum={rec_num})",
-            ref=inf_path,
-            spec=_SPEC,
-        )
+class FingerprintIndex:
+    """The stored SHA-256 fingerprints of one pool's chunks, looked up
+    through each group's ``.inf`` allocation table, cached per
+    ``(stream_id, group's starting bucket id)`` and LRU-bounded by
+    ``maxsize`` tables (8 KiB each)."""
 
-    fp_start = byte_off + run[0] * _FGP_RECORD_LENGTH
-    seg_idx = fp_start // _FGP_SEGMENT_SIZE
-    sub_offset = fp_start % _FGP_SEGMENT_SIZE
-    length = len(run) * _FGP_RECORD_LENGTH
-    fgp_path = await resolve_seq_path(dir_cache, full_dir, f"{prefix}_{seg_idx}.fgp")
-    blob = await store.read(fgp_path, sub_offset, length)
-    if len(blob) != length:
-        raise FormatError(
-            f"{fgp_path!r} truncated: expected {length} bytes at offset {sub_offset}, got {len(blob)}",
-            ref=fgp_path,
-        )
-    return {idx: blob[i * _FGP_RECORD_LENGTH : (i + 1) * _FGP_RECORD_LENGTH] for i, idx in enumerate(run)}
+    def __init__(
+        self,
+        store: ObjectStore,
+        dir_cache: DirCache,
+        pool_root: str,
+        *,
+        maxsize: int = DEFAULT_LIMITS.allocation_tables,
+    ) -> None:
+        self._store = store
+        self._dir_cache = dir_cache
+        self._pool_root = pool_root
+        self._tables: AsyncKeyedCache[tuple[int, int], _GroupTable] = AsyncKeyedCache(maxsize=maxsize)
 
+    def stats(self) -> CacheStats:
+        """Counters of the allocation-table cache."""
+        return self._tables.stats()
 
-async def fingerprint(
-    store: ObjectStore,
-    dir_cache: DirCache,
-    pool_root: str,
-    stream_id: StreamId,
-    bucket_id: BucketId,
-    chunk_idx: ChunkIdx,
-    *,
-    cache: AllocationTableCache | None = None,
-) -> bytes:
-    """Look up the stored 32-byte SHA-256 fingerprint for one chunk.
+    def clear(self) -> None:
+        """Drop every cached allocation table (see ``Pool.release_caches``)."""
+        self._tables.invalidate()
 
-    ``cache``, when given, shares one group's already-resolved allocation
-    table across every bucket in it instead of resolving fresh each call.
+    async def digests(self, stream_id: StreamId, bucket_id: BucketId, chunk_indices: Iterable[int]) -> dict[int, bytes]:
+        """The stored 32-byte digest of every ``chunk_idx`` in
+        ``chunk_indices`` of one bucket. Reads each maximal run of
+        consecutive indices within one ``.fgp`` segment with one
+        ``store.read()``; scattered indices cost one read each.
 
-    Raises ``DataCorruptError`` if ``chunk_idx`` is beyond the group's
-    recorded fingerprint count for this bucket, or if the ``.inf`` header
-    fails validation; ``FormatError`` if either file is truncated.
-    """
-    full_dir, prefix, inf_path, byte_off, rec_num = await _resolve_bucket_allocation(
-        store, dir_cache, pool_root, stream_id, bucket_id, cache=cache
-    )
-    return await _read_fingerprint(
-        store,
-        dir_cache,
-        full_dir=full_dir,
-        prefix=prefix,
-        inf_path=inf_path,
-        byte_off=byte_off,
-        rec_num=rec_num,
-        bucket_id=bucket_id,
-        chunk_idx=chunk_idx,
-    )
+        Raises:
+            NotFoundError: The group's ``.inf`` or ``.fgp`` file is missing.
+            DataCorruptError: A chunk index is beyond this bucket's recorded
+                fingerprint count, or the ``.inf`` header fails validation.
+            FormatError: The ``.inf`` or ``.fgp`` file is truncated.
+        """
+        allocation = await self._allocation(stream_id, bucket_id)
+        result: dict[int, bytes] = {}
+        for run in _group_contiguous_runs(chunk_indices, allocation.byte_off):
+            result.update(await self._read_run(allocation, bucket_id, run))
+        return result
 
+    async def _allocation(self, stream_id: StreamId, bucket_id: BucketId) -> _BucketAllocation:
+        group_start = group_start_bucket_id(bucket_id)
 
-async def fingerprints(
-    store: ObjectStore,
-    dir_cache: DirCache,
-    pool_root: str,
-    stream_id: StreamId,
-    bucket_id: BucketId,
-    chunk_indices: Iterable[ChunkIdx],
-    *,
-    cache: AllocationTableCache | None = None,
-) -> dict[ChunkIdx, bytes]:
-    """Batched ``fingerprint()`` for every ``chunk_idx`` in
-    ``chunk_indices``, all within the same ``(stream_id, bucket_id)`` —
-    resolves the shared ``.inf`` header/allocation-table entry once
-    regardless of chunk count.
+        async def _load(_key: tuple[int, int]) -> _GroupTable:
+            full_dir, prefix = _group_dir_and_prefix(self._pool_root, stream_id, bucket_id)
+            inf_path = await resolve_seq_path(self._dir_cache, full_dir, f"{prefix}.inf")
+            header_bytes = await self._store.read(inf_path, 0, HEADER_LEN)
+            parse_index_header(header_bytes, expect_magic=MAGIC["bucket_meta"], spec=_SPEC)
+            table = await self._store.read(inf_path, _ALLOC_TABLE_OFFSET, _ALLOC_TABLE_LENGTH)
+            return _GroupTable(full_dir, prefix, inf_path, table)
 
-    Digests are also batched: ``chunk_indices`` is grouped into maximal
-    runs of consecutive integers within one ``.fgp`` segment
-    (``_group_contiguous_runs``), each run costing one ``store.read()``
-    instead of one 32-byte read per chunk — the common case for a
-    bucket-wide sweep, where an unbatched read would turn one bucket's
-    worth of checking into tens of thousands of separate reads. Scattered
-    indices (no two adjacent) cost one read per index, same as unbatched.
-
-    ``cache``, when given, shares one group's already-resolved allocation
-    table across every bucket in it.
-
-    Raises the same exceptions ``fingerprint()`` does, for the same
-    reasons.
-    """
-    full_dir, prefix, inf_path, byte_off, rec_num = await _resolve_bucket_allocation(
-        store, dir_cache, pool_root, stream_id, bucket_id, cache=cache
-    )
-    result: dict[ChunkIdx, bytes] = {}
-    for run in _group_contiguous_runs(chunk_indices, byte_off):
-        result.update(
-            await _read_fingerprint_run(
-                store,
-                dir_cache,
-                full_dir=full_dir,
-                prefix=prefix,
-                inf_path=inf_path,
-                byte_off=byte_off,
-                rec_num=rec_num,
-                bucket_id=bucket_id,
-                run=run,
+        group = await self._tables.resolve((int(stream_id), int(group_start)), _load)
+        entry_off = (bucket_id & (GROUP_BUCKET_NUM - 1)) * _ALLOC_ENTRY_LENGTH
+        entry = group.table[entry_off : entry_off + _ALLOC_ENTRY_LENGTH]
+        if len(entry) < 4:
+            raise FormatError(
+                f"{group.inf_path!r} truncated: no allocation entry for bucket {bucket_id}", ref=group.inf_path
             )
-        )
-    return result
+        raw_pos = int.from_bytes(entry[0:4], "big")
+        return _BucketAllocation(group, (raw_pos >> _OFFSET4K_SHIFT) * _OFFSET4K_UNIT, raw_pos & _RECNUM_MASK)
+
+    async def _read_run(
+        self, allocation: _BucketAllocation, bucket_id: BucketId, run: tuple[int, int]
+    ) -> dict[int, bytes]:
+        """One contiguous, same-segment ``(chunk_idx_start, length)`` run,
+        read with a single ``store.read()``."""
+        group = allocation.group
+        run_start, run_length = run
+        last = run_start + run_length - 1
+        if last >= allocation.rec_num:
+            raise DataCorruptError(
+                f"chunk_idx {last} has no fingerprint recorded for bucket {bucket_id} (recNum={allocation.rec_num})",
+                ref=group.inf_path,
+                spec=_SPEC,
+            )
+        fp_start = allocation.byte_off + run_start * _FGP_RECORD_LENGTH
+        seg_idx = fp_start // _FGP_SEGMENT_SIZE
+        sub_offset = fp_start % _FGP_SEGMENT_SIZE
+        length = run_length * _FGP_RECORD_LENGTH
+        fgp_path = await resolve_seq_path(self._dir_cache, group.full_dir, f"{group.prefix}_{seg_idx}.fgp")
+        blob = await self._store.read(fgp_path, sub_offset, length)
+        if len(blob) != length:
+            raise FormatError(
+                f"{fgp_path!r} truncated: expected {length} bytes at offset {sub_offset}, got {len(blob)}",
+                ref=fgp_path,
+            )
+        return {
+            run_start + i: blob[offset : offset + _FGP_RECORD_LENGTH]
+            for i, offset in enumerate(range(0, length, _FGP_RECORD_LENGTH))
+        }

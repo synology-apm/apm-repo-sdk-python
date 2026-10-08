@@ -1,7 +1,6 @@
 """``NodeRef`` — a stable, round-trippable string address for any browsable
-node. CLI arguments, TUI breadcrumbs/bookmarks, and error messages all
-share this one addressing scheme instead of a pile of mutually-exclusive
-flags.
+node, shared by CLI arguments, TUI breadcrumbs/bookmarks and error
+messages.
 
 Three segment shapes share the same ``<repo-path>#<seg>/<seg>/...``
 structure — which shape a ref is is entirely a property of its
@@ -25,11 +24,8 @@ characters — each is percent-encoded before segments join with ``/``,
 decoded back on split, so round-tripping through ``str(ref)`` /
 ``NodeRef.parse`` is always safe. ``repo_path`` itself is never encoded
 (split off at the *first* ``#``), so a literal ``#`` inside it can't
-round-trip — accepted, since real filesystem paths essentially never
-contain one. A lone empty-string segment (``NodeRef(path, ("",))``) also
-isn't representable, since it encodes identically to no segments at all
-— no real display name or path component is ever the empty string, so
-this never arises.
+round-trip. A lone empty-string segment (``NodeRef(path, ("",))``) isn't
+representable either: it encodes identically to no segments at all.
 """
 
 from __future__ import annotations
@@ -39,7 +35,7 @@ import enum
 import hashlib
 from collections import Counter
 from collections.abc import Sequence
-from typing import TYPE_CHECKING, Protocol, TypeVar
+from typing import TYPE_CHECKING, Protocol, override
 from urllib.parse import unquote
 
 from ..identifiers import CatalogId, VersionUid, WorkloadId, resolve_catalog_id
@@ -50,13 +46,10 @@ if TYPE_CHECKING:
     from ..dedup.repository import DedupRepo
 
 _RESERVED = frozenset("#/%")
-_T = TypeVar("_T")
 
 
 class RefKind(enum.Enum):
-    """Which of the three segment shapes a ``NodeRef`` is: canonical
-    (``cat:``/``wl:``/``ver:`` prefixed), raw (``file_map`` fallback axis,
-    diagnostic-mode only), or human (display names, everything else)."""
+    """Which of the module docstring's three segment shapes a ``NodeRef`` is."""
 
     CANONICAL = "canonical"
     RAW = "raw"
@@ -78,7 +71,7 @@ def _decode_segment(segment: str) -> str:
     return unquote(segment, errors="strict")
 
 
-@dataclasses.dataclass(frozen=True)
+@dataclasses.dataclass(frozen=True, slots=True)
 class NodeRef:
     """``repo_path`` is a store-relative or filesystem path to the
     repository root (unencoded — it is a path, not ref content);
@@ -88,6 +81,7 @@ class NodeRef:
     repo_path: str
     segments: tuple[str, ...] = ()
 
+    @override
     def __str__(self) -> str:
         encoded = "/".join(_encode_segment(s) for s in self.segments)
         return f"{self.repo_path}#{encoded}"
@@ -97,7 +91,8 @@ class NodeRef:
         """Inverse of ``__str__``.
 
         Raises:
-            ValueError: ``text`` has no ``#`` at all (not a ref).
+            ValueError: ``text`` has no ``#`` at all (not a ref), or a
+                segment's percent-encoding is not valid UTF-8.
         """
         if "#" not in text:
             raise ValueError(f"not a NodeRef (missing '#'): {text!r}")
@@ -105,8 +100,18 @@ class NodeRef:
         segments = tuple(_decode_segment(part) for part in fragment.split("/")) if fragment else ()
         return cls(repo_path, segments)
 
+    @classmethod
+    def coerce(cls, ref: str | NodeRef) -> NodeRef:
+        """``ref`` itself, or ``parse(ref)`` for its string form.
+
+        Raises:
+            ValueError: ``ref`` is a string that is not a ref.
+        """
+        return ref if isinstance(ref, NodeRef) else cls.parse(ref)
+
     @property
     def kind(self) -> RefKind:
+        """Which addressing form this ref uses, from its first segment."""
         if not self.segments:
             return RefKind.HUMAN
         first = self.segments[0]
@@ -166,9 +171,8 @@ class NodeRef:
 
     @classmethod
     def raw(cls, repo_path: str, file_map_path: str) -> NodeRef:
-        # split into its own path components rather than one opaque
-        # segment, so the rendered ref reads as a normal-looking path
-        # ("raw/VM-uid/dir/disk.img") instead of one percent-escaped blob.
+        # One segment per path component, so the ref renders as a readable
+        # path ("raw/VM-uid/dir/disk.img").
         return cls(repo_path, ("raw", *file_map_path.split("/")))
 
     @classmethod
@@ -186,13 +190,10 @@ class NodeRef:
 def canonical_ref_for(repo: DedupRepo, version: Version, extra: Sequence[str] = ()) -> NodeRef:
     """``NodeRef.canonical`` for ``version``, within ``repo``.
 
-    ``catalog_id`` (``identifiers.resolve_catalog_id``) is
-    ``repo.layout.repo_id`` when set (object storage's own repo-id,
-    unique per bucket), falling back to ``version.connection_config_id``
-    otherwise — correct for a vault (whose ``connection_config_id`` is
-    already unique within it) and for the one object-storage edge case
-    with no derivable repo-id, since that case only arises when this
-    ``DedupRepo`` is the sole catalog reachable from here."""
+    ``catalog_id`` is ``repo.layout.repo_id`` when set (unique per bucket),
+    else ``version.connection_config_id`` — unique within a vault, and an
+    object-storage repo with no derivable repo-id is the only catalog
+    reachable from its root."""
     catalog_id = resolve_catalog_id(repo.layout.repo_id, version.connection_config_id)
     return NodeRef.canonical(
         repo.layout.repo_root,
@@ -204,10 +205,8 @@ def canonical_ref_for(repo: DedupRepo, version: Version, extra: Sequence[str] = 
 
 
 class _HasCatalogIdentity(Protocol):
-    """Structural stand-in for ``api.Catalog`` — this module can't import
-    it directly (``api/`` sits *above* ``units/`` in this project's own
-    layering; see ``ARCHITECTURE.md``), so ``catalog_pairs`` is typed
-    against just the two attributes it actually reads instead."""
+    """Structural stand-in for ``api.Catalog``, which sits in a layer above
+    this module."""
 
     @property
     def display_name(self) -> str: ...
@@ -217,8 +216,7 @@ class _HasCatalogIdentity(Protocol):
 
 def catalog_pairs(catalogs: Sequence[_HasCatalogIdentity]) -> list[tuple[str, str]]:
     """``(display_name, catalog_id)`` pairs, in ``catalogs``' own order —
-    feeds ``disambiguate()``/``match_display_name()``, shared by
-    ``Repository.walk_human_ref`` and the CLI's ``ls``/``tree``."""
+    feeds ``disambiguate()``/``match_display_name()``."""
     return [(c.display_name, str(c.catalog_id)) for c in catalogs]
 
 
@@ -273,19 +271,15 @@ def disambiguate(names_and_ids: Sequence[tuple[str, str]], *, hints: Sequence[st
 
 
 def disambiguate_catalogs(catalogs: Sequence[_HasCatalogIdentity]) -> list[str]:
-    """Disambiguated display names for ``catalogs``, in the same order.
-    Zipping the result back against ``catalogs`` (or any other parallel
-    sequence) is left to the caller."""
+    """Disambiguated display names for ``catalogs``, in the same order."""
     return disambiguate(catalog_pairs(catalogs))
 
 
 def disambiguate_workloads(workloads: Sequence[Workload], *, use_type_hint: bool = True) -> list[str]:
     """Same idea as ``disambiguate_catalogs``, for ``Workload``, folding
     in ``workload_pairs()``'s ``type_hint`` disambiguation hint by
-    default. ``use_type_hint=False`` skips it — for a caller whose
-    ``workloads`` are already grouped by ``type_hint`` (the browser's
-    per-sub_type leaf list), where showing it again would just repeat
-    what the grouping already conveys."""
+    default. ``use_type_hint=False`` skips it, for ``workloads`` already
+    grouped by ``type_hint``."""
     pairs, hints = workload_pairs(workloads)
     return disambiguate(pairs, hints=hints if use_type_hint else None)
 
@@ -295,17 +289,17 @@ def disambiguate_versions(versions: Sequence[Version]) -> list[str]:
     return disambiguate(version_pairs(versions))
 
 
-def match_display_name(
+def match_display_name[T](
     target: str,
     pairs: Sequence[tuple[str, str]],
-    objects: Sequence[_T],
+    objects: Sequence[T],
     *,
     hints: Sequence[str | None] | None = None,
-) -> _T | None:
+) -> T | None:
     """Match ``target`` against the *displayed* form of ``pairs``
     (``(display_name, stable_id)``) after running the collision suffix
-    through ``disambiguate`` — the same transform the CLI/TUI apply, so a
-    name copied straight out of a breadcrumb resolves back exactly.
+    through ``disambiguate`` — the same transform ``ls``/``tree`` apply,
+    so a name copied straight out of their output resolves back exactly.
 
     ``hints`` must match whatever the display side passed to its own
     ``disambiguate`` call for these same ``pairs``."""

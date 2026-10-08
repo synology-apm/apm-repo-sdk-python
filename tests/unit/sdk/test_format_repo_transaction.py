@@ -1,9 +1,6 @@
-"""Unit tests for ``synology_apm_repo.sdk.format.repo_transaction`` —
-synthetic bytes only (see
-``tests/integration/sdk/test_storage_generations.py`` for the
-cross-check against real ``repo_transaction.<N>`` files, where the
-filename's own ``<N>`` differs from the embedded ``transaction_id`` —
-exactly the trap this module exists to close off)."""
+"""Unit tests for ``synology_apm_repo.sdk.format.repo_transaction``. A real
+``repo_transaction.<N>``'s filename ``<N>`` can differ from its embedded
+``transaction_id`` (``tests/integration/sdk/test_storage_generations.py``)."""
 
 from __future__ import annotations
 
@@ -16,7 +13,7 @@ from synology_apm_repo.sdk.errors import DataCorruptError, FormatError
 from synology_apm_repo.sdk.format.repo_transaction import MAGIC, parse_repo_transaction
 
 
-def _build(*, major: int = 1, minor: int = 0, payload_obj: dict[str, object] | None = None) -> bytes:
+def _build(*, major: int = 1, minor: int = 0, payload_obj: object = None) -> bytes:
     payload_obj = (
         payload_obj
         if payload_obj is not None
@@ -52,39 +49,50 @@ def test_parse_round_trip(transaction_id: int) -> None:
 def test_bad_magic_raises_data_corrupt() -> None:
     data = bytearray(_build())
     data[0:4] = b"XXXX"
-    with pytest.raises(DataCorruptError):
+    with pytest.raises(DataCorruptError, match="bad magic"):
         parse_repo_transaction(bytes(data))
 
 
-def test_bad_header_crc_raises_data_corrupt() -> None:
+@pytest.mark.parametrize("offset", [pytest.param(59, id="bad_header_crc"), pytest.param(70, id="bad_payload_crc")])
+def test_a_bad_crc_raises_data_corrupt(offset: int) -> None:
     data = bytearray(_build())
-    data[59] ^= 0xFF
-    with pytest.raises(DataCorruptError):
-        parse_repo_transaction(bytes(data))
-
-
-def test_bad_payload_crc_raises_data_corrupt() -> None:
-    data = bytearray(_build())
-    data[70] ^= 0xFF
-    with pytest.raises(DataCorruptError):
+    data[offset] ^= 0xFF
+    with pytest.raises(DataCorruptError, match="CRC mismatch"):
         parse_repo_transaction(bytes(data))
 
 
 def test_truncated_payload_raises_format_error() -> None:
     data = _build()
-    with pytest.raises(FormatError):
+    with pytest.raises(FormatError, match="repo_transaction payload truncated"):
         parse_repo_transaction(data[:-5])
 
 
 def test_too_short_raises_format_error() -> None:
-    with pytest.raises(FormatError):
+    with pytest.raises(FormatError, match="header too short"):
         parse_repo_transaction(b"short")
 
 
 def test_missing_transaction_id_raises_data_corrupt() -> None:
     data = _build(payload_obj={"session_id": 1})
-    with pytest.raises(DataCorruptError):
+    with pytest.raises(DataCorruptError, match="repo_transaction payload has no integer transaction_id"):
         parse_repo_transaction(data)
 
 
-__all__: list[str] = []
+def test_a_non_numeric_transaction_id_raises_data_corrupt() -> None:
+    with pytest.raises(DataCorruptError, match="no integer transaction_id"):
+        parse_repo_transaction(_build(payload_obj={"transaction_id": "abc"}))
+
+
+def test_a_decimal_string_past_the_int_digit_limit_raises_data_corrupt() -> None:
+    with pytest.raises(DataCorruptError, match="no integer transaction_id"):
+        parse_repo_transaction(_build(payload_obj={"transaction_id": "1" * 5000}))
+
+
+def test_decimal_string_ids_parse_as_integers() -> None:
+    txn = parse_repo_transaction(_build(payload_obj={"transaction_id": "100", "session_id": "6", "compact_id": 0}))
+    assert (txn.transaction_id, txn.session_id, txn.compact_id) == (100, 6, 0)
+
+
+def test_a_payload_that_is_not_a_json_object_raises_data_corrupt() -> None:
+    with pytest.raises(DataCorruptError, match="expected an object"):
+        parse_repo_transaction(_build(payload_obj="100"))

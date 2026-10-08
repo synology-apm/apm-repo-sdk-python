@@ -1,8 +1,5 @@
-"""``device`` domain: VM/PC/PS workloads. One code path handles PC/PS's
-multi-fragment ``VirtualDiskContentSource`` the same as VM's single
-composition -- by design, per ``ARCHITECTURE.md``'s Unit Layer section,
-nothing above ``units/device.py`` needs a PC/PS-specific branch, so this
-phase doesn't add one either.
+"""``device`` domain: VM/PC/PS workloads, through one code path (the Unit
+Layer hides PC/PS's multi-fragment disks from callers).
 """
 
 from __future__ import annotations
@@ -28,10 +25,9 @@ from ._shared import bounded_read_and_export
 _DEVICE_TYPES = (TargetType.VM, TargetType.PC, TargetType.PS)
 _LEAF_KINDS = frozenset({UnitKind.DISK_IMAGE, UnitKind.DISK_FILE, UnitKind.DISK_FILESYSTEM})
 
-#: A device leaf with no readable chunk bytes is a documented, sample-
-#: specific data gap (ps-sample-2's PC/PS fragments are metadata-only --
-#: see its own comment in your smoke_samples.toml), not a real bug --
-#: degraded, not failed.
+#: A device leaf whose chunk bytes the sample doesn't hold (a metadata-only
+#: PC/PS fragment, a chunk compacted away) is a gap in that sample's data,
+#: not a bug: degraded, not failed.
 _DEGRADE_ON = (NotFoundError, DataCorruptError, ChunkCompactedError)
 
 
@@ -42,9 +38,6 @@ async def run_for_repo(ctx: SmokeContext, ri: RepoInfo) -> None:
         entries = [(r, c, w, v) for r, c, w, v in workloads if r is ri and w.workload_type == target_type]
         step_prefix = f"device.{ri.sample_name}.{target_type}"
         if not entries:
-            # Purely per-repo judgment: this sample alone lacking a
-            # workload type is reported here, not deferred to a
-            # once-per-run aggregate.
             ctx.skip("device", f"{step_prefix}.workload_present", f"no {target_type} workload in {ri.sample_name}")
             continue
         if not ri.readable:
@@ -69,10 +62,7 @@ async def run_for_repo(ctx: SmokeContext, ri: RepoInfo) -> None:
             continue
         _ri, _workload, _version, picked_provider, picked_leaf = picked
 
-        # The winning candidate is this call's own to close once done --
-        # pick_workload_with_retry only closes the candidates it rejects
-        # immediately, leaving the winner open for whichever caller
-        # actually uses it to close in turn.
+        # pick_workload_with_retry leaves the winner's provider open for us.
         try:
 
             async def _get_provider(provider: UnitProvider = picked_provider) -> UnitProvider:
@@ -88,7 +78,7 @@ async def run_for_repo(ctx: SmokeContext, ri: RepoInfo) -> None:
             unit = await ctx.call("device", f"{step_prefix}.unit", _get_unit, degrade_on=_DEGRADE_ON)
             if unit is None:
                 continue
-            content = unit.open()
+            content = unit.content
             await bounded_read_and_export(ctx, "device", step_prefix, content, degrade_on=_DEGRADE_ON)
         finally:
             await close_if_closable(picked_provider)

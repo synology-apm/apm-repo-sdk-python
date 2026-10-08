@@ -1,12 +1,8 @@
 """``BrowseCmd``: every effect ``update()`` can ask
-``runtime/browse_effects.py`` to perform -- data, never a callable, so
-``assert cmds == (LoadWorkloads(...),)`` is a one-line test with no
-Pilot involved.
+``runtime/browse_effects.py`` to perform.
 
-Pushing a screen is deliberately not a ``Cmd`` -- a synchronous navigation
-with no effect on this model. ``PromptForKey`` is the exception: an
-effect, not a screen method, must dispatch ``KeyVerified`` once
-``KeyDialog`` resolves."""
+Pushing a screen is not a ``Cmd``, except ``PromptForKey``, whose effect
+dispatches ``KeyVerified`` once ``KeyDialog`` resolves."""
 
 from __future__ import annotations
 
@@ -14,59 +10,60 @@ import dataclasses
 
 from synology_apm_repo.browser.core.keys import Epoch, RepoHandle, RequestId
 from synology_apm_repo.browser.core.notify import Notify as Notify
-from synology_apm_repo.sdk.api import Catalog, Workload
-from synology_apm_repo.sdk.identifiers import CatalogId
+from synology_apm_repo.sdk import Catalog, CatalogId, Workload
 
 
-@dataclasses.dataclass(frozen=True)
+@dataclasses.dataclass(frozen=True, slots=True)
 class CloseRepos:
-    """Releases every repository discarded by a rescan/unmount -- plural,
-    since one scan can discover more than one repository."""
+    """Releases every repository a rescan or unmount discarded."""
 
     repos: tuple[RepoHandle, ...]
 
 
-@dataclasses.dataclass(frozen=True)
+@dataclasses.dataclass(frozen=True, slots=True)
 class SetCurrentRepo:
     repo: RepoHandle
 
 
-@dataclasses.dataclass(frozen=True)
+@dataclasses.dataclass(frozen=True, slots=True)
 class LoadCatalogsFor:
     repo: RepoHandle
     epoch: Epoch
     request: RequestId
 
 
-@dataclasses.dataclass(frozen=True)
+@dataclasses.dataclass(frozen=True, slots=True)
 class LoadWorkloads:
-    """No ``epoch``/``request`` -- keyed by the selected catalog itself."""
+    """No ``epoch``/``request`` -- keyed by the selected catalog itself.
+    ``invalidate`` drops the repository's caches before fetching (a refresh)."""
 
     repo: RepoHandle
     catalog: Catalog
+    invalidate: bool = False
 
 
-@dataclasses.dataclass(frozen=True)
+@dataclasses.dataclass(frozen=True, slots=True)
 class PromptForKey:
     repo: RepoHandle
     catalog: Catalog
 
 
-@dataclasses.dataclass(frozen=True)
+@dataclasses.dataclass(frozen=True, slots=True)
 class ReloadCatalogsAfterKeyVerified:
     repo: RepoHandle
     catalog_id: CatalogId
 
 
-@dataclasses.dataclass(frozen=True)
+@dataclasses.dataclass(frozen=True, slots=True)
 class LoadVersions:
-    """``repo`` travels alongside ``catalog`` so the effect can compute
-    this fetch's ``WorkloadKey`` without reading ``model.selected_catalog``
-    live inside the worker."""
+    """``repo`` lets the effect build the result's ``WorkloadKey`` without
+    reading the live selection. ``invalidate`` drops the repository's caches
+    before fetching (a refresh)."""
 
     repo: RepoHandle
     catalog: Catalog
     workload: Workload
+    invalidate: bool = False
 
 
 BrowseCmd = (

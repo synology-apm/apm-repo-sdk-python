@@ -1,16 +1,8 @@
-"""Pure app-level state: the background-job registry every screen's own
-store subscribes to (currently only ``ExportScreen`` creates one, via
-``StartExport`` — see ``core/app/msg.py``), plus the small value types
-the status bar / ``WorklistScreen`` render from.
+"""App-level state: the background-job registry (export jobs, started by
+``ExportScreen``) and the value types screens render from.
 
-A ``Job`` holds no live Textual ``Worker`` (a frozen value can't), only
-its own ``group`` — the same worker-group name ``runtime/app_effects.py`` passes
-to ``run_worker(..., group=...)`` when it actually starts the job.
-Cancelling one is a ``CancelGroup`` command the effect interpreter turns
-into Textual's own ``workers.cancel_group(app, group)`` — group-based
-cancellation needs no live reference to the worker at all, only its
-name, which is exactly the kind of plain, comparable value a frozen
-model can hold.
+A ``Job`` holds its worker-group name, not a live ``Worker``: cancelling it
+is a ``CancelGroup`` command, which needs only the name.
 """
 
 from __future__ import annotations
@@ -22,19 +14,16 @@ from pathlib import Path
 from typing import Literal
 
 from synology_apm_repo.browser.core.keys import JobId
-from synology_apm_repo.sdk.units.base import RestorableUnit
+from synology_apm_repo.sdk import Catalog, Node, Repository, RestorableUnit, Version
 
-#: ``recent`` below is capped at this many entries — a long session can
-#: run many exports; nothing needs more than a handful of the most
-#: recent outcomes remembered (WorklistScreen never reads a finished
-#: job at all; a still-open ExportScreen only ever needs its own one).
+#: Cap on ``AppModel.recent``; only a still-open ``ExportScreen`` reads it,
+#: for its own job.
 _MAX_RECENT = 20
 
 
 class JobStatus(enum.StrEnum):
     """A background job's lifecycle: ``QUEUED`` -> ``RUNNING`` ->
-    ``CANCELLING``, never back. A ``StrEnum`` so status bar/worklist text
-    built from it reads as the plain "running"/"queued"/"cancelling" text."""
+    ``CANCELLING``, never back. Its value is the displayed status text."""
 
     RUNNING = "running"
     QUEUED = "queued"
@@ -48,11 +37,9 @@ class Job:
     request it'll run once promoted lives in ``AppModel.queued_requests``,
     keyed by the same ``id``.
 
-    ``size_text``/``rate_text``/``eta_text``/``elapsed_text`` (e.g.
-    ``"4.2 GiB"``/``"187 MiB/s"``/``"00:08"``/``"00:42"``) arrive
-    pre-formatted from whichever effect drives the job (rate/ETA tracking
-    is inherently stateful, which has no place in a frozen model). Each
-    stays ``""`` until the first progress tick arrives."""
+    ``size_text``/``rate_text``/``eta_text``/``elapsed_text`` arrive
+    pre-formatted from the effect driving the job, which owns the stateful
+    rate/ETA tracking; each is ``""`` until the first progress tick."""
 
     id: JobId
     label: str
@@ -64,6 +51,16 @@ class Job:
     rate_text: str = ""
     eta_text: str = ""
     elapsed_text: str = ""
+    #: A folder export's progress through its files ("file 3 of 12", or
+    #: "scanning...") and the file in flight; ``""`` for a single-item export.
+    #: ``done``/``total`` above are the bytes of that file.
+    position: str = ""
+    item: str = ""
+
+    @property
+    def file_text(self) -> str:
+        """The single line the export dialog shows."""
+        return " — ".join(part for part in (self.position, self.item) if part)
 
     @property
     def percent(self) -> int | None:
@@ -78,10 +75,8 @@ class Job:
 
 @dataclasses.dataclass(frozen=True, slots=True)
 class JobOutcome:
-    """A finished job's terminal result. Two texts: ``notify_message`` is
-    the plain app-wide toast string; ``status_text`` is the richer,
-    markup-styled text a screen renders into its own status line (e.g.
-    ``"[green]done[/green] — 4.2 GiB written, ..."``)."""
+    """A finished job's terminal result: ``notify_message`` is the plain
+    toast, ``status_text`` the markup a screen's status line shows."""
 
     notify_message: str
     notify_severity: Literal["information", "warning", "error"]
@@ -89,23 +84,40 @@ class JobOutcome:
 
 
 @dataclasses.dataclass(frozen=True, slots=True)
-class QueuedExport:
-    """The request a ``QUEUED`` export ``Job`` will actually run once
-    promoted to ``RUNNING`` — see ``update.py``'s ``_promote_next_queued``.
-    A ``Job`` itself carries none of this; it only exists once the export
-    is running, so a still-queued one has nothing to show."""
+class FolderExport:
+    """What to export when it is a folder: every item below ``node``.
 
-    unit: RestorableUnit
+    Carries what the export needs to open its *own* provider when it starts,
+    because the ``UnitScreen`` that offered it releases its provider once the
+    user navigates away, while an export may still be queued or running.
+    ``force_raw`` is the verbose mode that screen had the provider opened with."""
+
+    repo: Repository
+    catalog: Catalog
+    version: Version
+    force_raw: bool
+    node: Node
+    name: str
+
+
+ExportTarget = RestorableUnit | FolderExport
+"""One resolved item, or a whole folder."""
+
+
+@dataclasses.dataclass(frozen=True, slots=True)
+class QueuedExport:
+    """The request a ``QUEUED`` export ``Job`` runs once promoted to
+    ``RUNNING``."""
+
+    target: ExportTarget
     dst: Path
     sparse: bool
 
 
 @dataclasses.dataclass(frozen=True, slots=True)
 class FinishedJob:
-    """A job that has left ``AppModel.jobs`` — kept in ``AppModel.recent``
-    only so a still-open screen (``ExportScreen``) can read its own
-    job's terminal ``outcome`` after the fact; ``WorklistScreen`` never
-    reads this at all."""
+    """A job that has left ``AppModel.jobs``, kept in ``AppModel.recent``
+    so a still-open ``ExportScreen`` can read its ``outcome``."""
 
     id: JobId
     label: str
@@ -115,26 +127,24 @@ class FinishedJob:
 @dataclasses.dataclass(frozen=True, slots=True)
 class AppModel:
     jobs: Mapping[JobId, Job] = dataclasses.field(default_factory=dict)
-    #: Most-recently-finished last; see ``_MAX_RECENT`` above.
+    #: Most-recently-finished last, capped at ``_MAX_RECENT``.
     recent: tuple[FinishedJob, ...] = ()
     next_job_id: JobId = JobId(1)
-    #: The request payload for each currently-``QUEUED`` job in ``jobs``,
-    #: keyed by the same ``JobId`` — a ``QUEUED`` ``Job`` carries only its
-    #: label and group, not the full export request, which lives here
-    #: until it's promoted to ``RUNNING``.
+    #: The request of each ``QUEUED`` job in ``jobs``, until it is promoted.
     queued_requests: Mapping[JobId, QueuedExport] = dataclasses.field(default_factory=dict)
-    #: Set for the whole duration of a screen-local verify FULL check
-    #: (``DiagnosticsScreen`` cancels it on unmount instead of ever making
-    #: it a ``Job``, since it's a blocking start/wait/see-result flow, not
-    #: something to keep running in the background) so ``export_occupied``'s
-    #: counterpart on the export side has something to check against
-    #: without verify joining ``jobs`` itself.
+    #: Set while ``DiagnosticsScreen`` runs a verify FULL check, which is
+    #: screen-local rather than a ``Job``; a new export queues behind it.
     verify_full_running: bool = False
 
     @property
     def export_occupied(self) -> bool:
         """Whether some export already holds the one job slot."""
-        return any(job.status in (JobStatus.RUNNING, JobStatus.CANCELLING) for job in self.jobs.values())
+        return jobs_occupy_slot(self.jobs)
+
+
+def jobs_occupy_slot(jobs: Mapping[JobId, Job]) -> bool:
+    """Whether any of ``jobs`` is running (or still winding down), i.e. holds the export slot."""
+    return any(job.status in (JobStatus.RUNNING, JobStatus.CANCELLING) for job in jobs.values())
 
 
 def _cap_recent(recent: tuple[FinishedJob, ...]) -> tuple[FinishedJob, ...]:

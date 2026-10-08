@@ -1,7 +1,5 @@
 """Unit tests for ``synology_apm_repo.cli.errors``'s ``friendly_message()``
-and ``fail_from_apm_error()`` — synthetic ``ApmRepoError``/
-``KeyRequiredError``/``KeyMismatchError`` instances, no real repository
-needed."""
+and ``fail_from_apm_error()``."""
 
 from __future__ import annotations
 
@@ -17,7 +15,7 @@ from synology_apm_repo.sdk.errors import ApmRepoError, KeyMismatchError, KeyRequ
 
 
 def test_key_required_with_no_ref_is_rephrased_for_the_cli() -> None:
-    # The exact shape Repository._require_key_verified() raises: no ref,
+    # The exact shape KeyManager.require_verified() raises: no ref,
     # since it's a whole-repository gate with no single file to point at.
     exc = KeyRequiredError("this repository is encrypted; call set_key() before browsing workloads/versions")
     message = friendly_message(exc)
@@ -39,10 +37,7 @@ def test_key_mismatch_with_no_ref_is_rephrased_for_the_cli() -> None:
 
 
 def test_key_required_with_a_ref_falls_through_to_the_general_case() -> None:
-    # pool.py/sqlite_source.py raise the same two types for one specific
-    # file (a ref set) -- not the whole-repository gate's special rephrasing,
-    # so this is just an ordinary ApmRepoError as far as friendly_message
-    # is concerned: safe_message by default, ref restored under verbose.
+    # Only the ref-less whole-repository gate gets the CLI rephrasing.
     exc = KeyRequiredError(
         "data is aHlT-enveloped but no vault_key was given", ref="@ActiveProtectVault/@data/Pool/45/0"
     )
@@ -57,10 +52,8 @@ def test_key_mismatch_with_a_ref_falls_through_to_the_general_case() -> None:
 
 
 def test_an_unrelated_apm_repo_error_strips_ref_by_default_and_restores_it_verbose() -> None:
-    # The message text itself may still name the same path in plain
-    # English (this raise site does, redundantly, with its own ref=) --
-    # safe_message only strips the structured "[ref=...]" tag appended
-    # by ApmRepoError.__str__, not every occurrence of the value.
+    # safe_message strips only the structured "[ref=...]" tag
+    # ApmRepoError.__str__ appends, not the value wherever it appears.
     exc = NotFoundError("something went wrong reading it", ref="/tmp/x")
     assert friendly_message(exc) == exc.safe_message
     assert "[ref=" not in friendly_message(exc)
@@ -74,7 +67,7 @@ def test_returned_message_is_a_plain_str_not_the_exception_itself() -> None:
     assert isinstance(friendly_message(exc), str)
 
 
-# -- fail_from_apm_error() -- the shared tail every open/store skeleton uses --
+# -- fail_from_apm_error() --
 
 
 def test_fail_from_apm_error_raises_typer_exit_code_1() -> None:
@@ -109,9 +102,8 @@ def test_fail_from_apm_error_applies_its_own_prefix() -> None:
 
 
 def test_fail_from_apm_error_clears_a_live_progress_line_first() -> None:
-    """The clear must land *before* ``fail()``'s own error print — a
-    ``finally``-only clear would run after that print, too late to stop
-    the error message from landing on top of a dangling progress line."""
+    """The clear lands before the error print, so the message doesn't
+    share a line with a dangling progress line."""
     exc = ApmRepoError("boom")
     buf = io.StringIO()
     with redirect_stderr(buf), pytest.raises(typer.Exit):
@@ -119,6 +111,3 @@ def test_fail_from_apm_error_clears_a_live_progress_line_first() -> None:
     output = buf.getvalue()
     assert "\x1b[2K" in output
     assert output.index("\x1b[2K") < output.index("error:")
-
-
-__all__: list[str] = []
