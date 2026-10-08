@@ -1,14 +1,13 @@
-"""Unit tests for ``browser.core.browse.update`` -- every branch, no
-Textual/App/Pilot involved at all. Each test asserts on the returned
-``(model, cmds)`` pair directly -- ``Cmd`` is data, never a callable, so
-``assert cmds == (LoadWorkloads(...),)`` is a one-line test with no
-effects layer involved. Same convention as
-``test_browser_core_unit_update.py``."""
+"""Unit tests for ``browser.core.browse.update``; each test asserts on the
+returned ``(model, cmds)`` pair, with no Textual or effects layer."""
 
 from __future__ import annotations
 
 from typing import cast
 
+import pytest
+
+from support.model_factories import make_version, make_workload
 from synology_apm_repo.browser.core.browse.cmd import (
     CloseRepos,
     LoadCatalogsFor,
@@ -20,6 +19,7 @@ from synology_apm_repo.browser.core.browse.cmd import (
 )
 from synology_apm_repo.browser.core.browse.model import (
     BrowseModel,
+    FilterTree,
     RepoState,
     SelectedCatalog,
     TreeFilterState,
@@ -44,6 +44,7 @@ from synology_apm_repo.browser.core.browse.msg import (
     TreeFilterClosed,
     TreeFilterOpened,
     TreeFilterTextChanged,
+    VerboseSet,
     VersionFilterClosed,
     VersionFilterOpened,
     VersionFilterTextChanged,
@@ -53,20 +54,20 @@ from synology_apm_repo.browser.core.browse.msg import (
     WorkloadsLoaded,
     WorkloadsLoadFailed,
 )
+from synology_apm_repo.browser.core.browse.select import version_rows, workload_tree_spec
 from synology_apm_repo.browser.core.browse.update import update
 from synology_apm_repo.browser.core.keys import CatalogKey, Epoch, RepoHandle, RequestId, WorkloadKey
-from synology_apm_repo.browser.core.remote_data import FailureInfo, FailureKind, Loading, NotAsked, Success
-from synology_apm_repo.sdk.api import Catalog, KeyStatus, Version, Workload
+from synology_apm_repo.browser.core.remote_data import (
+    FailureInfo,
+    FailureKind,
+    Loading,
+    NotAsked,
+    RemoteData,
+    Success,
+)
+from synology_apm_repo.sdk.api import Catalog, KeyStatus
 from synology_apm_repo.sdk.identifiers import (
     CatalogId,
-    ConnectionConfigId,
-    SaasVersionId,
-    SnapshotUuid,
-    StreamUuid,
-    TargetId,
-    VersionId,
-    VersionUid,
-    WorkloadId,
 )
 from synology_apm_repo.sdk.storage.layout import RepoKind, RepositoryLayout
 
@@ -76,11 +77,7 @@ def _layout(repo_root: str = "repo-1") -> RepositoryLayout:
 
 
 class _FakeCatalog:
-    """A ``Catalog``-shaped duck-type carrying only ``catalog_id``/
-    ``display_name`` -- everything ``update.py``'s own pure logic
-    touches on a ``Catalog`` it's handed; no real ``DedupRepo``/
-    ``Connection`` needed for a pure test (same convention as
-    ``test_browser_browse_screen_gaps.py``'s own ``_FakeCatalogWithId``)."""
+    """A ``Catalog`` duck-type; ``update()`` reads only ``catalog_id``."""
 
     def __init__(self, catalog_id: str, display_name: str = "catalog") -> None:
         self.catalog_id = CatalogId(catalog_id)
@@ -91,33 +88,10 @@ def _catalog(catalog_id: str = "cat-1") -> Catalog:
     return cast(Catalog, _FakeCatalog(catalog_id))
 
 
-def _workload(workload_id: int, display_name: str = "Workload") -> Workload:
-    return Workload(
-        workload_id=WorkloadId(workload_id),
-        workload_uid=f"wl-{workload_id}",  # type: ignore[arg-type]
-        workload_type="VM",
-        sub_type=None,
-        display_name=display_name,
-        subtitle=None,
-        spec={},
-    )
-
-
-def _version() -> Version:
-    return Version(
-        version_id=VersionId(1),
-        version_uid=VersionUid("vuid-1"),
-        workload_id=WorkloadId(1),
-        connection_config_id=ConnectionConfigId(1),
-        target_type="VM",
-        target_id=TargetId("target"),
-        saas_stream_uuid=StreamUuid(""),
-        saas_snapshot_uuid=SnapshotUuid(""),
-        saas_version_id=SaasVersionId(0),
-        deleted=False,
-        display_name="2026-01-01 00:00",
-        meta=None,
-    )
+def _live(handle: int = 1) -> dict[RepoHandle, RepoState]:
+    """``BrowseModel.repos`` holding just ``handle``: every repo-scoped result
+    for a handle outside ``repos`` is dropped as stale."""
+    return {RepoHandle(handle): RepoState(layout=_layout(), key_status=KeyStatus.NOT_ENCRYPTED)}
 
 
 def test_rescan_started_with_nothing_open_resets_with_no_close_command() -> None:
@@ -137,7 +111,7 @@ def test_rescan_started_closes_every_previously_discovered_repo() -> None:
             handle_b: RepoState(layout=_layout(), key_status=KeyStatus.NOT_ENCRYPTED),
         },
         selected_catalog=SelectedCatalog(repo=handle_a, catalog=_catalog()),
-        selected_workload=_workload(1),
+        selected_workload=make_workload(workload_id=1),
     )
     new_model, cmds = update(model, RescanStarted(scan_path="/new-scan"))
 
@@ -155,9 +129,6 @@ def test_rescan_started_bumps_epoch_so_a_stale_in_flight_fetch_is_dropped() -> N
     new_model, _cmds = update(model, RescanStarted(scan_path=""))
 
     assert new_model.epoch == Epoch(4)
-    # The stale fetch's own result, arriving after this rescan, is
-    # checked against the model's *current* epoch by CatalogsLoaded --
-    # proven directly below, not just implied by the bump here.
     stale_result, _ = update(new_model, CatalogsLoaded(epoch=Epoch(3), request=RequestId(5), repo=handle, catalogs=()))
     assert stale_result is new_model
 
@@ -179,9 +150,6 @@ def test_repo_added_second_repo_does_not_re_adopt_current_repo() -> None:
 
     assert set(new_model.repos) == {first, second}
     assert cmds == ()
-    # The first repo's own already-stored state is untouched by adding
-    # a second one -- proves RepoAdded's dict-merge doesn't disturb an
-    # unrelated key's own identity.
     assert new_model.repos[first] is model.repos[first]
 
 
@@ -205,12 +173,26 @@ def test_catalogs_requested_marks_loading_and_mints_a_load_catalogs_command() ->
 
 
 def test_catalogs_requested_is_a_no_op_for_a_repo_no_longer_in_the_model() -> None:
-    """The dispatching ``Tree.NodeExpanded`` event can be stale -- queued
-    before a ``RescanStarted`` wiped ``model.repos`` out from under it.
-    Must no-op like every other repo-keyed case, not raise ``KeyError``
-    indexing a handle that's no longer there."""
+    """A stale ``Tree.NodeExpanded`` queued before a ``RescanStarted``
+    cleared ``model.repos`` is a no-op, not a ``KeyError``."""
     handle = RepoHandle(1)
     model = BrowseModel()
+    new_model, cmds = update(model, CatalogsRequested(repo=handle))
+
+    assert new_model is model
+    assert cmds == ()
+
+
+@pytest.mark.parametrize("catalogs", [Success(()), Loading()], ids=["loaded-empty", "loading"])
+def test_catalogs_requested_for_a_repo_already_loaded_or_loading_is_a_no_op(
+    catalogs: RemoteData[tuple[Catalog, ...]],
+) -> None:
+    """Re-expanding a repository node fetches nothing, even when its loaded
+    catalog list is empty and so has no child nodes."""
+    handle = RepoHandle(1)
+    model = BrowseModel(
+        repos={handle: RepoState(layout=_layout(), key_status=KeyStatus.NOT_ENCRYPTED, catalogs=catalogs)}
+    )
     new_model, cmds = update(model, CatalogsRequested(repo=handle))
 
     assert new_model is model
@@ -275,7 +257,7 @@ def test_catalogs_load_failed_dropped_when_superseded() -> None:
 def test_catalog_selected_on_a_cache_miss_marks_loading_and_dispatches_load_workloads() -> None:
     handle = RepoHandle(1)
     catalog = _catalog("cat-1")
-    model = BrowseModel()
+    model = BrowseModel(repos=_live())
     new_model, cmds = update(model, CatalogSelected(repo=handle, catalog=catalog))
 
     assert new_model.selected_catalog == SelectedCatalog(repo=handle, catalog=catalog)
@@ -288,8 +270,8 @@ def test_catalog_selected_on_a_cache_hit_serves_the_cached_workloads_with_no_fet
     handle = RepoHandle(1)
     catalog = _catalog("cat-1")
     key = catalog_key(handle, catalog)
-    workloads = (_workload(1),)
-    model = BrowseModel(catalog_workloads={key: Success(workloads)})
+    workloads = (make_workload(workload_id=1),)
+    model = BrowseModel(repos=_live(), catalog_workloads={key: Success(workloads)})
     new_model, cmds = update(model, CatalogSelected(repo=handle, catalog=catalog))
 
     assert new_model.selected_catalog == SelectedCatalog(repo=handle, catalog=catalog)
@@ -297,10 +279,22 @@ def test_catalog_selected_on_a_cache_hit_serves_the_cached_workloads_with_no_fet
     assert cmds == ()
 
 
+def test_catalog_selected_while_its_workloads_are_still_loading_selects_it_with_no_second_fetch() -> None:
+    handle = RepoHandle(1)
+    catalog = _catalog("cat-1")
+    key = catalog_key(handle, catalog)
+    model = BrowseModel(repos=_live(), catalog_workloads={key: Loading()})
+    new_model, cmds = update(model, CatalogSelected(repo=handle, catalog=catalog))
+
+    assert new_model.selected_catalog == SelectedCatalog(repo=handle, catalog=catalog)
+    assert new_model.catalog_workloads[key] == Loading()
+    assert cmds == ()
+
+
 def test_catalog_selected_resets_selected_workload_and_reload_failure() -> None:
     handle = RepoHandle(1)
     catalog = _catalog("cat-1")
-    model = BrowseModel(selected_workload=_workload(9), reload_failure="stale failure")
+    model = BrowseModel(repos=_live(), selected_workload=make_workload(workload_id=9), reload_failure="stale failure")
     new_model, _cmds = update(model, CatalogSelected(repo=handle, catalog=catalog))
 
     assert new_model.selected_workload is None
@@ -308,25 +302,22 @@ def test_catalog_selected_resets_selected_workload_and_reload_failure() -> None:
 
 
 def test_catalog_selected_a_prior_key_required_failure_is_never_a_cache_hit() -> None:
-    """A ``KEY_REQUIRED`` failure is cached as ``NotAsked`` (see
-    ``WorkloadsLoadFailed``'s own case below), never a ``Success`` --
-    reselecting must always retry (a key-required catalog can never
-    have a real cached workload list from before the key was
-    verified)."""
+    """A ``KEY_REQUIRED`` failure is cached as ``NotAsked``, so reselecting
+    the catalog always retries."""
     handle = RepoHandle(1)
     catalog = _catalog("cat-1")
     key = catalog_key(handle, catalog)
-    model = BrowseModel(catalog_workloads={key: NotAsked()})
+    model = BrowseModel(repos=_live(), catalog_workloads={key: NotAsked()})
     new_model, cmds = update(model, CatalogSelected(repo=handle, catalog=catalog))
 
     assert new_model.catalog_workloads[key] == Loading()
     assert cmds == (LoadWorkloads(repo=handle, catalog=catalog),)
 
 
-def test_workloads_loaded_writes_the_cache_unconditionally() -> None:
+def test_workloads_loaded_writes_the_cache_for_a_live_repo() -> None:
     key = CatalogKey(repo=RepoHandle(1), catalog_id=CatalogId("cat-1"))
-    workloads = (_workload(1), _workload(2))
-    model = BrowseModel()
+    workloads = (make_workload(workload_id=1), make_workload(workload_id=2))
+    model = BrowseModel(repos=_live())
     new_model, cmds = update(model, WorkloadsLoaded(catalog=key, workloads=workloads))
 
     assert new_model.catalog_workloads[key] == Success(workloads)
@@ -347,7 +338,7 @@ def test_workloads_load_failed_with_key_required_caches_not_asked_and_prompts() 
     handle = RepoHandle(1)
     catalog = _catalog("cat-1")
     key = catalog_key(handle, catalog)
-    model = BrowseModel()
+    model = BrowseModel(repos=_live())
     info = FailureInfo(message="key needed", kind=FailureKind.KEY_REQUIRED)
     new_model, cmds = update(model, WorkloadsLoadFailed(catalog=key, real_catalog=catalog, info=info))
 
@@ -359,7 +350,7 @@ def test_workloads_load_failed_with_a_plain_error_caches_the_failure_with_no_pro
     handle = RepoHandle(1)
     catalog = _catalog("cat-1")
     key = catalog_key(handle, catalog)
-    model = BrowseModel()
+    model = BrowseModel(repos=_live())
     info = FailureInfo(message="boom")
     new_model, cmds = update(model, WorkloadsLoadFailed(catalog=key, real_catalog=catalog, info=info))
 
@@ -401,7 +392,9 @@ def test_catalogs_refreshed_replaces_the_whole_tuple() -> None:
 def test_catalogs_refresh_failed_blanks_the_selection_and_sets_reload_failure() -> None:
     handle = RepoHandle(1)
     model = BrowseModel(
-        selected_catalog=SelectedCatalog(repo=handle, catalog=_catalog()), selected_workload=_workload(1)
+        repos=_live(),
+        selected_catalog=SelectedCatalog(repo=handle, catalog=_catalog()),
+        selected_workload=make_workload(workload_id=1),
     )
     new_model, cmds = update(model, CatalogsRefreshFailed(repo=handle, message="gone"))
 
@@ -411,10 +404,67 @@ def test_catalogs_refresh_failed_blanks_the_selection_and_sets_reload_failure() 
     assert cmds == ()
 
 
+def _rescanned_model() -> BrowseModel:
+    """A fresh scan's state, holding only ``RepoHandle(2)`` with a catalog
+    selected -- what a result for the pre-rescan ``RepoHandle(1)`` arrives into."""
+    live = RepoHandle(2)
+    return BrowseModel(
+        epoch=Epoch(1), repos=_live(2), selected_catalog=SelectedCatalog(repo=live, catalog=_catalog("new"))
+    )
+
+
+def test_catalogs_refresh_results_for_a_repo_a_rescan_discarded_leave_the_new_scan_untouched() -> None:
+    model = _rescanned_model()
+
+    for msg in (
+        CatalogsRefreshed(repo=RepoHandle(1), catalogs=(_catalog("old"),)),
+        CatalogsRefreshFailed(repo=RepoHandle(1), message="gone"),
+    ):
+        new_model, cmds = update(model, msg)
+        assert new_model is model
+        assert cmds == ()
+
+
+def test_catalog_selected_for_a_repo_a_rescan_discarded_is_dropped() -> None:
+    model = _rescanned_model()
+    new_model, cmds = update(model, CatalogSelected(repo=RepoHandle(1), catalog=_catalog("old")))
+
+    assert new_model is model
+    assert cmds == ()
+
+
+def test_workloads_results_for_a_repo_a_rescan_discarded_are_dropped_without_a_key_prompt() -> None:
+    model = _rescanned_model()
+    catalog = _catalog("old")
+    key = catalog_key(RepoHandle(1), catalog)
+    info = FailureInfo(message="key needed", kind=FailureKind.KEY_REQUIRED)
+
+    for msg in (
+        WorkloadsLoaded(catalog=key, workloads=(make_workload(workload_id=1),)),
+        WorkloadsLoadFailed(catalog=key, real_catalog=catalog, info=info),
+    ):
+        new_model, cmds = update(model, msg)
+        assert new_model is model
+        assert cmds == ()
+
+
+def test_versions_results_for_a_repo_a_rescan_discarded_are_dropped() -> None:
+    model = _rescanned_model()
+    key = WorkloadKey(catalog=CatalogKey(repo=RepoHandle(1), catalog_id=CatalogId("old")), workload_uid="wl-1")  # type: ignore[arg-type]
+
+    for msg in (
+        VersionsLoaded(workload=key, versions=(make_version(),)),
+        VersionsLoadFailed(workload=key, message="boom"),
+    ):
+        new_model, cmds = update(model, msg)
+        assert new_model is model
+        assert cmds == ()
+
+
 def test_workload_selected_on_a_cache_miss_marks_loading_and_dispatches_load_versions() -> None:
     handle = RepoHandle(1)
     catalog = _catalog("cat-1")
-    workload = _workload(1)
+    workload = make_workload(workload_id=1)
     model = BrowseModel(selected_catalog=SelectedCatalog(repo=handle, catalog=catalog))
     new_model, cmds = update(model, WorkloadSelected(workload=workload))
 
@@ -427,9 +477,9 @@ def test_workload_selected_on_a_cache_miss_marks_loading_and_dispatches_load_ver
 def test_workload_selected_on_a_cache_hit_serves_the_cached_versions_with_no_fetch() -> None:
     handle = RepoHandle(1)
     catalog = _catalog("cat-1")
-    workload = _workload(1)
+    workload = make_workload(workload_id=1)
     key = workload_key(catalog_key(handle, catalog), workload)
-    versions = (_version(),)
+    versions = (make_version(),)
     model = BrowseModel(
         selected_catalog=SelectedCatalog(repo=handle, catalog=catalog), workload_versions={key: Success(versions)}
     )
@@ -439,10 +489,25 @@ def test_workload_selected_on_a_cache_hit_serves_the_cached_versions_with_no_fet
     assert cmds == ()
 
 
-def test_versions_loaded_writes_the_cache_unconditionally() -> None:
+def test_workload_selected_while_its_versions_are_still_loading_dispatches_no_second_fetch() -> None:
+    handle = RepoHandle(1)
+    catalog = _catalog("cat-1")
+    workload = make_workload(workload_id=1)
+    key = workload_key(catalog_key(handle, catalog), workload)
+    model = BrowseModel(
+        selected_catalog=SelectedCatalog(repo=handle, catalog=catalog), workload_versions={key: Loading()}
+    )
+    new_model, cmds = update(model, WorkloadSelected(workload=workload))
+
+    assert new_model.selected_workload is workload
+    assert new_model.workload_versions[key] == Loading()
+    assert cmds == ()
+
+
+def test_versions_loaded_writes_the_cache_for_a_live_repo() -> None:
     key = WorkloadKey(catalog=CatalogKey(repo=RepoHandle(1), catalog_id=CatalogId("cat-1")), workload_uid="wl-1")  # type: ignore[arg-type]
-    versions = (_version(),)
-    model = BrowseModel()
+    versions = (make_version(),)
+    model = BrowseModel(repos=_live())
     new_model, cmds = update(model, VersionsLoaded(workload=key, versions=versions))
 
     assert new_model.workload_versions[key] == Success(versions)
@@ -451,7 +516,7 @@ def test_versions_loaded_writes_the_cache_unconditionally() -> None:
 
 def test_versions_load_failed_caches_a_failure_info() -> None:
     key = WorkloadKey(catalog=CatalogKey(repo=RepoHandle(1), catalog_id=CatalogId("cat-1")), workload_uid="wl-1")  # type: ignore[arg-type]
-    model = BrowseModel()
+    model = BrowseModel(repos=_live())
     new_model, cmds = update(model, VersionsLoadFailed(workload=key, message="versions boom"))
 
     assert new_model.workload_versions[key] == FailureInfo(message="versions boom")
@@ -462,36 +527,32 @@ def test_versions_load_failed_is_never_a_skip_refetch_cache_hit() -> None:
     key = WorkloadKey(catalog=CatalogKey(repo=RepoHandle(1), catalog_id=CatalogId("cat-1")), workload_uid="wl-1")  # type: ignore[arg-type]
     handle = RepoHandle(1)
     catalog = _catalog("cat-1")
-    workload = _workload(1, display_name="wl-1")
+    workload = make_workload(workload_id=1, display_name="wl-1")
     model = BrowseModel(
         selected_catalog=SelectedCatalog(repo=handle, catalog=catalog),
         workload_versions={key: FailureInfo(message="boom")},
     )
-    new_model, cmds = update(model, WorkloadSelected(workload=workload))
+    _new_model, cmds = update(model, WorkloadSelected(workload=workload))
 
-    # A reselect after a failure always retries -- a FailureInfo is
-    # never treated as a Success cache hit.
     assert cmds == (LoadVersions(repo=handle, catalog=catalog, workload=workload),)
 
 
 def test_refresh_requested_with_a_selected_workload_takes_priority_over_the_catalog() -> None:
     handle = RepoHandle(1)
     catalog = _catalog("cat-1")
-    workload = _workload(1)
+    workload = make_workload(workload_id=1)
     key = workload_key(catalog_key(handle, catalog), workload)
     model = BrowseModel(
         selected_catalog=SelectedCatalog(repo=handle, catalog=catalog),
         selected_workload=workload,
-        workload_versions={key: Success((_version(),))},
+        workload_versions={key: Success((make_version(),))},
     )
     new_model, cmds = update(model, RefreshRequested())
 
-    # Even though it was a cache hit -- a refresh always re-fetches. The
-    # stale Success value is carried forward as Loading.previous so
-    # column 3 stays populated while the refetch is in flight, instead of
-    # blanking to empty.
-    assert new_model.workload_versions[key] == Loading(previous=(_version(),))
-    assert cmds == (LoadVersions(repo=handle, catalog=catalog, workload=workload),)
+    # A refresh re-fetches even a cache hit, keeping the old rows as
+    # Loading.previous so column 3 stays populated meanwhile.
+    assert new_model.workload_versions[key] == Loading(previous=(make_version(),))
+    assert cmds == (LoadVersions(repo=handle, catalog=catalog, workload=workload, invalidate=True),)
 
 
 def test_refresh_requested_with_only_a_selected_catalog_re_fetches_workloads() -> None:
@@ -500,20 +561,49 @@ def test_refresh_requested_with_only_a_selected_catalog_re_fetches_workloads() -
     key = catalog_key(handle, catalog)
     model = BrowseModel(
         selected_catalog=SelectedCatalog(repo=handle, catalog=catalog),
-        catalog_workloads={key: Success((_workload(1),))},
+        catalog_workloads={key: Success((make_workload(workload_id=1),))},
     )
     new_model, cmds = update(model, RefreshRequested())
 
     # Same stale-while-revalidate carry-forward as the versions refresh above.
-    assert new_model.catalog_workloads[key] == Loading(previous=(_workload(1),))
-    assert cmds == (LoadWorkloads(repo=handle, catalog=catalog),)
+    assert new_model.catalog_workloads[key] == Loading(previous=(make_workload(workload_id=1),))
+    assert cmds == (LoadWorkloads(repo=handle, catalog=catalog, invalidate=True),)
+
+
+def test_refresh_requested_while_a_versions_refresh_is_still_loading_is_a_no_op() -> None:
+    """A second ``r`` keeps the first refresh's carried-forward rows."""
+    handle = RepoHandle(1)
+    catalog = _catalog("cat-1")
+    workload = make_workload(workload_id=1)
+    key = workload_key(catalog_key(handle, catalog), workload)
+    model = BrowseModel(
+        selected_catalog=SelectedCatalog(repo=handle, catalog=catalog),
+        selected_workload=workload,
+        workload_versions={key: Loading(previous=(make_version(),))},
+    )
+    new_model, cmds = update(model, RefreshRequested())
+
+    assert new_model is model
+    assert cmds == ()
+
+
+def test_refresh_requested_while_a_workloads_refresh_is_still_loading_is_a_no_op() -> None:
+    handle = RepoHandle(1)
+    catalog = _catalog("cat-1")
+    key = catalog_key(handle, catalog)
+    model = BrowseModel(
+        selected_catalog=SelectedCatalog(repo=handle, catalog=catalog),
+        catalog_workloads={key: Loading(previous=(make_workload(workload_id=1),))},
+    )
+    new_model, cmds = update(model, RefreshRequested())
+
+    assert new_model is model
+    assert cmds == ()
 
 
 def test_refresh_requested_with_nothing_selected_is_a_no_op() -> None:
-    """The screen's own ``action_refresh`` guards this case before ever
-    dispatching (falling back to reopening ``ConnectDialog`` instead) --
-    proven here directly anyway, since nothing about ``update()`` itself
-    depends on that screen-level guard actually running first."""
+    """``update()`` ignores a refresh with nothing selected, independently
+    of ``action_refresh``'s own guard."""
     model = BrowseModel()
     new_model, cmds = update(model, RefreshRequested())
 
@@ -521,21 +611,97 @@ def test_refresh_requested_with_nothing_selected_is_a_no_op() -> None:
     assert cmds == ()
 
 
+# -- a late result for a selection the user already left ----------------
+
+
+def test_a_late_workloads_result_for_a_catalog_the_user_left_leaves_column_two_alone() -> None:
+    handle = RepoHandle(1)
+    catalog_a, catalog_b = _catalog("a"), _catalog("b")
+    model = BrowseModel(repos=_live())
+    model, _ = update(model, CatalogSelected(repo=handle, catalog=catalog_a))
+    model, _ = update(model, CatalogSelected(repo=handle, catalog=catalog_b))
+    model, _ = update(
+        model,
+        WorkloadsLoaded(
+            catalog=catalog_key(handle, catalog_b), workloads=(make_workload(workload_id=2, display_name="B"),)
+        ),
+    )
+    shown = workload_tree_spec(model)
+    assert shown
+
+    model, cmds = update(
+        model,
+        WorkloadsLoaded(
+            catalog=catalog_key(handle, catalog_a), workloads=(make_workload(workload_id=1, display_name="A"),)
+        ),
+    )
+
+    assert model.selected_catalog == SelectedCatalog(repo=handle, catalog=catalog_b)
+    assert workload_tree_spec(model) == shown
+    assert cmds == ()
+
+
+def test_a_late_versions_result_for_a_workload_the_user_left_leaves_column_three_alone() -> None:
+    handle = RepoHandle(1)
+    catalog = _catalog("cat-1")
+    workload_a, workload_b = (
+        make_workload(workload_id=1, display_name="A"),
+        make_workload(workload_id=2, display_name="B"),
+    )
+    ck = catalog_key(handle, catalog)
+    model = BrowseModel(repos=_live(), selected_catalog=SelectedCatalog(repo=handle, catalog=catalog))
+    model, _ = update(model, WorkloadSelected(workload=workload_a))
+    model, _ = update(model, WorkloadSelected(workload=workload_b))
+    model, _ = update(model, VersionsLoaded(workload=workload_key(ck, workload_b), versions=(make_version(),)))
+    shown = version_rows(model)
+    assert len(shown) == 1
+
+    model, _ = update(
+        model, VersionsLoaded(workload=workload_key(ck, workload_a), versions=(make_version(), make_version()))
+    )
+
+    assert model.selected_workload is workload_b
+    assert version_rows(model) == shown
+
+
+def test_switching_catalogs_mid_versions_fetch_requests_nothing_from_the_new_catalog() -> None:
+    """The in-flight ``LoadVersions`` carries the catalog it was minted for;
+    selecting another catalog clears the workload and asks only for its
+    workloads, and the late result lands under the old catalog's key."""
+    handle = RepoHandle(1)
+    catalog_a, catalog_b = _catalog("a"), _catalog("b")
+    workload = make_workload(workload_id=1)
+    model = BrowseModel(repos=_live(), selected_catalog=SelectedCatalog(repo=handle, catalog=catalog_a))
+    model, cmds = update(model, WorkloadSelected(workload=workload))
+    assert cmds == (LoadVersions(repo=handle, catalog=catalog_a, workload=workload),)
+
+    model, cmds = update(model, CatalogSelected(repo=handle, catalog=catalog_b))
+    assert cmds == (LoadWorkloads(repo=handle, catalog=catalog_b),)
+    assert model.selected_workload is None
+
+    model, _ = update(
+        model,
+        VersionsLoaded(workload=workload_key(catalog_key(handle, catalog_a), workload), versions=(make_version(),)),
+    )
+    assert version_rows(model) == ()
+    assert model.workload_versions[workload_key(catalog_key(handle, catalog_a), workload)] == Success((make_version(),))
+
+
 def test_tree_filter_opened_sets_the_filter_state() -> None:
     handle = RepoHandle(1)
     model = BrowseModel()
-    new_model, cmds = update(model, TreeFilterOpened(tree="catalogs", parent_key=handle))
+    new_model, cmds = update(model, TreeFilterOpened(tree=FilterTree.CATALOGS, parent_key=handle))
 
-    assert new_model.tree_filter == TreeFilterState(tree="catalogs", parent_key=handle)
+    assert new_model.tree_filter == TreeFilterState(tree=FilterTree.CATALOGS, parent_key=handle)
     assert cmds == ()
 
 
 def test_tree_filter_text_changed_updates_the_open_filters_text() -> None:
     handle = RepoHandle(1)
-    model = update(BrowseModel(), TreeFilterOpened(tree="catalogs", parent_key=handle))[0]
+    model = update(BrowseModel(), TreeFilterOpened(tree=FilterTree.CATALOGS, parent_key=handle))[0]
     new_model, cmds = update(model, TreeFilterTextChanged(text="needle"))
 
-    assert new_model.tree_filter == TreeFilterState(tree="catalogs", parent_key=handle, text="needle")
+    assert new_model.tree_filter == TreeFilterState(tree=FilterTree.CATALOGS, parent_key=handle, text="needle")
     assert cmds == ()
 
 
@@ -548,7 +714,7 @@ def test_tree_filter_text_changed_is_a_no_op_with_no_filter_open() -> None:
 
 
 def test_tree_filter_closed_clears_the_filter_state() -> None:
-    model = update(BrowseModel(), TreeFilterOpened(tree="workloads", parent_key="group"))[0]
+    model = update(BrowseModel(), TreeFilterOpened(tree=FilterTree.WORKLOADS, parent_key="group"))[0]
     new_model, cmds = update(model, TreeFilterClosed())
 
     assert new_model.tree_filter is None
@@ -603,4 +769,8 @@ def test_version_filter_closed_is_a_no_op_with_no_filter_open() -> None:
     assert cmds == ()
 
 
-__all__: list[str] = []
+def test_verbose_set_stores_the_flag_and_survives_a_rescan() -> None:
+    model, cmds = update(BrowseModel(), VerboseSet(verbose=True))
+    assert model.verbose is True
+    assert cmds == ()
+    assert update(model, RescanStarted(scan_path="/x"))[0].verbose is True

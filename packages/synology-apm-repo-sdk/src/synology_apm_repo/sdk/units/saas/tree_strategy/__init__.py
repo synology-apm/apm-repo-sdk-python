@@ -1,33 +1,23 @@
-"""Shared tree-expansion helpers for SaaS application-layer
-providers. Every service-level DB in this project's real schemas
-expands into a browsable tree one of two shapes: parent-pointer
-recursion (``parent_folder_id`` + a root id — Drive, Site's document
-libraries, Contact folders) or a flat list, optionally grouped by one
-key (Calendar events by ``calendar_id``, Mail by folder, Site's lists
-ungrouped). FS's own third strategy (absolute-path lookup) is
-FS-specific and lives in ``units/fs.py``, not duplicated here.
+"""Tree shapes for SaaS application-layer providers. ``TreeStrategy`` is
+the interface ``SaasWorkloadProvider`` drives; every key is an opaque
+ref-segment tuple, ``()`` being the provider root.
 
-``TreeStrategy`` is the interface ``SaasWorkloadProvider``'s
-``children()``/``unit()`` drive: ``children_of`` is ``async`` — every
-call is a real one-page SQL fetch, never a full-table scan — while
-``row_for`` stays synchronous, a lookup into the per-key cache
-``children_of`` populates as it goes; every key is an opaque ref-segment tuple, ``()``
-meaning the provider root. Its concrete implementations —
-``SyntheticGroupedTree`` (Contact, and M365 Mail's own degrade path,
-``synthetic_grouped.py``), ``NamedGroupFlatTree`` (Calendar,
-``named_group_flat.py``), ``RecursiveTree`` (Drive, ``recursive.py``),
-``NamedGroupRecursiveTree`` (Site, ``named_group_recursive.py``),
-``RecursiveGroupFlatTree`` (M365 Mail's real folder hierarchy,
-``recursive_group_flat.py``), and ``CategorizedGroupTree`` (a further
-synthetic split wrapped around any of the above whose own root lists
-named groups, ``categorized.py``) — cover exactly those shapes. The shared plumbing every
-one of them builds on (the ``TreeStrategy`` protocol itself, the
-lazy-table/``ORDER BY``/leaf-listing helpers) lives in ``_base.py``.
+- ``SyntheticGroupedTree``: a flat table grouped by one column, or not at
+  all (Contact, GWS Mail, M365 Mail's fallback).
+- ``NamedGroupFlatTree``: groups from their own table, flat leaves
+  (Calendar).
+- ``RecursiveTree``: parent-pointer recursion over one table (Drive).
+- ``NamedGroupRecursiveTree``: groups from their own table, leaves
+  recursing by parent pointer (Site).
+- ``RecursiveGroupFlatTree``: a recursive group table, flat leaves (M365
+  Mail's folders).
+- ``CategorizedGroupTree``: a synthetic category level over another
+  tree's top-level entries (Calendar, Site, Teams channels).
 """
 
 from __future__ import annotations
 
-from ._base import FolderPredicate, TreeStrategy
+from ._base import FolderPredicate, Key, Row, SupportsTable, TreeEntry, TreeStrategy
 from .categorized import CategorizedGroupTree, categories_present_in_order
 from .named_group_flat import NamedGroupFlatTree
 from .named_group_recursive import NamedGroupRecursiveTree
@@ -38,11 +28,15 @@ from .synthetic_grouped import SyntheticGroupedTree
 __all__ = [
     "CategorizedGroupTree",
     "FolderPredicate",
+    "Key",
     "NamedGroupFlatTree",
     "NamedGroupRecursiveTree",
     "RecursiveGroupFlatTree",
     "RecursiveTree",
+    "Row",
+    "SupportsTable",
     "SyntheticGroupedTree",
+    "TreeEntry",
     "TreeStrategy",
     "categories_present_in_order",
 ]

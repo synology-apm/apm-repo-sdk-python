@@ -1,14 +1,8 @@
-"""``key_dialog`` domain: for one configured encrypted sample,
-``ConnectDialog`` (no key at connect time -- the browser never asks for
-one there) -> entering a connection triggers ``KeyDialog`` automatically
-(``BrowseScreen._prompt_for_key``, catching ``KeyRequiredError`` from
-``repo.workloads()``) -> paste the real key -> confirms unlocked. SDK-level
-key verification itself is already ``sdk/phases/_catalog.py``'s job; this
-is the modal flow itself.
-
-Runs in its own, separate ``App.run_test()`` session (see
-``__main__.py``) -- a fresh connect distinct from the main navigation
-session's own repository.
+"""``key_dialog`` domain: for one encrypted sample, ``ConnectDialog`` (no
+key at connect time) -> entering a connection opens ``KeyDialog``
+automatically -> paste the real key -> confirms unlocked. Key verification
+itself is ``sdk/phases/_catalog.py``'s job; this checks the modal flow, in
+its own ``App.run_test()`` session.
 """
 
 from __future__ import annotations
@@ -47,7 +41,11 @@ async def run(ctx: SmokeContext, app: Any, pilot: Any) -> None:
     async def _unlock() -> bool:
         from synology_apm_repo.browser.screens.key_dialog import KeyDialog
 
-        await wait_until(pilot, lambda: isinstance(app.screen, KeyDialog), message="KeyDialog never appeared")
+        await wait_until(
+            pilot,
+            lambda: isinstance(app.screen, KeyDialog) and app.screen.is_mounted,
+            message="KeyDialog never appeared",
+        )
         app.screen.query_one("#key-input", Input).value = ref.key
         await pilot.press("enter")
         await wait_until(

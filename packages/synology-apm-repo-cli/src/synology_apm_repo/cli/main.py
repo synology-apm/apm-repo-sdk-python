@@ -3,9 +3,9 @@
 from __future__ import annotations
 
 from importlib.metadata import version as _pkg_version
+from typing import Annotated
 
 import typer
-from rich.console import Console
 
 from synology_apm_repo.cli.commands import cat as cat_cmd
 from synology_apm_repo.cli.commands import doctor as doctor_cmd
@@ -16,6 +16,7 @@ from synology_apm_repo.cli.commands import ls as ls_cmd
 from synology_apm_repo.cli.commands import profile as profile_cmd
 from synology_apm_repo.cli.commands import tree as tree_cmd
 from synology_apm_repo.cli.commands import verify as verify_cmd
+from synology_apm_repo.cli.consoles import console
 from synology_apm_repo.cli.state import CliState, ProgressMode
 from synology_apm_repo.cli.strings import (
     APP_HELP,
@@ -27,9 +28,7 @@ from synology_apm_repo.cli.strings import (
     VERBOSE_HELP,
     VERSION_HELP,
 )
-from synology_apm_repo.sdk.presentation.logging_setup import configure_logging
-
-console = Console()
+from synology_apm_repo.sdk.presentation import configure_logging
 
 app = typer.Typer(
     name="synology-apm-repo-cli",
@@ -54,13 +53,15 @@ def _version_callback(value: bool) -> None:
 @app.callback()
 def _root(
     ctx: typer.Context,
-    verbose: bool = typer.Option(False, "--verbose", help=VERBOSE_HELP),
-    json_output: bool = typer.Option(False, "--json", help=JSON_HELP),
-    progress: ProgressMode = typer.Option(ProgressMode.AUTO.value, "--progress", help=PROGRESS_HELP),
-    trace: bool = typer.Option(False, "--trace", help=TRACE_HELP),
-    quiet: bool = typer.Option(False, "--quiet", "-q", help=QUIET_HELP),
-    no_input: bool = typer.Option(False, "--no-input", help=NO_INPUT_HELP),
-    version: bool = typer.Option(False, "--version", callback=_version_callback, is_eager=True, help=VERSION_HELP),
+    verbose: Annotated[bool, typer.Option("--verbose", help=VERBOSE_HELP)] = False,
+    json_output: Annotated[bool, typer.Option("--json", help=JSON_HELP)] = False,
+    progress: Annotated[ProgressMode, typer.Option("--progress", help=PROGRESS_HELP)] = ProgressMode.AUTO,
+    trace: Annotated[bool, typer.Option("--trace", help=TRACE_HELP)] = False,
+    quiet: Annotated[bool, typer.Option("--quiet", "-q", help=QUIET_HELP)] = False,
+    no_input: Annotated[bool, typer.Option("--no-input", help=NO_INPUT_HELP)] = False,
+    version: Annotated[
+        bool, typer.Option("--version", callback=_version_callback, is_eager=True, help=VERSION_HELP)
+    ] = False,
 ) -> None:
     """Root callback: keeps every subcommand explicit rather than Typer's
     single-command collapse, and is where the global ``--verbose``/
@@ -96,5 +97,5 @@ def main() -> None:  # pragma: no cover - real sys.argv/sys.exit; every test dri
     app()
 
 
-if __name__ == "__main__":  # pragma: no cover - same reason as main() above
+if __name__ == "__main__":
     main()

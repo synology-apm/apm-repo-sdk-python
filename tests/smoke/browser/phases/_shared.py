@@ -1,73 +1,94 @@
-"""Real-sample navigation helpers shared across ``browser/`` phases --
-adapted from ``tests/conftest.py``'s ``open_browser_pilot``/``wait_until``
-pytest fixtures into plain async functions (this tool isn't part of the
-pytest tree, so it can't use those directly), but the same underlying
-mechanics: drive the auto-opened ``ConnectDialog``, then poll real
-Textual state via ``pilot.pause()`` rather than a fixed sleep.
+"""Navigation helpers shared across ``browser/`` phases. ``wait_until`` is
+``tests/support/pilot.py``'s, with budgets sized for real samples: this tool
+runs as ``tests.smoke.*``, outside pytest's ``support.*`` import root, and
+mypy would see one file under two module names if it imported it.
+
+Each session connects one source: a second connect's ``RescanStarted``
+replaces the first's tree rather than adding to it.
 """
 
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from typing import Any
 
+from textual.css.query import NoMatches
+from textual.pilot import Pilot
 from textual.widgets import Button, Checkbox, Input, Select, Tabs, Tree
 
 from synology_apm_repo.browser.core.browse.select import CatalogTreeKey
 from synology_apm_repo.browser.screens.browse_screen import BrowseScreen
 from synology_apm_repo.browser.screens.connect_dialog import ConnectDialog
 from synology_apm_repo.browser.view.reconcile import Binding
-from synology_apm_repo.sdk import AzureProfileConfig, BackendKind, S3ProfileConfig, SmbProfileConfig
+from synology_apm_repo.sdk.profiles import (
+    AzureProfileConfig,
+    BackendKind,
+    S3ProfileConfig,
+    SmbProfileConfig,
+    form_fields_for,
+    profile_fields_with_secrets,
+)
 
 
 async def wait_until(
-    pilot: Any,
+    pilot: Pilot[Any],
     condition: Callable[[], object],
     *,
-    timeout: float = 10.0,  # noqa: ASYNC109 - a poll budget, not a cancellation scope; see docstring
+    timeout: float = 10.0,  # noqa: ASYNC109 - a poll budget, not a cancellation scope
     interval: float = 0.2,
     message: str = "condition not met before timeout",
 ) -> None:
-    """Polls ``condition()`` via repeated ``pilot.pause(interval)`` calls
-    until it returns truthy, raising ``TimeoutError(message)`` once
-    ``timeout`` seconds have elapsed without that happening."""
+    """Polls ``condition()`` between ``pilot.pause(interval)`` turns until it
+    is truthy; ``TimeoutError(message)`` after ``timeout`` seconds. A
+    ``NoMatches`` counts as "not yet"."""
     elapsed = 0.0
     while elapsed < timeout:
         await pilot.pause(interval)
-        if condition():
+        try:
+            met = condition()
+        except NoMatches:
+            met = False
+        if met:
             return
         elapsed += interval
     raise TimeoutError(message)
 
 
 async def connect_local(app: Any, pilot: Any, path: str) -> None:
-    """Drives the auto-opened ``ConnectDialog`` to connect a real local
-    repository at ``path``, and waits for ``BrowseScreen``'s ``#col-catalogs``
-    tree to gain the new repository's node. Callers only ever use this once per
-    session: reconnecting a second source the same way (whether via ``c``
-    or another auto-opened dialog) *replaces* the current scan's repositories/
-    tree rather than adding to it (``BrowseScreen._reset_for_new_scan``),
-    so a second sample needs its own fresh session (see
-    ``key_dialog``'s/``remote_connect``'s own reasoning in
-    ``__main__.py``), not a second call to this function in the same
-    one."""
-    await wait_until(pilot, lambda: isinstance(app.screen, ConnectDialog), message="ConnectDialog never appeared")
+    """Drives the auto-opened ``ConnectDialog`` to connect the local
+    repository at ``path`` and waits for ``BrowseScreen``'s ``#col-catalogs``
+    tree to gain its node."""
+    await wait_until(
+        pilot,
+        lambda: isinstance(app.screen, ConnectDialog) and app.screen.is_mounted,
+        message="ConnectDialog never appeared",
+    )
     dialog = app.screen
     assert isinstance(dialog, ConnectDialog), dialog
-    # BrowseScreen is the persistent root screen (never popped, see
-    # app.py's own on_mount), reachable even while ConnectDialog covers
-    # it -- so "how many repositories were already connected" is known before
-    # this connect adds one more. screen_stack[0] is Textual's own
-    # implicit base screen, pushed before BrowseScreen -- look it up by
-    # type rather than assuming a fixed index.
+    # BrowseScreen stays on the stack under ConnectDialog; found by type,
+    # since screen_stack[0] is Textual's implicit base screen.
     browse_screen = next(s for s in app.screen_stack if isinstance(s, BrowseScreen))
     tree = browse_screen.query_one("#col-catalogs", Tree)
     before = len(tree.root.children)
     dialog.query_one("#connect-local-path", Input).value = path
     dialog.query_one("#connect-submit", Button).press()
-    await wait_until(pilot, lambda: isinstance(app.screen, BrowseScreen), message="BrowseScreen never appeared")
+    await wait_until(
+        pilot,
+        lambda: isinstance(app.screen, BrowseScreen) and app.screen.is_mounted,
+        message="BrowseScreen never appeared",
+    )
     await wait_until(
         pilot, lambda: len(tree.root.children) > before, message="new repository node never appeared in #col-catalogs"
+    )
+
+
+def _form_holds(dialog: ConnectDialog, kind: BackendKind, values: Mapping[str, str | bool | int]) -> bool:
+    """Whether ``kind``'s text fields show ``values`` (absent ones blank)."""
+    return all(
+        dialog.query_one(f"#connect-{kind}-{field.name.replace('_', '-')}", Input).value
+        == str(values.get(field.name, ""))
+        for field in form_fields_for(kind)
+        if not field.is_checkbox
     )
 
 
@@ -80,19 +101,15 @@ async def connect_remote(
     config: S3ProfileConfig | AzureProfileConfig | SmbProfileConfig | None = None,
     secrets: dict[str, str] | None = None,
 ) -> None:
-    """Drives the auto-opened ``ConnectDialog`` to connect a real S3/Azure/
-    SMB ``kind`` repository -- either through a saved profile
-    (``profile_name`` given: picked from that tab's own profile ``Select``,
-    which resolves the real keyring secret and refills every field) or by
-    filling ``config``/``secrets`` into the raw fields directly
-    (``profile_name`` omitted -- the same manual-entry path a first-time
-    user goes through before ever saving a profile). Waits for
-    ``BrowseScreen``'s ``#col-catalogs`` tree to gain the new repository's
-    node. One connect per session, same as ``connect_local``: reconnecting
-    a second source the same way *replaces* the current scan's
-    repositories/tree rather than adding to it
-    (``BrowseScreen._reset_for_new_scan``)."""
-    await wait_until(pilot, lambda: isinstance(app.screen, ConnectDialog), message="ConnectDialog never appeared")
+    """Drives the auto-opened ``ConnectDialog`` to connect an S3/Azure/SMB
+    repository, through the tab's saved-profile ``Select`` when
+    ``profile_name`` is given, else by filling ``config``/``secrets`` into
+    the raw fields. Waits for ``#col-catalogs`` to gain the new node."""
+    await wait_until(
+        pilot,
+        lambda: isinstance(app.screen, ConnectDialog) and app.screen.is_mounted,
+        message="ConnectDialog never appeared",
+    )
     dialog = app.screen
     assert isinstance(dialog, ConnectDialog), dialog
     browse_screen = next(s for s in app.screen_stack if isinstance(s, BrowseScreen))
@@ -103,11 +120,15 @@ async def connect_remote(
     dialog.query_one("#connect-backend-tabs", Tabs).active = tab
 
     if profile_name is not None:
+        expected = await profile_fields_with_secrets(profile_name)
         dialog.query_one(f"#connect-{tab}-profile-select", Select).value = profile_name
-        # Lets the profile-load worker (SavedProfileManager.load_selected,
-        # a keyring round trip) actually resolve the secret and refill the
-        # form before #connect-submit reads it back.
-        await pilot.pause(0.3)
+        # Selecting a profile refills the form from a worker (a keyring round
+        # trip); submit only once the form holds the profile's values.
+        await wait_until(
+            pilot,
+            lambda: _form_holds(dialog, kind, expected),
+            message=f"the {tab} form never filled from profile {profile_name!r}",
+        )
     elif kind is BackendKind.S3:
         assert isinstance(config, S3ProfileConfig)
         secret_source = secrets or {}
@@ -133,10 +154,12 @@ async def connect_remote(
         dialog.query_one("#connect-smb-password", Input).value = secret_source.get("password", "")
 
     dialog.query_one("#connect-submit", Button).press()
-    # Generous timeouts (vs. connect_local's default 10s): a real network
-    # round trip to a live S3/Azure/SMB endpoint, not an in-memory local scan.
+    # A live network scan: longer than connect_local's 10 s.
     await wait_until(
-        pilot, lambda: isinstance(app.screen, BrowseScreen), timeout=30.0, message="BrowseScreen never appeared"
+        pilot,
+        lambda: isinstance(app.screen, BrowseScreen) and app.screen.is_mounted,
+        timeout=30.0,
+        message="BrowseScreen never appeared",
     )
     await wait_until(
         pilot,

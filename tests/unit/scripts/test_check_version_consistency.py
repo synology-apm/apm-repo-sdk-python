@@ -1,21 +1,13 @@
-"""Tests for scripts/check_version_consistency.py.
-
-``scripts/`` isn't an installed package, so the module under test is loaded
-by path via ``importlib`` through the ``check_version_consistency`` fixture.
-This checker only ever reads local ``pyproject.toml`` files, never the
-network, so every scenario here is offline, including a "regression guard
-against the real repository files" test,
-``TestMain.test_actual_repo_pyproject_files_are_consistent``.
-"""
+"""Tests for scripts/check_version_consistency.py."""
 
 from __future__ import annotations
 
-import importlib.util
-import sys
 from pathlib import Path
 from types import ModuleType
 
 import pytest
+
+from support.modules import load_module
 
 _SCRIPT_PATH = Path(__file__).resolve().parents[3] / "scripts" / "check_version_consistency.py"
 
@@ -24,18 +16,9 @@ _CLI = "synology-apm-repo-cli"
 _BROWSER = "synology-apm-repo-browser"
 
 
-def _load_module() -> ModuleType:
-    spec = importlib.util.spec_from_file_location("check_version_consistency", _SCRIPT_PATH)
-    assert spec is not None and spec.loader is not None
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[spec.name] = module
-    spec.loader.exec_module(module)
-    return module
-
-
 @pytest.fixture
 def check_version_consistency() -> ModuleType:
-    return _load_module()
+    return load_module("check_version_consistency", _SCRIPT_PATH)
 
 
 def _write_pyproject(tmp_path: Path, name: str, version: str, dependencies: tuple[str, ...] = ()) -> Path:
@@ -122,14 +105,3 @@ class TestMain:
         assert check_version_consistency.main() == 1
         err = capsys.readouterr().err
         assert f"pins {_SDK}==0.9.0" in err
-
-    def test_actual_repo_pyproject_files_are_consistent(self, check_version_consistency: ModuleType) -> None:
-        """No monkeypatching — this repository's real three ``pyproject.toml``
-        files, via the script's own unmodified ``ROOT``/``PYPROJECT_PATHS``.
-        Turns "did I bump all three lockstep versions/pins correctly" into
-        a named, individually-runnable assertion instead of only a
-        ``make test``-time signal."""
-        assert check_version_consistency.main() == 0
-
-
-__all__: list[str] = []

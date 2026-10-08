@@ -1,18 +1,16 @@
 """Distinct identifier spaces that look identical on the wire (all ``int`` or
 all ``str``) but must never be mixed.
 
-Declaring each as a ``typing.NewType`` costs nothing at runtime — these are
-plain ``int``/``str`` at the bytes level — and turns "silently read the wrong
-repository file because two same-shaped identifiers got swapped" from a
-support incident into a mypy error, since ``mypy --strict`` is already
-enabled for this project.
+Each is a ``typing.NewType``: plain ``int``/``str`` at runtime, but swapping
+two same-shaped identifiers is a mypy error.
 """
 
 from __future__ import annotations
 
 from typing import NewType
 
-# --- dedup addressing (FORMAT-SPEC.md: ChunkAddress, composition-splitting, file_map-relationship) --------------------
+# --- dedup addressing (FORMAT-SPEC.md: ChunkAddress; Composition file splitting;
+#     `file_map` relationship) ---
 
 StreamId = NewType("StreamId", int)
 """``ChunkAddress`` / composition-path stream id (0-255, ``uint8``)."""
@@ -42,25 +40,18 @@ ConnectionConfigId = NewType("ConnectionConfigId", int)
 primary key for a connection *and version_type* pair."""
 
 CatalogId = NewType("CatalogId", str)
-"""Repository Layer identifier for one ``api.Catalog`` — part of the
-``Session``/``Repository``/``Catalog`` split that CLI/TUI code imports
-directly, with everything below that split treated as an implementation
-detail — distinct from every id above in that it's not a raw
-on-disk column: a vault's own catalogs share one ``connection_config`` table
-(unique *within* that vault, so ``str(connection_config_id)`` alone
-identifies one), but each object-storage sibling's own ``connection_config``
-table independently starts back at 1 — a bare ``connection_config_id`` can't
-tell two siblings apart. For a vault, this is ``str(connection.connection_config_id)``;
-for object storage, the repo-id string itself (already unique per bucket by
-construction, being a directory name)."""
+"""Repository Layer identifier for one ``api.Catalog``; not an on-disk
+column. A vault's ``connection_config`` table is unique within that vault,
+but each object-storage sibling's own table restarts at 1, so a bare
+``connection_config_id`` can't tell siblings apart. For a vault this is
+``str(connection.connection_config_id)``; for object storage, the repo-id
+string (a directory name, unique per bucket)."""
 
 
 def resolve_catalog_id(repo_id: str | None, connection_config_id: ConnectionConfigId) -> CatalogId:
-    """The one shared place holding the ``CatalogId`` fallback formula —
-    ``repo_id`` when set (object storage), else ``str(connection_config_id)``
-    (a vault) — used both by ``api.catalog.Catalog.catalog_id``
-    and ``units.node_ref.canonical_ref_for``, which would otherwise each
-    carry an identical, independently-drifting copy of this fallback."""
+    """The ``CatalogId`` formula shared by ``api.catalog.Catalog.catalog_id``
+    and ``units.node_ref.canonical_ref_for``: ``repo_id`` when set (object
+    storage), else ``str(connection_config_id)`` (a vault)."""
     return CatalogId(repo_id or str(connection_config_id))
 
 

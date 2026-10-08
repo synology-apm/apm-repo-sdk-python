@@ -1,10 +1,8 @@
-"""Schema-tolerant SQLite table access — declare the columns
-a query needs and whether each is required, and this introspects the real
-table once (``PRAGMA table_info``) to work out which optional columns
-this particular connector version's schema actually has. A missing
-*optional* column reads back as ``None`` for every row instead of raising
-``sqlite3.OperationalError: no such column`` — the failure mode this
-project hits repeatedly across every workload DB, not just those two.
+"""Schema-tolerant SQLite table access: declare the columns a query needs and
+whether each is required, and ``Table.create`` introspects the real table
+(``PRAGMA table_info``) once. A missing *optional* column reads back as
+``None`` for every row instead of raising ``no such column``, which differs
+across connector versions.
 """
 
 from __future__ import annotations
@@ -19,10 +17,10 @@ from ..errors import DataCorruptError
 from .sqlite import apply_index_hint
 
 
-@dataclasses.dataclass(frozen=True)
+@dataclasses.dataclass(frozen=True, slots=True)
 class Column:
-    """One column a ``Table`` expects — ``required=False`` for a column
-    only some connector-version schemas have."""
+    """One column a ``Table`` expects; ``required=False`` for a column only
+    some connector-version schemas have."""
 
     name: str
     required: bool = True
@@ -31,22 +29,19 @@ class Column:
 class Table:
     """A schema-tolerant view of one real SQLite table.
 
-    Introspects ``PRAGMA table_info(name)`` once at construction time —
-    cheap, and the schema can't change under a read-only connection mid
-    ``Table`` lifetime. Raises ``DataCorruptError`` immediately if any
-    *required* column is absent; missing optional columns are simply
+    Introspects ``PRAGMA table_info(name)`` once, in ``create``. A missing
+    *required* column raises ``DataCorruptError``; a missing optional one is
     left out of the ``SELECT`` and backfilled as ``None`` in every row.
 
-    **Constructed via** ``await Table.create(conn, name, columns)``, never
-    ``Table(conn, ...)`` directly: introspecting ``PRAGMA table_info`` is
-    a database query, and ``__init__`` cannot be ``async def`` — the same
-    async-classmethod-factory idiom ``aiosqlite.connect()`` uses.
+    Build with ``await Table.create(conn, name, columns)``, not
+    ``Table(...)``: introspection is a query and ``__init__`` can't be async.
+
+    Attributes:
+        name: The table name.
+        columns: The declared ``Column``\\ s.
     """
 
-    #: Populated by ``create``, which is the only supported way to build
-    #: one of these — declared here so the type checker sees them without
-    #: ``__init__`` having to invent placeholder values it would immediately
-    #: overwrite.
+    #: Populated by ``create``, declared here for the type checker.
     _present_columns: list[str]
     _all_columns: frozenset[str]
     _conn: aiosqlite.Connection
@@ -64,16 +59,19 @@ class Table:
         *,
         index_hints: Sequence[Sequence[str]] = (),
     ) -> Self:
-        """Introspect ``name``'s real schema and return a ``Table`` bound
-        to ``conn``.
+        """Introspect ``name``'s real schema and return a ``Table`` bound to
+        ``conn``.
 
-        ``index_hints``: each entry is a column-name sequence this
-        table's callers intend to filter/sort by (e.g.
-        ``[["parent_folder_id"]]``, or a composite), declared here
-        alongside the schema introspection rather than scattered into
-        query logic later. Each is passed straight to
-        ``apply_index_hint``, which doesn't need to know or care whether
-        ``conn`` allows writing.
+        Args:
+            conn: Connection to query through.
+            name: Table name.
+            columns: The columns callers need.
+            index_hints: Column sequences callers will filter or sort by
+                (e.g. ``[["parent_folder_id"]]``), each passed to
+                ``apply_index_hint``, which copes with a read-only ``conn``.
+
+        Raises:
+            DataCorruptError: The table is missing or lacks a required column.
         """
         self = cls(name, columns)
         cursor = await conn.execute(f"PRAGMA table_info({name})")
@@ -92,25 +90,17 @@ class Table:
 
     @staticmethod
     async def exists_in(conn: aiosqlite.Connection, name: str) -> bool:
-        """Whether ``name`` exists at all (and has at least one column) —
-        a non-raising presence check, for the genuinely different
-        situation from a missing *column*: some repository shapes don't have a
-        given table at all (e.g. ``file_meta`` may not exist in every
-        repository shape). Callers needing that distinction check this
-        *before* constructing a ``Table`` — the constructor's own
-        "table must exist" contract stays intact for the normal
-        "table exists but drifted a column" case."""
+        """Whether ``name`` exists with at least one column. Call before
+        ``create`` for a table some repository shapes lack entirely (e.g.
+        ``file_meta``); ``create`` raises for a missing table."""
         cursor = await conn.execute(f"PRAGMA table_info({name})")
         return bool({row[1] for row in await cursor.fetchall()})
 
     @property
     def columns_present(self) -> frozenset[str]:
-        """The table's *actual* full column set, as introspected —
-        independent of which columns this ``Table`` was asked to
-        declare. For call sites that must pick a real column name via a
-        heuristic rather than a fixed declaration, because the table's
-        schema varies across repositories and so there is no fixed name to
-        declare."""
+        """The table's actual column set, independent of the declared columns,
+        for callers that pick a column by heuristic because its name varies
+        across repositories."""
         return self._all_columns
 
     async def select(
@@ -127,17 +117,14 @@ class Table:
         ``{column_name: value}``, with every declared-but-absent optional
         column backfilled as ``None``.
 
-        ``where``/``order_by`` are literal SQL fragments written by the
-        caller (not untrusted input) — parameterize actual *values* via
-        ``params``; this only ever interpolates column/table names this
-        module itself introspected.
-
-        ``limit``/``offset`` are the pagination primitives: ``limit=None``
-        (default) means "no cap" but still lets ``offset`` apply via
-        SQLite's own ``LIMIT -1`` idiom, since ``OFFSET`` alone isn't
-        valid syntax without some ``LIMIT`` present. Both are
-        parameterized (``?``), since they're plain integers from the
-        caller, not schema-derived text.
+        Args:
+            where: Literal SQL written by the caller, never untrusted input;
+                pass values through ``params``.
+            params: Values for the ``?`` placeholders in ``where``.
+            order_by: Literal SQL ``ORDER BY`` fragment.
+            limit: Row cap; ``None`` is uncapped but still honors ``offset``
+                (via ``LIMIT -1``).
+            offset: Rows to skip.
         """
         select_list = ", ".join(self._present_columns)
         query = f"SELECT {select_list} FROM {self.name}"
@@ -158,36 +145,35 @@ class Table:
             yield record
 
     async def select_one(self, where: str = "", params: Sequence[object] = ()) -> dict[str, object | None] | None:
+        """The first row ``select(where, params)`` yields, or ``None``."""
         async for row in self.select(where, params):
             return row
         return None
 
 
 def as_int(value: object) -> int:
-    """Narrow one of ``Table.select``'s ``object | None`` values to
-    ``int`` — a thin, explicit boundary between a caller's typed
-    dataclasses and the untyped ``dict`` rows SQLite hands back, rather
-    than scattering ``# type: ignore`` at every call site. Raises
-    ``DataCorruptError``, the same exception this module's own
-    ``Table.create`` already raises for a schema mismatch, rather than a
-    bare ``AssertionError`` a caller's ``except (..., DataCorruptError,
-    ...)`` degrade path wouldn't catch."""
+    """Narrow one of ``Table.select``'s ``object | None`` values to ``int``.
+
+    Raises:
+        DataCorruptError: ``value`` is not an ``int``.
+    """
     if not isinstance(value, int):
         raise DataCorruptError(f"expected an int column value, got {value!r}")
     return value
 
 
 def as_str(value: object) -> str:
-    """Narrow one of ``Table.select``'s ``object | None`` values to
-    ``str``, the same way ``as_int`` narrows to ``int``."""
+    """Narrow one of ``Table.select``'s values to ``str``.
+
+    Raises:
+        DataCorruptError: ``value`` is not a ``str``.
+    """
     if not isinstance(value, str):
         raise DataCorruptError(f"expected a str column value, got {value!r}")
     return value
 
 
 def sql_placeholders(n: int) -> str:
-    """A comma-joined ``n``-item ``"?"`` placeholder list for a batched
-    ``WHERE <column> IN (...)`` query — every caller building one of
-    these still owns its own "nothing to look up" early return (an empty
-    ``IN ()`` is invalid SQL), just not the placeholder string itself."""
+    """A comma-joined list of ``n`` ``"?"`` placeholders for ``IN (...)``.
+    ``n`` must be positive: an empty ``IN ()`` is invalid SQL."""
     return ",".join("?" * n)

@@ -1,7 +1,5 @@
-"""Size/duration/count formatting shared by the CLI and the TUI. Both
-surfaces must render these identically, so they live in the SDK rather
-than in ``cli/progress_render.py`` or ``browser/format.py``: a per-surface
-copy would let them silently drift apart."""
+"""Size, duration, rate, timestamp and count formatting shared by every
+frontend."""
 
 from __future__ import annotations
 
@@ -10,14 +8,14 @@ from datetime import datetime
 
 def pluralize(count: int, singular: str, plural: str | None = None) -> str:
     """``singular`` for ``count == 1``, else ``plural`` (default:
-    ``singular`` with an "s" appended) — the English-pluralization shape
-    every status line reporting a count already needed on its own."""
+    ``singular`` with an "s" appended)."""
     if count == 1:
         return singular
     return plural if plural is not None else f"{singular}s"
 
 
 def format_bytes(n: int) -> str:
+    """``n`` bytes in binary units: ``"512 B"``, ``"1.5 MiB"``, up to TiB."""
     value = float(n)
     unit = "B"
     for candidate in ("KiB", "MiB", "GiB", "TiB"):
@@ -29,6 +27,7 @@ def format_bytes(n: int) -> str:
 
 
 def format_duration(seconds: float) -> str:
+    """``seconds`` as ``MM:SS``, or ``HH:MM:SS`` from one hour up."""
     total = int(seconds)
     h, rem = divmod(total, 3600)
     m, s = divmod(rem, 60)
@@ -36,18 +35,14 @@ def format_duration(seconds: float) -> str:
 
 
 def format_timestamp(dt: datetime) -> str:
-    """Renders an already timezone-aware ``datetime`` (a ``Node``'s own
-    ``node_modified_time()``, a version's own backup epoch, ...) in the
-    machine's local timezone — shared by ``catalog/version.py``'s own
-    ``_version_display_name()``, so a Modified column and a version's own
-    display name read consistently."""
+    """A timezone-aware ``datetime`` as ``"YYYY-MM-DD HH:MM:SS"`` in the
+    machine's local timezone; ``Version.display_name`` uses the same
+    format."""
     return dt.astimezone().strftime("%Y-%m-%d %H:%M:%S")
 
 
 def format_rate(rate: float, unit: str) -> str:
-    """Format a ``ProgressMeter.rate`` value for display: ``"12.3 MiB/s"``
-    for the byte-denominated ``"bytes"`` unit, ``"4.0 <unit>/s"`` for any
-    other progress unit. Callers should only invoke this once ``rate > 0``
-    — a zero/negative rate isn't a meaningful display value and both call
-    sites already gate on it."""
+    """A ``ProgressMeter.rate`` value for display: ``"12.3 MiB/s"`` for the
+    ``"bytes"`` unit, ``"4.0 <unit>/s"`` for any other. Meaningful only
+    for ``rate > 0``."""
     return f"{format_bytes(int(rate))}/s" if unit == "bytes" else f"{rate:.1f} {unit}/s"

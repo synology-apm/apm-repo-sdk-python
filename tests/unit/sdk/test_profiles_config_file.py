@@ -8,14 +8,14 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from typing import TextIO
 
 import pytest
 
-from synology_apm_repo.sdk.errors import ProfileConfigCorruptError
 from synology_apm_repo.sdk.profiles import config_file
+from synology_apm_repo.sdk.profiles.errors import ProfileConfigCorruptError
 from synology_apm_repo.sdk.profiles.model import (
     AzureProfileConfig,
-    BackendKind,
     Profile,
     S3ProfileConfig,
     SmbProfileConfig,
@@ -30,17 +30,14 @@ def test_write_then_read_round_trips_every_backend(tmp_path: Path) -> None:
     profiles = {
         "s3-one": Profile(
             name="s3-one",
-            kind=BackendKind.S3,
             config=S3ProfileConfig(bucket="b", endpoint="http://minio:9000", region=None, verify_tls=True),
         ),
         "azure-one": Profile(
             name="azure-one",
-            kind=BackendKind.AZURE,
             config=AzureProfileConfig(container="c", account_url="https://acct.blob.core.windows.net"),
         ),
         "smb-one": Profile(
             name="smb-one",
-            kind=BackendKind.SMB,
             config=SmbProfileConfig(server="nas.example.com", share="backups", username="admin"),
         ),
     }
@@ -56,34 +53,32 @@ def test_write_creates_config_dir(tmp_path: Path) -> None:
 
 def test_read_corrupt_json_raises_profile_config_corrupt(tmp_path: Path) -> None:
     (tmp_path / "profiles.json").write_text("{not json", encoding="utf-8")
-    with pytest.raises(ProfileConfigCorruptError):
+    with pytest.raises(ProfileConfigCorruptError, match="could not parse"):
         config_file.read_profiles(config_dir=tmp_path)
 
 
 def test_read_missing_schema_version_raises(tmp_path: Path) -> None:
     (tmp_path / "profiles.json").write_text(json.dumps({"profiles": {}}), encoding="utf-8")
-    with pytest.raises(ProfileConfigCorruptError):
+    with pytest.raises(ProfileConfigCorruptError, match="unsupported or missing schema_version in"):
         config_file.read_profiles(config_dir=tmp_path)
 
 
-def test_read_unknown_kind_raises(tmp_path: Path) -> None:
-    payload = {"schema_version": 1, "profiles": {"x": {"kind": "gcs", "bucket": "b"}}}
+@pytest.mark.parametrize(
+    ("profile", "message"),
+    [
+        pytest.param({"kind": "gcs", "bucket": "b"}, "has an invalid or missing 'kind'", id="unknown_kind"),
+        pytest.param({"kind": "s3"}, "is missing required field 'bucket'", id="missing_required_field"),
+        pytest.param(
+            {"kind": "smb", "server": "nas.example.com"},
+            "is missing required field 'share'",
+            id="smb_missing_required_field",
+        ),
+    ],
+)
+def test_read_invalid_profile_raises(tmp_path: Path, profile: dict[str, str], message: str) -> None:
+    payload = {"schema_version": 1, "profiles": {"x": profile}}
     (tmp_path / "profiles.json").write_text(json.dumps(payload), encoding="utf-8")
-    with pytest.raises(ProfileConfigCorruptError):
-        config_file.read_profiles(config_dir=tmp_path)
-
-
-def test_read_missing_required_field_raises(tmp_path: Path) -> None:
-    payload = {"schema_version": 1, "profiles": {"x": {"kind": "s3"}}}  # no "bucket"
-    (tmp_path / "profiles.json").write_text(json.dumps(payload), encoding="utf-8")
-    with pytest.raises(ProfileConfigCorruptError):
-        config_file.read_profiles(config_dir=tmp_path)
-
-
-def test_read_smb_missing_required_field_raises(tmp_path: Path) -> None:
-    payload = {"schema_version": 1, "profiles": {"x": {"kind": "smb", "server": "nas.example.com"}}}  # no "share"
-    (tmp_path / "profiles.json").write_text(json.dumps(payload), encoding="utf-8")
-    with pytest.raises(ProfileConfigCorruptError):
+    with pytest.raises(ProfileConfigCorruptError, match=message):
         config_file.read_profiles(config_dir=tmp_path)
 
 
@@ -92,7 +87,7 @@ def test_read_malformed_profiles_object_raises(tmp_path: Path) -> None:
     # {name: entry} mapping shape.
     payload = {"schema_version": 1, "profiles": ["not", "a", "mapping"]}
     (tmp_path / "profiles.json").write_text(json.dumps(payload), encoding="utf-8")
-    with pytest.raises(ProfileConfigCorruptError):
+    with pytest.raises(ProfileConfigCorruptError, match="malformed 'profiles' object in"):
         config_file.read_profiles(config_dir=tmp_path)
 
 
@@ -103,24 +98,31 @@ def test_write_failure_cleans_up_its_own_tmp_file(tmp_path: Path, monkeypatch: p
     monkeypatch.setattr(json, "dump", _failing_dump)
     with pytest.raises(OSError, match="synthetic disk-full"):
         config_file.write_profiles({}, config_dir=tmp_path)
-    assert list(tmp_path.iterdir()) == []  # the .tmp file was cleaned up, not left behind
+    assert list(tmp_path.iterdir()) == []
 
 
-def test_write_is_atomic_no_tmp_file_left_behind(tmp_path: Path) -> None:
-    config_file.write_profiles(
-        {"a": Profile(name="a", kind=BackendKind.S3, config=S3ProfileConfig(bucket="b"))}, config_dir=tmp_path
-    )
-    leftovers = [p for p in tmp_path.iterdir() if p.name != "profiles.json"]
-    assert leftovers == []
+def test_write_is_atomic_no_tmp_file_left_behind(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    config_file.write_profiles({"a": Profile(name="a", config=S3ProfileConfig(bucket="one"))}, config_dir=tmp_path)
+    assert [p.name for p in tmp_path.iterdir()] == ["profiles.json"]
+    before = (tmp_path / "profiles.json").read_bytes()
+
+    def _dump_half_then_fail(obj: object, handle: TextIO, **kwargs: object) -> None:
+        handle.write('{"schema_version": 1, "prof')
+        handle.flush()
+        raise OSError("synthetic crash mid-write")
+
+    monkeypatch.setattr(json, "dump", _dump_half_then_fail)
+    with pytest.raises(OSError, match="synthetic crash mid-write"):
+        config_file.write_profiles({"a": Profile(name="a", config=S3ProfileConfig(bucket="two"))}, config_dir=tmp_path)
+
+    # The half-written payload never replaced the old file.
+    assert (tmp_path / "profiles.json").read_bytes() == before
+    assert [p.name for p in tmp_path.iterdir()] == ["profiles.json"]
 
 
 def test_write_overwrites_existing_file(tmp_path: Path) -> None:
-    config_file.write_profiles(
-        {"a": Profile(name="a", kind=BackendKind.S3, config=S3ProfileConfig(bucket="one"))}, config_dir=tmp_path
-    )
-    config_file.write_profiles(
-        {"a": Profile(name="a", kind=BackendKind.S3, config=S3ProfileConfig(bucket="two"))}, config_dir=tmp_path
-    )
+    config_file.write_profiles({"a": Profile(name="a", config=S3ProfileConfig(bucket="one"))}, config_dir=tmp_path)
+    config_file.write_profiles({"a": Profile(name="a", config=S3ProfileConfig(bucket="two"))}, config_dir=tmp_path)
     profiles = config_file.read_profiles(config_dir=tmp_path)
     assert isinstance(profiles["a"].config, S3ProfileConfig)
     assert profiles["a"].config.bucket == "two"
@@ -138,16 +140,18 @@ def test_default_config_dir_honors_xdg_config_home(monkeypatch: pytest.MonkeyPat
     assert config_file.default_config_dir() == xdg / "synology-apm-repo"
 
 
-def test_default_config_dir_ignores_empty_xdg_config_home(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
-    monkeypatch.setenv("XDG_CONFIG_HOME", "")
-    monkeypatch.setattr(Path, "home", lambda: tmp_path)
-    assert config_file.default_config_dir() == tmp_path / ".config" / "synology-apm-repo"
-
-
-def test_default_config_dir_ignores_relative_xdg_config_home(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
-    """Per the XDG Base Directory Specification, a relative value is
-    invalid and must be treated as unset, not resolved relative to the
-    current directory."""
-    monkeypatch.setenv("XDG_CONFIG_HOME", "relative/path")
+@pytest.mark.parametrize(
+    "value",
+    [
+        pytest.param("", id="empty"),
+        # The XDG Base Directory Specification treats a relative value as
+        # invalid, i.e. unset, not resolved against the current directory.
+        pytest.param("relative/path", id="relative"),
+    ],
+)
+def test_default_config_dir_ignores_an_invalid_xdg_config_home(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, value: str
+) -> None:
+    monkeypatch.setenv("XDG_CONFIG_HOME", value)
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
     assert config_file.default_config_dir() == tmp_path / ".config" / "synology-apm-repo"

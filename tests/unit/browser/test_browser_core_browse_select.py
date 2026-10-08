@@ -1,44 +1,52 @@
-"""Pure unit tests for ``core/browse/select.py`` -- ``BrowseModel`` ->
-``NodeSpec``/row translation, no Textual/App/Pilot involved at all. Same
-convention as ``test_browser_core_unit_select.py``."""
+"""Pure unit tests for ``core/browse/select.py`` (``BrowseModel`` ->
+``NodeSpec``/row translation); no Textual involved. A label built from
+backup-derived or exception text is markup-escaped: ``Tree`` re-parses a
+plain ``str`` label as Rich markup."""
 
 from __future__ import annotations
 
+import dataclasses
 from typing import cast
 
-from synology_apm_repo.browser.core.browse.model import BrowseModel, RepoState, SelectedCatalog, TreeFilterState
+from support.model_factories import make_catalog, make_connection, make_version, make_workload
+from synology_apm_repo.browser.core.browse.model import (
+    BrowseModel,
+    FilterTree,
+    RepoState,
+    SelectedCatalog,
+    TreeFilterState,
+    VersionFilterState,
+)
 from synology_apm_repo.browser.core.browse.model import catalog_key as _catalog_key_of
 from synology_apm_repo.browser.core.browse.model import workload_key as _workload_key_of
+from synology_apm_repo.browser.core.browse.msg import TreeFilterOpened
+from synology_apm_repo.browser.core.browse.repo_labels import repo_path_component
 from synology_apm_repo.browser.core.browse.select import (
     WORKLOAD_ERROR_KEY,
     RepoErrorKey,
     WorkloadGroupKey,
+    breadcrumb,
     catalog_tree_spec,
+    current_workloads,
     is_workload_current,
+    tree_filter_target,
     version_fetch_pending,
     version_load_error,
     version_rows,
+    visible_version_rows,
     workload_tree_spec,
 )
+from synology_apm_repo.browser.core.browse.workload_grouping import humanize_type
 from synology_apm_repo.browser.core.keys import RepoHandle
 from synology_apm_repo.browser.core.remote_data import FailureInfo, Loading, Success
-from synology_apm_repo.sdk.api import Catalog, Connection, KeyStatus, Version, Workload
+from synology_apm_repo.sdk.api import Catalog, KeyStatus, Workload
 from synology_apm_repo.sdk.dedup.repository import DedupRepo
 from synology_apm_repo.sdk.format.repo_info import RepoInfo
 from synology_apm_repo.sdk.identifiers import (
     CatalogId,
-    ConnectionConfigId,
-    ConnectionId,
-    SaasVersionId,
-    SnapshotUuid,
-    StreamUuid,
-    TargetId,
-    VersionId,
-    VersionUid,
-    WorkloadId,
 )
+from synology_apm_repo.sdk.presentation import safe
 from synology_apm_repo.sdk.storage.layout import RepoKind, RepoLayout, RepositoryLayout
-from synology_apm_repo.sdk.units.saas.stream import SaasStreamCache
 
 
 def _layout(repo_root: str = "repo-1") -> RepositoryLayout:
@@ -56,22 +64,12 @@ def _catalog(catalog_id: str, display_name: str) -> Catalog:
 
 
 def _real_catalog(connection_id: str, display_name: str) -> Catalog:
-    """A genuine ``Catalog`` (not the duck-typed ``_FakeCatalog`` above)
-    -- needed only where verbose-mode label formatting reaches
+    """A genuine ``Catalog``, for verbose-mode labels that reach
     ``catalog.info``/``catalog.connection`` (``repo_labels.py``'s
-    ``_catalog_label``), which a duck-type can't satisfy. No I/O:
-    ``Catalog.__init__`` does none itself, same reasoning as
-    ``test_browser_browse_screen_gaps.py``'s own ``_fake_catalog``."""
+    ``catalog_label``), which ``_FakeCatalog`` can't satisfy."""
     import types
 
-    connection = Connection(
-        connection_config_id=ConnectionConfigId(1),
-        connection_id=ConnectionId(connection_id),
-        display_name=display_name,
-        namespaces=(),
-        workload_count=1,
-        version_count=1,
-    )
+    connection = make_connection(connection_id=connection_id, display_name=display_name)
     info = RepoInfo(
         uuid="repo-uuid",
         major=1,
@@ -85,25 +83,12 @@ def _real_catalog(connection_id: str, display_name: str) -> Catalog:
         raw={},
     )
     dedup_repo = types.SimpleNamespace(layout=RepoLayout(kind=RepoKind.VAULT, repo_root=""), info=info)
-    typed_dedup_repo = cast(DedupRepo, dedup_repo)
-    return Catalog(
-        typed_dedup_repo,
-        connection,
-        saas_streams=SaasStreamCache(typed_dedup_repo),
-        track=lambda provider: provider,
-        require_key_verified=lambda: None,
-    )
+    return make_catalog(connection, dedup_repo=cast(DedupRepo, dedup_repo))
 
 
 def _device_workload(workload_id: int, display_name: str, type_hint: str = "VM") -> Workload:
-    return Workload(
-        workload_id=WorkloadId(workload_id),
-        workload_uid=f"wl-{workload_id}",  # type: ignore[arg-type]
-        workload_type=type_hint,
-        sub_type=None,
-        display_name=display_name,
-        subtitle=None,
-        spec={},
+    return make_workload(
+        workload_id=workload_id, workload_uid=f"wl-{workload_id}", workload_type=type_hint, display_name=display_name
     )
 
 
@@ -121,31 +106,13 @@ def _saas_workload(
         spec["spec"] = {"tenant_id": tenant_id}
     if domain is not None:
         spec["spec"] = {"domain": domain}
-    return Workload(
-        workload_id=WorkloadId(workload_id),
-        workload_uid=f"wl-{workload_id}",  # type: ignore[arg-type]
+    return make_workload(
+        workload_id=workload_id,
+        workload_uid=f"wl-{workload_id}",
         workload_type=workload_type,
         sub_type=sub_type,
         display_name=display_name,
-        subtitle=None,
         spec=spec,
-    )
-
-
-def _version(uid: str = "vuid-1", display_name: str = "2026-01-01 00:00") -> Version:
-    return Version(
-        version_id=VersionId(1),
-        version_uid=VersionUid(uid),
-        workload_id=WorkloadId(1),
-        connection_config_id=ConnectionConfigId(1),
-        target_type="VM",
-        target_id=TargetId("target"),
-        saas_stream_uuid=StreamUuid(""),
-        saas_snapshot_uuid=SnapshotUuid(""),
-        saas_version_id=SaasVersionId(0),
-        deleted=False,
-        display_name=display_name,
-        meta=None,
     )
 
 
@@ -153,13 +120,13 @@ def _version(uid: str = "vuid-1", display_name: str = "2026-01-01 00:00") -> Ver
 
 
 def test_catalog_tree_spec_is_empty_with_no_repos() -> None:
-    assert catalog_tree_spec(BrowseModel(), scan_path="", verbose=False) == ()
+    assert catalog_tree_spec(BrowseModel()) == ()
 
 
 def test_catalog_tree_spec_a_not_asked_repo_has_no_children_modeled() -> None:
     handle = RepoHandle(1)
     model = BrowseModel(repos={handle: RepoState(layout=_layout(), key_status=KeyStatus.NOT_ENCRYPTED)})
-    specs = catalog_tree_spec(model, scan_path="/scan", verbose=False)
+    specs = catalog_tree_spec(dataclasses.replace(model, scan_path="/scan"))
 
     assert len(specs) == 1
     assert specs[0].key == handle
@@ -173,7 +140,7 @@ def test_catalog_tree_spec_a_loading_repo_also_has_no_children_modeled() -> None
     model = BrowseModel(
         repos={handle: RepoState(layout=_layout(), key_status=KeyStatus.NOT_ENCRYPTED, catalogs=Loading())}
     )
-    specs = catalog_tree_spec(model, scan_path="", verbose=False)
+    specs = catalog_tree_spec(model)
 
     assert specs[0].children is None
 
@@ -187,15 +154,11 @@ def test_catalog_tree_spec_a_failed_repo_renders_a_single_error_leaf() -> None:
             )
         }
     )
-    specs = catalog_tree_spec(model, scan_path="", verbose=False)
+    specs = catalog_tree_spec(model)
 
     assert specs[0].children is not None
     assert len(specs[0].children) == 1
     error_spec = specs[0].children[0]
-    # An exception's own str() is arbitrary text -- escaped before
-    # reaching this Tree label (Tree.process_label re-parses a plain str
-    # as Rich markup, same as Static, and an unescaped bracket can crash
-    # the widget outright with a markup error).
     assert error_spec.label == r"error: boom \[/] bang"
     assert error_spec.key == RepoErrorKey(repo=handle)
     assert error_spec.allow_expand is False
@@ -207,7 +170,7 @@ def test_catalog_tree_spec_renders_a_leaf_per_successfully_loaded_catalog() -> N
     model = BrowseModel(
         repos={handle: RepoState(layout=_layout(), key_status=KeyStatus.VERIFIED, catalogs=Success((cat_a, cat_b)))}
     )
-    specs = catalog_tree_spec(model, scan_path="", verbose=False)
+    specs = catalog_tree_spec(model)
 
     assert specs[0].children is not None
     assert [c.label for c in specs[0].children] == ["Catalog A", "Catalog B"]
@@ -224,14 +187,14 @@ def test_catalog_tree_spec_preserves_discovery_order_across_repos() -> None:
             second: RepoState(layout=_layout("second"), key_status=KeyStatus.NOT_ENCRYPTED),
         }
     )
-    specs = catalog_tree_spec(model, scan_path="", verbose=False)
+    specs = catalog_tree_spec(model)
     assert [s.key for s in specs] == [first, second]
 
 
 def test_catalog_tree_spec_filter_narrows_only_the_targeted_repos_catalogs() -> None:
     repo_a, repo_b = RepoHandle(1), RepoHandle(2)
     cat_apple, cat_banana = _catalog("apple", "Apple"), _catalog("banana", "Banana")
-    cat_other = _catalog("x", "Apple")
+    cat_other = _catalog("x", "Cherry")
     model = BrowseModel(
         repos={
             repo_a: RepoState(
@@ -239,18 +202,18 @@ def test_catalog_tree_spec_filter_narrows_only_the_targeted_repos_catalogs() -> 
             ),
             repo_b: RepoState(layout=_layout(), key_status=KeyStatus.NOT_ENCRYPTED, catalogs=Success((cat_other,))),
         },
-        tree_filter=TreeFilterState(tree="catalogs", parent_key=repo_a, text="apple"),
+        tree_filter=TreeFilterState(tree=FilterTree.CATALOGS, parent_key=repo_a, text="apple"),
     )
-    specs = catalog_tree_spec(model, scan_path="", verbose=False)
+    specs = catalog_tree_spec(model)
 
     by_key = {s.key: s for s in specs}
     repo_a_children = by_key[repo_a].children
     repo_b_children = by_key[repo_b].children
     assert repo_a_children is not None
     assert [c.label for c in repo_a_children] == ["Apple"]
-    # repo_b's own catalogs are untouched by a filter scoped to repo_a.
+    # "Cherry" doesn't match "apple": it survives because the filter is scoped to repo_a.
     assert repo_b_children is not None
-    assert [c.label for c in repo_b_children] == ["Apple"]
+    assert [c.label for c in repo_b_children] == ["Cherry"]
 
 
 def test_catalog_tree_spec_verbose_flag_reaches_the_repo_and_catalog_labels() -> None:
@@ -259,8 +222,8 @@ def test_catalog_tree_spec_verbose_flag_reaches_the_repo_and_catalog_labels() ->
     model = BrowseModel(
         repos={handle: RepoState(layout=_layout(), key_status=KeyStatus.NOT_ENCRYPTED, catalogs=Success((catalog,)))}
     )
-    plain = catalog_tree_spec(model, scan_path="", verbose=False)
-    verbose = catalog_tree_spec(model, scan_path="", verbose=True)
+    plain = catalog_tree_spec(model)
+    verbose = catalog_tree_spec(dataclasses.replace(model, verbose=True))
 
     assert plain[0].label != verbose[0].label  # repo label gains a "(layout: ...)" suffix
     assert plain[0].children is not None and verbose[0].children is not None
@@ -278,7 +241,7 @@ def test_workload_tree_spec_a_reload_failure_renders_a_single_error_leaf_and_ign
     model = BrowseModel(
         selected_catalog=_selected(RepoHandle(1), _catalog("a", "A")), reload_failure="sibling [/] gone"
     )
-    specs = workload_tree_spec(model, verbose=False)
+    specs = workload_tree_spec(model)
 
     assert len(specs) == 1
     assert specs[0].key == WORKLOAD_ERROR_KEY
@@ -286,29 +249,27 @@ def test_workload_tree_spec_a_reload_failure_renders_a_single_error_leaf_and_ign
 
 
 def test_workload_tree_spec_is_empty_with_no_catalog_selected() -> None:
-    assert workload_tree_spec(BrowseModel(), verbose=False) == ()
+    assert workload_tree_spec(BrowseModel()) == ()
 
 
 def test_workload_tree_spec_is_empty_while_the_catalogs_own_workloads_are_not_yet_loaded() -> None:
     handle, catalog = RepoHandle(1), _catalog("a", "A")
     model = BrowseModel(selected_catalog=_selected(handle, catalog))
-    assert workload_tree_spec(model, verbose=False) == ()
+    assert workload_tree_spec(model) == ()
 
     key = _catalog_key_of(handle, catalog)
     loading_model = BrowseModel(selected_catalog=_selected(handle, catalog), catalog_workloads={key: Loading()})
-    assert workload_tree_spec(loading_model, verbose=False) == ()
+    assert workload_tree_spec(loading_model) == ()
 
 
 def test_workload_tree_spec_a_refreshing_loading_state_renders_the_stale_previous_workloads() -> None:
-    """``RefreshRequested`` carries the last ``Success`` forward as
-    ``Loading.previous``, rendered here exactly like a real ``Success`` so
-    column 2 stays populated, stale-but-real, instead of blanking to
-    empty while the refetch is in flight."""
+    """A ``Loading`` carrying ``previous`` renders like a ``Success``, so
+    column 2 stays populated while the refetch is in flight."""
     handle, catalog = RepoHandle(1), _catalog("a", "A")
     key = _catalog_key_of(handle, catalog)
     vm = _device_workload(1, "VM-1", type_hint="VM")
     model = BrowseModel(selected_catalog=_selected(handle, catalog), catalog_workloads={key: Loading(previous=(vm,))})
-    specs = workload_tree_spec(model, verbose=False)
+    specs = workload_tree_spec(model)
 
     assert [s.key for s in specs] == [WorkloadGroupKey(path=("VM",))]
     assert specs[0].children is not None
@@ -321,7 +282,7 @@ def test_workload_tree_spec_a_failed_workloads_fetch_renders_a_single_error_leaf
     model = BrowseModel(
         selected_catalog=_selected(handle, catalog), catalog_workloads={key: FailureInfo(message="boom [/] bang")}
     )
-    specs = workload_tree_spec(model, verbose=False)
+    specs = workload_tree_spec(model)
 
     assert len(specs) == 1
     assert specs[0].key == WORKLOAD_ERROR_KEY
@@ -334,7 +295,7 @@ def test_workload_tree_spec_groups_device_workloads_by_type_hint() -> None:
     vm = _device_workload(1, "VM-1", type_hint="VM")
     fs = _device_workload(2, "FS-1", type_hint="FS")
     model = BrowseModel(selected_catalog=_selected(handle, catalog), catalog_workloads={key: Success((vm, fs))})
-    specs = workload_tree_spec(model, verbose=False)
+    specs = workload_tree_spec(model)
 
     assert [s.key for s in specs] == [WorkloadGroupKey(path=("VM",)), WorkloadGroupKey(path=("FS",))]
     vm_group = specs[0]
@@ -346,16 +307,11 @@ def test_workload_tree_spec_groups_device_workloads_by_type_hint() -> None:
 
 
 def test_workload_tree_spec_escapes_a_display_name_shaped_like_rich_markup() -> None:
-    """``workload.display_name`` is real, backup-derived content -- both
-    ``Tree`` and ``DataTable`` re-parse a plain ``str`` label/cell as
-    Rich markup, so it must be escaped before reaching this leaf's own
-    label: an unescaped bracket can otherwise crash the widget outright
-    with a markup error."""
     handle, catalog = RepoHandle(1), _catalog("a", "A")
     key = _catalog_key_of(handle, catalog)
     vm = _device_workload(1, "a[/]b", type_hint="VM")
     model = BrowseModel(selected_catalog=_selected(handle, catalog), catalog_workloads={key: Success((vm,))})
-    specs = workload_tree_spec(model, verbose=False)
+    specs = workload_tree_spec(model)
 
     assert specs[0].children is not None
     assert [c.label for c in specs[0].children] == [r"a\[/]b"]
@@ -364,9 +320,9 @@ def test_workload_tree_spec_escapes_a_display_name_shaped_like_rich_markup() -> 
 def test_workload_tree_spec_nests_saas_workloads_platform_tenant_subtype() -> None:
     handle, catalog = RepoHandle(1), _catalog("a", "A")
     key = _catalog_key_of(handle, catalog)
-    mail = _saas_workload(1, "alice@corp.com", workload_type="M365", sub_type="USER_EXCHANGE", tenant_id="tenant-x")
+    mail = _saas_workload(1, "alice@example.com", workload_type="M365", sub_type="USER_EXCHANGE", tenant_id="tenant-x")
     model = BrowseModel(selected_catalog=_selected(handle, catalog), catalog_workloads={key: Success((mail,))})
-    specs = workload_tree_spec(model, verbose=False)
+    specs = workload_tree_spec(model)
 
     assert len(specs) == 1
     platform_spec = specs[0]
@@ -387,14 +343,11 @@ def test_workload_tree_spec_nests_saas_workloads_platform_tenant_subtype() -> No
 
 
 def test_workload_tree_spec_escapes_a_tenant_key_shaped_like_rich_markup() -> None:
-    """``tenant_key`` is a real M365 tenant GUID or GW domain name
-    (``_saas_group_key``) -- escaped before reaching this Tree label,
-    same reasoning as the display-name test above."""
     handle, catalog = RepoHandle(1), _catalog("a", "A")
     key = _catalog_key_of(handle, catalog)
     mail = _saas_workload(1, "alice", workload_type="M365", sub_type="USER_EXCHANGE", tenant_id="a[/]b")
     model = BrowseModel(selected_catalog=_selected(handle, catalog), catalog_workloads={key: Success((mail,))})
-    specs = workload_tree_spec(model, verbose=False)
+    specs = workload_tree_spec(model)
 
     assert specs[0].children is not None
     tenant_spec = specs[0].children[0]
@@ -411,9 +364,9 @@ def test_workload_tree_spec_filter_narrows_only_the_targeted_groups_leaves() -> 
     model = BrowseModel(
         selected_catalog=_selected(handle, catalog),
         catalog_workloads={key: Success((apple, banana))},
-        tree_filter=TreeFilterState(tree="workloads", parent_key=group_key, text="apple"),
+        tree_filter=TreeFilterState(tree=FilterTree.WORKLOADS, parent_key=group_key, text="apple"),
     )
-    specs = workload_tree_spec(model, verbose=False)
+    specs = workload_tree_spec(model)
 
     assert specs[0].children is not None
     assert [c.label for c in specs[0].children] == ["Apple"]
@@ -427,10 +380,10 @@ def test_workload_tree_spec_filter_scoped_to_a_different_group_does_not_narrow_t
         selected_catalog=_selected(handle, catalog),
         catalog_workloads={key: Success((apple,))},
         tree_filter=TreeFilterState(
-            tree="workloads", parent_key=WorkloadGroupKey(path=("SOMETHING_ELSE",)), text="zzz"
+            tree=FilterTree.WORKLOADS, parent_key=WorkloadGroupKey(path=("SOMETHING_ELSE",)), text="zzz"
         ),
     )
-    specs = workload_tree_spec(model, verbose=False)
+    specs = workload_tree_spec(model)
 
     assert specs[0].children is not None
     assert [c.label for c in specs[0].children] == ["Apple"]
@@ -456,13 +409,11 @@ def test_version_rows_is_empty_while_still_loading_or_not_asked() -> None:
 
 
 def test_version_rows_a_refreshing_loading_state_renders_the_stale_previous_versions() -> None:
-    """Same stale-while-revalidate rendering as
-    ``test_workload_tree_spec_a_refreshing_loading_state_renders_the_stale_previous_workloads``,
-    for column 3."""
+    """Stale-while-revalidate rendering, as for column 2."""
     handle, catalog = RepoHandle(1), _catalog("a", "A")
     workload = _device_workload(1, "W")
     key = _workload_key_of(_catalog_key_of(handle, catalog), workload)
-    v1 = _version("v1", "2026-01-01 00:00")
+    v1 = make_version(version_uid="v1")
     model = BrowseModel(
         selected_catalog=_selected(handle, catalog),
         selected_workload=workload,
@@ -477,8 +428,8 @@ def test_version_rows_returns_disambiguated_index_name_pairs_on_success() -> Non
     handle, catalog = RepoHandle(1), _catalog("a", "A")
     workload = _device_workload(1, "W")
     key = _workload_key_of(_catalog_key_of(handle, catalog), workload)
-    v1 = _version("v1", "2026-01-01 00:00")
-    v2 = _version("v2", "2026-01-02 00:00")
+    v1 = make_version(version_uid="v1")
+    v2 = make_version(version_uid="v2", display_name="2026-01-02 00:00")
     model = BrowseModel(
         selected_catalog=_selected(handle, catalog),
         selected_workload=workload,
@@ -519,13 +470,12 @@ def test_version_fetch_pending_is_true_before_a_first_fetch_has_resolved() -> No
 
 
 def test_version_fetch_pending_is_false_once_resolved_including_a_failure() -> None:
-    """A failed fetch has still resolved -- ``version_fetch_pending`` only
-    tracks whether the first resolution has happened yet, not whether it
-    succeeded."""
+    """``version_fetch_pending`` tracks only whether the first fetch has
+    resolved, success or failure."""
     handle, catalog = RepoHandle(1), _catalog("a", "A")
     workload = _device_workload(1, "W")
     key = _workload_key_of(_catalog_key_of(handle, catalog), workload)
-    v1 = _version("v1", "2026-01-01 00:00")
+    v1 = make_version(version_uid="v1")
 
     success_model = BrowseModel(
         selected_catalog=_selected(handle, catalog),
@@ -572,4 +522,101 @@ def test_is_workload_current_is_true_for_the_selected_workload() -> None:
     assert is_workload_current(model, key) is True
 
 
-__all__: list[str] = []
+class TestTreeFilterTarget:
+    def _model(self, handle: RepoHandle, *, loaded: bool) -> BrowseModel:
+        catalogs: Success[tuple[Catalog, ...]] | Loading[tuple[Catalog, ...]] = (
+            Success((_catalog("1", "Source"),)) if loaded else Loading()
+        )
+        return BrowseModel(
+            repos={handle: RepoState(layout=_layout(), key_status=KeyStatus.NOT_ENCRYPTED, catalogs=catalogs)}
+        )
+
+    def test_a_repository_with_loaded_catalogs_opens_the_catalog_filter(self) -> None:
+        handle = RepoHandle(1)
+        opened = tree_filter_target(self._model(handle, loaded=True), FilterTree.CATALOGS, handle)
+        assert opened == TreeFilterOpened(tree=FilterTree.CATALOGS, parent_key=handle)
+
+    def test_nothing_to_narrow_in_the_catalog_tree(self) -> None:
+        handle = RepoHandle(1)
+        assert tree_filter_target(self._model(handle, loaded=False), FilterTree.CATALOGS, handle) is None
+        assert tree_filter_target(self._model(handle, loaded=True), FilterTree.CATALOGS, None) is None
+        assert tree_filter_target(self._model(handle, loaded=True), FilterTree.CATALOGS, RepoErrorKey(handle)) is None
+        assert tree_filter_target(BrowseModel(), FilterTree.CATALOGS, RepoHandle(2)) is None
+
+    def test_only_a_workload_group_opens_the_workload_filter(self) -> None:
+        group = WorkloadGroupKey(("VM",))
+        assert tree_filter_target(BrowseModel(), FilterTree.WORKLOADS, group) == TreeFilterOpened(
+            tree=FilterTree.WORKLOADS, parent_key=group
+        )
+        assert tree_filter_target(BrowseModel(), FilterTree.WORKLOADS, "a-workload-leaf") is None
+        assert tree_filter_target(BrowseModel(), FilterTree.WORKLOADS, None) is None
+
+
+# -- visible_version_rows / selected_workload_key -------------------------
+
+
+def _model_with_versions(*names: str, filter_text: str | None = None) -> BrowseModel:
+    handle, catalog = RepoHandle(1), _catalog("a", "A")
+    workload = _device_workload(1, "W")
+    key = _workload_key_of(_catalog_key_of(handle, catalog), workload)
+    versions = tuple(make_version(version_uid=f"v{i}", display_name=name) for i, name in enumerate(names))
+    return BrowseModel(
+        selected_catalog=_selected(handle, catalog),
+        selected_workload=workload,
+        workload_versions={key: Success(versions)},
+        version_filter=VersionFilterState(text=filter_text) if filter_text is not None else None,
+    )
+
+
+def test_visible_version_rows_without_a_filter_is_every_row() -> None:
+    model = _model_with_versions("2026-01-01 00:00", "2026-02-01 00:00")
+    assert visible_version_rows(model) == version_rows(model)
+
+
+def test_visible_version_rows_keeps_original_indices_of_the_rows_the_filter_matches() -> None:
+    model = _model_with_versions("2026-01-01 00:00", "2026-02-01 00:00", "2026-02-15 00:00", filter_text="-02-")
+    assert visible_version_rows(model) == ((1, "2026-02-01 00:00"), (2, "2026-02-15 00:00"))
+
+
+def test_selected_workload_key_needs_both_a_catalog_and_a_workload() -> None:
+    handle, catalog = RepoHandle(1), _catalog("a", "A")
+    workload = _device_workload(1, "W")
+    assert BrowseModel().selected_workload_key is None
+    assert BrowseModel(selected_catalog=_selected(handle, catalog)).selected_workload_key is None
+    model = BrowseModel(selected_catalog=_selected(handle, catalog), selected_workload=workload)
+    assert model.selected_workload_key == _workload_key_of(_catalog_key_of(handle, catalog), workload)
+
+
+# -- current_workloads / breadcrumb ---------------------------------------
+
+
+def test_current_workloads_is_none_until_the_selected_catalogs_workloads_load() -> None:
+    handle, catalog = RepoHandle(1), _catalog("a", "A")
+    key = _catalog_key_of(handle, catalog)
+    workloads = (_device_workload(1, "W"),)
+    assert current_workloads(BrowseModel()) is None
+    loading = BrowseModel(selected_catalog=_selected(handle, catalog), catalog_workloads={key: Loading()})
+    assert current_workloads(loading) is None
+    loaded = BrowseModel(selected_catalog=_selected(handle, catalog), catalog_workloads={key: Success(workloads)})
+    assert current_workloads(loaded) == workloads
+
+
+def test_breadcrumb_with_nothing_selected_is_the_root() -> None:
+    assert breadcrumb(BrowseModel()) == "/"
+
+
+def test_breadcrumb_names_repo_catalog_type_and_workload_escaped() -> None:
+    handle, catalog = RepoHandle(1), _catalog("a", "Cat [x]")
+    layout = _layout()
+    model = BrowseModel(
+        scan_path="/scan/backups",
+        repos={handle: RepoState(layout=layout, key_status=KeyStatus.NOT_ENCRYPTED)},
+        selected_catalog=_selected(handle, catalog),
+        selected_workload=_device_workload(1, "W [1]"),
+    )
+    assert breadcrumb(model).split(" › ") == [
+        safe(repo_path_component(layout, "/scan/backups")),
+        safe("Cat [x]"),
+        humanize_type("VM"),
+        safe("W [1]"),
+    ]

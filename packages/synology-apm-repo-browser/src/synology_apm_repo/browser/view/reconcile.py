@@ -1,42 +1,30 @@
-"""Keyed reconciliation for one ``Tree`` level: given the domain
-``NodeSpec``s a screen wants a level to show, updates a real ``Tree``'s
-children in place, indexed by domain identity, so a survivor keeps its
-own ``TreeNode`` (and its expansion/cursor state) instead of a full
-rebuild — and never keys off ``id(TreeNode)``, since CPython can reuse a
-destroyed node's address for an unrelated later one.
+"""Keyed reconciliation of a ``Tree``: updates a node's children in place
+to match the ``NodeSpec``s a screen wants, keyed by domain identity, so a
+survivor keeps its ``TreeNode`` (and its expansion/cursor state).
 
-**Precondition**: a ``TreeNode`` this module reconciles must have been
-created by a previous ``reconcile_children`` call (its ``.data`` is a
-``Binding``) — this module owns 100% of ``parent``'s children, not just
-the ones it recognizes. A foreign child (``.data`` isn't a ``Binding``)
-is left untouched, never counted as a survivor or removed.
-
-**Scope**: reconciles one level only (never recurses past what
-``NodeSpec.children`` describes) and only adds/removes — it does not
-reposition a survivor whose relative order changed.
+A reconciled ``TreeNode`` was created by ``reconcile_children`` (its
+``.data`` is a ``Binding``); a foreign child (``.data`` is ``None``) is left
+alone. Reconciliation recurses only as far as ``NodeSpec.children``
+describes, and only adds and removes: a survivor whose relative order
+changed is not moved.
 """
 
 from __future__ import annotations
 
 import dataclasses
 from collections.abc import Callable, Sequence
-from typing import Any, Generic, TypeVar
+from typing import Any
 
 from textual.widgets import Tree
 from textual.widgets.tree import TreeNode
 
-NodeKeyT = TypeVar("NodeKeyT")
-
 
 @dataclasses.dataclass(frozen=True, slots=True)
-class Binding(Generic[NodeKeyT]):
-    """A reconciled ``TreeNode``'s own ``.data``: domain identity
-    (``key``), the label actually on screen (``label`` — compared
-    against, not the live ``node.label``, so a suffix another widget
-    appends directly, e.g. a loading spinner's, stays invisible to this
-    comparison), and whatever payload a screen's own
-    ``on_tree_node_selected`` handler wants back (a ``CatalogEntry``, a
-    ``Workload``, a ``Node``, ...)."""
+class Binding[NodeKeyT]:
+    """A reconciled ``TreeNode``'s ``.data``: its domain ``key``, the
+    ``label`` reconciliation last set (compared instead of the live label,
+    to which a loading sink may append), and the ``payload`` a screen's
+    selection handler reads back."""
 
     key: NodeKeyT
     label: str
@@ -44,11 +32,9 @@ class Binding(Generic[NodeKeyT]):
 
 
 @dataclasses.dataclass(frozen=True, slots=True)
-class NodeSpec(Generic[NodeKeyT]):
-    """One level's wanted shape for one child. ``children=None`` means
-    "not modelled" — this module leaves that subtree alone rather than
-    treating it as "should have zero children". An explicit ``()``
-    reconciles down to genuinely empty."""
+class NodeSpec[NodeKeyT]:
+    """One wanted child. ``children=None`` leaves its subtree alone; ``()``
+    empties it."""
 
     key: NodeKeyT
     label: str
@@ -58,11 +44,10 @@ class NodeSpec(Generic[NodeKeyT]):
 
 
 @dataclasses.dataclass(frozen=True, slots=True)
-class Diff(Generic[NodeKeyT]):
-    """What one ``reconcile_children`` call did. ``before``/``after``
-    are this level's own key order. ``rebuilt=True`` means the
-    bulk-removal fallback fired — every survivor's own ``TreeNode``
-    identity was lost that pass, same as a full rebuild."""
+class Diff[NodeKeyT]:
+    """What one ``reconcile_children`` call did to one level.
+    ``before``/``after`` are its key order; ``rebuilt`` means the
+    bulk-removal fallback re-created every child."""
 
     before: tuple[NodeKeyT, ...]
     after: tuple[NodeKeyT, ...]
@@ -72,11 +57,11 @@ class Diff(Generic[NodeKeyT]):
     rebuilt: bool = False
 
 
-def _binding(spec: NodeSpec[NodeKeyT]) -> Binding[NodeKeyT]:
+def _binding[NodeKeyT](spec: NodeSpec[NodeKeyT]) -> Binding[NodeKeyT]:
     return Binding(key=spec.key, label=spec.label, payload=spec.payload)
 
 
-def _add_spec(
+def _add_spec[NodeKeyT](
     parent: TreeNode[Binding[NodeKeyT]],
     spec: NodeSpec[NodeKeyT],
     *,
@@ -97,16 +82,12 @@ def _add_spec(
     return node
 
 
-def update_node(node: TreeNode[Binding[NodeKeyT]], spec: NodeSpec[NodeKeyT]) -> bool:
-    """Updates ``node`` in place to match ``spec`` — returns whether the
-    label actually changed. Compares against the *stored*
-    ``node.data.label``, never the live ``node.label``, since something
-    else (e.g. ``TreeNodeLoadingSink``'s per-node suffix) can append to
-    the live label directly. Skips ``set_label()`` when the label is
-    unchanged, since it unconditionally schedules a repaint. Exported
-    separately for a screen whose own tree root is itself a domain node
-    (``UnitScreen``'s), since ``reconcile_children`` only ever touches a
-    parent's children, never the parent node itself."""
+def update_node[NodeKeyT](node: TreeNode[Binding[NodeKeyT]], spec: NodeSpec[NodeKeyT]) -> bool:
+    """Updates ``node`` in place to match ``spec``; whether the label
+    changed (against the stored ``Binding.label``). ``set_label()`` is
+    skipped when unchanged, since it always repaints. Public for a screen
+    whose tree root is itself a domain node (``UnitScreen``), which
+    ``reconcile_children`` never touches."""
     relabelled = node.data is None or node.data.label != spec.label
     if relabelled:
         node.set_label(spec.label)
@@ -116,33 +97,24 @@ def update_node(node: TreeNode[Binding[NodeKeyT]], spec: NodeSpec[NodeKeyT]) -> 
     return relabelled
 
 
-def reconcile_children(
+def reconcile_children[NodeKeyT](
     parent: TreeNode[Binding[NodeKeyT]],
     specs: Sequence[NodeSpec[NodeKeyT]],
     *,
     on_diff: Callable[[NodeKeyT | None, Diff[NodeKeyT]], None] | None = None,
     on_node: Callable[[NodeKeyT, TreeNode[Binding[NodeKeyT]]], None] | None = None,
 ) -> Diff[NodeKeyT]:
-    """Updates ``parent``'s children to match ``specs``, keyed by domain
-    identity (``NodeSpec.key``) rather than position — a survivor keeps
-    its own ``TreeNode`` (and its expansion/cursor state); only what's
-    new or gone is added or removed.
+    """Updates ``parent``'s children to match ``specs``, keyed by
+    ``NodeSpec.key``: only what's new or gone is added or removed.
 
-    Bulk-removal fallback: when more than half of ``parent``'s current
-    managed children would be removed, removes all of them
-    (``remove_children()``) and re-adds every wanted child fresh instead
-    of one at a time — cheaper at that scale, though survivors lose
-    their own identity, same as a full rebuild. Only taken when
-    ``parent`` has no foreign child: ``remove_children()`` wipes every
-    real child unconditionally, with no way to spare one this module
-    didn't create.
+    When more than half the current children would be removed and none is
+    foreign, all are removed and the wanted ones re-added, which is cheaper
+    at that scale but loses survivors' identity.
 
-    ``on_diff``, when given, is called once per level reconciled (this
-    one, plus every nested level recursed into), keyed by that level's
-    own parent key (``None`` for a root with no ``Binding`` of its own).
-    ``on_node``, when given, is called once for every spec resolved to a
-    real ``TreeNode`` — survivor or freshly added — keyed by its domain
-    key."""
+    ``on_diff`` is called once per level reconciled, nested ones included,
+    with that level's parent key (``None`` for a root without a
+    ``Binding``). ``on_node`` is called for every spec's resolved
+    ``TreeNode``, survivor or new."""
     existing: dict[NodeKeyT, TreeNode[Binding[NodeKeyT]]] = {
         node.data.key: node for node in parent.children if node.data is not None
     }
@@ -185,13 +157,10 @@ def reconcile_children(
     return diff
 
 
-def next_cursor_key(cursor_key: NodeKeyT, diff: Diff[NodeKeyT]) -> NodeKeyT | None:
-    """Where the cursor should move after a reconcile removed the node
-    it was on — the nearest surviving sibling by original position,
-    forward then backward; ``None`` if nothing at this level survived
-    (the caller then climbs the ancestor chain instead). Returns
-    ``cursor_key`` unchanged when it's still present, so callers can call
-    this unconditionally without checking first."""
+def next_cursor_key[NodeKeyT](cursor_key: NodeKeyT, diff: Diff[NodeKeyT]) -> NodeKeyT | None:
+    """Where the cursor goes after ``diff``: ``cursor_key`` if it
+    survived, else the nearest surviving sibling by original position
+    (forward, then backward), else ``None``."""
     if cursor_key in diff.after:
         return cursor_key
     if cursor_key not in diff.before:
@@ -207,12 +176,9 @@ def next_cursor_key(cursor_key: NodeKeyT, diff: Diff[NodeKeyT]) -> NodeKeyT | No
     return None
 
 
-def find_node(root: TreeNode[Binding[NodeKeyT]], key: NodeKeyT) -> TreeNode[Binding[NodeKeyT]] | None:
-    """A bounded walk of whatever's currently reconciled under ``root``
-    to find the ``TreeNode`` representing ``key`` — a survivor keeping
-    its own ``TreeNode`` (this module's core guarantee) doesn't mean the
-    cursor followed it, since ``Tree.cursor_node`` is derived from line
-    position, not node identity."""
+def find_node[NodeKeyT](root: TreeNode[Binding[NodeKeyT]], key: NodeKeyT) -> TreeNode[Binding[NodeKeyT]] | None:
+    """The ``TreeNode`` under ``root`` (itself included) whose key is
+    ``key``."""
     if root.data is not None and root.data.key == key:
         return root
     for child in root.children:
@@ -231,28 +197,22 @@ def force_tree_line_cache(tree: Tree[Any]) -> None:
 
 
 def move_cursor_keyed(tree: Tree[Any], node: TreeNode[Any]) -> None:
-    """Moves ``tree``'s cursor to ``node`` — a no-op when the cursor is
-    already there, since ``Tree.move_cursor`` always schedules a repaint
-    even when unchanged. Call ``force_tree_line_cache`` first if
-    ``node`` is new or the cursor is actually moving. ``node`` must be
-    reachable (every ancestor expanded); ``Tree.move_cursor`` silently
-    no-ops on an unreachable node rather than raising."""
+    """Moves ``tree``'s cursor to ``node``, skipping the repaint when it is
+    already there. ``node`` must be reachable (every ancestor expanded):
+    ``Tree.move_cursor`` silently ignores an unreachable one."""
     if tree.cursor_node is node and node._line != -1:  # noqa: SLF001 - unbuilt nodes read -1 here; see force_tree_line_cache
         return
     force_tree_line_cache(tree)
     tree.move_cursor(node)
 
 
-def reconcile_and_restore_cursor(tree: Tree[Binding[NodeKeyT]], specs: Sequence[NodeSpec[NodeKeyT]]) -> Diff[NodeKeyT]:
-    """Reconciles ``tree.root``'s children to ``specs``, then restores
-    the cursor by domain key rather than trusting ``TreeNode`` identity,
-    since ``Tree.cursor_node`` is derived from line position.
-
-    If the cursor's key didn't survive, moves to the nearest surviving
-    sibling (``next_cursor_key``); if none did either, climbs the
-    captured ancestor chain to the nearest surviving ancestor (an entire
-    subtree can vanish in one reconcile); falls back to ``tree.root`` if
-    nothing survived."""
+def reconcile_and_restore_cursor[NodeKeyT](
+    tree: Tree[Binding[NodeKeyT]], specs: Sequence[NodeSpec[NodeKeyT]]
+) -> Diff[NodeKeyT]:
+    """Reconciles ``tree.root``'s children to ``specs``, then restores the
+    cursor by domain key, since ``Tree.cursor_node`` follows line position,
+    not node identity: to the same key, else its nearest surviving sibling,
+    else its nearest surviving ancestor, else ``tree.root``."""
     cursor_node = tree.cursor_node
     cursor_key: NodeKeyT | None = None
     ancestor_keys: list[NodeKeyT] = []

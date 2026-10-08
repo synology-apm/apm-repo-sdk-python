@@ -16,13 +16,10 @@ def _format_when(when: date | datetime) -> str:
 
 
 def render_calendar_event_preview(data: bytes) -> str:
-    """Parse one exported ``.ics`` (a single ``VEVENT`` —
-    ``units/content/saas_calendar.py::build_ics``'s output shape) into
-    Organizer/Title/Location/Start Time/End Time/Recurrence lines, one
-    per line, always in that order. A field the real event genuinely
-    doesn't have shows ``_NONE_LABEL`` (``_NO_TITLE_LABEL`` for Title
-    specifically) — never dropped, never a raw internal id. Same
-    let-it-propagate posture as ``render_mail_preview``."""
+    """Organizer/Title/Location/Start Time/End Time/Recurrence lines for one
+    exported ``.ics`` (a single ``VEVENT``), always in that order; a missing
+    field shows ``_NONE_LABEL`` (``_NO_TITLE_LABEL`` for Title). Parse
+    failures propagate."""
     cal = icalendar.Calendar.from_ical(data)
     events = cal.walk("VEVENT")
     if not events:

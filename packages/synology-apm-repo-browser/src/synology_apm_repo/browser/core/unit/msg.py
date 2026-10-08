@@ -1,30 +1,26 @@
-"""``UnitMsg``: every event ``UnitScreen``'s own store can react to.
-Every fetch-result variant carries the ``epoch``/``request`` its own
-dispatching ``Cmd`` was minted with (captured at dispatch time, in
-``update.py`` -- never re-read from live model state inside an effect),
-so ``update()`` can tell a stale result apart from the one it's still
-waiting on before ever applying it."""
+"""``UnitMsg``: every event ``UnitScreen``'s store handles. Every fetch
+result carries the ``epoch``/``request`` of the ``Cmd`` that started it, so
+``update()`` can drop a stale one."""
 
 from __future__ import annotations
 
 import dataclasses
 
 from synology_apm_repo.browser.core.keys import Epoch, ProviderHandle, RequestId
-from synology_apm_repo.sdk.units.base import Node
-from synology_apm_repo.sdk.units.node_ref import NodeRef
+from synology_apm_repo.browser.core.unit.model import DetailBody, UnitPurpose
+from synology_apm_repo.sdk import Node, NodeRef, RestorableUnit
 
 
-@dataclasses.dataclass(frozen=True)
+@dataclasses.dataclass(frozen=True, slots=True)
 class RootRequested:
-    """A fresh root/provider load. ``force_raw`` is captured by the
-    screen from ``app_state.verbose`` at dispatch time, since ``update()``
-    is pure and can't read a Textual reactive itself."""
+    """A fresh root/provider load. ``force_raw`` is the app's verbose flag
+    at dispatch time."""
 
     invalidate: bool
     force_raw: bool
 
 
-@dataclasses.dataclass(frozen=True)
+@dataclasses.dataclass(frozen=True, slots=True)
 class RootLoaded:
     epoch: Epoch
     request: RequestId
@@ -32,23 +28,22 @@ class RootLoaded:
     root: Node
 
 
-@dataclasses.dataclass(frozen=True)
+@dataclasses.dataclass(frozen=True, slots=True)
 class RootLoadFailed:
     epoch: Epoch
     request: RequestId
     message: str
 
 
-@dataclasses.dataclass(frozen=True)
+@dataclasses.dataclass(frozen=True, slots=True)
 class ChildrenRequested:
-    """An ordinary expand of a node not yet in ``model.loaded`` --
-    ``node`` is captured from the ``TreeNode``'s own ``.data`` at dispatch
-    time, not re-derived from the model."""
+    """A request for ``node``'s first page of children; a no-op if they
+    are loaded or loading."""
 
     node: Node
 
 
-@dataclasses.dataclass(frozen=True)
+@dataclasses.dataclass(frozen=True, slots=True)
 class ChildrenLoaded:
     epoch: Epoch
     request: RequestId
@@ -57,7 +52,7 @@ class ChildrenLoaded:
     exhausted: bool
 
 
-@dataclasses.dataclass(frozen=True)
+@dataclasses.dataclass(frozen=True, slots=True)
 class ChildrenLoadFailed:
     epoch: Epoch
     request: RequestId
@@ -65,12 +60,12 @@ class ChildrenLoadFailed:
     message: str
 
 
-@dataclasses.dataclass(frozen=True)
+@dataclasses.dataclass(frozen=True, slots=True)
 class LoadMoreRequested:
     node: Node
 
 
-@dataclasses.dataclass(frozen=True)
+@dataclasses.dataclass(frozen=True, slots=True)
 class MoreChildrenLoaded:
     epoch: Epoch
     request: RequestId
@@ -79,7 +74,7 @@ class MoreChildrenLoaded:
     exhausted: bool
 
 
-@dataclasses.dataclass(frozen=True)
+@dataclasses.dataclass(frozen=True, slots=True)
 class MoreChildrenLoadFailed:
     epoch: Epoch
     request: RequestId
@@ -87,40 +82,107 @@ class MoreChildrenLoadFailed:
     message: str
 
 
-@dataclasses.dataclass(frozen=True)
-class ChainStepResolved:
-    """``GotoChainWalker``'s dispatch for one chain step's exhaustive
-    sibling list -- unconditionally replaces whatever ``ref`` was
-    previously loaded, whether nothing yet or only a partial page."""
+@dataclasses.dataclass(frozen=True, slots=True)
+class GotoRequested:
+    """A ``g`` target in this version; resolved once the root has loaded."""
 
-    ref: NodeRef
-    children: tuple[Node, ...]
+    target: NodeRef
 
 
-@dataclasses.dataclass(frozen=True)
+@dataclasses.dataclass(frozen=True, slots=True)
+class GotoResolved:
+    """``chain`` is ``(root, ..., target)``; ``children_by_step[i]`` is
+    ``chain[i]``'s complete child list, for every step but the target."""
+
+    epoch: Epoch
+    request: RequestId
+    chain: tuple[Node, ...]
+    children_by_step: tuple[tuple[Node, ...], ...]
+
+
+@dataclasses.dataclass(frozen=True, slots=True)
+class GotoNotFound:
+    epoch: Epoch
+    request: RequestId
+
+
+@dataclasses.dataclass(frozen=True, slots=True)
+class GotoFailed:
+    epoch: Epoch
+    request: RequestId
+    message: str
+
+
+@dataclasses.dataclass(frozen=True, slots=True)
+class UnitOpenRequested:
+    """Open leaf ``node`` as a unit, for ``purpose``."""
+
+    node: Node
+    purpose: UnitPurpose
+
+
+@dataclasses.dataclass(frozen=True, slots=True)
+class UnitOpened:
+    epoch: Epoch
+    request: RequestId
+    unit: RestorableUnit
+    purpose: UnitPurpose
+
+
+@dataclasses.dataclass(frozen=True, slots=True)
+class UnitOpenFailed:
+    epoch: Epoch
+    request: RequestId
+    message: str
+
+
+@dataclasses.dataclass(frozen=True, slots=True)
 class FilterOpened:
     ref: NodeRef
 
 
-@dataclasses.dataclass(frozen=True)
+@dataclasses.dataclass(frozen=True, slots=True)
 class FilterTextChanged:
     text: str
 
 
-@dataclasses.dataclass(frozen=True)
+@dataclasses.dataclass(frozen=True, slots=True)
 class FilterClosed:
     pass
 
 
-@dataclasses.dataclass(frozen=True)
+@dataclasses.dataclass(frozen=True, slots=True)
 class FolderSelected:
-    """Dispatched whenever the user navigates to a different folder --
-    either the folder tree's own selection, or activating a subfolder row
-    (both converge here). Pure: just updates ``model.selected``, no
-    ``Cmd`` -- fetching unloaded children is ``ChildrenRequested``,
-    dispatched separately."""
+    """The user navigated to ``folder`` (in the folder tree or the file
+    table): the file table shows its children. A flat category's are
+    fetched here (it has no expand arrow); any other folder's come with its
+    expansion (``ChildrenRequested``). A List-overview group, which has no
+    file-table contents, leaves the selection as it was."""
 
-    ref: NodeRef
+    folder: Node
+
+
+@dataclasses.dataclass(frozen=True, slots=True)
+class DetailRequested:
+    """The user selected ``node`` (a folder, a file row, a goto landing):
+    the detail pane shows its header and, for a leaf or a SharePoint List
+    group, fetches what goes under it."""
+
+    node: Node
+
+
+@dataclasses.dataclass(frozen=True, slots=True)
+class DetailResolved:
+    """The finished body of the detail fetch ``request`` started."""
+
+    epoch: Epoch
+    request: RequestId
+    body: DetailBody
+
+
+@dataclasses.dataclass(frozen=True, slots=True)
+class VerboseSet:
+    verbose: bool
 
 
 UnitMsg = (
@@ -133,9 +195,18 @@ UnitMsg = (
     | LoadMoreRequested
     | MoreChildrenLoaded
     | MoreChildrenLoadFailed
-    | ChainStepResolved
+    | GotoRequested
+    | GotoResolved
+    | GotoNotFound
+    | GotoFailed
+    | UnitOpenRequested
+    | UnitOpened
+    | UnitOpenFailed
     | FilterOpened
     | FilterTextChanged
     | FilterClosed
     | FolderSelected
+    | DetailRequested
+    | DetailResolved
+    | VerboseSet
 )

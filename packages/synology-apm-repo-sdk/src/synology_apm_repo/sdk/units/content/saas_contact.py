@@ -8,9 +8,9 @@ from __future__ import annotations
 import csv
 import io
 
-from .saas_artifact import parse_meta_json
+from ..._util.jsonparse import parse_json_object
 
-# M365 Outlook-compatible CSV column order (FORMAT-SPEC.md: m365-contact).
+# M365 Outlook-compatible CSV column order (FORMAT-SPEC.md: M365 Contact).
 _CSV_HEADER = [
     "First Name",
     "Middle Name",
@@ -31,11 +31,15 @@ _CSV_HEADER = [
 
 
 def build_contact_csv(meta_bytes: bytes) -> bytes:
-    """M365 only: one Outlook-compatible CSV row (UTF-8 BOM) from a
-    ``client_metadata`` (Graph API contact fields, camelCase) JSON
-    object (FORMAT-SPEC.md: m365-contact — column set is this module's own
-    reasonable subset of the fields that table documents)."""
-    meta = parse_meta_json(meta_bytes, "contact META")
+    """M365 only: an Outlook-compatible CSV (UTF-8 BOM, header plus one
+    row) from a contact META object's ``client_metadata`` (Graph API
+    contact fields), using a subset of the fields documented in
+    FORMAT-SPEC.md: M365 Contact.
+
+    Raises:
+        DataCorruptError: ``meta_bytes`` is not a JSON object.
+    """
+    meta = parse_json_object(meta_bytes, "contact META")
     client_metadata = meta.get("client_metadata") or {}
     emails = client_metadata.get("emailAddresses") or []
     business_phones = client_metadata.get("businessPhones") or []

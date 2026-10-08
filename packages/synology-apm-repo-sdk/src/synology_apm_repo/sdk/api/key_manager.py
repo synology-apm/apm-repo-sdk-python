@@ -1,8 +1,6 @@
-"""``KeyManager``: the encryption-key state machine for one opened
-``Repository``, part of the Repository Layer (see ``api/__init__.py``).
-Owns
-exactly the state ``KeyStatus`` depends on (``keys``/``key_verification``/
-``encrypted``) and the pure ``KeyStatus`` resolution logic.
+"""``KeyManager``: one opened ``Repository``'s encryption-key state
+(``keys``/``key_verification``/``encrypted``) and the ``KeyStatus`` it
+resolves to.
 """
 
 from __future__ import annotations
@@ -16,16 +14,28 @@ from ..storage.layout import RepositoryLayout, key_probe_layout
 
 
 class KeyStatus(enum.Enum):
-    """The same four states the ``doctor`` command reports, as a proper
-    type instead of a raw dict. ``NO_KEY_PROVIDED`` means "encrypted, no
-    key tried yet" — except in the rare case the encryption probe itself
-    couldn't tell, which shouldn't happen for a properly initialized
-    repository."""
+    """A repository's key state. ``NO_KEY_PROVIDED`` means encrypted (or,
+    rarely, undeterminable) with no key tried yet; ``INVALID`` means the
+    last key tried was rejected."""
 
     NO_KEY_PROVIDED = "no_key_provided"
     NOT_ENCRYPTED = "not_encrypted"
     VERIFIED = "verified"
     INVALID = "invalid"
+
+    @property
+    def label(self) -> str:
+        """This status as a user reads it (``"key needed"``,
+        ``"not encrypted"``, ``"key verified"`` or ``"invalid key"``)."""
+        return _KEY_STATUS_LABELS[self]
+
+
+_KEY_STATUS_LABELS = {
+    KeyStatus.NO_KEY_PROVIDED: "key needed",
+    KeyStatus.NOT_ENCRYPTED: "not encrypted",
+    KeyStatus.VERIFIED: "key verified",
+    KeyStatus.INVALID: "invalid key",
+}
 
 
 def _resolve_key_status(
@@ -44,9 +54,8 @@ def _resolve_key_status(
 
 
 class KeyManager:
-    """One ``Repository``'s own encryption-key state: the pure state
-    itself, not the ``verify()``/``adopt()``/``record()`` orchestration
-    around it (``Repository.set_key()``'s job)."""
+    """One ``Repository``'s encryption-key state. ``Repository.set_key()``
+    sequences ``verify()``/``adopt()``/``record()``."""
 
     def __init__(
         self,
@@ -57,22 +66,20 @@ class KeyManager:
     ) -> None:
         self._keys = keys
         self._key_verification = key_verification
-        # Only meaningful when keys is None; resolved eagerly since
-        # Session.discover()/Session.open() already probe encryption
-        # status before any key is tried.
+        # Only meaningful when keys is None; Session probes it when a
+        # repository is opened without a key.
         self._encrypted = encrypted
         self._status = _resolve_key_status(keys, key_verification, encrypted)
 
     @property
     def keys(self) -> KeyMaterial | None:
-        """``None`` until key material has actually been supplied — at
-        construction, or via a later ``adopt()`` (a rejected attempt never
-        reaches ``adopt()``)."""
+        """The adopted key material; ``None`` until a key is supplied at
+        construction or ``adopt()``-ed. A rejected key is never adopted."""
         return self._keys
 
     @property
     def status(self) -> KeyStatus:
-        """A plain, no-I/O property returning the precomputed ``KeyStatus``."""
+        """The current ``KeyStatus``; no I/O."""
         return self._status
 
     @property
@@ -84,10 +91,8 @@ class KeyManager:
 
     @property
     def is_encrypted(self) -> bool | None:
-        """Whether this repository is actually encrypted — ``True`` even
-        when the key turns out to be wrong; see ``verification`` for that.
-        ``None`` only when the underlying probe genuinely couldn't tell.
-        """
+        """Whether this repository is encrypted, ``True`` even when the key
+        was rejected; ``None`` when the probe couldn't tell."""
         if self._status is KeyStatus.NOT_ENCRYPTED:
             return False
         if self._status is KeyStatus.NO_KEY_PROVIDED:
@@ -95,10 +100,14 @@ class KeyManager:
         return True  # VERIFIED or INVALID
 
     def require_verified(self) -> None:
-        """Raise before any catalog I/O if this repository is *confirmed*
-        encrypted and its key hasn't been verified yet. Not called by
-        ``Repository.catalogs()``: those rows are plaintext, needing no
-        key."""
+        """Check, before workload/version I/O, that a confirmed-encrypted
+        repository has a verified key.
+
+        Raises:
+            KeyRequiredError: The repository is encrypted and no key was
+                supplied.
+            KeyMismatchError: The last key supplied was rejected.
+        """
         if self._status is KeyStatus.NO_KEY_PROVIDED and self.is_encrypted is True:
             raise KeyRequiredError("this repository is encrypted; call set_key() before browsing workloads/versions")
         if self._status is KeyStatus.INVALID:
@@ -110,26 +119,25 @@ class KeyManager:
     async def verify(
         self, store: ObjectStore, layout: RepositoryLayout, key_string: str
     ) -> tuple[KeyMaterial, KeyVerification]:
-        """Builds ``KeyMaterial`` from ``key_string`` and verifies it
-        against ``layout``'s own key-probe location. Pure — doesn't touch
-        this manager's own state; ``Repository.set_key()`` decides what to
-        do with the result."""
+        """``KeyMaterial`` from ``key_string``, verified against ``layout``'s
+        key-probe location. Leaves this manager's state unchanged.
+
+        Raises:
+            KeyMaterialError: ``key_string`` is malformed.
+            DataCorruptError: The repository's key record is unreadable.
+        """
         keys = KeyMaterial.from_key_string(key_string)
         verification = await keys.verify(store, key_probe_layout(layout))
         return keys, verification
 
     def adopt(self, keys: KeyMaterial) -> None:
-        """Commits ``keys`` as this manager's own key material immediately,
-        so not-yet-opened catalogs pick it up on their own eventual first
-        open. Leaves ``status``/``verification`` untouched — ``record()``
-        updates those once the reopen sweep completes."""
+        """Make ``keys`` the key material catalogs open with from now on.
+        ``status``/``verification`` change only on ``record()``."""
         self._keys = keys
 
     def record(self, keys: KeyMaterial, verification: KeyVerification) -> None:
-        """Records ``verification``'s outcome and recomputes ``status``.
-        ``keys`` is the just-tried key material, not necessarily
-        ``self.keys`` — a rejected key never reaches ``adopt()``, but
-        ``status`` must still distinguish "never tried" from "tried and
-        failed"."""
+        """Record ``verification`` and recompute ``status``. ``keys`` is the
+        key just tried, adopted or not, so a rejected key still yields
+        ``INVALID`` rather than ``NO_KEY_PROVIDED``."""
         self._key_verification = verification
         self._status = _resolve_key_status(keys, verification, self._encrypted)

@@ -1,49 +1,55 @@
 """Data model for saved S3/Azure/SMB connection profiles.
 
-One canonical, UI-facing field-naming scheme (``bucket``/``endpoint``/
-``region``/``verify_tls``/... rather than ``aws_access_key_id``/
-``region_name``/...) is used everywhere a profile's fields are named — CLI
-flags, the TUI's saved/loaded field dicts, and the dataclasses here.
-Translation to the third-party client's own kwarg names is isolated to each
-config dataclass's ``client_kwargs`` property, never duplicated at each
-call site.
-
-Secret fields (S3's access/secret key, Azure's credential, SMB's password)
-never appear on these dataclasses — they live in the OS keyring (see
-``secrets.py``) and are merged back in only by ``profiles.build_store``.
+Profile fields go by one canonical name everywhere (CLI flags, TUI forms,
+these dataclasses): ``bucket``/``endpoint``/``region``/``verify_tls``/...
+Each config's ``client_kwargs`` translates them to its client's kwarg
+names. Secret fields (S3's access/secret key, Azure's credential, SMB's
+password) live in the OS keyring, never on these dataclasses;
+``client_kwargs_with_secrets`` merges them in.
 """
 
 from __future__ import annotations
 
 import dataclasses
 import enum
-from collections.abc import Mapping
-from typing import Any
+from collections.abc import Callable, Mapping
+from typing import Any, ClassVar
+
+from ..storage.base import ObjectStore
+from ..storage.smb import DEFAULT_SMB_PORT
+from .errors import ProfileFieldError
 
 
-class BackendKind(enum.Enum):
-    """Which backend a profile targets."""
+class BackendKind(enum.StrEnum):
+    """Which backend a profile targets; the value is also its CLI/TUI name."""
 
     S3 = "s3"
     AZURE = "azure"
     SMB = "smb"
 
 
-@dataclasses.dataclass(frozen=True)
+@dataclasses.dataclass(frozen=True, slots=True)
 class S3ProfileConfig:
     """Non-secret ``S3Store`` constructor inputs. ``access_key``/
     ``secret_key`` are not fields here — see ``secrets.py``."""
+
+    kind: ClassVar[BackendKind] = BackendKind.S3
 
     bucket: str
     endpoint: str | None = None
     region: str | None = None
     verify_tls: bool = True
 
+    def open_store(self, **client_kwargs: Any) -> ObjectStore:
+        """The ``S3Store`` for this bucket, built with ``client_kwargs``
+        (``client_kwargs_with_secrets``'s result)."""
+        from ..storage import S3Store
+
+        return S3Store(self.bucket, **client_kwargs)
+
     @property
     def client_kwargs(self) -> dict[str, Any]:
-        """Everything but ``bucket`` and the secret fields, already in
-        ``S3Store``/``aioboto3``'s own kwarg names. Callers merge the
-        resolved secrets in on top of this dict."""
+        """``S3Store`` kwargs for everything but ``bucket`` and the secrets."""
         kwargs: dict[str, Any] = {"verify": self.verify_tls}
         if self.endpoint is not None:
             kwargs["endpoint_url"] = self.endpoint
@@ -53,29 +59,46 @@ class S3ProfileConfig:
 
     @property
     def display_fields(self) -> dict[str, str | None]:
-        """Ordered field-name -> value pairs for CLI/TUI display (a saved
-        profile's JSON and human-readable ``show`` output alike) — the one
-        place this backend's own display field list is spelled out, so
-        both renderers read it from here instead of each re-declaring
-        it."""
+        """Ordered field name -> value pairs the CLI and TUI display."""
         return {"bucket": self.bucket, "endpoint": self.endpoint, "region": self.region}
 
+    @property
+    def label(self) -> str:
+        """``s3://<bucket>``, how CLI/TUI name the store this config opens."""
+        return f"s3://{self.bucket}"
 
-@dataclasses.dataclass(frozen=True)
+
+@dataclasses.dataclass(frozen=True, slots=True)
 class AzureProfileConfig:
     """Non-secret ``AzureStore`` constructor inputs. ``credential`` is not
     a field here — see ``secrets.py``."""
+
+    kind: ClassVar[BackendKind] = BackendKind.AZURE
 
     container: str
     account_url: str | None = None
     verify_tls: bool = True
 
+    def open_store(self, **client_kwargs: Any) -> ObjectStore:
+        """The ``AzureStore`` for this container; see
+        ``S3ProfileConfig.open_store``.
+
+        Raises:
+            ProfileFieldError: Azure rejected ``account_url`` (missing or
+                malformed).
+        """
+        from ..storage import AzureStore
+
+        try:
+            return AzureStore(self.container, **client_kwargs)
+        except (TypeError, ValueError) as exc:
+            # BlobServiceClient validates account_url while constructing.
+            raise ProfileFieldError("account_url", f"invalid Azure account URL: {exc}") from exc
+
     @property
     def client_kwargs(self) -> dict[str, Any]:
-        """Everything but ``container`` and the secret field, already in
-        ``AzureStore``/``azure-storage-blob``'s own kwarg names — note
-        ``connection_verify``, not ``verify`` (``azure.core.Configuration``'s
-        own name for this, deliberately different from boto3's)."""
+        """``AzureStore`` kwargs for everything but ``container`` and the
+        secret (TLS verification is ``connection_verify`` there)."""
         kwargs: dict[str, Any] = {"connection_verify": self.verify_tls}
         if self.account_url is not None:
             kwargs["account_url"] = self.account_url
@@ -86,29 +109,35 @@ class AzureProfileConfig:
         """Same role as ``S3ProfileConfig.display_fields``."""
         return {"container": self.container, "account_url": self.account_url}
 
+    @property
+    def label(self) -> str:
+        """``azure://<container>``; see ``S3ProfileConfig.label``."""
+        return f"azure://{self.container}"
 
-@dataclasses.dataclass(frozen=True)
+
+@dataclasses.dataclass(frozen=True, slots=True)
 class SmbProfileConfig:
     """Non-secret ``SmbStore`` constructor inputs. ``password`` is not a
-    field here — see ``secrets.py``.
+    field here — see ``secrets.py``. ``username`` may carry a domain as
+    ``DOMAIN\\username`` or ``user@domain``; a profile names a whole
+    share."""
 
-    ``username`` takes the Windows-native ``DOMAIN\\username`` (or
-    ``user@domain`` UPN) form directly — ``smbprotocol``'s own NTLM/SPNEGO
-    layer splits the domain back out of that single string, so there is no
-    separate ``domain`` field to keep in sync with it. No ``path``/sub-root
-    field either, matching ``S3ProfileConfig``/``AzureProfileConfig``: a
-    share, like a bucket/container, is the whole scope one profile names."""
+    kind: ClassVar[BackendKind] = BackendKind.SMB
 
     server: str
     share: str
-    port: int = 445
+    port: int = DEFAULT_SMB_PORT
     username: str | None = None
+
+    def open_store(self, **client_kwargs: Any) -> ObjectStore:
+        """The ``SmbStore`` for this share; see ``S3ProfileConfig.open_store``."""
+        from ..storage import SmbStore
+
+        return SmbStore(self.share, **client_kwargs)
 
     @property
     def client_kwargs(self) -> dict[str, Any]:
-        """Everything but ``share`` and the secret field, already in
-        ``SmbStore``'s own kwarg names. Callers merge the resolved secret
-        in on top of this dict."""
+        """``SmbStore`` kwargs for everything but ``share`` and the secret."""
         kwargs: dict[str, Any] = {"server": self.server, "port": self.port}
         if self.username is not None:
             kwargs["username"] = self.username
@@ -119,117 +148,178 @@ class SmbProfileConfig:
         """Same role as ``S3ProfileConfig.display_fields``."""
         return {"server": self.server, "share": self.share, "port": self.port, "username": self.username}
 
+    @property
+    def label(self) -> str:
+        """``smb://<server>/<share>``; see ``S3ProfileConfig.label``."""
+        return f"smb://{self.server}/{self.share}"
 
-@dataclasses.dataclass(frozen=True)
+
+ProfileConfig = S3ProfileConfig | AzureProfileConfig | SmbProfileConfig
+"""Any backend's non-secret profile config."""
+
+
+@dataclasses.dataclass(frozen=True, slots=True)
 class Profile:
     """One saved profile, keyed by its user-chosen ``name`` (unique across
     every backend kind). Never carries secret values."""
 
     name: str
-    kind: BackendKind
     config: S3ProfileConfig | AzureProfileConfig | SmbProfileConfig
 
-
-@dataclasses.dataclass(frozen=True)
-class ProfileSummary:
-    """Cheap listing entry — derived from ``profiles.json`` alone, no
-    keyring access needed to produce it."""
-
-    name: str
-    kind: BackendKind
+    @property
+    def kind(self) -> BackendKind:
+        """The backend this profile targets, its config's ``kind``."""
+        return self.config.kind
 
 
-#: Keyring "username" per secret field, and the ``fields`` dict key
-#: ``profiles.load_profile``/``save_profile`` use for it — see
-#: ``secrets.py`` for how these map onto the underlying client's own
-#: kwarg names.
-S3_SECRET_FIELDS: tuple[str, ...] = ("access_key", "secret_key")
-AZURE_SECRET_FIELDS: tuple[str, ...] = ("credential",)
-SMB_SECRET_FIELDS: tuple[str, ...] = ("password",)
-
-_SECRET_FIELDS_BY_KIND: dict[BackendKind, tuple[str, ...]] = {
-    BackendKind.S3: S3_SECRET_FIELDS,
-    BackendKind.AZURE: AZURE_SECRET_FIELDS,
-    BackendKind.SMB: SMB_SECRET_FIELDS,
-}
-
-
-def secret_fields_for(kind: BackendKind) -> tuple[str, ...]:
-    """Which ``fields`` dict keys are secret (keyring-backed) for ``kind`` —
-    the rest are plain config, persisted to ``profiles.json``."""
-    return _SECRET_FIELDS_BY_KIND[kind]
-
-
-@dataclasses.dataclass(frozen=True)
+@dataclasses.dataclass(frozen=True, slots=True)
 class ProfileFieldSpec:
-    """One profile field's widget-binding shape, in canonical collection/
-    display order, for one backend — the single place a connection form
-    (the TUI's connect/saved-profile tabs today) reads a backend's full
-    field list from, instead of privately re-enumerating it. ``strip`` is
-    ``False`` for a value whose leading/trailing whitespace might be
-    significant (``secret_key``/``credential``/``password``) — not simply
-    every secret field, since ``access_key`` (also keyring-backed, per
-    ``secret_fields_for``) has no such concern and is stripped like an
-    ordinary field."""
+    """One profile field, in canonical collection/display order for its
+    backend: what a connection form binds and how ``config_from_fields``
+    reads it.
+
+    Attributes:
+        name: The canonical field name.
+        strip: Whether leading/trailing whitespace is dropped; ``False`` where
+            it might be significant (``secret_key``/``credential``/``password``).
+        is_checkbox: A boolean field, true when absent.
+        is_port: A port number, ``DEFAULT_SMB_PORT`` when blank.
+        required: Must be non-blank.
+        secret: Kept in the OS keyring, never in ``profiles.json``.
+        prompt: The interactive prompt for a secret field.
+    """
 
     name: str
     strip: bool = True
     is_checkbox: bool = False
+    is_port: bool = False
+    required: bool = False
+    secret: bool = False
+    prompt: str = ""
 
 
-#: Each backend's own field table — the CLI's per-backend prompt
-#: collectors (``cli/commands/profile.py``) keep their own field lists
-#: (each prompt has a distinct human label typer options don't carry, so
-#: looping over this table there wouldn't save anything); this is for a
-#: consumer that needs the field set/order and nothing else, one entry
-#: per real widget a connection form binds.
-S3_FORM_FIELDS: tuple[ProfileFieldSpec, ...] = (
-    ProfileFieldSpec("bucket"),
-    ProfileFieldSpec("endpoint"),
-    ProfileFieldSpec("region"),
-    ProfileFieldSpec("verify_tls", is_checkbox=True),
-    ProfileFieldSpec("access_key"),
-    ProfileFieldSpec("secret_key", strip=False),
-)
-#: No ``verify_tls`` entry — unlike S3, no Azure connection form in this
-#: project has a ``verify_tls`` widget (``AzureProfileConfig.verify_tls``
-#: only ever takes its dataclass default here), so this table stays an
-#: explicit list rather than one derived from ``AzureProfileConfig``'s own
-#: dataclass fields.
-AZURE_FORM_FIELDS: tuple[ProfileFieldSpec, ...] = (
-    ProfileFieldSpec("container"),
-    ProfileFieldSpec("account_url"),
-    ProfileFieldSpec("credential", strip=False),
-)
-SMB_FORM_FIELDS: tuple[ProfileFieldSpec, ...] = (
-    ProfileFieldSpec("server"),
-    ProfileFieldSpec("share"),
-    ProfileFieldSpec("port"),
-    ProfileFieldSpec("username"),
-    ProfileFieldSpec("password", strip=False),
-)
 _FORM_FIELDS_BY_KIND: dict[BackendKind, tuple[ProfileFieldSpec, ...]] = {
-    BackendKind.S3: S3_FORM_FIELDS,
-    BackendKind.AZURE: AZURE_FORM_FIELDS,
-    BackendKind.SMB: SMB_FORM_FIELDS,
+    BackendKind.S3: (
+        ProfileFieldSpec("bucket", required=True),
+        ProfileFieldSpec("endpoint"),
+        ProfileFieldSpec("region"),
+        ProfileFieldSpec("verify_tls", is_checkbox=True),
+        ProfileFieldSpec("access_key", secret=True, prompt="Access key (blank for ambient credential chain)"),
+        ProfileFieldSpec(
+            "secret_key", strip=False, secret=True, prompt="Secret key (blank for ambient credential chain)"
+        ),
+    ),
+    BackendKind.AZURE: (
+        ProfileFieldSpec("container", required=True),
+        ProfileFieldSpec("account_url"),
+        ProfileFieldSpec("verify_tls", is_checkbox=True),
+        ProfileFieldSpec(
+            "credential",
+            strip=False,
+            secret=True,
+            prompt="Credential — account key or SAS token (blank for ambient credential chain)",
+        ),
+    ),
+    BackendKind.SMB: (
+        ProfileFieldSpec("server", required=True),
+        ProfileFieldSpec("share", required=True),
+        ProfileFieldSpec("port", is_port=True),
+        ProfileFieldSpec("username"),
+        ProfileFieldSpec(
+            "password", strip=False, secret=True, prompt="Password (blank for an anonymous/guest session)"
+        ),
+    ),
+}
+
+_CONFIG_CLS_BY_KIND: dict[BackendKind, Callable[..., ProfileConfig]] = {
+    BackendKind.S3: S3ProfileConfig,
+    BackendKind.AZURE: AzureProfileConfig,
+    BackendKind.SMB: SmbProfileConfig,
 }
 
 
 def form_fields_for(kind: BackendKind) -> tuple[ProfileFieldSpec, ...]:
     """``kind``'s full field list, in canonical order — every field a
-    connection form binds, secrets included, unlike ``display_fields``
-    (non-secret only, read from an already-built config instance rather
-    than named ahead of one existing)."""
+    connection form binds, secrets included."""
     return _FORM_FIELDS_BY_KIND[kind]
 
 
-#: Secret field name -> the underlying client's own kwarg name for it —
-#: identity for Azure's ``credential``/SMB's ``password`` but not for S3's,
-#: whose keyring field names (``access_key``/``secret_key``) differ from
-#: ``aioboto3``'s own (``aws_access_key_id``/``aws_secret_access_key``).
-#: Keyed the same way regardless of backend so ``client_kwargs_with_secrets``
-#: can look up any field ``secret_fields_for`` names, for any kind, from
-#: one dict.
+def secret_fields_for(kind: BackendKind) -> tuple[str, ...]:
+    """Which field names are secret (keyring-backed) for ``kind`` — the
+    rest are plain config, persisted to ``profiles.json``."""
+    return tuple(field.name for field in _FORM_FIELDS_BY_KIND[kind] if field.secret)
+
+
+def config_from_fields(
+    kind: BackendKind, fields: Mapping[str, str | bool | int], *, check_required: bool = True
+) -> ProfileConfig:
+    """``fields`` (canonical names, as a connection form or the CLI collects
+    them; extra keys, secrets included, are ignored) turned into ``kind``'s
+    config. A blank optional field means "not set"; a blank port means
+    ``DEFAULT_SMB_PORT``. ``check_required=False`` accepts blank required
+    fields, for an account-level operation (listing buckets) that has none
+    chosen yet.
+
+    Raises:
+        ProfileFieldError: A required field is blank, or the port is not a number.
+    """
+    values: dict[str, object] = {}
+    for spec in _FORM_FIELDS_BY_KIND[kind]:
+        if spec.secret:
+            continue
+        raw = fields.get(spec.name)
+        if spec.is_checkbox:
+            values[spec.name] = True if raw is None else bool(raw)
+        elif spec.is_port:
+            values[spec.name] = _port(raw)
+        elif spec.required:
+            if not raw and check_required:
+                raise ProfileFieldError(spec.name, f"{spec.name} is required for a {kind} profile")
+            values[spec.name] = str(raw) if raw else ""
+        else:
+            values[spec.name] = str(raw) if raw else None
+    return _CONFIG_CLS_BY_KIND[kind](**values)
+
+
+def _port(raw: object) -> int:
+    if raw is None or raw == "":
+        return DEFAULT_SMB_PORT
+    try:
+        return int(str(raw))
+    except ValueError:
+        raise ProfileFieldError("port", f"port must be a number, not {raw!r}") from None
+
+
+def config_from_json(kind: BackendKind, raw: Mapping[str, Any]) -> ProfileConfig:
+    """``kind``'s config from one saved ``profiles.json`` entry, strictly:
+    nothing is coerced, so a hand-edited ``"false"`` is rejected rather
+    than read as true.
+
+    Raises:
+        KeyError: A required field is missing.
+        TypeError: A field has the wrong JSON type.
+    """
+    values: dict[str, object] = {}
+    for spec in _FORM_FIELDS_BY_KIND[kind]:
+        if spec.secret:
+            continue
+        expected: tuple[type, ...]
+        if spec.required:
+            value, expected = raw[spec.name], (str,)
+        elif spec.is_checkbox:
+            value, expected = raw.get(spec.name, True), (bool,)
+        elif spec.is_port:
+            value, expected = raw.get(spec.name, DEFAULT_SMB_PORT), (int,)
+        else:
+            value, expected = raw.get(spec.name), (str, type(None))
+        if not isinstance(value, expected) or (expected == (int,) and isinstance(value, bool)):
+            names = " or ".join(t.__name__ for t in expected)
+            raise TypeError(f"{spec.name} must be {names}, not {value!r}")
+        values[spec.name] = value
+    return _CONFIG_CLS_BY_KIND[kind](**values)
+
+
+#: Secret field name -> its store-constructor kwarg name, for every backend.
 _SECRET_KWARG_NAMES: dict[str, str] = {
     "access_key": "aws_access_key_id",
     "secret_key": "aws_secret_access_key",
@@ -237,29 +327,15 @@ _SECRET_KWARG_NAMES: dict[str, str] = {
     "password": "password",
 }
 
-_KIND_BY_CONFIG_TYPE: dict[type, BackendKind] = {
-    S3ProfileConfig: BackendKind.S3,
-    AzureProfileConfig: BackendKind.AZURE,
-    SmbProfileConfig: BackendKind.SMB,
-}
 
-
-def client_kwargs_with_secrets(
-    config: S3ProfileConfig | AzureProfileConfig | SmbProfileConfig, secrets: Mapping[str, str]
-) -> dict[str, Any]:
-    """``config.client_kwargs``, overlaid with whichever of
-    ``secret_fields_for(kind)``'s fields ``secrets`` actually carries a
-    truthy value for — the shared shape behind every "resolve one
-    profile's config plus its secrets into constructor kwargs" call site.
-    ``secrets`` may be a superset of what applies here (a not-yet-saved
-    connection form carries every backend's fields at once) — only the
-    keys ``secret_fields_for`` names for ``config``'s own kind are ever
-    read from it; a present-but-falsy value (an empty string from an
-    untouched form field) is treated the same as absent."""
-    kind = _KIND_BY_CONFIG_TYPE[type(config)]
+def client_kwargs_with_secrets(config: ProfileConfig, secrets: Mapping[str, object]) -> dict[str, Any]:
+    """``config.client_kwargs`` plus each of its kind's secret fields that
+    ``secrets`` holds as a non-empty string; other keys in ``secrets`` are
+    ignored."""
+    kind = config.kind
     kwargs = dict(config.client_kwargs)
     for field_name in secret_fields_for(kind):
         value = secrets.get(field_name)
-        if value:
+        if value and isinstance(value, str):
             kwargs[_SECRET_KWARG_NAMES[field_name]] = value
     return kwargs

@@ -49,7 +49,7 @@ contract does this touch."
 
 | layer | module | responsibility |
 |---|---|---|
-| Repository Layer | `api/` (+ `diagnostics.py` sibling) | `Session`/`Repository`/`Catalog` facade — the intended entry point for CLI/TUI |
+| Repository Layer | `api/` (+ `diagnostics.py`/`export.py` siblings) | `Session`/`Repository`/`Catalog` facade, re-exported by the top-level `sdk` package — the entry point for every consumer |
 | Unit Layer | `units/` (minus `content/`; includes the `saas/` subpackage — Mail/Drive/Contact/Calendar/Site/Teams/raw providers) | tree navigation: `Node`/`RestorableUnit`/`UnitProvider`/`NodeRef`, provider skeletons, dispatch |
 | Content Layer | `units/content/` | concrete `ContentSource` implementations + pure content-rendering functions |
 | Catalog Layer | `catalog/` | `Connection`/`Workload`/`Version` — plain SQLite, cheap to enumerate |
@@ -58,13 +58,23 @@ contract does this touch."
 | Codec Layer | `format/` | pure `bytes ↔ dataclass` codecs, zero I/O |
 
 Not part of the stack — cross-cutting, reachable from any layer that needs
-them. Kernel primitives (`errors.py`, `identifiers.py`, `asynccache.py`) and
-`presentation/` are true leaves: zero internal imports of their own, so they
-never depend *upward* into `format/`/`storage/`/`dedup/`/`catalog/`/`units/`/
-`api/`. `profiles/` (saved S3/Azure/SMB connection profiles) is the one
-partial exception — its `build_store()` imports `storage.base.ObjectStore`
-to construct the store it returns, a real but narrow dependency on the
-Storage layer.
+them (`scripts/check_sdk_layers.py`, run by `make test`, enforces the layer
+direction, the leaf and `profiles/` rules below, that `units/content/`
+reaches the Unit Layer only through `units/base.py` and
+`units/provider_kit.py`, that every top-level
+module is classified, and the absence of import cycles). Kernel
+primitives (`errors.py`, `identifiers.py`, `findings.py`, `asynccache.py`, `cachemanager.py`,
+`concurrency.py`, `positional_io.py`), `_util/` (guarded JSON parsing, close sweeps and cancellation-safe
+cleanup, `AsyncOnce` lazy init) and `presentation/` are true leaves: they import no
+layered package, so they never depend *upward* into `format/`/`storage/`/
+`dedup/`/`catalog/`/`units/`/`api/`. One side module is a partial
+exception, allowed only the Storage layer: `profiles/` (saved
+S3/Azure/SMB connection profiles) imports
+`storage.base.ObjectStore` and `storage.smb.DEFAULT_SMB_PORT` (and, lazily,
+the concrete `S3Store`/`AzureStore`/`SmbStore` classes plus
+`list_buckets`/`list_containers`) to construct and enumerate the stores it
+returns, a real but narrow dependency on the Storage layer (the same script
+checks both).
 
 ```mermaid
 graph BT
@@ -113,30 +123,52 @@ touch buckets, chunks, or crypto directly. The second shared primitive is
 Pure `bytes → dataclass` / `bytes → bytes` functions: header parsing, chunk-map
 decoding, SizeStore bit-unpacking, compression, AES-CTR/GCM crypto. This is the
 only layer that has to track the on-disk spec bit-for-bit, and the easiest to
-test with synthetic bytes (no real sample needed). **Untouched by the async
-migration** — there is no I/O here to make async.
+test with synthetic bytes (no real sample needed). Nothing here is async —
+there is no I/O to wait on.
+
+`compression.iter_decompressed_zstd()` yields decompressed pieces
+incrementally, checking a running total against a ceiling, so a caller
+writing to a real file (`storage/sqlite_source.py`'s `_peel_into()`, the
+streaming form of `peel()` that writes a temporary SQLite file) never
+materializes the whole payload — the bound against a
+decompression-bomb-shaped input. The write itself happens one layer up.
+`decompress_zstd_stream()` is the `bytes → bytes` wrapper over the same
+generator.
 
 Unlike every other layer, a narrow `format/` function is reachable directly
 from any layer above it — the "never knowledge of what's two layers down"
 rule is about avoiding coupling to another layer's *state* or *I/O*, and a
 pure, zero-I/O codec function has neither: `catalog/version.py`'s
-`decrypt_version_spec`, `units/verify_reachable.py`'s
-`group_start_bucket_id`, and `api/catalog.py`'s `RepoInfo` are real,
-intentional skip-layer imports, not a violation.
+`decrypt_version_spec`, `units/saas/services.py`'s `zstd_content_size`,
+and `api/catalog.py`'s `RepoInfo` are real, intentional skip-layer imports,
+not a violation.
 
 ### Storage Layer — `storage/`, "how do I get these bytes"
 
-`ObjectStore` — four narrow `async def` methods (`read`/`size`/`exists`/
-`listdir`), nothing else; async is only genuinely non-blocking for the
+`ObjectStore` — four narrow `async def` read methods (`read`/`size`/`exists`/
+`listdir`) plus `close()` (a no-op where nothing is held, as for
+`LocalFsStore`), nothing else. `listdir` returns `Entry(name, size)` values sorted
+by name, each file with the size its listing reported (S3/Azure list
+responses, `scandir`, SMB directory entries all carry it, so a sized listing
+costs no extra request), `None` for a directory; `list_names()` is the
+names-only view. Every backend
+failure surfaces as `NotFoundError`, `PermissionDeniedError` or
+`StorageBackendError` (network, timeout, service or OS I/O error), never a
+client library's own exception; code that turns unreadable data into a verify
+finding, a skipped layout or a stopped walk re-raises `StorageBackendError`,
+since a transport failure says nothing about the data. Async is only
+genuinely non-blocking for the
 network backends (`S3Store`/`AzureStore`) — see "Async-native, by design"
 below for why `LocalFsStore`'s async is a thread-hop wrapper, not the real
 thing. Implementations: `LocalFsStore` (the
 common case), `S3Store`/`AzureStore`/`SmbStore` (built in — always installed,
 but their own third-party client libraries are imported lazily to keep import
 cost down for callers who never touch them). `SmbStore` follows
-`LocalFsStore`'s `asyncio.to_thread()`-wrapped shape, not `S3Store`/
-`AzureStore`'s native-async one — `smbprotocol`'s `smbclient` module has no
-`aiohttp`-shaped async surface to sit on. **No backend caches anything
+`LocalFsStore`'s thread-hop shape, not `S3Store`/`AzureStore`'s native-async
+one — `smbprotocol`'s `smbclient` module has no `aiohttp`-shaped async
+surface to sit on — but on a bounded thread pool of its own rather than the
+loop's default executor, since a timed-out call's thread cannot be stopped
+and a stalled server would otherwise starve every other `to_thread()` user. **No backend caches anything
 per-path** — every `read()` is a fresh, independent fetch (a plain
 open+pread+close for `LocalFsStore`/`SmbStore`, a fresh request for
 `S3Store`/`AzureStore`); the only state any of them shares across calls is a
@@ -152,12 +184,25 @@ across two files for two separate concerns: WAL-sidecar materialization for
 an already-unencrypted on-disk SQLite file (`open_sqlite()`) and
 envelope-stripping (`aHlT` AES-CTR, zstd frames) for an encrypted blob before
 a SQLite file even exists (`peel()`) — shared logic every backend needs
-identically either way, not something each backend reimplements.
-`DirCache` caches every directory listing for a repository's whole lifetime
-(re-`listdir()`-ing per lookup turns an export into O(n²) — or, on object
-storage, hundreds of paginated list-object calls); `Repository.
-invalidate_directory_cache()` is the one way a caller (the TUI's "refresh"
-action) drops it deliberately.
+identically either way, not something each backend reimplements. Every
+temp file either one writes first passes `storage/disk_space.py`'s
+`reserve_disk_space()`: the write's largest possible size (a plain
+payload's length, a zstd frame's declared size, else the caller's fallback
+cap) must fit with a reserve left free for the rest of the machine (its
+module docstring gives the formula), counting what this process's other
+unfinished temp writes there already hold; a frame with neither a declared
+size nor a cap holds the bytes it has written so far and stops before it
+would reach into the reserve or those holds.
+`DirCache` caches directory listings, bounded by count (re-`listdir()`-ing per
+lookup turns an export into O(n²) — or, on object storage, hundreds of
+paginated list-object calls), and keeps the sizes each listing reports, so a
+caller that needs a bucket's size
+(`Pool.bucket_size`, verify) reads it from the entry path resolution already
+filled instead of issuing a `size` request per file. A `DedupRepo` owns two
+instances so a scan cannot evict what a lookup depends on: `dir_scan` (Pool
+leaf directories and Composition directories, which a bulk walk touches by the
+hundreds) and `dir_fixed` (the handful of metadata directories — `db`, the repo
+root, `suppl_transaction_ids`, `repo_transactions`).
 
 ### Dedup Layer — `dedup/`, the core contract
 
@@ -168,7 +213,12 @@ composition record's chunk-map array. `DedupFile.read()`/`.stream()` combine
 these into a byte-addressable logical file, with the `_extents()`/`read()` split
 binary-searching into the chunk-map array rather than scanning linearly — this
 is a hard performance requirement, not a nice-to-have, once a single file's
-chunk-map array can be tens of millions of entries.
+chunk-map array can be tens of millions of entries. `DedupRepo`
+(`dedup/repository.py`, one opened repository) hands these out —
+`open_file()`/`open_composition()` for a `DedupFile`, `composition_reader()`,
+and `new_pool(verify=...)` for an operation that needs a `Pool` with its own
+caches and verify policy — so no caller builds them from the repository's
+root paths.
 
 `chunk_walk.py` (`plan_chunks_windowed()`/`exec_chunks()`) is the plan/execute
 engine every unbounded-range sweep of more than one chunk uses (export,
@@ -177,25 +227,72 @@ verify FULL's per-bucket decode) — DATA chunks grouped by
 `BucketReader.read_chunks()` call per bucket instead of one
 `Pool.read_chunk()` per chunk, so a dedup'd file's scattered chunk references
 get read in disk order instead of randomly re-visiting the same `.buk` file.
-A bounded, already-windowed multi-chunk read (an interactive `read()`
-spanning one extent) uses the same grouped-fetch strategy independently, via
-`dedup_file.py`'s `_fill_data_extent()` — kept separate since its range is
-always caller-bounded, never a whole-file sweep.
-`export_scheduler.py::export_to()` (used by `DedupFile.export_to()`/
-`ByteRangeView.export_to()`, `synology-apm-repo-cli export`, and the Content
-Layer's `VirtualDiskContentSource`) goes through it — on a real S3-backed
-repository this runs two orders of magnitude faster than reading one chunk
-at a time. The test suite also keeps a naive per-chunk
-path as an independent correctness oracle for the export side.
+An interactive `read()` (always caller-bounded, never a whole-file sweep)
+skips the planner: `dedup_file.py`'s `_fill_data_extent()` expands the same
+chunk runs (`chunk_walk.iter_chunk_runs()`) and reads them per bucket through
+`Pool`'s chunk cache.
+`export_scheduler.py::export_to_writer()` (used by `DedupFile.export_range()`/
+`ByteRangeView.export_range()` and, per fragment through
+`export_fragments_to_writer()`, the Content Layer's `VirtualDiskContentSource`)
+goes through it. A content source exports a range of itself:
+`ContentSource.export_range(writer, start, end)` writes `[start, end)` at offsets
+relative to `start`, and `planned_bytes(start, end)` is the progress total for it
+(the real `DATA` bytes for dedup-backed content). The test suite also keeps a
+naive per-chunk path as an independent correctness oracle for the export side.
+
+The destination side is a contract of its own, `export_sink.py`'s
+`ExportSink` (`segment_size`/`open`/`begin_segment`/`commit`/`abort`; public in
+`sdk.export` for consumers writing their own sink). An
+export is cut into segments: `begin_segment` hands out the `SegmentWriter` for
+each, and `run_export()` completes it before asking for the next. The scheduler
+writes through an `ExportWriter` (`write_at`/`write_zero`/`caps`/`preallocated`,
+plus `worker_target()` — where a worker process may write directly, or `None`
+when every write must stay in the parent — and `note_worker_write()` — workers
+are about to write behind the writer's back), which is a segment's writer, or
+the sink itself for a `RandomAccessExportSink` — a destination that takes
+writes at any offset, whose one segment is the whole export. Every contract is
+a `Protocol`; `RandomAccessExportSink` and `BufferedExportSink` are base classes
+that inherit them explicitly, so a type checker flags an implementation
+missing a member. The caller owns the lifecycle: `run_sink_export()` does
+open → body → commit and aborts on any failure, so one writer can be fed by
+several sources (`VirtualDiskContentSource` shares one across a disk's
+fragments through `export_scheduler.export_fragments_to_writer()` and
+`OffsetWriter`). `export_scheduler.py` only writes through the writer; its
+`_ExportAccounting` counts bytes and applies the sparse policy.
+
+A destination that takes bytes in order only (a zip entry, an upload stream)
+extends `buffered_export_sink.py`'s `BufferedExportSink`. It holds each segment
+in a `Slot` of a `SlotPool` (`segment_buffers.py`): one shared-memory block,
+or one sparse temporary file (`storage="spool"`), holding every slot side by
+side, where the exporter's out-of-order writes — the worker processes'
+included — are fine, and flushes completed segments in order on a
+background task while the exporter fills the next (the SDK README's "A
+destination that takes bytes in order only" covers its knobs).
+`local_file_sink.py`'s `LocalFileSink` is the local-file implementation (fd
+primitives in `local_file_io.py` and `positional_io.py`): one writer thread
+owns the fd and closes it, with optional `<dst>.part` staging. A dense
+(`--no-sparse`) export preallocates the whole file in `open()`
+(`posix_fallocate`; `fcntl(F_PREALLOCATE)` on macOS) where the platform and filesystem allow, so a
+full disk fails before any data is decoded and the zero-fill is skipped.
+`api/export.py::run_export()` is the one entry point `synology-apm-repo-cli
+export` and the TUI both use; a folder export is `api/export_tree.py`'s
+`plan_tree_export()` / `preflight_tree()` / `run_tree_export()`, which run
+`run_export()` once per file. A writer without a `worker_target` decodes and
+writes in-process; the multiprocess path below needs a destination every
+worker can open itself. A window touching too few bucket groups
+(`_MIN_WORKER_GROUPS`) also runs in-process, since a worker pool's start-up costs more
+than it saves; `export_fragments_to_writer()` is the exception and builds its
+shared pool up front.
 
 `synology-apm-repo-cli verify` (`units/verify_reachable.py::verify_reachable()`,
 what `Repository.verify()`/`Catalog.verify()` call) walks Catalog → Workload →
 Version top-down and only checks data actually reachable from a live,
 browsable version — a stale `db/file_map` row nothing reachable still
-references is never visited. The check primitives both of
-`verify_reachable()`'s levels use live in `dedup/verify_checks.py`, a home
-chosen so a fix to one check's logic can't land in a duplicate copy
-elsewhere.
+references is never visited. It resolves each version to its composition
+extents (`units/verify_extents.py`) and hands them to
+`dedup/verify_walk.py`'s `ReachabilitySweep`, which checks every record and
+bucket they reach; the check primitives both levels use live in
+`dedup/verify_checks.py`.
 
 `verify_reachable()`'s two levels differ only in how deep the *per-chunk*
 check goes — every reachable composition record and bucket is checked
@@ -212,10 +309,7 @@ FULL does any per-chunk checking.
 Buckets are *discovered* by walking Catalog/Workload/Version serially, but
 *checked* concurrently once claimed, in batches bounded by a semaphore —
 each bucket its own isolated task, so one bucket's failure never aborts its
-batch siblings. Raising `_MAX_CONCURRENT_BUCKET_CHECKS` further hasn't
-helped: a small regression at double its shipped value on a local-disk
-sample, and no measurable difference at several times it against a real
-S3-compatible object-storage backend.
+batch siblings.
 
 **Validation strength is tiered by context**, because `mapCrc` covers a
 chunk-map array that can be hundreds of MB — validating it on every open would
@@ -224,20 +318,20 @@ make interactive browsing unusable:
 | context | headCrc | mapCrc | bucket header/SizeStore CRC | ChunkCrcStore trailer self-consistency + `expected_bucket_size()` | per-chunk ciphertext CRC | per-chunk fingerprint |
 |---|---|---|---|---|---|---|
 | interactive read (`read()`, TUI preview, tree expansion) | checked | not checked | checked | not checked | not checked | not checked |
-| `export_to()` — every export path, including `synology-apm-repo-cli export` and the TUI export screen | checked | not checked | checked | not checked | not checked | not checked |
+| `export_range()` — every export path, including `synology-apm-repo-cli export` and the TUI export screen | checked | not checked | checked | not checked | not checked | not checked |
 | `verify` at `VerifyLevel.QUICK` | checked | checked | checked | checked | not checked | not checked |
 | `verify` at `VerifyLevel.FULL` | checked | checked | checked | checked | every live chunk in a touched bucket | every live chunk in a touched bucket |
 
-`export_to()` has no `verify_map_crc` option of its own — chunk-map CRC
+Export has no `verify_map_crc` option of its own — chunk-map CRC
 validation is `verify`'s job specifically. Header/SizeStore CRC is
 unconditionally checked by `BucketReader.open()` itself; the ChunkCrcStore
 trailer's own `crcOfChunkCrc` self-consistency
 (`BucketReader.ensure_chunk_crc_store()`) and `expected_bucket_size()`'s
 real-on-disk-size check (`dedup/verify_checks.py::check_bucket_structure()`)
-are verify-exclusive. Per-chunk ciphertext-CRC/fingerprint verification
-(`BucketReader.read_chunk`/`read_chunks`' own
-`verify_ciphertext_crc`/`Pool.read_chunk`'s `verify_fingerprint`) is off by
-default everywhere except `VerifyLevel.FULL`.
+are verify-exclusive. Per-chunk ciphertext-CRC/fingerprint verification is a
+`Pool`'s `VerifyPolicy`, fixed when the pool is built: `NO_VERIFY` everywhere
+except `VerifyLevel.FULL`, whose private pool
+(`DedupRepo.new_pool(verify=FULL_VERIFY)`) reads with `FULL_VERIFY`.
 
 ### Catalog Layer — `catalog/`, cheap enumeration
 
@@ -246,17 +340,17 @@ One sibling module per entity — `catalog/connection.py` (`Connection`,
 `workloads()`/`workload_by_id()`, display-name derivation), `catalog/version.py`
 (`Version`/`VersionMeta`, `versions()`, meta-availability checks,
 `open_target_db()`) — mirroring the Repository Layer's own `api/`
-three-way split below. `catalog/workload_config.py` holds one small shared
-constant (`db/workload_config`'s required-column list) both
-`connection.py`'s and `workload.py`'s own queries against that table
-declare, so the two can't silently drift apart — a leaf module both
-depend on, rather than either importing the other's constant directly.
+three-way split below. `catalog/workload_config.py` holds the
+`db/workload_config` access both `connection.py` and `workload.py` need (its
+required columns and `workload_spec` parsing), a module of its own because
+`workload.py` imports `connection.py` and the reverse would be a cycle.
 `connections()`/`workloads()`/`versions()` are plain
 SQLite queries returning frozen dataclasses, no behavior. Never reads dedup
-bytes. `open_target_db()` is the one place this layer does real decrypt work
-(`copy_meta_file`'s `target.db`, always `aHlT`-enveloped) — shared by the
-Unit Layer's Device and FS providers rather than each independently
-resolving+peeling it.
+bytes. Its decrypt work is `catalog/version.py`'s: `parse_version_spec()`
+for each `version_spec` value, and `open_target_db()` for
+`copy_meta_file`'s `target.db` (`aHlT`-enveloped in an encrypted
+repository) — the latter shared by the Unit Layer's Device and FS
+providers rather than each independently resolving+peeling it.
 
 ### Content Layer — `units/content/`, decoding what a version's bytes mean
 
@@ -265,19 +359,25 @@ navigation because they're a genuinely different concern: dumb byte-stitching
 (`pcps_disk.py`'s `VirtualDiskContentSource`, reassembling PC/PS disk
 fragments — see the Unit Layer section below) versus real decoding/rendering
 that reaches for an external library or builds a synthetic file format
-(`disk_fs.py`'s Dissect-based partition/filesystem parsing — always
+(the `disk_fs/` package's Dissect-based partition/filesystem parsing — always
 installed, imported lazily for the same import-cost reason; the
 `saas_*.py` modules' EML/ICS/CSV assembly and Teams-chat HTML rendering).
 `ContentSource` itself stays in `units/base.py` —
 a pure structural `Protocol`, no external-library dependency — only its
-concrete implementations live here. Every implementation states its own
-`supports_concurrent_export` capability directly, rather than the Unit Layer
-inferring it via `isinstance` against a concrete class.
+concrete implementations live here.
 
 ### Unit Layer — `units/` (minus `content/`), the minimal restorable unit
 
 `UnitProvider` is one workload version's browsable tree (`root`/`children`/
-`unit` — `root()` is sync, the other two are async).
+`unit` — `root()` is sync, the other two are async). A `Node`'s typed fields
+(`mtime`, `file_state`, `leaf_kind`, `diagnostic`, `degraded`, `role`) are
+what callers act on; `columns` (`ItemColumns`: a mail's sender, a contact's
+email, an event's start/end/recurrence) is what a frontend lays out as list
+columns; `details` is free-form display data, shown in verbose mode and
+never read for behaviour; and what its provider needs to find the node's children or content again (a
+tree key, a disk's fragments) is its `handle`, which no other caller reads.
+A provider building a `RestorableUnit` from a listed `Node` uses
+`RestorableUnit.of(node, content)`, so every field carries over.
 
 Device (VM/PC/PS), FS, and SaaS (Mail/Drive/Contact/Calendar/Site/Teams/raw)
 providers all implement this same shape. **Degradation, not failure, is the
@@ -286,15 +386,13 @@ three distinct mechanisms serve this, depending on what's missing: no SaaS
 sub-type match at all falls back to a different provider entirely,
 `RawObjectProvider` (`units/dispatch.py::saas_provider_for()`); a specific
 sub-piece that can't be resolved (a PC/PS disk's missing fragments, no
-filesystem recognized on a disk) becomes a synthetic placeholder leaf built
-by `diagnostic_node()` (`units/base.py`), its explanation in
-`attrs["diagnostic"]`; and an otherwise-fully-browsable node whose display
-name alone couldn't be resolved (a Teams chat with no derivable name) keeps
-its real content but records why in `attrs["degraded"]`
-(`units/saas/teams_chat.py`). None of the three ever makes the whole version
-unbrowsable. `units/dispatch.py` picks a provider per `Version`
-(`provider_for()`); this lives in `units`, not `catalog`, to avoid a
-lower-layer-depends-on-upper-layer cycle.
+filesystem recognized on a disk, a SaaS object-name index the raw fallback
+can't open) becomes a synthetic placeholder leaf built
+by `diagnostic_node()` (`units/provider_kit.py`), its explanation in
+`Node.diagnostic`; and real content that is only partly resolved (a Teams
+chat with no derivable name, a PC/PS disk with missing fragments) records a
+short, user-facing reason in `Node.degraded`, which the CLI and TUI report
+on export. None of the three ever makes the whole version unbrowsable.
 
 PC/PS's disk model differs from VM's in one structural way `units/device.py`
 has to reconcile: one physical disk lands as *several* independently-
@@ -303,16 +401,15 @@ registered fragment objects, not one composition per disk (Windows
 The actual fragment-name parsing/grouping (the `D(diskUuid)`/`S(diskIndex)`
 regex, `_pcps_disk_key()`) lives in the sibling module `units/device_pcps.py`;
 the "(filesystem)" sibling-axis diagnostic node built when no filesystem can
-be recognized on a disk lives in `units/device_disk_fs.py`; `units/device_kind.py`
-holds the small shared node-kind vocabulary both of them and `device.py`
-classify against instead of an `isinstance` check on each other's concrete
-classes. `device.py` composes these two collaborators (`PcpsDiskTree`,
+be recognized on a disk lives in `units/device_disk_fs.py`; `units/device_handles.py`
+holds the `Node.handle` types all three build their nodes with, and
+`device.py`'s `children()`/`unit()` dispatch on the handle's class. `device.py` composes these two collaborators (`PcpsDiskTree`,
 `DiskFsSibling`) rather than containing this logic inline. The Content Layer's
 `VirtualDiskContentSource` reassembles a disk's fragments (grouped by the
 `D(diskUuid)`/`S(diskIndex)` in their own filenames) into one `ContentSource`
 spanning the whole disk, so nothing above `units/device.py` needs a
 PC/PS-specific branch — the CLI `export` command and the TUI export screen
-both see the same `size`/`read`/`stream`/`export_to` shape a VM's single-
+both see the same `size`/`read`/`stream`/`export_range` shape a VM's single-
 composition disk image already has. Listing a PC/PS version's
 disks stays as cheap as the VM path's own `_object_nodes()`/`_open_object()`
 split: grouping only reads `file_meta`'s own `path`/`file_size` columns, and
@@ -320,9 +417,10 @@ every fragment's real `locate_file()`/composition I/O is deferred to
 `unit()`/open time.
 
 `SaasWorkloadProvider` + `SaasWorkloadConfig` (`units/saas/provider.py`) is the
-shared base for Mail/Drive/Contact/Calendar/Site — four of those five modules
-are just a `SaasWorkloadConfig` constant plus an `assemble()` function, not a
-duplicated provider class; `site.py` and `calendar.py` additionally each build
+shared base for Mail/Drive/Contact/Calendar/Site — each of those modules
+is just a `SaasWorkloadConfig` constant plus a `content()` function (the
+provider builds the leaf's `RestorableUnit` around it), not a duplicated
+provider class; `site.py` and `calendar.py` additionally each build
 a `tree_strategy.CategorizedGroupTree` on top of their own inner tree —
 one shared wrapper class, not a per-module helper, splitting a tree's own top
 level into named categories (Document Library/List for Site, My/Other
@@ -343,19 +441,27 @@ object-name index can't be resolved has nothing to show.
 
 ### Repository Layer — `api/`, the facade
 
-`Session` (`api/session.py`: discovery, key material, caches, temp-dir
+`Session` (`api/session.py`: discovery, key material, repository and store
 lifetime), `Repository` (`api/repository.py`), and `Catalog`
 (`api/catalog.py`: one catalog's own workload/version/provider
 operations) are split into sibling modules since each is substantial on
 its own, with `api/__init__.py` re-exporting every public name from all
-three so a caller never needs to know that split exists. This is the
-entry point CLI and
-TUI code is built on — neither talks to the Unit/Content/Catalog/Dedup/
-Storage layers directly, except for a few narrow, explicitly-named
-exceptions (each scoped to one call site) that `api/__init__.py`
-enumerates rather than this document duplicating — the list changes as
-call sites are added or removed, and a second copy here would just be
-one more place for it to drift out of sync.
+three so a caller never needs to know that split exists.
+
+**The SDK's public surface** is the top-level `synology_apm_repo.sdk` —
+which re-exports this whole facade plus the value types, node helpers,
+ids, errors and the `ObjectStore` contract (with `TracingStore`) — and four public modules,
+each the only place its names are exported: `sdk.export` (the
+export-sink contract, `run_export`, folder export and the
+`preload_resource_tracker()` start-up hook), `sdk.presentation`
+(rendering every frontend shares, `Progress` and the verify-report
+grouping included), `sdk.profiles` (saved connection profiles, their form
+fields and their errors) and
+`sdk.diagnostics` (format-level inspection, the CLI's `dump`). Everything
+else, `api/` included, is internal. The CLI, the TUI and `examples/` use
+only these five modules, so whatever a frontend needs is public for any
+other frontend too; `scripts/check_sdk_import_boundary.py` (run by
+`make test`) enforces it.
 
 **Repository/Catalog naming follows FORMAT-SPEC.md §2.1's canonical
 mapping** (`Repository` = one opened bucket or vault, `Catalog` = one
@@ -364,47 +470,50 @@ shapes genuinely differ: a vault's several `db/connection_config` rows
 share one physical dedup pool (one `Pool`/`Composition`/`db`, opened
 once), while an object-storage bucket's several sibling `<repo-id>`
 directories are each an independent physical dedup pool of their own
-(FORMAT-SPEC.md: no cross-repo-id dedup) — `Repository` opens one
+(FORMAT-SPEC.md §2.1) — `Repository` opens one
 `DedupRepo` for a vault, or one per sibling repo-id for object
 storage, lazily, and hides that difference
 entirely: `Repository.catalogs() -> list[Catalog]` is the one, uniform
 way to enumerate what's inside, for either backend. `Catalog` (one
 `connection_config` row for a vault, one repo-id's worth of data for
 object storage) is where the actual browsing operations live —
-`workloads()`/`versions()`/`provider()`/`verify()`/`walk_human_ref()`/
-`connection`/`info`/`display_name`/`catalog_id`. `Repository` itself keeps only what's genuinely bucket/
+`workloads()`/`versions()`/`version_by_uid()` (a `VersionLocation`)/
+`provider()`/`verify()`/`locate()`/`connection`/`info`/`display_name`/`catalog_id`. `Repository` itself keeps only what's genuinely bucket/
 vault-wide: `is_encrypted`/`key_status`/`key_verification`/`set_key()`
-(one shared key tree either way), `catalogs()`, `verify()` (aggregated
+(one shared key tree either way; returns a `SetKeyResult` — the
+verification outcome plus any catalog-reopen failures), `catalogs()`/`catalog_by_id()`,
+`file_map_tree()`, `release_provider()`, `invalidate_caches()`, `verify()` (aggregated
 across every *distinct* opened `DedupRepo` — a vault's several
 `Catalog`s share one, so this doesn't re-run the same check once per
-sibling), `resolve()`/`walk_human_ref()` (thin dispatchers: pick the
-right `Catalog` by its first ref segment, then delegate the rest to
-`Catalog.walk_human_ref()`), and `close()`.
+sibling), `version_for_ref()` (the ref's `VersionLocation`),
+`locate()`/`resolve()` (thin dispatchers: a human ref picks the
+right `Catalog` by its first segment, then delegates the rest to
+`Catalog.locate()`; `locate()` returns the `Frame` union —
+`RootFrame`/`CatalogFrame`/`WorkloadFrame`/`NodeFrame`, as deep as the ref's
+segments go — and `resolve()` only a `NodeFrame`, which carries the node's
+provider and whose `unit()` turns a leaf into its `RestorableUnit`). It has
+no public `close()`: the `Session` that handed it out closes it, and
+`Session.close_repo()` releases one early along with its store once no
+sibling shares it.
 
 `is_encrypted` answers "is this repository encrypted" with no catalog
-opened, no Pool scan, and no I/O at the point a caller reads it — it needs
-only the bucket-level layout, never a specific opened `DedupRepo`, which is
-what makes resolving it before anything is opened possible at all:
-`Session.discover()`/`Session.open()` resolve it eagerly, once, before
-constructing each `Repository`, passed as that constructor's `encrypted`
-argument, by reading `db/vault_encryption_key`'s latest row (VAULT) or the
-`@ActiveProtectKey/userKey/` object listing (OBJECT_STORE) — see
-`dedup/keys.py`'s `probe_encrypted()` for the mechanism.
+opened and no I/O at the point a caller reads it — it needs only the
+bucket-level layout, never an opened `DedupRepo`, so `Session.discover()`/
+`Session.open()` resolve it once, before constructing each `Repository`:
+with a key, its verification decides; without one, `dedup/keys.py`'s
+`probe_encrypted()` reads `db/vault_encryption_key`'s latest row (VAULT) or
+the `@ActiveProtectKey/userKey/` listing (OBJECT_STORE).
 
-`Repository.catalogs()` never gates on key state up front — its own
-`connection_config`/`workload_config` tables are plaintext regardless — but
-still surfaces `KeyMismatchError` immediately if a given key doesn't match.
-`Catalog.workloads()`/`versions()` instead raise `KeyRequiredError`/
-`KeyMismatchError` before any catalog I/O once `is_encrypted is True` and
-not yet key-verified — without that gate, an unverified key would leave
-`version_spec` failing to decrypt so no row passes the browsable-status
-filter, so a locked repository's version list can't come back
-silently empty and be mistaken for "no backups" — this also lets catalog
-names show up before any key prompt in the TUI. `is_encrypted is None` (a
-rare case) is left ungated rather than presumed encrypted.
-`Repository.verify()`/`Catalog.verify()` share this same gate, since
-`units.verify_reachable`'s top-down walk also discovers versions through
-`catalog.versions()`.
+`Repository.catalogs()` never gates on key state — its
+`connection_config`/`workload_config` tables are plaintext, so catalog
+names show up before any key prompt. `Catalog.workloads()`/`versions()`/
+`verify()` and `Repository.verify()` raise `KeyRequiredError`/
+`KeyMismatchError` before any catalog I/O while `is_encrypted is True` and
+the key is not verified: an unverified key would leave every
+`version_spec` undecryptable, so no row would pass the browsable-status
+filter and a locked repository would look like one with no backups.
+`is_encrypted is None` (the probe couldn't tell) is left ungated rather
+than presumed encrypted.
 
 `NodeRef` is the canonical, round-trippable address format shared by CLI
 arguments, TUI breadcrumbs, and error messages, with a `human` display
@@ -416,16 +525,16 @@ within it), or an object-storage catalog's own repo-id string (needed
 since each sibling's own `connection_config` table independently starts
 at 1, so a bare `connection_config_id` can't tell two siblings apart).
 `Catalog.provider()`/`workloads()`/`versions()` are always reached
-*through* a `Catalog` obtained from `Repository.catalogs()` — nothing
-above the Repository Layer scans across catalogs by id. `file_map_tree()`,
+*through* a `Catalog` obtained from `Repository.catalogs()` or
+`Repository.catalog_by_id()` — nothing above the Repository Layer scans
+across catalogs itself. `file_map_tree()`,
 a diagnostic-only escape hatch, resolves straight from `db/file_map` on
 the first catalog when catalog metadata is missing or unhelpful — the
 fallback axis of last resort, gated behind the CLI's `--verbose` /
 the TUI's own `verbose` toggle (`d` key) — same concept, same name, on
 both sides; a `RAW` ref's grammar carries no catalog
 segment at all, so it doesn't disambiguate between object-storage
-siblings, a pre-existing limitation of this axis rather than something
-new here.
+siblings.
 
 ---
 
@@ -437,8 +546,11 @@ The whole SDK, CLI, and TUI are async-native end to end:
   loop** — `LocalFsStore`'s syscalls (`pread`, `fstat`, `iterdir`; no
   async-native local-file I/O exists in CPython, the same technique
   `aiofiles` uses), `SmbStore`'s calls into `smbprotocol`'s synchronous
-  `smbclient` module, and `BucketReader._read_run`'s batch chunk
-  decode/decrypt (one hop per merged run, not per chunk — the single-chunk
+  `smbclient` module (on its own bounded pool, above), and
+  `BucketReader._read_run`'s batch chunk
+  decode/decrypt (one hop per merged run, not per chunk; for a store offering
+  `storage.base.SyncReadable`, `LocalFsStore`, the run's read happens on that
+  same thread rather than a hop of its own — the single-chunk
   path, `BucketReader.read_chunk`, decodes inline instead, since one
   4096-byte decode is cheaper than a thread hop). It never parallelizes
   CPU-bound work: decompress/decrypt/hash all serialize under CPython's
@@ -446,16 +558,19 @@ The whole SDK, CLI, and TUI are async-native end to end:
 - **Real multi-core parallelism, when CPU-bound work is heavy enough to be
   worth it, comes from a `concurrent.futures.ProcessPoolExecutor`** —
   verify FULL's per-bucket decode sweep
-  (`units/verify_reachable.py::check_all_buckets`) and export's
+  (`dedup/verify_walk.py::ReachabilitySweep.check_all_buckets`) and export's
   bucket-group decode (`dedup/chunk_walk.py::exec_chunks`'s multiprocess
-  counterpart, dispatched from `dedup/export_scheduler.py`). Sized by
+  counterpart in `dedup/export_workers.py`, dispatched per window from
+  `dedup/export_scheduler.py`). Sized by
   `concurrency.default_worker_count()` (`clamp(os.cpu_count() // 2, 1, 8)`
   — the `// 2` biases toward a machine's faster cores, since an
   asymmetric-core machine's slowest task drags down the whole batch's
-  completion time). Applied unconditionally except when the repository's
+  completion time). Applied except when the repository's
   `ObjectStore` can't be reconstructed in a fresh process
   (`storage.store_descriptor.describe_store()` returns `None`), falling
-  back to the single-process/`asyncio` path. `concurrency.dispatch_to_pool()`
+  back to the single-process/`asyncio` path; export also stays on that path
+  for a writer with no `worker_target()` and for a window that touches few
+  bucket groups. `concurrency.dispatch_to_pool()`
   is the shared "bounded, dynamically load-balanced dispatch of N items to
   a process pool" primitive both call sites use — a free worker always
   picks up the next item via the executor's own queue, which measurably
@@ -470,10 +585,9 @@ The whole SDK, CLI, and TUI are async-native end to end:
   A known, accepted cost of export's windowed multiprocess dispatch: a
   bucket independently re-referenced (via internal dedup) at two
   far-apart points in a file can land in two different
-  `plan_chunks_windowed` windows and get opened/decoded twice — measured
-  ~12% of buckets on a real 32GB VM fixture. The duplication comes from
-  genuinely separate references, not a splittable run, so no windowing
-  change removes it.
+  `plan_chunks_windowed` windows and get opened/decoded twice. The
+  duplication comes from genuinely separate references, not a splittable
+  run, so no windowing change removes it.
 - **`S3Store`/`AzureStore`** are the one place async is *actually* non-blocking
   (network I/O via `aioboto3`/`azure.storage.blob.aio`, both on `aiohttp`) —
   genuinely different from the local-file/SMB cases above.
@@ -484,7 +598,8 @@ The whole SDK, CLI, and TUI are async-native end to end:
   so one leaked connection makes `threading._shutdown()` block forever and
   the interpreter never exits — whatever opens a connection owns closing it,
   on every path including error paths (`Repository` tracks every provider it
-  hands out; `SaasWorkloadProvider.close()` closes its `SaasStream`;
+  hands out; `SaasWorkloadProvider.close()` closes the SQLite sources it
+  opened;
   `ObjectDb.from_bytes()` closes its `SqliteSource` on introspection
   failure). A cache reusing many such connections also needs an upper bound
   on how many stay open *concurrently*, not just a guarantee they eventually
@@ -505,12 +620,10 @@ The whole SDK, CLI, and TUI are async-native end to end:
 CLI and TUI users are support engineers or end users, not format researchers.
 Internal identifiers (`connection_config_id`, `stream_id`, `object_id`, bucket
 numbers) **never appear in the default view** — only in an explicit verbose
-mode (`--verbose` / TUI's `d` key), with one deliberate carve-out: the TUI's
-own exception-message display (see "Cross-cutting shared mechanisms" below)
-always shows an `ApmRepoError`'s full detail, `ref=`/`spec=` tags included,
-regardless of the `d` toggle — the CLI's equivalent (`friendly_message()`)
-still gates on `--verbose` as this rule states. The user-visible hierarchy
-is always:
+mode (`--verbose` / TUI's `d` key), with one deliberate carve-out: the TUI
+always shows an error's full detail (see `ApmRepoError.safe_message` under
+"Cross-cutting shared mechanisms" below). The user-visible hierarchy is
+always:
 
 ```
 backup source → workload → version (named by backup time) → item
@@ -522,10 +635,11 @@ extends to error messages and progress text — a `diagnostic_node()`
 placeholder (see the Unit Layer section's degradation mechanisms) shows a
 short, already-specific label as its listing name unconditionally (e.g.
 "(no filesystem recognized on this disk)"), while the fuller technical
-explanation carried in `attrs["diagnostic"]` only surfaces if that node is
-actually opened, as the `NotFoundError` it then raises — gated by the same
-`--verbose`/`d`-key mechanism as any other error (`ApmRepoError.safe_message`,
-below), not a separate placeholder-substitution mechanism of its own.
+explanation carried in `Node.diagnostic` surfaces only in the TUI's verbose
+detail pane or when that node is opened, as the `NotFoundError` it then
+raises — rendered like any other error (`ApmRepoError.safe_message`,
+below), not through a separate placeholder-substitution mechanism of its
+own.
 
 ---
 
@@ -535,26 +649,41 @@ below), not a separate placeholder-substitution mechanism of its own.
   — real multi-core parallelism for CPU-bound decode work, as a trio: the
   first owns worker sizing/dispatch/lifecycle (`default_worker_count()`,
   `new_process_pool()`, `dispatch_to_pool()`,
-  `run_in_worker_loop()`/`close_worker_loop()`); the second, whether a
+  `run_in_worker_loop()`/`close_worker_loop()`, plus `common_descriptor()`
+  for "can these share one pool", `shutdown_pool()`, and
+  `raise_worker_failure()`, which turns a dead worker into
+  `WorkerProcessError`); the second, whether a
   repository's `ObjectStore` can be rebuilt inside a fresh process
   (`describe_store()`/`rebuild_store()`, `None` meaning "no, fall back");
   the third, rebuilding an equivalent `Pool` from one of those descriptors
-  (`PoolDescriptor`/`build_worker_pool()`). `units/verify_reachable.py`
-  (FULL level) and `dedup/export_scheduler.py` are today's two call sites —
+  (`PoolDescriptor`/`build_worker_pool()`), with `BoundProcessPool` (an
+  executor whose workers are bound to one descriptor) and `WorkerContext` (a
+  worker's warm store/pool pair). `dedup/verify_bucket_check.py`
+  (verify FULL level's workers, dispatched from `dedup/verify_walk.py`)
+  and `dedup/export_workers.py` (export's, dispatched from
+  `dedup/export_scheduler.py`) are today's two call sites —
   see "Async-native, by design" above for why. A third call site wanting
   the same real parallelism should reach for this trio, not stand up its
   own `ProcessPoolExecutor`. `concurrency.preload_resource_tracker()` avoids
   a `ProcessPoolExecutor`-construction crash under Textual's stderr capture
   — see its own docstring for the mechanism; `browser/app.py::main()` calls
   it before `.run()`.
-- **`RecordingStore`/`ReplayStore`** (`storage/recording.py`) — wraps a real
-  `ObjectStore`, records every call/result pair, and replays it with zero real
-  I/O. This is how a handful of real, production-shaped bytes become a
-  committable, sample-independent test fixture (a few hundred KB to a couple
-  MB uncompressed; committed gzip-compressed as `tests/fixtures/*.json.gz`,
-  smaller still) instead of requiring the real sample tree itself. Also backs
-  `TracingStore`, wrapping the same four narrow methods to drive the CLI's
-  `--trace` flag.
+- **`InstrumentedStore`** (`storage/recording.py`) — an `ObjectStore` wrapper
+  that forwards the four read methods (and `close()`) and hands each
+  completed call, and each failed one, to its subclass as a typed call
+  event. `TracingStore` (the CLI's `--trace` flag) is one; the test suite's
+  fixture recorder (`tests/support/recording/fixture_store.py`'s `RecordingStore`, see
+  `tests/CLAUDE.md`) is the other.
+- **`CacheLimits` / `CacheManager`** (`cachemanager.py`) — every cache a
+  `DedupRepo` owns has an explicit bound declared in `CacheLimits`; one with no
+  count bound must say what bounds it (a closed key set, for its db sources),
+  and a per-stream or per-record cache is bounded by construction. Storage is
+  assumed immutable while a repository is open, so nothing revalidates:
+  `DedupRepo.caches` registers its caches by name and
+  `Repository.invalidate_caches()` drops them (the TUI's `r`), keeping every
+  `Catalog` valid. Per-operation caches (a verify run's, an export's) are
+  private instances sized from the same `CacheLimits`, so a bulk walk never
+  evicts the repository's interactive entries.
 - **`peel()` / `SqliteSource`** (`storage/sqlite_source.py`) — every one of this
   project's several envelope→SQLite paths (repository `db/<name>`, `copy_meta_file`'s
   `target.db`, `version.db.zst`, SaaS service DBs, ...) reduces to at most two
@@ -575,19 +704,18 @@ below), not a separate placeholder-substitution mechanism of its own.
   Copy-version UUID) despite the similar name, but it isn't itself modeled
   as a `NewType` (nothing else in the SDK references it).
 - **`presentation/`** — anything that must render identically in the CLI and
-  TUI (progress/ETA formatting, byte-size formatting) lives here, in the SDK,
+  TUI (progress/ETA formatting, byte-size formatting, how an unfinished export
+  is described in `export_report.py`, how a `Repository.verify()` result is
+  grouped and ordered in `verify_report.py`) lives here, in the SDK,
   once — not duplicated per frontend. "CLI and TUI disagree" is a bug by
   definition for anything in this module. (`NodeRef`'s human-form rendering
   and `disambiguate()` are the same kind of shared-once mechanism but live in
   `units/node_ref.py` instead, since they're address logic, not display
-  formatting; `dedup/verify_report.py`'s `group_findings()`/`sort_key()` are
-  the same idea again for grouping/ordering a `Repository.verify()` result,
-  but live in `dedup/` instead, since `presentation/` is a true leaf with
-  zero internal imports of its own and this logic needs `Finding`, which
-  lives one layer up.)
+  formatting.)
 - **`ApmRepoError.safe_message`** (`errors.py`) — the message alone, with the
   `ref=`/`spec=` tags `str(exc)` appends stripped, so the same exception can
   render two ways: full detail, or that detail stripped down. Only the CLI's
   `cli/errors.py::friendly_message()` picks between the two, gated on
-  `--verbose`. The TUI always renders via plain `str(exc)` instead,
-  `d`-toggle or not — a deliberate, scoped exception, not an oversight.
+  `--verbose`. The TUI always renders plain `str(exc)`, `ref=`/`spec=` tags
+  included, whatever the `d` toggle says — the one deliberate exception to
+  the Presentation rule above.

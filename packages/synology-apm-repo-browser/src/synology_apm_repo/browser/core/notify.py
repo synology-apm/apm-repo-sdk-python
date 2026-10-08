@@ -1,7 +1,5 @@
-"""``Notify``: the one plain-toast ``Cmd`` every screen's ``Cmd`` union
-carries, turned into ``notify()`` by each screen's own effect
-interpreter. Shared here so ``severity``/``title`` can't drift between
-domains.
+"""``Notify``: the toast ``Cmd`` every domain's ``Cmd`` union carries, which
+each effect interpreter turns into ``notify()``.
 """
 
 from __future__ import annotations
@@ -12,8 +10,7 @@ from typing import Literal
 
 @dataclasses.dataclass(frozen=True, slots=True)
 class Notify:
-    """``title`` is only set for a job's terminal outcome; other domains
-    never set it, and their effect interpreters pass it through regardless."""
+    """``title`` is set only for a job's terminal outcome."""
 
     message: str
     severity: Literal["information", "warning", "error"] = "information"

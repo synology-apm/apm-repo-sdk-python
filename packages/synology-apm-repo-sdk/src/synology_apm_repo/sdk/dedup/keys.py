@@ -4,13 +4,9 @@ locations this repository's layout uses.
 
 **"Is this key correct" is answered by ``KeyMaterial.verify`` alone, via
 AES-256-GCM's own authentication tag — never by also decrypting a real
-chunk.** GCM tag success already proves the ``(userKeyID, userKey)``
-pair correctly unwraps the stored wrapped-VaultKey record
-(FORMAT-SPEC.md: vaultkey-custody); since the DEK (``vaultKey``) never
-changes after first initialization, that same VaultKey is the one used
-for every real chunk. Per-chunk fingerprint verification is a separate
-concern this module has no part in — see ``Pool.read_chunk``'s
-``verify_fingerprint`` option.
+chunk** (see ``format.crypto.unwrap_vault_key``; FORMAT-SPEC.md: VaultKey
+custody). Per-chunk fingerprint verification is ``Pool``'s
+``VerifyPolicy``, not this module's.
 """
 
 from __future__ import annotations
@@ -19,31 +15,29 @@ import base64
 import binascii
 import dataclasses
 import sqlite3
-from typing import Self
+from typing import Self, override
 
 import aiosqlite
 
 from ..errors import DataCorruptError, KeyMismatchError, NotFoundError
 from ..format.crypto import NO_ENCRYPTION_USER_KEY_ID, parse_key_string, unwrap_vault_key
-from ..storage.base import ObjectStore, join_path
+from ..storage.base import ObjectStore, join_path, list_names
 from ..storage.layout import RepoKind, RepoLayout
 from ..storage.sqlite_source import SqliteSource
 
-_SPEC = "FORMAT-SPEC.md: chunk-pool-encryption/vaultkey-custody"
+_VAULT_KEY_DB = "db/vault_encryption_key"
+"""A vault's key table, relative to its repository root."""
+
+_SPEC = "FORMAT-SPEC.md: Chunk pool encryption; VaultKey custody"
 
 
 async def _vault_db_row(
     store: ObjectStore, db_path: str, query: str, params: tuple[object, ...] = ()
 ) -> sqlite3.Row | None:
-    """Run ``query`` against the vault's own ``db/vault_encryption_key``
-    and return its first row (``None`` if none) — the one place
-    ``aiosqlite.Error`` gets wrapped into ``DataCorruptError``, shared by
-    ``KeyMaterial._wrapped_vault_key_from_db`` and
-    ``_probe_encrypted_from_vault_db`` below. A half-written vault can
-    have ``db_path`` present but truncated/garbage — reported as a
-    recognized ``ApmRepoError`` rather than a raw sqlite3 exception, so
-    callers up the stack (``Session.discover()``'s "skip, don't abort"
-    contract) can tell the two apart.
+    """Run ``query`` against the vault's ``db/vault_encryption_key`` and return
+    its first row (``None`` if none). A truncated or garbage ``db_path``
+    raises ``DataCorruptError`` instead of a raw sqlite error, so callers
+    (``Session.discover()``) can skip that repository.
     """
     try:
         async with await SqliteSource.from_raw_store(store, db_path) as source:
@@ -53,7 +47,7 @@ async def _vault_db_row(
         raise DataCorruptError(f"{db_path} is not a readable vault_encryption_key database", ref=db_path) from exc
 
 
-@dataclasses.dataclass(frozen=True)
+@dataclasses.dataclass(frozen=True, slots=True)
 class KeyVerification:
     """Result of ``KeyMaterial.verify``. ``vault_key`` holds the resolved
     DEK only when ``gcm_ok`` and encryption is actually in use; it's
@@ -63,9 +57,9 @@ class KeyVerification:
     gcm_ok: bool
     vault_key: bytes | None
 
+    @override
     def __repr__(self) -> str:
-        # See KeyMaterial.__repr__ below: vault_key is
-        # exactly the same kind of secret as user_key there.
+        # vault_key is a secret like KeyMaterial.user_key; see its __repr__.
         vault_key_repr = "<redacted>" if self.vault_key is not None else None
         return f"KeyVerification(gcm_ok={self.gcm_ok!r}, vault_key={vault_key_repr})"
 
@@ -74,7 +68,7 @@ class KeyVerification:
         return self.gcm_ok
 
 
-@dataclasses.dataclass(frozen=True)
+@dataclasses.dataclass(frozen=True, slots=True)
 class KeyMaterial:
     """A parsed ``"<userKeyID>@<base64(userKey)>"`` key string.
 
@@ -87,6 +81,11 @@ class KeyMaterial:
 
     @classmethod
     def from_key_string(cls, key_string: str) -> Self:
+        """Parse ``key_string`` (see ``format.crypto.parse_key_string``).
+
+        Raises:
+            KeyMaterialError: The string is malformed.
+        """
         user_key_id, user_key = parse_key_string(key_string)
         return cls(user_key_id=user_key_id, user_key=user_key)
 
@@ -94,11 +93,9 @@ class KeyMaterial:
     def is_no_encryption(self) -> bool:
         return self.user_key_id == NO_ENCRYPTION_USER_KEY_ID
 
+    @override
     def __repr__(self) -> str:
-        # Key material must never leak into a log,
-        # exception message, or repr — user_key is deliberately omitted here
-        # even though user_key_id alone is not secret. Same rule applies to
-        # KeyVerification.vault_key above.
+        # user_key must never reach a log, message, or repr (user_key_id alone is not secret).
         return f"KeyMaterial(user_key_id={self.user_key_id!r}, user_key=<redacted>)"
 
     # -- layer 1: GCM unwrap ---------------------------------------------
@@ -108,11 +105,15 @@ class KeyMaterial:
         two on-disk locations ``layout.kind`` implies) and AES-256-GCM
         unwrap it.
 
-        Returns ``None`` if no wrapped key is on record at all (e.g. the
-        lookup row/file is simply absent) — as distinct from
-        ``KeyMismatchError``, which means a
-        wrapped key *was* found but this ``(userKeyID, userKey)`` pair does
-        not open it.
+        Returns:
+            The VaultKey, or ``None`` if no wrapped key is on record (the
+            lookup row/file is absent).
+
+        Raises:
+            KeyMismatchError: A wrapped key was found but this
+                ``(userKeyID, userKey)`` pair does not open it.
+            KeyMaterialError: The stored wrapped key has the wrong length.
+            DataCorruptError: The key database or file is unreadable.
         """
         wrapped = await self._wrapped_vault_key(store, layout)
         if wrapped is None:
@@ -125,7 +126,7 @@ class KeyMaterial:
         return await self._wrapped_vault_key_from_key_file(store, layout)
 
     async def _wrapped_vault_key_from_db(self, store: ObjectStore, layout: RepoLayout) -> bytes | None:
-        db_path = join_path(layout.repo_root, "db", "vault_encryption_key")
+        db_path = join_path(layout.repo_root, _VAULT_KEY_DB)
         if not await store.exists(db_path):
             return None
         row = await _vault_db_row(
@@ -148,20 +149,17 @@ class KeyMaterial:
         try:
             return base64.b64decode(raw.decode("ascii").strip())
         except (UnicodeDecodeError, binascii.Error) as exc:
-            # Same "half-written, present but truncated/garbage" reasoning
-            # as _vault_db_row above, for the OBJECT_STORE key-file
-            # counterpart of that same vault-db read.
+            # Same truncated/garbage handling as _vault_db_row, for the key file.
             raise DataCorruptError(f"{path} is not a readable userKey file", ref=path) from exc
 
     async def verify(self, store: ObjectStore, layout: RepoLayout) -> KeyVerification:
-        """The whole answer to "is this key correct" — no separate
-        per-chunk check follows this. Never raises for an ordinary "wrong
-        key" outcome — that is reported via the returned
-        ``KeyVerification``, not an exception; the caller decides what a
-        failed verification means for its flow (CLI/TUI report it,
-        ``Repository.set_key`` may choose to reject it). Touches only the
-        wrapped-VaultKey record itself (one sqlite row or one small key
-        file) — never the Pool.
+        """The whole answer to "is this key correct"; no per-chunk check follows.
+        A wrong key is reported via the returned ``KeyVerification``, not
+        raised. Reads only the wrapped-VaultKey record, never the Pool.
+
+        Raises:
+            KeyMaterialError: The stored wrapped key has the wrong length.
+            DataCorruptError: The key database or file is unreadable.
         """
         if self.is_no_encryption:
             return KeyVerification(gcm_ok=True, vault_key=None)
@@ -179,22 +177,20 @@ class KeyMaterial:
 
 
 async def probe_encrypted(store: ObjectStore, layout: RepoLayout) -> bool | None:
-    """Cheaply determine whether this repository is vault-encrypted by
-    reading its own encryption-key record directly — VAULT layout reads
-    ``db/vault_encryption_key``'s latest row, OBJECT_STORE layout reads
-    the key-dir marker under ``<key_root>/userKey/``. No bucket file
-    opened, no Pool scan, no key required.
+    """Whether this repository is vault-encrypted, read from its key record
+    alone (no key, no bucket file, no Pool scan).
 
-    VAULT layout: ``db/vault_encryption_key`` is an append-only
-    key-rotation log; its last-inserted row's ``user_key_uuid`` is the
-    active key, ``"NoEncryption"`` iff never encrypted (this cannot
-    toggle after first initialization — FORMAT-SPEC.md:
-    vaultkey-custody). OBJECT_STORE layout: the equivalent record lives
-    as individual objects named by ``userKeyID`` under
-    ``<key_root>/userKey/``, with the same ``"NoEncryption"`` sentinel.
+    VAULT layout: the last-inserted row of ``db/vault_encryption_key``;
+    its ``user_key_uuid`` is ``"NoEncryption"`` iff never encrypted, which
+    cannot change after first initialization (FORMAT-SPEC.md: VaultKey
+    custody). OBJECT_STORE layout: the object names under
+    ``<key_root>/userKey/``, with the same sentinel.
 
-    Returns ``None`` only if the record itself is entirely absent — as
-    distinct from a confirmed-unencrypted repository (``False``).
+    Returns:
+        ``True``/``False``, or ``None`` if the record is entirely absent.
+
+    Raises:
+        DataCorruptError: The VAULT key database is unreadable.
     """
     if layout.kind is RepoKind.VAULT:
         return await _probe_encrypted_from_vault_db(store, layout)
@@ -202,7 +198,7 @@ async def probe_encrypted(store: ObjectStore, layout: RepoLayout) -> bool | None
 
 
 async def _probe_encrypted_from_vault_db(store: ObjectStore, layout: RepoLayout) -> bool | None:
-    db_path = join_path(layout.repo_root, "db", "vault_encryption_key")
+    db_path = join_path(layout.repo_root, _VAULT_KEY_DB)
     if not await store.exists(db_path):
         return None
     row = await _vault_db_row(
@@ -217,7 +213,7 @@ async def _probe_encrypted_from_key_dir(store: ObjectStore, layout: RepoLayout) 
     if layout.key_root is None:
         return None
     try:
-        names = await store.listdir(join_path(layout.key_root, "userKey"))
+        names = await list_names(store, join_path(layout.key_root, "userKey"))
     except NotFoundError:
         return None
     # An encrypted object-store bucket can carry an extra init@<userKeyID>

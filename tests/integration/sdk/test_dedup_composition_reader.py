@@ -1,23 +1,16 @@
-"""Regression test for ``dedup.composition_reader`` — replayed from a
-committed fixture recorded against a real composition sub-file
-(``apv-sample-1``'s ``Composition/132/0.com/c0.8``) — including binary
-search landing on an entry partway through the real 37-entry map array,
-not just a full sequential walk — with **no external dependency**: this
-always runs, on CI or anywhere else, because it goes through
-``ReplayStore`` instead of a real ``LocalFsStore``.
+"""Regression tests for ``dedup.composition_reader`` against one real
+composition record: header verify, record head, a full sequential
+``entries()`` walk, a binary-search start partway through the map array,
+and a bounded ``[start, end)`` walk.
 
-The fixture (``tests/fixtures/dedup_composition_reader_c0_8_apv1.json.gz``)
-was produced against a real store rooted at ``apv-sample-1`` —
-recording every ``ObjectStore`` call a header-verify, a record-head
-read, a full sequential ``entries()`` walk, a binary-search walk, and a
-bounded ``[start, end)`` walk make against the same real record. No
-single test below reproduces all five call shapes, so re-recording needs
-all five run together against one real backend, not just the widest one
-— see ``tests/CLAUDE.md``'s "Recording a fixture" section.
+Fixture: ``dedup_composition_reader_c0_8_vault_plain.json.gz``, recorded against
+``vault-plain``. No single test makes every call, so recording needs the
+whole file run together.
 """
 
 from __future__ import annotations
 
+import itertools
 import zlib
 from collections.abc import Awaitable, Callable
 
@@ -38,13 +31,14 @@ _MAP_ARRAY_OFF = _HEAD_OFF + 32  # chunk_map_array_offset(64)
 
 
 async def _reader(record_target: Callable[[str], Awaitable[ObjectStore]]) -> CompositionReader:
-    store = await record_target("dedup_composition_reader_c0_8_apv1.json.gz")
+    store = await record_target("dedup_composition_reader_c0_8_vault_plain.json.gz")
     return CompositionReader(store, DirCache(store), _COMP_ROOT, _STREAM_ID, _SESSION_ID)
 
 
 async def test_replayed_verify_header_matches_real_subfile_size_constant(
     record_target: Callable[[str], Awaitable[ObjectStore]],
 ) -> None:
+    # verify_header() raises unless subFileSize is the fixed 16 MiB.
     header = await (await _reader(record_target)).verify_header()
     assert header.major == 1
 
@@ -61,11 +55,8 @@ async def test_replayed_record_head_matches_previously_confirmed_raw_values(
 async def test_replayed_full_walk_reproduces_the_real_recorded_mapcrc(
     record_target: Callable[[str], Awaitable[ObjectStore]],
 ) -> None:
-    # entries() never auto-verifies mapCrc (interactive reads skip it)
-    # but a full sequential walk touches every raw 20-byte record,
-    # so recomputing the CRC over those same bytes here is an independent
-    # end-to-end check that entries() is walking the *real* array, not just
-    # that individual fields decode.
+    # entries() doesn't verify mapCrc; recomputing it over the raw array
+    # checks that the walk below covers the real records.
     reader = await _reader(record_target)
     raw = await reader.read_at(_MAP_ARRAY_OFF, _MAP_NUM * CHUNK_MAP_RECORD_LENGTH)
     assert zlib.crc32(raw) & 0xFFFFFFFF == _MAP_CRC
@@ -73,9 +64,7 @@ async def test_replayed_full_walk_reproduces_the_real_recorded_mapcrc(
     record = await reader.record(_HEAD_OFF)
     entries = [e async for e in record.entries()]
     assert len(entries) == _MAP_NUM
-    # entries are strictly ordered by file_offset (on-disk-format.md §8)
-    # (deliberately strict=False: entries[1:] is one shorter by construction)
-    assert all(a.file_offset < b.file_offset for a, b in zip(entries, entries[1:], strict=False))
+    assert all(a.file_offset < b.file_offset for a, b in itertools.pairwise(entries))
 
 
 async def test_replayed_binary_search_lands_on_the_correct_entry_partway_through(
@@ -86,9 +75,7 @@ async def test_replayed_binary_search_lands_on_the_correct_entry_partway_through
     all_entries = [e async for e in record.entries()]
     mid = all_entries[len(all_entries) // 2]
 
-    # asking to start exactly at a real, non-trivial entry's file_offset
-    # must resolve (via binary search, not a sequential walk) to that same
-    # entry as the first result.
+    # Starting exactly at an entry's file_offset yields that entry first.
     from_binary_search = [e async for e in record.entries(start=mid.file_offset)]
     assert from_binary_search[0].file_offset == mid.file_offset
     assert from_binary_search[0].kind == mid.kind
@@ -105,6 +92,3 @@ async def test_replayed_start_one_byte_into_an_entry_still_returns_that_entry(
     result = [e async for e in record.entries(start=target.file_offset + 1, end=target.end_offset)]
     assert len(result) == 1
     assert result[0].file_offset == target.file_offset
-
-
-__all__: list[str] = []

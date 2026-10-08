@@ -1,13 +1,11 @@
 """``index.md`` renderer, shared by ``sdk/``, ``cli/``, and ``browser/`` --
-adapted from ``../apm-sdk-python/tests/smoke/_report.py``, trimmed to this
-project's own run metadata (no host/username/m365-scopes fields; those
-belong to a live APM connection this project never has) and four-state
-checklist icons instead of three.
+run metadata plus a per-step checklist with four outcomes (passed/skipped/degraded/failed).
 """
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+import sys
+from collections.abc import Mapping, Sequence
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -25,6 +23,28 @@ def make_report_dir(tool: str) -> Path:
     return report_dir
 
 
+def resource_usage(*, children: bool = False) -> dict[str, str]:
+    """CPU and peak-memory figures for this process, or for its waited-for
+    children (``children=True``, for a tool that drives subprocesses).
+
+    ``ru_maxrss`` is bytes on macOS and KiB elsewhere; with ``children`` it is
+    the largest single child, not a sum. The ``resource`` module does not exist
+    on Windows, so there the section only says so.
+    """
+    if sys.platform == "win32":
+        return {"scope": "unavailable on Windows"}
+    import resource
+
+    usage = resource.getrusage(resource.RUSAGE_CHILDREN if children else resource.RUSAGE_SELF)
+    scale = 1 if sys.platform == "darwin" else 1024
+    return {
+        "scope": "child processes" if children else "this process",
+        "user CPU": f"{usage.ru_utime:.1f} s",
+        "system CPU": f"{usage.ru_stime:.1f} s",
+        "max RSS": f"{usage.ru_maxrss * scale / (1024 * 1024):.0f} MiB",
+    }
+
+
 def write_index(
     report_dir: Path,
     *,
@@ -37,14 +57,12 @@ def write_index(
     stats: dict[str, DomainStats],
     step_results: dict[str, list[StepResult]],
     trace_files: Sequence[str] = (),
+    resources: Mapping[str, str] | None = None,
 ) -> None:
     """Write ``index.md``: run metadata, per-domain stats table, full
-    checklist, file pointers. ``title`` and ``domains`` are the one thing
-    that differs per distribution (``sdk/``'s own five domains, ``cli/``'s
-    and ``browser/``'s own, different sets) -- everything else about the
-    rendering is shared as-is. ``trace_files`` lists extra trace artifacts
-    this run wrote (e.g. ``store_trace.jsonl``) to link from ``## Files`` --
-    empty for a tool that writes none."""
+    checklist, file pointers. ``trace_files`` lists extra artifacts this run
+    wrote (``store_trace.jsonl``) to link from ``## Files``; ``resources``
+    (see ``resource_usage``) adds a ``## Resource usage`` section."""
     lines: list[str] = [
         f"# {title}",
         "",
@@ -64,6 +82,10 @@ def write_index(
             f"| {domain} | {s.ran} | {s.skipped} | {s.degraded} | "
             f"{s.checks_passed} | {s.checks_failed} | {s.unexpected} |"
         )
+
+    if resources:
+        lines += ["", "## Resource usage", ""]
+        lines += [f"- {key}: {value}" for key, value in resources.items()]
 
     lines += ["", "## Checklist", ""]
     for domain in domains:
@@ -93,9 +115,7 @@ def write_index(
         "",
         "If many steps above show `skipped`, the configured sample set may be"
         " missing prerequisite data -- see"
-        # report_dir is tests/smoke/reports/<distribution>/<timestamp>/,
-        # three levels below tests/smoke/ itself, where smoke_samples.toml
-        # lives -- shared by sdk/cli/browser, so all three point here.
+        # report_dir is tests/smoke/reports/<tool>/<timestamp>/.
         " [smoke_samples.toml](../../../smoke_samples.toml)'s own per-sample"
         " comments for what each named sample is expected to cover, and any"
         " `degraded` outcome documented there as expected for that sample.",

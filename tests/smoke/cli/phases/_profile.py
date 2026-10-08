@@ -1,8 +1,6 @@
-"""``profile`` domain: ``profile add/list/show/remove`` round trip against
-a sandboxed config dir, driven through ``--no-input``'s stdin-secrets flow
-(``add`` reads secrets one-per-line off stdin in prompt order; ``remove``
-needs ``--force`` instead of a confirm prompt) -- fully offline, no real
-repository needed.
+"""``profile`` domain: an offline ``profile add/list/show/remove`` round trip
+in a sandboxed config dir, under ``--no-input`` (``add`` reads secrets
+one per line from stdin; ``remove`` needs ``--force``).
 """
 
 from __future__ import annotations
@@ -19,12 +17,7 @@ def run(ctx: SmokeContext) -> None:
     with tempfile.TemporaryDirectory(prefix="apm-cli-smoke-home-") as home_dir:
         env = ctx.runner.sandboxed_env(Path(home_dir))
 
-        # --no-verify: this profile's bucket doesn't exist -- --verify's
-        # default connectivity check would only ever fail against it, and
-        # this phase is checking the add/list/show/remove round trip
-        # itself, not real S3 connectivity (already the concern of
-        # whichever real sample's own ObjectStore this tool discovers
-        # elsewhere).
+        # --no-verify: this profile's bucket doesn't exist.
         ctx.run(
             "profile",
             "profile.add",

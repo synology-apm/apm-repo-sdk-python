@@ -1,5 +1,5 @@
-# Builds the Sphinx API docs on every push/PR, and on push to main also
-# publishes them to GitHub Pages.
+# Builds the Sphinx API docs on every pull request and push to main (and on
+# manual dispatch); a push to main also publishes them to GitHub Pages.
 #
 # Prerequisite (one-time, manual, not automatable from this repository):
 #   Enable GitHub Pages for this repository with "Source: GitHub Actions" under

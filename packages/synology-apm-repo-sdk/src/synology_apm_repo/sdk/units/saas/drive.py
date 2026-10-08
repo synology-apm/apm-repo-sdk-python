@@ -1,35 +1,32 @@
-"""``DriveProvider``: OneDrive (M365) / Google Drive (GWS) via
+"""``open_drive_provider``: OneDrive (M365) / Google Drive (GWS) via
 ``item_table``, built as a ``SaasWorkloadProvider`` + ``RecursiveTree``
 config.
 
-Both platforms share one schema and one provider. Content addressing
-has no application-layer wrapper: ``content_object_id`` points directly
-at the real file bytes, unlike Mail's META/fragment reassembly — see
-``_root_folder_id`` and ``_build_tree`` for the one piece of this
-provider (the synthetic root anchor) that doesn't fit ``RecursiveTree``'s
-constructor unchanged.
+Both platforms share one schema and one provider. ``content_object_id``
+points directly at the file's bytes, with no application-layer wrapper.
 """
 
 from __future__ import annotations
 
-from ...errors import NotFoundError
 from ...storage.table import Column, Table, as_int
-from ..base import RestorableUnit, UnitKind, mtime_attrs, not_restorable
+from ...units.provider_kit import mtime_from_raw, not_restorable
+from ..base import ContentSource, UnitKind
 from .provider import (
+    NodeExtras,
     RecursiveTreeSaasProvider,
     SaasWorkloadConfig,
     SaasWorkloadProvider,
     make_saas_provider,
 )
-from .tree_strategy import FolderPredicate, RecursiveTree
+from .tree_strategy import FolderPredicate, Key, RecursiveTree, Row
 
 _ITEM_TABLE = "item_table"
-# item_table.type: 0=folder, 1=file. Real data: a folder row always has
-# size=0 and an empty content_object_id.
+# item_table.type: 0=folder, 1=file. A folder row has size=0 and an
+# empty content_object_id.
 _TYPE_FOLDER = 0
 
-_Row = dict[str, object | None]
-_Key = tuple[str, ...]
+
+_Provider = SaasWorkloadProvider[None]
 
 
 _ITEM_COLUMNS = [
@@ -49,7 +46,7 @@ _ITEM_COLUMNS = [
 _CONFIG_COLUMNS = [Column("key"), Column("value")]
 
 
-async def _root_folder_id(provider: SaasWorkloadProvider) -> str:
+async def _root_folder_id(provider: _Provider) -> str:
     # config_table.root_folder_id names an id with no row of its own in
     # item_table — a synthetic anchor, not a browsable item.
     table = await Table.create(provider.table(_ITEM_TABLE), "config_table", _CONFIG_COLUMNS)
@@ -57,99 +54,60 @@ async def _root_folder_id(provider: SaasWorkloadProvider) -> str:
     return str(row["value"]) if row is not None else ""
 
 
-async def _build_tree(provider: SaasWorkloadProvider) -> RecursiveTree:
-    return RecursiveTree(
+async def _build_tree(provider: _Provider) -> tuple[RecursiveTree, None]:
+    tree = RecursiveTree(
         provider,
         table=_ITEM_TABLE,
         columns=_ITEM_COLUMNS,
         id_column="item_id",
         parent_column="parent_folder_id",
-        # Looked up eagerly here since RecursiveTree's constructor takes
-        # root_id directly — every other workload's "root" is just (),
-        # an opaque empty key; Drive's is a real id read off a third
-        # table (config_table).
         root_id=await _root_folder_id(provider),
         folder=FolderPredicate(is_folder=lambda row: as_int(row["type"]) == _TYPE_FOLDER, sql=f"type = {_TYPE_FOLDER}"),
         display_name=lambda row: str(row["name"]),
-        # "name" is the natural file-browser sort (required, always
-        # present); tree_strategy/_base.py's _resolve_order_by() appends
-        # SQLite's own implicit ``rowid`` as the deterministic pagination
-        # tiebreaker regardless.
         order_by=["name"],
+    )
+    return tree, None
+
+
+def _extras(provider: _Provider, row: Row) -> NodeExtras:
+    del provider
+    # item_table.hash equals the META object's client_metadata.md5Checksum,
+    # exposed for a caller's restore-integrity check.
+    return NodeExtras(
+        mtime=mtime_from_raw(row["mtime"]),
+        details={"content_object_id": row["content_object_id"], "hash": row.get("hash")},
     )
 
 
-def _extra_attrs(provider: SaasWorkloadProvider, row: _Row) -> dict[str, object]:
-    # Doesn't need ``provider`` — row-only reshaping (the shared
-    # extra_attrs callback signature always carries a provider param
-    # regardless: other workloads' extras need it, this one doesn't).
-    del provider
-    # item_table.hash is byte-identical to the file's own meta_object_id
-    # JSON's client_metadata.md5Checksum — exposed as node.attrs["hash"]
-    # for a caller's own restore-integrity cross-check.
-    attrs: dict[str, object] = {"content_object_id": row["content_object_id"], "hash": row.get("hash")}
-    attrs.update(mtime_attrs(row["mtime"]))
-    # ``extra_attrs`` only ever runs for a leaf row (``provider.py``'s own
-    # ``_node_for``) — a Drive folder's ``mtime`` is never surfaced, even
-    # though ``item_table`` carries one for every row regardless of type.
-    return attrs
-
-
-def _item_size(row: _Row) -> int | None:
+def _item_size(row: Row) -> int | None:
     return as_int(row["size"]) if row["size"] is not None else None
 
 
-async def _assemble(provider: SaasWorkloadProvider, row: _Row, key: _Key) -> RestorableUnit:
+async def _content(provider: _Provider, row: Row, key: Key) -> ContentSource:
     content_object_id = row.get("content_object_id")
     if not content_object_id:
         not_restorable("item", key)
-    try:
-        offset, length = await provider.object_db(_ITEM_TABLE).get(str(content_object_id))
-    except NotFoundError:
-        # A stale/malformed index entry (the same "recorded but not
-        # actually present" shape raw_object.py's own _named_nodes
-        # degrades on at listing time) — this one item just isn't
-        # restorable, not a reason to crash the caller.
-        not_restorable("item", key)
-    view = provider.dedup_file.view(offset, length)
-    size = _item_size(row)
-    return RestorableUnit(
-        ref=provider.ref_for(key),
-        name=str(row["name"]),
-        is_leaf=True,
-        kind=UnitKind.DRIVE_ITEM,
-        size=size,
-        content=view,
-    )
+    return await provider.object_view(_ITEM_TABLE, str(content_object_id), key)
 
 
-#: ``SaasWorkloadConfig`` behind ``DriveProvider`` — one schema shared by
+#: ``SaasWorkloadConfig`` behind ``open_drive_provider`` — one schema shared by
 #: OneDrive and Google Drive.
 DRIVE_CONFIG = SaasWorkloadConfig(
     root_name="/",
     leaf_kind=UnitKind.DRIVE_ITEM,
     tables=(_ITEM_TABLE,),
     tree_factory=_build_tree,
-    assemble=_assemble,
-    extra_attrs=_extra_attrs,
+    content=_content,
+    leaf_extras=_extras,
     leaf_size=_item_size,
-    # Content-level, not just metadata: "drive_db" covers GWS's own
-    # Drive, M365's OneDrive (USER_DRIVE), and TEAM_DRIVE alike.
+    # "drive_db" covers GWS Drive, M365 OneDrive (USER_DRIVE) and TEAM_DRIVE.
     object_names={_ITEM_TABLE: ("drive_db",)},
 )
 
 
-#: Constructor-style factory over ``DRIVE_CONFIG`` — callable exactly
-#: like a constructor (``await DriveProvider(repo, version, saas_streams)``),
-#: resolving the service DB via the connector's own object-name index
-#: only, never a scan. ``shared`` is accepted only for
-#: calling-convention uniformity with ``units/dispatch.py``'s
-#: ``_ProviderFactory`` — no ``DRIVE``/``USER_DRIVE``/``TEAM_DRIVE``
-#: ``sub_type`` ever offers more than this one candidate, so it is
-#: always ``None`` in practice. Built as a
-#: ``RecursiveTreeSaasProvider`` — Drive's flat, depth-independent
-#: ``item_id`` addressing is the one SaaS shape ``units/resolve.py``
-#: can't prefix-guide a descent through, so this is the one SaaS
-#: factory that needs the direct-lookup capability that subclass
-#: provides.
-DriveProvider = make_saas_provider(DRIVE_CONFIG, name="DriveProvider", provider_cls=RecursiveTreeSaasProvider)
+#: Async factory over ``DRIVE_CONFIG`` (see ``make_saas_provider``),
+#: building a ``RecursiveTreeSaasProvider`` for Drive's depth-independent
+#: ``item_id`` refs.
+open_drive_provider = make_saas_provider(
+    DRIVE_CONFIG, name="open_drive_provider", provider_cls=RecursiveTreeSaasProvider
+)

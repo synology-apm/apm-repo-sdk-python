@@ -7,7 +7,7 @@ from types import SimpleNamespace
 from typing import Any, cast
 
 import pytest
-from hypothesis import given
+from hypothesis import HealthCheck, given, settings
 from hypothesis import strategies as st
 
 from synology_apm_repo.sdk.identifiers import CatalogId, VersionUid, WorkloadId, WorkloadUid
@@ -89,6 +89,19 @@ class TestStrAndParseRoundTrip:
             NodeRef.parse("no-hash-here")
 
 
+class TestCoerce:
+    def test_a_node_ref_is_returned_as_is(self) -> None:
+        ref = NodeRef("repo", ("a", "b"))
+        assert NodeRef.coerce(ref) is ref
+
+    def test_a_string_is_parsed(self) -> None:
+        assert NodeRef.coerce("repo#a/b") == NodeRef("repo", ("a", "b"))
+
+    def test_a_string_that_is_not_a_ref_raises(self) -> None:
+        with pytest.raises(ValueError, match="missing '#'"):
+            NodeRef.coerce("no-hash")
+
+
 class TestKindClassification:
     def test_canonical(self) -> None:
         ref = NodeRef("repo", ("cat:1", "wl:2", "ver:x"))
@@ -122,8 +135,7 @@ class TestCanonicalIds:
         assert ref.canonical_ids is None
 
     def test_none_for_a_malformed_canonical_prefix(self) -> None:
-        # catalog_id is a plain string, never int-parsed, so only
-        # workload_id can still be malformed this way.
+        # catalog_id is never int-parsed, so only workload_id can be malformed.
         ref = NodeRef("repo", ("cat:1", "wl:notanumber", "ver:x"))
         assert ref.canonical_ids is None
 
@@ -134,13 +146,9 @@ class TestCanonicalIds:
 
 class TestCanonicalRefFor:
     def test_builds_the_shared_prefix_from_repo_and_version(self) -> None:
-        # canonical_ref_for's own contract: the (repo_root, repo_id,
-        # ccid, workload_id, version_uid) prefix every provider's ref_for
-        # shares, extra untouched. Only .layout.repo_root/.layout.repo_id/
-        # .connection_config_id/.workload_id/.version_uid are ever
-        # read, so lightweight stand-ins are enough -- no need to
-        # construct a real DedupRepo/Version. repo_id=None mirrors a
-        # vault's own RepoLayout, falling back to str(connection_config_id).
+        # Only .layout.repo_root/.layout.repo_id/.connection_config_id/.workload_id/
+        # .version_uid are read. repo_id=None (a vault's RepoLayout) falls back to
+        # connection_config_id as the catalog id.
         repo = cast(Any, SimpleNamespace(layout=SimpleNamespace(repo_root="myrepo", repo_id=None)))
         version = cast(Any, SimpleNamespace(connection_config_id=7, workload_id=42, version_uid="v-abc"))
 
@@ -188,7 +196,7 @@ class TestChild:
         ref = NodeRef.human("repo", "a")
         assert ref.child("b", "c") == NodeRef.human("repo", "a", "b", "c")
 
-    def test_no_extra_segments_returns_an_equal_but_new_ref(self) -> None:
+    def test_no_extra_segments_returns_an_equal_ref(self) -> None:
         ref = NodeRef.human("repo", "a")
         assert ref.child() == ref
 
@@ -242,11 +250,7 @@ class TestDisambiguate:
         assert not any("#" in name for name in result)
 
     def test_missing_hint_leaves_that_entry_bare_when_the_hint_alone_already_resolves_it(self) -> None:
-        # entry 1 gets "dup · MAIL"; entry 2 has no hint so stays "dup" —
-        # and that's already unique (no candidate else equals bare "dup"),
-        # so no hash is needed at all. This is the algorithm correctly
-        # noticing the hinted candidate no longer collides with anything,
-        # not a case that still needs a hash fallback.
+        # Once entry 1 becomes "dup · MAIL", bare "dup" is unique: no hash needed.
         result = disambiguate(
             [("dup", "id-1"), ("dup", "id-2")],
             hints=["MAIL", None],
@@ -254,9 +258,7 @@ class TestDisambiguate:
         assert result == ["dup · MAIL", "dup"]
 
     def test_two_entries_sharing_both_name_and_hint_still_fall_back_to_a_hash(self) -> None:
-        # collision-safety must never be weakened by a hint that doesn't
-        # actually resolve it (two different real workloads happen to
-        # share a sub_type too, e.g. two MAIL accounts).
+        # e.g. two MAIL accounts with the same display name.
         result = disambiguate(
             [("dup", "id-1"), ("dup", "id-2")],
             hints=["MAIL", "MAIL"],
@@ -276,14 +278,9 @@ class TestDisambiguate:
 
 
 class TestDisambiguateCatalogsWorkloadsVersions:
-    """``disambiguate_catalogs``/``disambiguate_workloads``/
-    ``disambiguate_versions`` — the "build pairs, ``disambiguate()``" step
-    ``catalog_pairs``/``workload_pairs``/``version_pairs`` each fed
-    independently in the CLI and the browser before these existed.
-    ``TestDisambiguate`` above already covers ``disambiguate()``'s own
-    collision/hint/hash logic in full; these only check that each
-    wrapper builds the right pairs (and, for workloads, the right hint)
-    from real-shaped objects and returns names in the same order."""
+    """``disambiguate_catalogs``/``disambiguate_workloads``/``disambiguate_versions``:
+    each builds the right pairs (and, for workloads, the right hint) and keeps
+    order; ``TestDisambiguate`` covers ``disambiguate()`` itself."""
 
     def test_disambiguate_catalogs_disambiguates_colliding_display_names(self) -> None:
         catalogs = [
@@ -305,10 +302,8 @@ class TestDisambiguateCatalogsWorkloadsVersions:
         assert result == ["Alice · MAIL", "Alice · DRIVE"]
 
     def test_disambiguate_workloads_use_type_hint_false_skips_the_hint(self) -> None:
-        """The browser's own per-sub_type leaf list: every sibling already
-        shares one ``type_hint`` by construction, so showing it again
-        would be redundant -- ``use_type_hint=False`` falls back straight
-        to the hash suffix instead, same as passing no hints at all."""
+        """The browser's per-sub_type leaf list: every sibling shares one
+        ``type_hint``, so ``use_type_hint=False`` falls back to the hash suffix."""
         workloads = [
             SimpleNamespace(display_name="Alice", workload_uid=WorkloadUid("wl-1"), type_hint="MAIL"),
             SimpleNamespace(display_name="Alice", workload_uid=WorkloadUid("wl-2"), type_hint="MAIL"),
@@ -343,10 +338,7 @@ class TestMatchDisplayName:
         assert suffixed == "obj1"
 
     def test_hints_resolve_a_collision_the_same_way_disambiguate_does(self) -> None:
-        # hints must match whatever the display side passed to its own
-        # disambiguate() call for these same pairs -- e.g. resolving
-        # "Alice Example <a@x> · MAIL" back to the Mail workload, not
-        # just any workload sharing that display name.
+        # The hints are the ones the display side passed to disambiguate() for these pairs.
         pairs = [("Alice Example <a@x>", "wl-1"), ("Alice Example <a@x>", "wl-2")]
         objects = ["mail-workload", "drive-workload"]
 
@@ -373,10 +365,7 @@ class TestAmbiguousMatches:
         ]
 
     def test_reports_hint_resolved_names_when_hints_given(self) -> None:
-        # the *raw* (pre-suffix) name is what's compared against target --
-        # both rows still share it even though a hint resolved each one's
-        # own disambiguated form differently, so both come back as real,
-        # actionable candidates (not narrowed away by the hint).
+        # The raw (pre-suffix) name is compared against target, so both rows match.
         pairs = [("Alice Example <a@x>", "wl-1"), ("Alice Example <a@x>", "wl-2")]
         assert ambiguous_matches("Alice Example <a@x>", pairs, hints=["MAIL", "DRIVE"]) == [
             "Alice Example <a@x> · MAIL",
@@ -389,11 +378,11 @@ class TestAmbiguousMatches:
 _segment_text = st.text(alphabet=st.characters(min_codepoint=0x20, max_codepoint=0x2FFFF), max_size=40)
 
 
+# Both wall-clock checks flake on a loaded machine; the property itself is unaffected.
+@settings(suppress_health_check=[HealthCheck.too_slow], deadline=None)
 @given(
     repo_path=st.text(min_size=1, max_size=20).filter(lambda s: "#" not in s),
-    # a *lone* empty-string segment is the one documented, unrepresentable
-    # edge case (indistinguishable from zero segments — both encode to
-    # ""); excluded here as out of scope for this property, not ignored.
+    # A lone empty segment is unrepresentable: it encodes to "", like zero segments.
     segments=st.lists(_segment_text, max_size=6).filter(lambda s: s != [""]),
 )
 def test_str_parse_round_trip_property(repo_path: str, segments: list[str]) -> None:

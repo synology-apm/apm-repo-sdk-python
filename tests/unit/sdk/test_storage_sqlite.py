@@ -4,15 +4,21 @@ from __future__ import annotations
 
 import asyncio
 import sqlite3
+import tempfile
 import threading
 from pathlib import Path
-from typing import Any
+from typing import Any, BinaryIO
 
 import aiosqlite
 import pytest
 
+from support.fakes import faithful_to
+from synology_apm_repo.sdk.errors import NotFoundError, ResourceLimitExceededError
+from synology_apm_repo.sdk.storage import sqlite_source as sqlite_source_mod
+from synology_apm_repo.sdk.storage.base import Entry, ObjectStore
 from synology_apm_repo.sdk.storage.local import LocalFsStore
 from synology_apm_repo.sdk.storage.sqlite import apply_index_hint, open_sqlite
+from unit.sdk.storage_fakes import fake_disk_usage
 
 
 def _make_plain_db(root: Path, name: str = "test.db") -> None:
@@ -41,6 +47,14 @@ async def test_fast_path_opens_plain_db(tmp_path: Path) -> None:
         await conn.close()
 
 
+async def test_fast_path_refuses_a_path_that_escapes_the_store_root(tmp_path: Path) -> None:
+    root = tmp_path / "root"
+    root.mkdir()
+    _make_plain_db(tmp_path, "outside.db")
+    with pytest.raises(NotFoundError, match="escapes store root"):
+        await open_sqlite(LocalFsStore(root), "../outside.db")
+
+
 async def test_zero_length_wal_sidecar_still_takes_fast_path(tmp_path: Path) -> None:
     _make_plain_db(tmp_path)
     (tmp_path / "test.db-wal").write_bytes(b"")  # present, but empty
@@ -54,8 +68,7 @@ async def test_zero_length_wal_sidecar_still_takes_fast_path(tmp_path: Path) -> 
 
 
 async def test_nonzero_shm_alone_does_not_trigger_slow_path(tmp_path: Path) -> None:
-    # per spec, only -wal's size gates the decision — a non-zero -shm alone
-    # must not force materialization.
+    # Only -wal's size gates the slow path.
     _make_plain_db(tmp_path)
     (tmp_path / "test.db-shm").write_bytes(b"\x00" * 32768)
     store = LocalFsStore(tmp_path)
@@ -68,10 +81,8 @@ async def test_nonzero_shm_alone_does_not_trigger_slow_path(tmp_path: Path) -> N
 
 
 async def test_nonzero_wal_takes_slow_path_and_sees_wal_committed_data(tmp_path: Path) -> None:
-    # Construct a genuine, non-checkpointed WAL: hold a read transaction
-    # open on a second connection to block SQLite's automatic checkpoint,
-    # then commit more data on the first connection and close it — the
-    # main .db file alone is now stale; the newer row only exists in -wal.
+    # A non-checkpointed WAL: a read transaction on a second connection blocks
+    # SQLite's automatic checkpoint, so the newer row exists only in -wal.
     db_path = tmp_path / "test.db"
     writer = sqlite3.connect(str(db_path))
     writer.execute("PRAGMA journal_mode=WAL")
@@ -104,6 +115,23 @@ async def test_nonzero_wal_takes_slow_path_and_sees_wal_committed_data(tmp_path:
         blocker.close()
 
 
+async def test_the_slow_path_copy_is_refused_when_it_would_eat_into_the_reserve(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _make_plain_db(repo)
+    (repo / "test.db-wal").write_bytes(b"w" * 100)  # forces the slow path
+    scratch = tmp_path / "scratch"
+    scratch.mkdir()
+    db_size = (repo / "test.db").stat().st_size
+    # 16 GiB keeps the 1 GiB floor reserve; one byte short for test.db.
+    fake_disk_usage(monkeypatch, total=16 << 30, free=(1 << 30) + db_size - 1)
+    with pytest.raises(ResourceLimitExceededError, match="not enough free space under"):
+        await open_sqlite(LocalFsStore(repo), "test.db", tmp_dir=scratch)
+    assert list(scratch.iterdir()) == []
+
+
 async def test_transform_forces_slow_path_even_with_no_wal(tmp_path: Path) -> None:
     _make_plain_db(tmp_path, name="wrapped.db")
     wrapped_path = tmp_path / "wrapped.db"
@@ -111,10 +139,13 @@ async def test_transform_forces_slow_path_even_with_no_wal(tmp_path: Path) -> No
     def _xor(data: bytes) -> bytes:
         return bytes(b ^ 0xFF for b in data)
 
+    def _xor_to_file(data: bytes, dest: BinaryIO) -> None:
+        dest.write(_xor(data))
+
     wrapped_path.write_bytes(_xor(wrapped_path.read_bytes()))
     store = LocalFsStore(tmp_path)
 
-    conn, materialized = await open_sqlite(store, "wrapped.db", transform=_xor)
+    conn, materialized = await open_sqlite(store, "wrapped.db", transform=_xor_to_file)
     try:
         assert materialized is not None  # transform alone forces the slow path, no -wal needed
         cursor = await conn.execute("SELECT v FROM t")
@@ -127,10 +158,8 @@ async def test_transform_forces_slow_path_even_with_no_wal(tmp_path: Path) -> No
 
 
 async def test_transform_applied_independently_to_main_file_and_wal(tmp_path: Path) -> None:
-    # Same WAL-building recipe as test_nonzero_wal_takes_slow_path_and_sees_wal_committed_data,
-    # plus wrapping the main file and its sidecars independently -- each
-    # file decides its own wrapping on its own, per FORMAT-SPEC.md:
-    # copy_meta_file-layout's per-file detection rule.
+    # The main file and its sidecars are wrapped independently: each file is
+    # detected on its own (FORMAT-SPEC.md §6.1, §5.5).
     db_path = tmp_path / "test.db"
     writer = sqlite3.connect(str(db_path))
     writer.execute("PRAGMA journal_mode=WAL")
@@ -152,6 +181,9 @@ async def test_transform_applied_independently_to_main_file_and_wal(tmp_path: Pa
     def _xor(data: bytes) -> bytes:
         return bytes(b ^ 0xFF for b in data)
 
+    def _xor_to_file(data: bytes, dest: BinaryIO) -> None:
+        dest.write(_xor(data))
+
     # Snapshot the three files into a directory no connection has open,
     # and wrap them there: `blocker` has to stay open to keep the WAL from
     # being checkpointed away, but on Windows it also holds `-shm` memory
@@ -163,7 +195,7 @@ async def test_transform_applied_independently_to_main_file_and_wal(tmp_path: Pa
             (wrapped_dir / candidate.name).write_bytes(_xor(candidate.read_bytes()))
 
     store = LocalFsStore(wrapped_dir)
-    conn, materialized = await open_sqlite(store, "test.db", transform=_xor)
+    conn, materialized = await open_sqlite(store, "test.db", transform=_xor_to_file)
     try:
         assert materialized is not None
         cursor = await conn.execute("SELECT v FROM t")
@@ -176,23 +208,36 @@ async def test_transform_applied_independently_to_main_file_and_wal(tmp_path: Pa
         blocker.close()
 
 
-async def test_a_fast_failing_main_read_does_not_race_a_slower_sidecars_write(tmp_path: Path) -> None:
-    """Regression: a failing main-file read must not let ``tmp.cleanup()``
-    run while a still-in-flight sidecar task is mid-write into the same
-    directory. ``sidecar_finished`` being set proves the sidecar's own
-    ``store.read()`` -- deliberately slower than the main file's immediate
-    failure -- ran to completion before the exception (still its own
-    ``RuntimeError``, not wrapped) ever propagated."""
+async def test_a_fast_failing_main_read_does_not_race_a_slower_sidecars_write(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A failing main-file read must not let ``tmp.cleanup()`` run while a
+    slower sidecar task is still writing into the same directory; the main
+    read's own ``RuntimeError`` propagates unwrapped."""
     (tmp_path / "wrapped.db-wal").write_bytes(b"fake-wal-bytes")
-    sidecar_finished = asyncio.Event()
+    events: list[str] = []
+    sidecar_reading, main_failed = asyncio.Event(), asyncio.Event()
 
+    class _RecordingTemporaryDirectory(tempfile.TemporaryDirectory[str]):
+        def cleanup(self) -> None:
+            events.append("cleanup")
+            super().cleanup()
+
+    monkeypatch.setattr(tempfile, "TemporaryDirectory", _RecordingTemporaryDirectory)
+
+    @faithful_to(ObjectStore)
     class _RacyStore:
         async def read(self, path: str, offset: int = 0, length: int | None = None) -> bytes:
             if path.endswith("-wal"):
-                await asyncio.sleep(0.05)  # still in flight when the main read below raises
+                sidecar_reading.set()
+                await main_failed.wait()  # in flight when the main read below raises
+                for _ in range(20):  # loop turns in which a non-waiting caller would reach its cleanup
+                    await asyncio.sleep(0)
                 data = (tmp_path / path).read_bytes()
-                sidecar_finished.set()
+                events.append("sidecar done")
                 return data
+            await asyncio.wait_for(sidecar_reading.wait(), 5)
+            main_failed.set()
             raise RuntimeError("main file read failed")
 
         async def size(self, path: str) -> int:
@@ -201,24 +246,35 @@ async def test_a_fast_failing_main_read_does_not_race_a_slower_sidecars_write(tm
         async def exists(self, path: str) -> bool:
             return (tmp_path / path).exists()
 
-        async def listdir(self, path: str) -> list[str]:
+        async def close(self) -> None:
+            pass
+
+        async def listdir(self, path: str) -> list[Entry]:
             raise NotImplementedError
 
     with pytest.raises(RuntimeError, match="main file read failed"):
         await open_sqlite(_RacyStore(), "wrapped.db")
-    assert sidecar_finished.is_set()
+    assert events == ["sidecar done", "cleanup"]
 
 
+async def test_a_cancelled_slow_path_open_removes_its_temp_directory(tmp_path: Path) -> None:
+    (tmp_path / "wrapped.db-wal").write_bytes(b"fake-wal-bytes")
+    tmp_root = tmp_path / "tmp"
+    tmp_root.mkdir()
+
+    class _CancellingStore(_NonLocalStub):
+        async def read(self, path: str, offset: int = 0, length: int | None = None) -> bytes:
+            raise asyncio.CancelledError
+
+    with pytest.raises(asyncio.CancelledError):
+        await open_sqlite(_CancellingStore(tmp_path), "wrapped.db", tmp_dir=tmp_root)
+    assert list(tmp_root.iterdir()) == []
+
+
+@faithful_to(ObjectStore)
 class _NonLocalStub:
-    """Minimal ObjectStore stand-in that is deliberately *not* a
-    LocalFsStore, to prove the fast path is unavailable to any other
-    backend regardless of WAL state.
-
-    Its four methods are ``async def`` like the real
-    ``ObjectStore`` Protocol's —
-    a synchronous stub would hand ``open_sqlite`` coroutine objects where
-    it expects ``bytes``/``int``/``bool``.
-    """
+    """An ``ObjectStore`` that is not a ``LocalFsStore``, so the fast path is
+    unavailable whatever the WAL state."""
 
     def __init__(self, root: Path) -> None:
         self._root = root
@@ -233,21 +289,17 @@ class _NonLocalStub:
     async def exists(self, path: str) -> bool:
         return (self._root / path).exists()
 
-    async def listdir(self, path: str) -> list[str]:
-        return sorted(p.name for p in (self._root / path).iterdir())
+    async def close(self) -> None:
+        pass
+
+    async def listdir(self, path: str) -> list[Entry]:
+        return sorted(Entry(p.name, None if p.is_dir() else p.stat().st_size) for p in (self._root / path).iterdir())
 
 
 async def test_connection_opened_in_worker_thread_can_be_closed_from_main_thread(tmp_path: Path) -> None:
-    # A connection lazily created inside one @work(thread=True) worker
-    # and later closed from the main UI thread at app shutdown must not
-    # raise sqlite3.ProgrammingError. Reproduce the shape directly (open
-    # on a background thread running its own event loop, close on this
-    # — the main — thread's loop) without needing Textual at all.
-    #
-    # Safe because aiosqlite always routes a connection's statements --
-    # close() included -- through the one thread that opened it, no
-    # matter which thread's loop issues the call. Asserts that the
-    # open-here / close-there sequence completes without ProgrammingError.
+    # The TUI opens a connection in a worker thread's loop and closes it from
+    # the main thread's at shutdown; aiosqlite routes every statement, close()
+    # included, through the thread that opened it, so no ProgrammingError.
     _make_plain_db(tmp_path)
     store = LocalFsStore(tmp_path)
 
@@ -263,7 +315,7 @@ async def test_connection_opened_in_worker_thread_can_be_closed_from_main_thread
     def worker_thread() -> None:
         try:
             asyncio.run(open_on_worker_loop())
-        except BaseException as exc:
+        except BaseException as exc:  # noqa: BLE001
             errors.append(exc)
 
     worker = threading.Thread(target=worker_thread)
@@ -302,14 +354,9 @@ async def _index_names(conn: aiosqlite.Connection, table: str) -> set[str]:
 
 
 class TestApplyIndexHint:
-    """``apply_index_hint()`` is a pure declaration of intent, not a
-    command guaranteed to succeed: a genuinely read-only connection makes
-    ``CREATE INDEX`` raise ``OperationalError: attempt to write a readonly
-    database``, which it catches and treats as the hint quietly doing
-    nothing. These tests exercise both halves of that contract: real index
-    creation against a writable connection, and a silent no-op against a
-    read-only one (the shape ``storage/sqlite.py``'s own fast path opens
-    directly against a real repository file — never to be mutated)."""
+    """``apply_index_hint()`` creates the index on a writable connection and is
+    a silent no-op on a read-only one (where ``CREATE INDEX`` raises
+    "attempt to write a readonly database"), the shape the fast path opens."""
 
     async def test_creates_an_index_when_none_covers_the_columns(self, tmp_path: Path) -> None:
         conn = await aiosqlite.connect(tmp_path / "t.db")
@@ -399,19 +446,21 @@ async def _plan(conn: aiosqlite.Connection, sql: str, *params: object) -> str:
 
 
 async def test_index_hint_builds_a_real_index_on_a_materialized_copy(tmp_path: Path) -> None:
-    """The slow path's copy is ours to write to, so the hint must actually
-    take effect there — otherwise every hinted query silently degrades to the
-    full table scan a ``mode=ro`` connection would have left it with."""
+    """The slow path's copy is writable, so the hint takes effect there instead
+    of leaving every hinted query a full table scan."""
     _make_plain_db(tmp_path, name="wrapped.db")
     wrapped = tmp_path / "wrapped.db"
 
     def _xor(data: bytes) -> bytes:
         return bytes(b ^ 0xFF for b in data)
 
+    def _xor_to_file(data: bytes, dest: BinaryIO) -> None:
+        dest.write(_xor(data))
+
     wrapped.write_bytes(_xor(wrapped.read_bytes()))
     store = LocalFsStore(tmp_path)
 
-    conn, materialized = await open_sqlite(store, "wrapped.db", transform=_xor)
+    conn, materialized = await open_sqlite(store, "wrapped.db", transform=_xor_to_file)
     try:
         assert materialized is not None  # transform forces the slow path
         await apply_index_hint(conn, "t", ["v"])
@@ -426,9 +475,8 @@ async def test_index_hint_builds_a_real_index_on_a_materialized_copy(tmp_path: P
 
 
 async def test_index_hint_is_a_silent_no_op_on_the_fast_path(tmp_path: Path) -> None:
-    """The fast path opens the store's *real* file, read-only and immutable —
-    the hint stays a no-op there rather than raising, and the query still
-    answers correctly (by scanning)."""
+    """The fast path opens the store's real file read-only and immutable: the
+    hint is a no-op and the query still answers (by scanning)."""
     _make_plain_db(tmp_path)
     store = LocalFsStore(tmp_path)
 
@@ -441,3 +489,61 @@ async def test_index_hint_is_a_silent_no_op_on_the_fast_path(tmp_path: Path) -> 
         assert list(await cursor.fetchall()) == [(1,)]
     finally:
         await conn.close()
+
+
+def _copy(raw: bytes, dest: BinaryIO) -> None:
+    dest.write(raw)
+
+
+class TestConnectCancelled:
+    @pytest.mark.parametrize("path", ["fast", "slow", "temp file"])
+    async def test_a_connection_that_opens_after_the_caller_was_cancelled_is_closed(
+        self, path: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Cancelled while ``aiosqlite.connect`` is still opening: the connection
+        that opens anyway is closed, not leaked with its non-daemon thread, and a
+        temp copy is removed."""
+        db = tmp_path / "x.db"
+        sqlite3.connect(db).close()
+        started, gate, open_done = asyncio.Event(), asyncio.Event(), asyncio.Event()
+        opened: list[Any] = []
+        real_connect = aiosqlite.connect
+
+        async def gated_connect(database: str, **kwargs: Any) -> aiosqlite.Connection:
+            async def open_after_gate() -> aiosqlite.Connection:
+                started.set()
+                await gate.wait()
+                connection = await real_connect(database, **kwargs)
+                opened.append(connection)
+                open_done.set()
+                return connection
+
+            # Like aiosqlite's own thread, the open goes on even if this
+            # await is cancelled.
+            return await asyncio.shield(asyncio.ensure_future(open_after_gate()))
+
+        monkeypatch.setattr(aiosqlite, "connect", gated_connect)
+        store = LocalFsStore(tmp_path)
+        task: asyncio.Task[object]
+        match path:
+            case "fast":
+                task = asyncio.create_task(open_sqlite(store, "x.db"))
+            case "slow":
+                task = asyncio.create_task(open_sqlite(store, "x.db", tmp_dir=tmp_path, transform=_copy))
+            case _:
+                copy = tmp_path / "copy.db"
+                copy.write_bytes(db.read_bytes())
+                task = asyncio.create_task(sqlite_source_mod._connect_temp_file(str(copy)))
+        await asyncio.wait_for(started.wait(), 5)
+        task.cancel()
+        await asyncio.sleep(0)
+        gate.set()
+
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        # A caller that didn't wait for the open would return before it ends; wait for it here.
+        await asyncio.wait_for(open_done.wait(), 5)
+        (connection,) = opened
+        with pytest.raises(ValueError, match="no active connection"):
+            await connection.execute("SELECT 1")
+        assert sorted(entry.name for entry in tmp_path.iterdir()) == ["x.db"]

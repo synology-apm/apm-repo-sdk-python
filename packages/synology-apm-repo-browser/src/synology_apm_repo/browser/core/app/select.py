@@ -1,7 +1,4 @@
-"""Pure selectors deriving display text from app-level state — no
-Textual, no widget access; a caller writes the result into whatever
-widget it owns.
-"""
+"""Selectors deriving display state from the app-level model."""
 
 from __future__ import annotations
 
@@ -13,9 +10,8 @@ from synology_apm_repo.browser.strings import EXPORT_CANCEL_LABEL, EXPORT_START_
 
 @dataclasses.dataclass(frozen=True, slots=True)
 class ExportButtonSpec:
-    """``ExportScreen``'s start/cancel button and progress-bar-active state,
-    as a pure function of its job. ``variant`` is a plain ``str``, not
-    Textual's ``ButtonVariant`` literal, since ``core/`` stays Textual-free."""
+    """``ExportScreen``'s start/cancel button and progress-bar state.
+    ``variant`` is a plain ``str``, since ``core/`` imports no Textual."""
 
     label: str
     variant: str

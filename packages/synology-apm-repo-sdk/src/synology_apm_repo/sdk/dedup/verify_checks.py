@@ -1,136 +1,54 @@
-"""Byte-level integrity check primitives for ``units/verify_reachable.py``'s
-top-down, reachability-scoped walk — what ``Repository.verify()``/
-``Catalog.verify()`` actually use.
+"""Byte-level integrity check primitives for the reachability-scoped walk
+(``dedup.verify_walk``, driven by ``units/verify_reachable.py``) behind
+``Repository.verify()``/``Catalog.verify()``.
 
-Every function here is a pure "given this already-open reader/triple,
-check it, return the ``Finding``(s)" primitive — no scanning of
-``db/file_map``, no bucket sampling, no notion of which triples/buckets
-are worth looking at in the first place. That's the walker's own job;
-this module only owns *how* to check one thing once it's been decided
-the thing is worth checking.
-
-Also owns the ``Finding``/``Stage``/``Symptom``/``VerifyLevel`` value
-types the walker (and its callers, ``api.catalog``/``api.repository``)
-share — defined here, at the bottom of the dependency, so nothing above
-this module ever needs to import back into ``units/verify_reachable.py``
-just to reference one of these value types.
+Each function checks what it is handed (an open reader, or for
+``check_repo_info`` the repository) and returns ``Finding``\\ s; choosing what to check is the walker's job.
 """
 
 from __future__ import annotations
 
 import asyncio
-import dataclasses
-import enum
 from collections.abc import Sequence
 from typing import TYPE_CHECKING
 
-from ..errors import DataCorruptError, FormatError, NotFoundError
+from ..errors import DataCorruptError, FormatError, NotFoundError, StorageBackendError
+from ..findings import Finding, Stage, Symptom
 from ..format.bucket import expected_bucket_size
 from ..format.composition import (
     RecordHead,
     chunk_map_array_offset,
     parse_record_head,
-    should_thread_chunk_map_crc,
     verify_attr_crc,
     verify_chunk_map_crc,
 )
 from ..format.const import CHUNK_MAP_RECORD_LENGTH, RECORD_HEAD_LENGTH, REDUNDANCY_COVERAGE_COMPOSITION
-from ..format.redundancy import redundancy_size, repair_via_trailer
+from ..format.redundancy import redundancy_size
 from ..format.repo_info import parse_repo_info
 from ..identifiers import ChunkIdx
 from ..storage.base import ObjectStore, join_path
-from ..storage.seqid import resolve_seq_path
+from ..storage.layout import REPO_INFO_NAME
 from .composition_reader import CompositionReader
 from .pool import BucketReader
+from .redundancy_repair import repair_via_trailer
 
 if TYPE_CHECKING:
-    # Type-only: check_repo_info's signature needs DedupRepo, but this
-    # module has no runtime reason to depend on .repository. This
-    # module's own ``from __future__ import annotations`` means the name
-    # is never evaluated at runtime, so no real import happens here.
     from .repository import DedupRepo
 
-_REPO_INFO_NAME = "repo_info"
 
-
-class Symptom(enum.Enum):
-    """The symptom categories a finding can carry."""
-
-    CORRUPTION = "Corruption"
-    FILE_MISSING = "FileMissing"
-    MISMATCH = "Mismatch"
-    DATA_MISSING = "DataMissing"
-    KEY_MISSING = "KeyMissing"
-    REPAIRED_VIA_PARITY = "RepairedViaParity"
-    """A CRC mismatch that this SDK's own Redundancy-blob self-repair
-    (``format.redundancy.attempt_repair``) was able to reconstruct and
-    byte-for-byte confirm correct. Still reported, not silently dropped —
-    repeated repairs against the same bucket group over time is itself a
-    signal of failing underlying storage, even though the check the
-    caller actually cared about (is this data readable) passed."""
-
-
-class VerifyLevel(enum.Enum):
-    """How thorough a ``verify`` run is. ``FULL`` reads and checks every
-    live chunk in a touched bucket — both its ciphertext CRC32 and, once a
-    vault key is available, its decrypt+decompress+SHA-256 fingerprint —
-    as costly as a real full export of the whole repository. ``QUICK``
-    reads no chunk content at all, only each touched bucket's own
-    structural checks; there is deliberately no sampled middle tier."""
-
-    QUICK = "quick"
-    FULL = "full"
-
-
-class Stage(enum.StrEnum):
-    """The stages a ``Finding`` can come from. A ``str`` subclass: every
-    existing site rendering/serializing ``Finding.stage`` directly as a
-    string keeps working unchanged."""
-
-    REPO_INFO = "RepoInfo"
-    FILE_MAP = "FileMap"
-    COMPOSITION = "Composition"
-    BUCKET = "Bucket"
-    ENCRYPT_KEY = "EncryptKey"
-    VERSION = "Version"
-    """A catalog/workload/version that should resolve to real content,
-    per its own metadata, but doesn't — covers failure at either the
-    version level or the workload/connection-enumeration level above it,
-    one stage rather than one per layer of a top-down walk."""
-
-
-@dataclasses.dataclass(frozen=True)
-class Finding:
-    """One integrity-check result. ``path`` is whatever store-relative
-    path (or ``file_map`` path, or workload/version display info, for a
-    ``Stage.VERSION`` finding) the finding is about.
-
-    ``ref`` (``None`` unless set) is a canonical
-    ``repo_path#cat:<id>/wl:<id>/ver:<uid>`` ref (``units.node_ref.NodeRef``)
-    naming the exact catalog/workload/version this finding was found while
-    checking — set by ``units/verify_reachable.py``'s top-down walk, the
-    only place with a ``Version`` in hand to name. When a bucket/chunk is
-    shared by more than one version through dedup, ``ref`` names whichever
-    version's own check actually triggered this finding first —
-    memoization means a later version sharing the same already-checked
-    data produces no finding of its own, not a second one with a
-    different ``ref``."""
-
-    stage: Stage
-    symptom: Symptom
-    path: str
-    detail: str
-    ref: str | None = None
+STALE_ROTATED_SUFFIX = "possibly a stale/rotated reference"
+"""Appended (behind an em dash) to a ``NotFoundError``'s message in a
+``Symptom.DATA_MISSING`` ``Finding``: ``unresolvable_finding``'s default
+``missing_suffix``."""
 
 
 async def check_repo_info(repo: DedupRepo) -> list[Finding]:
-    """``repo_info``'s own header/CRC/JSON-parse check — repository-wide, not
-    scoped to any one catalog reference, so ``verify_reachable()`` runs
-    this exactly once regardless of what else it covers."""
+    """``repo_info``'s header/CRC/JSON-parse check; repository-wide, so
+    ``verify_reachable()`` runs it once."""
     try:
-        path = await resolve_seq_path(repo.dir_cache, repo.layout.repo_root, _REPO_INFO_NAME)
+        path = await repo.repo_info_path()
     except NotFoundError:
-        path = join_path(repo.layout.repo_root, _REPO_INFO_NAME)
+        path = join_path(repo.layout.repo_root, REPO_INFO_NAME)
         return [Finding(Stage.REPO_INFO, Symptom.FILE_MISSING, path, "repo_info not found")]
     try:
         raw = await repo.store.read(path)
@@ -138,22 +56,20 @@ async def check_repo_info(repo: DedupRepo) -> list[Finding]:
         return [Finding(Stage.REPO_INFO, Symptom.FILE_MISSING, path, "repo_info not found")]
     try:
         parse_repo_info(raw)
-    except (DataCorruptError, FormatError) as exc:
+    except FormatError as exc:
         return [Finding(Stage.REPO_INFO, Symptom.CORRUPTION, path, str(exc))]
     return []
 
 
 async def check_composition_header(reader: CompositionReader, *, path: str) -> Finding | None:
-    """The session's own ``subID=0`` sub-file header
-    (``CompositionReader.verify_header``) — the stricter, opt-in check
-    ``CompositionReader`` itself normally skips. Meant to be called once
-    per distinct ``(stream_id, session_id)``, not once per row/extent
-    that happens to share it."""
+    """The session's ``subID=0`` sub-file header
+    (``CompositionReader.verify_header``), which ``CompositionReader`` itself
+    skips. Call once per distinct ``(stream_id, session_id)``."""
     try:
         await reader.verify_header()
     except NotFoundError as exc:
         return Finding(Stage.COMPOSITION, Symptom.DATA_MISSING, path, str(exc))
-    except (DataCorruptError, FormatError) as exc:
+    except FormatError as exc:
         return Finding(Stage.COMPOSITION, Symptom.CORRUPTION, path, str(exc))
     return None
 
@@ -161,27 +77,33 @@ async def check_composition_header(reader: CompositionReader, *, path: str) -> F
 async def check_record_head(
     reader: CompositionReader, comp_offset: int, *, path: str
 ) -> tuple[Finding | None, RecordHead | None]:
-    """Read and parse the 32-byte ``RecordHead`` at ``comp_offset`` —
-    magic + ``head_crc`` are checked unconditionally by
-    ``parse_record_head`` itself. Returns ``(finding, None)`` on failure,
-    ``(None, record_head)`` on success."""
+    """Read and parse the 32-byte ``RecordHead`` at ``comp_offset``
+    (``parse_record_head`` checks magic and ``head_crc``). Returns
+    ``(finding, None)`` on failure, ``(None, record_head)`` on success."""
     try:
         raw = await reader.read_at(comp_offset, RECORD_HEAD_LENGTH)
         return None, parse_record_head(raw)
     except NotFoundError as exc:
         return Finding(Stage.FILE_MAP, Symptom.DATA_MISSING, path, str(exc)), None
-    except (DataCorruptError, FormatError) as exc:
+    except FormatError as exc:
         return Finding(Stage.FILE_MAP, Symptom.CORRUPTION, path, str(exc)), None
 
 
+_CRC_THREAD_HOP_MIN_BYTES = 1 << 18  # 256 KiB
+"""Below this size, calling ``verify_chunk_map_crc`` directly is cheaper
+than an ``asyncio.to_thread()`` hop. Most chunk-map arrays are well under it."""
+
+
+def should_thread_chunk_map_crc(map_array_bytes: bytes) -> bool:
+    """Whether ``verify_chunk_map_crc(map_array_bytes, ...)`` is worth
+    running via ``asyncio.to_thread()`` (see ``_CRC_THREAD_HOP_MIN_BYTES``)."""
+    return len(map_array_bytes) >= _CRC_THREAD_HOP_MIN_BYTES
+
+
 async def verify_chunk_map_crc_threaded(map_array_bytes: bytes, expected_crc: int) -> None:
-    """``format.composition.verify_chunk_map_crc``, with the thread-hop
-    decision folded in — ``map_array_bytes`` can be a multi-hundred-MB
-    array, so this keeps the rare large case's ``zlib.crc32`` pass off
-    the event loop. ``should_thread_chunk_map_crc`` skips the hop for the
-    common small-array case, where the hop would cost more than the
-    ``crc32`` pass it saves. Shared by ``check_map_and_attr_crc`` and
-    ``diagnostics.py``'s ``_verify_map_crc``.
+    """``format.composition.verify_chunk_map_crc``, moved to a thread when
+    ``should_thread_chunk_map_crc`` says the array is large enough to block
+    the event loop.
 
     Raises:
         DataCorruptError: ``map_array_bytes`` doesn't match ``expected_crc``.
@@ -195,19 +117,14 @@ async def verify_chunk_map_crc_threaded(map_array_bytes: bytes, expected_crc: in
 async def _attempt_map_crc_repair(
     reader: CompositionReader, map_array_off: int, map_array_len: int, attr_leng: int, array_raw: bytes, map_crc: int
 ) -> bytes | None:
-    """On a ``map_crc`` mismatch, lazily fetch the record's trailing
-    Redundancy blob (FORMAT-SPEC.md: ChunkCrcStore/RecordHead — stored
-    after the attribute blob, at ``map_array_off + map_array_len +
-    attr_leng``, coverage 8192) and attempt in-memory self-repair
-    (``format.redundancy.repair_via_trailer``).
+    """On a ``map_crc`` mismatch, fetch the record's trailing Redundancy blob
+    (FORMAT-SPEC.md: RecordHead; ChunkCrcStore & Redundancy; stored after the
+    attribute blob, coverage 8192) and try in-memory self-repair
+    (``redundancy_repair.repair_via_trailer``). Not read on the healthy path.
 
-    Never read on the healthy path — only called once
-    ``verify_chunk_map_crc_threaded`` has already raised.
-
-    Returns the repaired array bytes on a confirmed-correct
-    reconstruction, or ``None`` if the trailer can't be fetched/parsed or
-    the reconstruction still doesn't validate — either way, the caller
-    falls back to reporting the original mismatch unchanged.
+    Returns:
+        The confirmed-correct array bytes, or ``None`` if the trailer can't
+        be fetched/parsed or the repair doesn't validate.
     """
     trailer_len = redundancy_size(map_array_len, REDUNDANCY_COVERAGE_COMPOSITION)
     trailer_off = map_array_off + map_array_len + attr_leng
@@ -222,25 +139,21 @@ async def _attempt_map_crc_repair(
 async def check_map_and_attr_crc(
     reader: CompositionReader, comp_offset: int, record_head: RecordHead, *, path: str
 ) -> tuple[list[Finding], bytes | None]:
-    """Full ``mapCrc`` over the whole chunk-map array plus (when present)
-    ``attrCrc`` over the trailing JSON attribute blob — one merged read
-    for both, since they're contiguous.
+    """``mapCrc`` over the whole chunk-map array plus (when present)
+    ``attrCrc`` over the trailing JSON attribute blob, in one merged read.
 
-    A ``map_crc`` mismatch first tries the record's own Redundancy-blob
-    self-repair (``_attempt_map_crc_repair``), since every current-format
-    record carries one. A confirmed-correct repair is reported as
-    ``Symptom.REPAIRED_VIA_PARITY`` rather than dropped silently.
-
-    Nothing is checked when ``record_head.map_num == 0``.
+    A ``map_crc`` mismatch first tries Redundancy-blob self-repair
+    (``_attempt_map_crc_repair``); a confirmed repair is reported as
+    ``Symptom.REPAIRED_VIA_PARITY``. Nothing is checked when
+    ``record_head.map_num == 0``.
 
     Returns:
         ``(findings, repaired_array)``. ``repaired_array`` is the
         confirmed-correct chunk-map array bytes exactly when a
-        ``map_crc`` mismatch was just repaired via parity, ``None``
-        otherwise. A caller with its own separate re-read of this same
-        array must feed a non-``None`` result into
-        ``CompositionRecord.seed_pages_from_array`` itself, or it
-        re-derives entries from the still-corrupted on-disk bytes.
+        ``map_crc`` mismatch was repaired via parity, ``None`` otherwise.
+        A caller that re-reads this array must pass a non-``None`` result to
+        ``CompositionRecord.seed_pages_from_array``, or it reads the
+        still-corrupted on-disk bytes.
     """
     if record_head.map_num == 0:
         return [], None
@@ -277,24 +190,27 @@ async def check_map_and_attr_crc(
     return findings, repaired_array
 
 
-async def check_bucket_structure(store: ObjectStore, reader: BucketReader) -> list[Finding]:
-    """Everything about this bucket that doesn't depend on which chunk(s)
-    a caller cares about: ``expected_bucket_size`` against the real
-    on-disk size, and the ChunkCrcStore trailer's own self-consistency
-    (via ``BucketReader.ensure_chunk_crc_store``, which also warms the
-    cache ``check_chunk_ciphertext_crc`` below reuses). Header/SizeStore
-    CRC are already checked by ``BucketReader.open`` itself; this adds a
-    ``Symptom.REPAIRED_VIA_PARITY`` finding when ``open()``'s own
-    SizeStore self-repair succeeded, since ``open()`` has no
-    ``Finding``-returning contract of its own.
+async def check_bucket_structure(
+    store: ObjectStore, reader: BucketReader, *, known_file_size: int | None = None
+) -> list[Finding]:
+    """The chunk-independent checks of one bucket: ``expected_bucket_size``
+    against the on-disk size, and the ChunkCrcStore trailer's
+    self-consistency (``BucketReader.ensure_chunk_crc_store``, which also
+    warms the cache ``check_chunk_ciphertext_crc`` reuses). Header/SizeStore
+    CRC are checked by ``BucketReader.open``; this adds a
+    ``Symptom.REPAIRED_VIA_PARITY`` finding when its SizeStore self-repair
+    succeeded.
 
     A legacy uncompressed-layout bucket has neither an
-    ``expected_bucket_size`` formula nor a ChunkCrcStore trailer — both
-    are skipped, not treated as findings.
+    ``expected_bucket_size`` formula nor a ChunkCrcStore trailer; both checks
+    are skipped.
 
-    Takes a bare ``store``, not a full ``DedupRepo``, so a caller with
-    just an ``ObjectStore`` in hand (a multiprocess worker rebuilding its
-    own state via ``dedup.pool_descriptor``) can call this directly.
+    ``known_file_size`` is the on-disk size when the caller already has it
+    (``Pool.bucket_size``, from the directory listing); without it, and
+    unless a SizeStore repair fetched it, this asks ``store.size``.
+
+    Takes a bare ``store`` so a worker process holding only an
+    ``ObjectStore`` can call it.
     """
     findings: list[Finding] = []
     if not reader.header.is_compressed:
@@ -305,11 +221,10 @@ async def check_bucket_structure(store: ObjectStore, reader: BucketReader) -> li
                 Stage.BUCKET, Symptom.REPAIRED_VIA_PARITY, reader.path, "SizeStore CRC mismatch repaired via parity"
             )
         )
-    expected = expected_bucket_size(reader.header, reader.entries)
-    # reader.known_file_size is already the actual on-disk size when
-    # SizeStore repair fetched it moments earlier — reuse it instead of a
-    # second store.size() round-trip.
-    actual = reader.known_file_size if reader.known_file_size is not None else await store.size(reader.path)
+    expected = expected_bucket_size(reader.header, reader.index)
+    actual = reader.known_file_size if reader.known_file_size is not None else known_file_size
+    if actual is None:
+        actual = await store.size(reader.path)
     if actual != expected:
         findings.append(
             Finding(
@@ -323,38 +238,23 @@ async def check_bucket_structure(store: ObjectStore, reader: BucketReader) -> li
         await reader.ensure_chunk_crc_store()
     except NotFoundError as exc:
         findings.append(Finding(Stage.BUCKET, Symptom.DATA_MISSING, reader.path, f"ChunkCrcStore trailer: {exc}"))
-    except (DataCorruptError, FormatError) as exc:
+    except FormatError as exc:
         findings.append(Finding(Stage.BUCKET, Symptom.CORRUPTION, reader.path, str(exc)))
     return findings
 
 
-async def check_chunk_ciphertext_crc(reader: BucketReader, chunk_idx: int) -> Finding | None:
-    """One chunk's *stored* bytes against its own ChunkCrcStore entry
-    (FORMAT-SPEC.md: ChunkCrcStore) — no decrypt/decompress attempt, so
-    this needs no vault key and runs the same whether or not the bucket
-    turns out to be encrypted."""
-    try:
-        await reader.verify_chunk_ciphertext_crc(ChunkIdx(chunk_idx))
-    except NotFoundError as exc:
-        return Finding(Stage.BUCKET, Symptom.DATA_MISSING, reader.path, f"chunk {chunk_idx} ciphertext: {exc}")
-    except DataCorruptError:
-        return Finding(Stage.BUCKET, Symptom.MISMATCH, reader.path, f"chunk {chunk_idx} ciphertext CRC mismatch")
-    except FormatError as exc:
-        return Finding(Stage.BUCKET, Symptom.CORRUPTION, reader.path, str(exc))
-    return None
-
-
-async def check_raw_chunk_ciphertext_crc(
-    reader: BucketReader, chunk_idx: int, raw: bytes | memoryview
+async def check_chunk_ciphertext_crc(
+    reader: BucketReader, chunk_idx: int, raw: bytes | memoryview | None = None
 ) -> Finding | None:
-    """``check_chunk_ciphertext_crc``'s counterpart for a caller that
-    already has ``chunk_idx``'s stored bytes in hand (e.g. from a batched
-    ``read_raw_chunks`` call). Same exception mapping as the singular
-    form above; kept separate from ``check_chunk_ciphertext_crcs`` below
-    (its only caller) so that caller's batched-fetch-then-check shape
-    stays readable."""
+    """One chunk's *stored* bytes against its ChunkCrcStore entry
+    (FORMAT-SPEC.md: ChunkCrcStore & Redundancy): ``raw`` when the caller
+    already holds them (e.g. from ``read_raw_chunks``), else read here.
+    Nothing is decrypted, so no vault key is needed."""
     try:
-        await reader.verify_raw_chunk_ciphertext_crc(chunk_idx, raw)
+        if raw is None:
+            await reader.verify_chunk_ciphertext_crc(ChunkIdx(chunk_idx))
+        else:
+            await reader.verify_raw_chunk_ciphertext_crc(chunk_idx, raw)
     except NotFoundError as exc:
         return Finding(Stage.BUCKET, Symptom.DATA_MISSING, reader.path, f"chunk {chunk_idx} ciphertext: {exc}")
     except DataCorruptError:
@@ -365,36 +265,32 @@ async def check_raw_chunk_ciphertext_crc(
 
 
 async def check_chunk_ciphertext_crcs(reader: BucketReader, chunk_indices: Sequence[int]) -> list[Finding]:
-    """Batched ``check_chunk_ciphertext_crc``: every one of
-    ``chunk_indices``'s stored bytes is fetched via
-    ``reader.read_raw_chunks`` — one merged ``store.read()`` per
-    contiguous run instead of one per chunk — before checking each
-    against its own ``ChunkCrcStore`` entry.
+    """Batched ``check_chunk_ciphertext_crc``: fetches every chunk via
+    ``reader.read_raw_chunks`` (one merged read per contiguous run), then
+    checks each against its ``ChunkCrcStore`` entry.
 
-    ``read_raw_chunks`` has no per-run isolation: a later run's failure
-    discards every earlier run's already-fetched (but never checked)
-    bytes. So any failure at all from the batched read falls back to one
-    ``check_chunk_ciphertext_crc`` call per chunk instead — reserved for
-    the failure path only; the common case never pays for it.
+    ``read_raw_chunks`` discards earlier runs when a later one fails, so any
+    failure but a ``StorageBackendError`` (raised) falls back to one
+    ``check_chunk_ciphertext_crc`` call per chunk.
     """
     try:
         raw_by_chunk = await reader.read_raw_chunks(list(chunk_indices))
-    except Exception:
+    except StorageBackendError:
+        raise
+    except Exception:  # noqa: BLE001
         return await _check_chunk_ciphertext_crcs_one_by_one(reader, chunk_indices)
 
     findings: list[Finding] = []
     for chunk_idx in chunk_indices:
-        finding = await check_raw_chunk_ciphertext_crc(reader, chunk_idx, raw_by_chunk[chunk_idx])
+        finding = await check_chunk_ciphertext_crc(reader, chunk_idx, raw_by_chunk[chunk_idx])
         if finding is not None:
             findings.append(finding)
     return findings
 
 
 async def _check_chunk_ciphertext_crcs_one_by_one(reader: BucketReader, chunk_indices: Sequence[int]) -> list[Finding]:
-    """``check_chunk_ciphertext_crcs``'s fallback when its own batched
-    ``read_raw_chunks`` call fails: one ``check_chunk_ciphertext_crc``
-    call per chunk, each with its own independent error handling, so one
-    chunk's failure can never hide another's already-fetched result."""
+    """``check_chunk_ciphertext_crcs``'s fallback: one independent
+    ``check_chunk_ciphertext_crc`` per chunk, so one failure hides no other."""
     findings: list[Finding] = []
     for chunk_idx in chunk_indices:
         finding = await check_chunk_ciphertext_crc(reader, chunk_idx)

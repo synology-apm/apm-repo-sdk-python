@@ -11,28 +11,31 @@ if TYPE_CHECKING:
 
 
 def forward_to_focused(screen: Screen[Any], action_name: str) -> None:
-    """Forwards ``action_name`` to whichever widget currently has focus,
-    if it implements that action (``DataTable``/``Tree`` both implement
-    ``action_cursor_down``/``_up``/``action_select_cursor``; anything
-    without it — an ``Input``, say — simply ignores the forward). Shared
-    by ``NavigableScreen``'s own ``action_cursor_down``/``_up``/
-    ``action_select`` and ``WorklistScreen``'s (a ``ModalScreen``, so it
-    can't inherit ``NavigableScreen`` itself, but still hosts a
-    ``DataTable`` with the same ``j``/``k`` forwarding need) rather than
-    each keeping its own identical copy."""
+    """Runs ``action_name`` on the focused widget if it has that action
+    (``DataTable``/``Tree`` do; an ``Input`` doesn't, and ignores it)."""
     action = getattr(screen.focused, action_name, None)
     if callable(action):
         action()
 
 
 def delegate_common_action(screen: Screen[Any], action_name: str) -> None:
-    """Runs ``action_<action_name>`` on the App directly — the fix a
-    ``ModalScreen`` keeping ``COMMON_BINDINGS`` in its own ``BINDINGS``
-    needs: Textual's own action dispatch runs the method on whichever node the
-    key's own ``Binding`` was found on, never bubbling further once the
-    modal chain is truncated at that screen, so each of ``quit_app``/
-    ``toggle_verbose``/``show_help`` still needs its own same-named
-    ``action_*`` method on the screen to redirect through here, rather
-    than dispatch ever reaching the App on its own."""
+    """Runs ``action_<action_name>`` on the App. A ``ModalScreen`` truncates
+    the binding chain at itself and Textual runs a binding's action on the
+    node that declares it, so a modal keeping ``COMMON_BINDINGS`` needs a
+    same-named ``action_*`` method that redirects here."""
     app = cast("ApmRepoBrowserApp", screen.app)
     getattr(app, f"action_{action_name}")()
+
+
+class DelegatesCommonActions:
+    """Mixed into a ``ModalScreen`` that keeps ``COMMON_BINDINGS``: the
+    same-named ``action_*`` methods ``delegate_common_action`` needs on it."""
+
+    def action_quit_app(self) -> None:
+        delegate_common_action(cast("Screen[Any]", self), "quit_app")
+
+    def action_toggle_verbose(self) -> None:
+        delegate_common_action(cast("Screen[Any]", self), "toggle_verbose")
+
+    def action_show_help(self) -> None:
+        delegate_common_action(cast("Screen[Any]", self), "show_help")

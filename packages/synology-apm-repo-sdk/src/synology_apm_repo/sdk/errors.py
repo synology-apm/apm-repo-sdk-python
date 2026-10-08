@@ -1,19 +1,15 @@
 """Exception hierarchy for synology-apm-repo-sdk.
 
-Every exception carries two optional pieces of support/forensics context:
+Every ``ApmRepoError`` carries two optional pieces of context:
 
-- ``ref``: which node/file the error refers to — a plain string (a
-  store-relative path, a ``file_map`` path, or similar locator). Callers
-  holding a ``NodeRef`` pass ``str(node_ref)``; this module doesn't import
-  that type, to avoid a dependency from the lowest layer onto the highest.
-- ``spec``: a pointer into ``FORMAT-SPEC.md`` (e.g. ``"FORMAT-SPEC.md:
-  SizeStore"``) explaining why this is an error, not just that it is one.
+- ``ref``: the node/file the error refers to, as a plain string (a
+  store-relative path, a ``file_map`` path, ``str(node_ref)``, ...).
+- ``spec``: the ``FORMAT-SPEC.md`` subsection explaining why this is an
+  error.
 
-No exception here is named ``KeyError`` — that would shadow the builtin
-and be silently swallowed by unrelated ``except KeyError`` blocks.
-Argument/programmer-error validation raises stdlib ``ValueError``/
-``IndexError`` directly instead of this hierarchy, which is reserved for
-on-disk data problems.
+The hierarchy covers repository data, backend and worker failures;
+argument and programmer errors raise stdlib ``ValueError``/``IndexError``.
+Names avoid shadowing builtins such as ``KeyError``.
 """
 
 from __future__ import annotations
@@ -41,15 +37,9 @@ class ApmRepoError(Exception):
 
     @property
     def safe_message(self) -> str:
-        """This error's message alone, without the ``[ref=...]``/
-        ``[spec=...]`` tags ``str(exc)`` appends — for a presentation
-        layer's default, non-verbose rendering. Strips only that
-        structured suffix, not every occurrence of the same value a raise
-        site's own message text may separately mention. ``str(exc)``
-        itself is unchanged and keeps carrying the full detail (internal
-        call sites that store ``str(exc)`` for later diagnostic display,
-        e.g. ``units/device_disk_fs.py``'s per-disk failure reasons, rely
-        on that)."""
+        """The message alone, without the ``[ref=...]``/``[spec=...]`` tags
+        ``str(exc)`` appends — for a presentation layer's non-verbose
+        rendering. ``str(exc)`` keeps the full detail."""
         return self._message
 
 
@@ -60,12 +50,13 @@ class FormatError(ApmRepoError):
 
 
 class DataCorruptError(FormatError):
-    """A CRC32 (or similar) integrity check failed: the magic matched but
-    the payload did not survive intact."""
+    """An integrity check failed: a magic, CRC32 or other self-consistency
+    check did not match, so the bytes did not survive intact."""
 
 
 class UnsupportedVersionError(FormatError):
-    """The on-disk major/minor version is newer than this SDK understands."""
+    """The on-disk format version is one this SDK does not read: a newer
+    major version, or an obsolete layout."""
 
 
 class ChunkCompactedError(FormatError):
@@ -80,14 +71,13 @@ class KeyMaterialError(ApmRepoError):
 
 
 class KeyRequiredError(KeyMaterialError):
-    """The repository is encrypted (some ``.buk`` has mode bit ``0x80`` set,
-    or a ``copy_meta_file`` entry starts with the ``aHlT`` magic) but no key
-    was supplied."""
+    """The repository, or the data being read, is encrypted but no key was
+    supplied."""
 
 
 class KeyMismatchError(KeyMaterialError):
-    """The AES-256-GCM tag check, or the chunk-fingerprint verification,
-    failed for the supplied key (FORMAT-SPEC.md: chunk-pool-encryption/vaultkey-custody)."""
+    """The supplied key does not unwrap this repository's VaultKey, or was
+    already rejected by ``Repository.set_key()`` (FORMAT-SPEC.md: Key hierarchy)."""
 
 
 class NotFoundError(ApmRepoError):
@@ -96,21 +86,29 @@ class NotFoundError(ApmRepoError):
 
 
 class ContentUnavailableError(ApmRepoError):
-    """This node's metadata was found, but its real content is not
-    available to read — either the guest OS only held a placeholder at
-    backup time (e.g. iCloud Drive/OneDrive Files-On-Demand eviction), or
-    the bytes exist but this SDK has no key material for them (e.g. an
-    NTFS EFS-encrypted file). Distinct from ``DataCorruptError``: nothing
-    here asserts the bytes are damaged. Not a ``NotFoundError`` subclass,
-    so callers treating that as absent-and-skippable don't swallow this
-    too."""
+    """This node's metadata was found but its content can't be read: the
+    guest held only a placeholder at backup time (e.g. a cloud-only
+    OneDrive/iCloud file), or the bytes need key material this SDK lacks
+    (e.g. NTFS EFS). Says nothing about damage, and is deliberately not a
+    ``NotFoundError``, so code skipping absent nodes doesn't swallow it."""
+
+
+class NotRestorableError(ApmRepoError):
+    """A resolved node/item that has no restorable content (a folder, a
+    group, a node missing the metadata its content comes from)."""
 
 
 class PermissionDeniedError(ApmRepoError):
-    """The referenced path/node exists but the OS or backend denied the
-    access needed to read or list it — as opposed to not existing at all
-    (see ``NotFoundError``). Not a ``NotFoundError`` subclass, so callers
-    treating that as absent-and-skippable don't swallow this too."""
+    """The OS or backend denied reading or listing an existing path;
+    deliberately not a ``NotFoundError``, so code skipping absent paths
+    doesn't swallow it."""
+
+
+class StorageBackendError(ApmRepoError):
+    """The storage backend failed to serve a request — a network or
+    transport failure, a timeout, a service-side error, or an OS-level I/O
+    error. Not a statement about the repository's data, so code that turns
+    unreadable data into a finding or a placeholder re-raises it instead."""
 
 
 class UnsupportedDataFormatError(ApmRepoError):
@@ -119,19 +117,14 @@ class UnsupportedDataFormatError(ApmRepoError):
     silently-wrong bytes."""
 
 
-class ProfileNotFoundError(NotFoundError):
-    """The named S3/Azure/SMB connection profile does not exist in
-    ``profiles.json``."""
+class ResourceLimitExceededError(ApmRepoError):
+    """A requested size exceeds a safety ceiling (a guard against a corrupt
+    or hostile repository's implausible sizes, e.g. one ``DedupFile.read()``)
+    or the free disk space a temporary copy needs with a reserve left
+    over (``storage.disk_space``); not a claim that the bytes are damaged."""
 
 
-class ProfileConfigCorruptError(DataCorruptError):
-    """``profiles.json`` failed to parse, or failed schema validation (bad
-    ``schema_version``, unknown ``kind``, missing/malformed field)."""
-
-
-class ProfileSecretBackendUnavailableError(ApmRepoError):
-    """No usable OS keyring backend is available to store/retrieve a
-    profile's secret fields — either ``keyring`` failed to import, or it
-    resolved no real backend (e.g. headless Linux with no Secret
-    Service/dbus). Not a ``KeyMaterialError`` subclass — that hierarchy is
-    about a dedup repository's own encryption key, an unrelated "key"."""
+class WorkerProcessError(ApmRepoError):
+    """A worker process of an export or a FULL verify died (killed, out of
+    memory, crashed), so the operation was aborted. Not a statement about
+    the repository's data."""

@@ -1,135 +1,162 @@
-"""``Workload``: one ``db/workload_config`` row, with its own display-name/
-subtitle extraction (``_device_display_name``/``_saas_display_name``).
-
-``workloads()``'s per-connection lookup, ``_workload_ids_for_connection``,
-relies on the same ``copy_target_version`` join ``catalog/connection.py``
-uses in its batched form.
-"""
+"""``Workload``: one ``db/workload_config`` row with its display name and
+subtitle extracted, and the queries that list or look one up."""
 
 from __future__ import annotations
 
 import dataclasses
 import enum
-import json
+from collections.abc import Mapping
 from typing import Any
 
+from .._util.jsonparse import json_object
 from ..dedup.repository import DedupRepo
-from ..identifiers import ConnectionConfigId, WorkloadId, WorkloadUid
+from ..identifiers import WorkloadId, WorkloadUid
 from ..storage.table import Table, as_int, as_str, sql_placeholders
-from .connection import Connection
-from .workload_config import _WORKLOAD_COLUMNS
+from .connection import Connection, workload_ids_by_connection
+from .workload_config import WORKLOAD_COLUMNS, workload_spec_from_row
 
 
 class TargetType(enum.StrEnum):
-    """The six real ``Workload.workload_type``/``Version.target_type``
-    values — device workloads (VM/PC/PS/FS) vs. SaaS connector kinds
-    (GW/M365). A ``str`` subclass, so existing sites comparing against a
-    plain ``"VM"``/``"GW"`` literal keep working unchanged."""
+    """The ``Workload.workload_type``/``Version.target_type`` values: device
+    workloads (VM/PC/PS/FS) and SaaS connector kinds (GWS/M365). A ``str``
+    enum, so members compare equal to the raw column values; each member is
+    named after its value except ``GWS``, stored on disk as ``"GW"``."""
 
     VM = "VM"
     PC = "PC"
     PS = "PS"
     FS = "FS"
-    GW = "GW"
+    GWS = "GW"
     M365 = "M365"
 
 
-_DEVICE_TYPES = frozenset({TargetType.VM, TargetType.PC, TargetType.PS, TargetType.FS})
-_SAAS_TYPES = frozenset({TargetType.GW, TargetType.M365})
+DEVICE_TARGET_TYPES = frozenset({TargetType.VM, TargetType.PC, TargetType.PS, TargetType.FS})
+SAAS_TARGET_TYPES = frozenset({TargetType.GWS, TargetType.M365})
 
 
-@dataclasses.dataclass(frozen=True)
+class SaasSubType(enum.StrEnum):
+    """The known ``Workload.sub_type`` values: a SaaS workload's
+    ``spec.workload_type``. ``Workload.sub_type`` holds the raw string,
+    which a member compares equal to, and may be a value not listed here."""
+
+    MAIL = "MAIL"
+    CONTACT = "CONTACT"
+    CALENDAR = "CALENDAR"
+    DRIVE = "DRIVE"
+    TEAM_DRIVE = "TEAM_DRIVE"
+    USER_EXCHANGE = "USER_EXCHANGE"
+    GROUP_EXCHANGE = "GROUP_EXCHANGE"
+    USER_DRIVE = "USER_DRIVE"
+    USER_CHAT = "USER_CHAT"
+    SITE = "SITE"
+    TEAMS = "TEAMS"
+
+
+@dataclasses.dataclass(frozen=True, slots=True)
 class Workload:
-    """One ``db/workload_config`` row, with display fields extracted
-    per this module's docstring."""
+    """One ``db/workload_config`` row, with display fields extracted.
+
+    Attributes:
+        workload_type: The raw column value, normally a ``TargetType``
+            value.
+        sub_type: For SaaS, ``spec.workload_type`` (``"MAIL"``,
+            ``"DRIVE"``, ``"SITE"``, ...); ``None`` otherwise, or when it
+            is not a non-empty string.
+        display_name: The device's or SaaS entity's name, or a
+            placeholder naming the workload's kind when it has none.
+        subtitle: A device's OS or hypervisor name, a SaaS workload's
+            ``sub_type``, or ``None``.
+        spec: The parsed ``workload_spec`` JSON.
+    """
 
     workload_id: WorkloadId
     workload_uid: WorkloadUid
-    workload_type: str  # one of TargetType's values, straight off the on-disk DB column
-    sub_type: str | None  # SaaS only: "MAIL" / "DRIVE" / "CONTACT" / "SITE" / ...
+    workload_type: str
+    sub_type: str | None
     display_name: str
     subtitle: str | None
-    spec: dict[str, object]
+    spec: Mapping[str, object]
+
+    @property
+    def is_saas(self) -> bool:
+        """Whether this is a SaaS (GWS/M365) workload."""
+        return self.workload_type in SAAS_TARGET_TYPES
 
     @property
     def type_hint(self) -> str:
-        """A short, human-meaningful classification for disambiguation —
-        ``sub_type`` where present, else the top-level ``workload_type``.
-        Not ``subtitle``, which carries workload-specific detail (an OS
-        name, a host IP), not a type classification. Feeds
-        ``disambiguate``'s ``hints`` parameter."""
+        """The classification ``disambiguate``'s ``hints`` uses to tell
+        same-named workloads apart; ``sub_type``, else ``workload_type``."""
         return self.sub_type or self.workload_type
 
     def _spec_str(self, key: str) -> str | None:
-        spec: dict[str, Any] = self.spec
-        value = (spec.get("spec") or {}).get(key)
+        spec: Mapping[str, Any] = self.spec
+        value = json_object(spec.get("spec")).get(key)
         return str(value) if value else None
 
     @property
     def tenant_id(self) -> str | None:
-        """The real M365 tenant GUID — ``workload_spec.spec.tenant_id``,
-        not the same as ``workload_spec``'s own ``namespace`` field (a
-        backup-server-internal bookkeeping UUID). ``None`` for non-M365
-        workloads; GW's tenant-equivalent is ``domain`` instead."""
+        """The M365 tenant GUID, ``workload_spec.spec.tenant_id`` (not the
+        internal ``namespace`` UUID); ``None`` for other workloads."""
         return self._spec_str("tenant_id")
 
     @property
     def domain(self) -> str | None:
-        """The real GWS domain — ``workload_spec.spec.domain``, a plain
-        human-readable string, unlike M365's GUID-only ``tenant_id``.
-        ``None`` for non-GW workloads."""
+        """The Google Workspace domain, ``workload_spec.spec.domain``;
+        ``None`` for other workloads."""
         return self._spec_str("domain")
 
-
-async def _workload_ids_for_connection(repo: DedupRepo, connection_config_id: ConnectionConfigId) -> list[WorkloadId]:
-    """Workloads for one connection — the single-connection form of the
-    ``copy_target_version`` join ``catalog/connection.py`` uses."""
-    conn = await repo.db("copy_target_version")
-    cursor = await conn.execute(
-        "SELECT DISTINCT workload_id FROM copy_target_version WHERE connection_config_id = ?",
-        (connection_config_id,),
-    )
-    rows = await cursor.fetchall()
-    return [r[0] for r in rows]
+    @property
+    def user_info(self) -> dict[str, object] | None:
+        """The backed-up SaaS account's profile (``email``, ``name``, ...),
+        ``workload_spec.status.entity_meta.spec.user_info``; ``None`` when
+        absent."""
+        user_info = _entity_spec(self.spec).get("user_info")
+        return user_info if isinstance(user_info, dict) else None
 
 
 async def workloads(repo: DedupRepo, connection: Connection) -> list[Workload]:
-    """Sorted by ``display_name`` (case-insensitive), same reasoning as
-    ``connections()``."""
-    workload_ids = await _workload_ids_for_connection(repo, connection.connection_config_id)
+    """``connection``'s workloads, sorted by ``display_name``
+    (case-insensitive).
+
+    Raises:
+        DataCorruptError: A row's ``workload_spec`` is not a JSON object.
+    """
+    connection_config_id = connection.connection_config_id
+    workload_ids = (await workload_ids_by_connection(repo, [connection_config_id])).get(connection_config_id, [])
     if not workload_ids:
         return []
     placeholders = sql_placeholders(len(workload_ids))
-    table = await Table.create(await repo.db("workload_config"), "workload_config", _WORKLOAD_COLUMNS)
+    table = await Table.create(await repo.db("workload_config"), "workload_config", WORKLOAD_COLUMNS)
     result = [_workload_from_row(row) async for row in table.select(f"workload_id IN ({placeholders})", workload_ids)]
     result.sort(key=lambda workload: workload.display_name.casefold())
     return result
 
 
 async def workload_by_id(repo: DedupRepo, workload_id: WorkloadId) -> Workload | None:
-    """A single ``Workload`` by its own ``workload_config`` primary key —
-    a direct ``WHERE workload_id = ?`` lookup rather than scanning every
-    connection's workloads, since no ``Workload`` field depends on which
-    connection it belongs to. ``None`` if ``workload_id`` doesn't resolve."""
-    table = await Table.create(await repo.db("workload_config"), "workload_config", _WORKLOAD_COLUMNS)
+    """The ``Workload`` with primary key ``workload_id``, or ``None``.
+
+    Raises:
+        DataCorruptError: The row's ``workload_spec`` is not a JSON object.
+    """
+    table = await Table.create(await repo.db("workload_config"), "workload_config", WORKLOAD_COLUMNS)
     row = await table.select_one("workload_id = ?", (workload_id,))
     return _workload_from_row(row) if row is not None else None
 
 
 def _workload_from_row(row: dict[str, object]) -> Workload:
     workload_type = as_str(row["workload_type"])
-    spec_json: dict[str, Any] = json.loads(as_str(row["workload_spec"]))
-    spec_inner: dict[str, Any] = spec_json.get("spec") or {}
+    spec_json = workload_spec_from_row(row)
+    spec_inner = json_object(spec_json.get("spec"))
 
     sub_type: str | None
-    if workload_type in _DEVICE_TYPES:
+    if workload_type in DEVICE_TARGET_TYPES:
         display_name, subtitle = _device_display_name(workload_type, spec_inner)
         sub_type = None
-    elif workload_type in _SAAS_TYPES:
-        sub_type = spec_inner.get("workload_type")
+    elif workload_type in SAAS_TARGET_TYPES:
+        sub_type = _nonempty_str(spec_inner.get("workload_type"))
         display_name = _saas_display_name(spec_json, sub_type)
         subtitle = sub_type
-    else:  # unknown connector kind — degrade rather than fail
+    else:  # unknown connector kind
         display_name = f"{workload_type} {as_str(row['workload_uid'])[:8]}"
         subtitle = None
         sub_type = None
@@ -146,27 +173,27 @@ def _workload_from_row(row: dict[str, object]) -> Workload:
 
 
 def _device_display_name(workload_type: str, spec_inner: dict[str, Any]) -> tuple[str, str | None]:
-    # display_name from workload_name; subtitle from an OS/hypervisor name
-    # where this device type actually carries one (VM: config_vm.os_name/
-    # hypervisor_name; FS: config_fs.os_name; PC/PS have no subtitle).
-    name = spec_inner.get("workload_name")
-    if not name:
+    # Subtitle: VM's config_vm.os_name/hypervisor_name, FS's
+    # config_fs.os_name; PC/PS have none.
+    name = _nonempty_str(spec_inner.get("workload_name"))
+    if name is None:
         return f"{workload_type} (unnamed)", None
     subtitle: str | None = None
-    if workload_type == "VM":
-        config_vm = spec_inner.get("config_vm") or {}
-        subtitle = config_vm.get("os_name") or config_vm.get("hypervisor_name")
-    elif workload_type == "FS":
-        config_fs = spec_inner.get("config_fs") or {}
-        subtitle = config_fs.get("os_name")
-    return str(name), subtitle
+    if workload_type == TargetType.VM:
+        config_vm = json_object(spec_inner.get("config_vm"))
+        subtitle = _nonempty_str(config_vm.get("os_name")) or _nonempty_str(config_vm.get("hypervisor_name"))
+    elif workload_type == TargetType.FS:
+        subtitle = _nonempty_str(json_object(spec_inner.get("config_fs")).get("os_name"))
+    return name, subtitle
 
 
-#: ``(entity_spec key, name fields to try in order, label for the
-#: "unnamed ..." fallback)`` — every ``_saas_display_name`` case past
-#: ``user_info`` (the one genuinely special case: it combines *two*
-#: fields into one ``"name <email>"`` display, not just a first-truthy
-#: pick) follows this same shape.
+def _nonempty_str(value: object) -> str | None:
+    """``value`` if it is a non-empty JSON string, else ``None``."""
+    return value if isinstance(value, str) and value else None
+
+
+#: ``(entity_spec key, name fields to try in order, "unnamed ..." label)``
+#: for every ``_saas_display_name`` case after ``user_info``.
 _SAAS_INFO_FALLBACKS = [
     ("site_info", ("site_name",), "site"),
     ("group_info", ("display_name", "mail"), "group"),
@@ -175,32 +202,31 @@ _SAAS_INFO_FALLBACKS = [
 ]
 
 
-def _saas_display_name(spec_json: dict[str, Any], sub_type: str | None) -> str:
-    # Exactly one of user_info/site_info/group_info/team_drive_info/
-    # team_info is ever populated for a given workload; checked in this
-    # order. team_drive_info/team_info are each specific to their own
-    # sub_type (TEAM_DRIVE/TEAMS respectively). ``sub_type`` is the
-    # caller's own already-computed ``Workload.sub_type`` (same
-    # ``spec.workload_type`` field) — passed in rather than recomputed
-    # here, so the two never have a chance to diverge.
-    status = spec_json.get("status") or {}
-    entity_meta = status.get("entity_meta") or {}
-    entity_spec = entity_meta.get("spec") or {}
+def _entity_spec(spec: Mapping[str, Any]) -> dict[str, Any]:
+    """``spec.status.entity_meta.spec``; a level that is absent or not a JSON
+    object counts as empty."""
+    return json_object(json_object(json_object(spec.get("status")).get("entity_meta")).get("spec"))
 
+
+def _saas_display_name(spec_json: dict[str, Any], sub_type: str | None) -> str:
+    # One *_info entity is populated per workload; user_info is checked
+    # first, then _SAAS_INFO_FALLBACKS in order. An entity that isn't a JSON
+    # object, or a name field that isn't a string, counts as absent.
+    entity_spec = _entity_spec(spec_json)
     user_info = entity_spec.get("user_info")
-    if user_info:
-        name, email = user_info.get("name"), user_info.get("email")
+    if isinstance(user_info, dict) and user_info:
+        name, email = _nonempty_str(user_info.get("name")), _nonempty_str(user_info.get("email"))
         if name and email:
             return f"{name} <{email}>"
-        return str(name or email or "unnamed user")
+        return name or email or "unnamed user"
 
     for key, name_fields, label in _SAAS_INFO_FALLBACKS:
         info = entity_spec.get(key)
-        if info:
+        if isinstance(info, dict) and info:
             for field in name_fields:
-                value = info.get(field)
+                value = _nonempty_str(info.get(field))
                 if value:
-                    return str(value)
+                    return value
             return f"unnamed {label}"
 
     return f"{sub_type or 'SaaS'} workload"

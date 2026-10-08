@@ -4,25 +4,17 @@ from __future__ import annotations
 
 
 def modal_box_css(name: str, *, width: int, guard_child_horizontal: bool = False) -> str:
-    """The shared "centered dialog box" CSS every ``ModalScreen``
-    subclass in this package needs (``KeyDialog``/``ConnectDialog``/
-    ``ExportScreen``) — ``align: center middle`` on the screen itself,
-    plus its direct-child ``Vertical`` sized to ``width`` with the same
-    border/background/padding. Meant to be concatenated with each
-    screen's own remaining, genuinely screen-specific ``DEFAULT_CSS``
-    rules (widget ids, tab visibility, ...), not used standalone — these
-    three screens' CSS was never fully identical, only this shared
-    prefix was.
+    """The centered-dialog CSS shared by the package's ``ModalScreen`` subclasses.
 
-    ``guard_child_horizontal`` adds the same ``> Vertical > Horizontal
-    { height: auto; }`` override two of the three screens need: Textual's
-    own ``Horizontal``/``Vertical`` containers default to
-    ``height: 1fr`` (fill remaining space) — harmless inside a screen
-    that already fills the terminal, but fatal inside this
-    ``height: auto`` dialog box, since with nothing pinning a
-    direct-child ``Horizontal`` down, it resolves its ``1fr`` against
-    the ``Screen`` itself and silently eats *all* of the dialog's
-    remaining height, stretching the whole box to fill the terminal."""
+    Centers the screen and sizes its direct-child ``Vertical`` to ``width``
+    cells with the common border/background/padding; concatenate it with the
+    screen's own ``DEFAULT_CSS`` rules.
+
+    ``guard_child_horizontal`` pins a direct-child ``Horizontal`` to
+    ``height: auto``. Without it the ``Horizontal``'s default ``1fr`` resolves
+    against the ``Screen`` and stretches the ``height: auto`` dialog box to
+    the full terminal.
+    """
     guard = (
         f"""
     {name} > Vertical > Horizontal {{

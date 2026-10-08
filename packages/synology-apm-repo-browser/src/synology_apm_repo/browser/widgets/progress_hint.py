@@ -1,22 +1,12 @@
-"""``DebouncedProgress`` (below): debounces the loading indicator for an
-expensive call behind a 300 ms delay, so a call that finishes quickly never
-touches the screen.
+"""``DebouncedProgress``: a loading indicator shown only once a call has
+run for 300 ms, so a quick call never touches the screen.
 
-Where the spinner actually renders is pluggable via a ``_LoadingSink`` —
-each anchored at whatever widget/region is actually about to show the
-fetch's own result, per ``browser/README.md``'s "anchor a loading
-indicator at the specific widget..." rule: ``_BreadcrumbSink`` (a whole
-screen's own location is changing — a ``g`` jump, or a transient resolve
-before pushing an entirely different screen), ``TreeNodeLoadingSink`` (one
-``TreeNode`` — its own children, or, for a permanent non-domain tree
-root, that tree's whole column), ``DataTableLoadingRowSink`` (a flat
-``DataTable`` column with no per-node equivalent), and ``StaticTextSink``
-(a Store-less screen's own single status line).
+A ``LoadingSink`` decides where it renders (``browser/README.md``'s
+placement rule): the screen's breadcrumb by default, ``TreeNodeLoadingSink``
+(a tree node's label), ``DataTableLoadingRowSink`` (a trailing table row) or
+``StaticTextSink`` (a status line).
 
-Must be constructed/stopped on the App's event loop (arms timers) — safe
-because every worker in this package runs as a native async task on that
-same loop, never a thread: a thread-hosted worker would have to marshal
-back onto the loop before it could touch a timer at all.
+Construct and stop it on the App's event loop, since it arms timers.
 """
 
 from __future__ import annotations
@@ -37,28 +27,22 @@ if TYPE_CHECKING:
     from textual.widgets.data_table import RowKey
     from textual.widgets.tree import TreeNode
 
-    from synology_apm_repo.browser.screens._shared import NavigableScreen
 
-_DEFAULT_DELAY = 0.3
-#: Every tick repaints the sink's target, and a repaint is not free —
-#: Textual reapplies the stylesheet per widget, the dominant cost of
-#: driving this app at all. 500ms still reads as "something is running"
-#: while costing a fifth of what 100ms did.
+_DELAY = 0.3
+#: Every tick repaints the sink's target, which is costly in Textual (the
+#: stylesheet is reapplied per widget); 500ms still reads as "running".
 _FRAME_INTERVAL = 0.5
-#: A Braille dot spinner — unlike ASCII fallbacks such as ``|/-\``, never
-#: mistaken for real content.
+#: A Braille dot spinner, never mistaken for real content.
 _SPINNER_FRAMES = "⠁⠉⠙⠹⠼⠶⠧⠇⠃"
-#: Deliberately loud — this is the one signal telling the user something
-#: is still running, not a subtle status-bar tone. Only ``_BreadcrumbSink``
-#: uses this: a ``Static``'s text parses Rich markup, a ``TreeNode``'s
-#: label doesn't (see ``TreeNodeLoadingSink``).
+#: Deliberately loud: the one signal that something is still running. For
+#: markup-parsing targets only; a ``TreeNode`` label gets plain text.
 _LOADING_STYLE = "bold bright_yellow"
 
 
-class _LoadingSink(Protocol):
-    """Where one ``DebouncedProgress``'s animated frames actually render.
-    ``show`` is called once per tick with the current spinner frame;
-    ``hide`` once, on ``stop()``, only if ``show`` ever ran."""
+class LoadingSink(Protocol):
+    """Where one ``DebouncedProgress``'s frames render: ``show`` once per
+    tick with the current frame, ``hide`` once on ``stop()`` if ``show``
+    ever ran."""
 
     def show(self, frame: str) -> None: ...
 
@@ -66,25 +50,26 @@ class _LoadingSink(Protocol):
 
 
 class _TimerHost(Protocol):
-    """Structural minimum ``DebouncedProgress`` needs from its host: just
-    enough to arm timers. Lets a ``runtime/*_effects.py`` caller (whose
-    ``self._screen`` is typed as a bare ``Widget``, per this package's own
-    ``runtime`` -> ``screens`` layering ban forbidding the real
-    ``NavigableScreen`` type there) pass it directly, with no
-    ``# type: ignore``. The default sink (``_BreadcrumbSink``) still
-    statically requires a real ``NavigableScreen``, so only an explicit,
-    non-default ``sink=`` can actually make use of the wider type here."""
+    """What ``DebouncedProgress`` needs from a host given an explicit
+    ``sink``: timers."""
 
     def set_timer(self, delay: float, callback: Callable[[], None]) -> Timer: ...
 
     def set_interval(self, interval: float, callback: Callable[[], None]) -> Timer: ...
 
 
+class _BreadcrumbHost(_TimerHost, Protocol):
+    """A screen with a breadcrumb: ``NavigableScreen``, named structurally
+    since widgets/ may not import screens/."""
+
+    def _set_loading_indicator(self, markup: str | None) -> None: ...
+
+
 class _BreadcrumbSink:
     """Appends the styled spinner frame to the screen's own breadcrumb text
     via ``NavigableScreen._set_loading_indicator``."""
 
-    def __init__(self, screen: NavigableScreen) -> None:
+    def __init__(self, screen: _BreadcrumbHost) -> None:
         self._screen = screen
 
     def show(self, frame: str) -> None:
@@ -97,14 +82,10 @@ class _BreadcrumbSink:
 
 
 class TreeNodeLoadingSink:
-    """Targets one expanding ``TreeNode``'s own label instead of the
-    breadcrumb. Each ``show``/``hide`` strips *this sink's own*
-    previously-appended suffix (if present) off whatever the label
-    currently is, rather than snapshotting it once at construction — an
-    unrelated relabel of the same node while this sink is animating (e.g.
-    toggling verbose mode mid-load) is preserved instead of clobbered. A
-    ``Tree``'s label doesn't parse Rich markup the way a ``Static``'s
-    text does, so the frame is appended as plain text."""
+    """Appends the frame to one ``TreeNode``'s label as plain text. Each
+    ``show``/``hide`` strips its own suffix from the current label rather
+    than restoring a snapshot, so a relabel mid-load (e.g. a verbose
+    toggle) survives."""
 
     def __init__(self, node: TreeNode[Any]) -> None:
         self._node = node
@@ -129,16 +110,9 @@ class TreeNodeLoadingSink:
 
 
 class _ConditionalResetSink:
-    """Shared bookkeeping for a sink whose ``show``/``hide`` write into a
-    widget a slow-enough operation's own final result might also write
-    into (``work()`` wraps the whole decorated method, so a call past
-    the debounce delay can already show its real result by the time
-    ``hide()`` runs): ``hide()`` only resets when ``read()`` still
-    returns exactly what ``show()`` last wrote, avoiding clobbering that
-    result. Used by both ``StaticTextSink`` (below) and
-    ``screens/detail_pane.py``'s ``DetailPaneLoadingSink``, each
-    supplying only its own widget-specific
-    ``write_loading``/``write_reset``/``read``."""
+    """Bookkeeping for a sink whose widget the operation's result may also
+    write into before ``hide()`` runs: ``hide()`` resets only when
+    ``read()`` still returns what ``show()`` last wrote."""
 
     def __init__(
         self, *, write_loading: Callable[[str], None], write_reset: Callable[[], None], read: Callable[[], str]
@@ -159,17 +133,9 @@ class _ConditionalResetSink:
 
 
 class StaticTextSink:
-    """Targets a Store-less screen's own single status ``Static`` (e.g.
-    ``ConnectDialog``'s/``DiagnosticsScreen``'s ``#connect-status``/
-    ``#diag-status``).
-
-    ``Static.render()`` strips Rich markup, so comparing against its
-    plain-text output is what lets ``_ConditionalResetSink`` tell "nothing
-    else touched this since I last wrote it" apart from "something already
-    superseded me" without parsing the widget's live markup back out --
-    the same problem ``TreeNodeLoadingSink`` solves for a ``TreeNode``'s
-    plain-text label, solved here the same way for a ``Static``'s
-    rendered plain text instead of its markup source."""
+    """Appends the frame to a screen's status ``Static`` (e.g.
+    ``ConnectDialog``'s ``#connect-status``); ``hide()`` resets it to
+    ``base()`` only if nothing else has written since."""
 
     def __init__(self, host: Widget, selector: str, *, base: Callable[[], str]) -> None:
         self._host = host
@@ -180,10 +146,8 @@ class StaticTextSink:
         )
 
     def _static(self) -> Static | None:
-        # Tolerates the widget already being gone -- same rationale as
-        # NavigableScreen._update_breadcrumb_text: a DebouncedProgress's
-        # final stop() can fire after its host screen has already been
-        # popped/dismissed.
+        # The widget may be gone: a final stop() can fire after the host
+        # screen was popped/dismissed.
         with contextlib.suppress(NoMatches):
             return self._host.query_one(self._selector, Static)
         return None
@@ -210,19 +174,10 @@ class StaticTextSink:
 
 
 class DataTableLoadingRowSink:
-    """A flat ``DataTable`` column's own counterpart to
-    ``TreeNodeLoadingSink``: with no per-node label to append a suffix
-    onto, this instead appends one trailing ``"{frame} Loading"`` row,
-    leaving real rows already on screen untouched underneath it.
-    ``hide()`` removes exactly that row and no other, tolerating it
-    already being gone (the common case — a finished fetch's dispatch
-    typically clears/repopulates the table, taking this row with it,
-    before ``hide()`` ever runs).
-
-    ``is_current`` (default: always current) is ``show()``'s own
-    staleness guard for a fetch scoped to one row/folder/workload —
-    only ``show()`` checks it; ``hide()`` only ever touches its own
-    tracked row, so it needs no staleness gate of its own."""
+    """Appends one trailing ``"{frame} Loading"`` row to a ``DataTable``;
+    ``hide()`` removes it, tolerating it already being gone. ``show()``
+    adds nothing once ``is_current()`` is false (the fetch's folder or
+    workload is no longer selected)."""
 
     def __init__(self, table: DataTable[Any], *, is_current: Callable[[], bool] = lambda: True) -> None:
         self._table = table
@@ -231,33 +186,23 @@ class DataTableLoadingRowSink:
 
     def show(self, frame: str) -> None:
         if not self._is_current():
-            # The selection this fetch was for has since moved on. An
-            # unrelated table.clear() (a real folder/workload switch)
-            # usually already took this row with it -- but not always
-            # (the empty-to-empty folder-switch case above), so still
-            # remove it here rather than assume.
+            # The selection moved on. A table.clear() usually took this
+            # row with it already, but not always, so remove it if tracked.
             if self._row_key is not None:
                 self._remove_own_row()
                 self._row_key = None
             return
         text = f"{frame} Loading"
         if self._row_key is not None:
-            # Update the existing row's own cell in place on a repeat
-            # tick, rather than remove+re-add just to change one frame
-            # character -- cheaper, and avoids a moment with no loading
-            # row at all between the remove and the re-add.
+            # Repeat tick: update the cell in place rather than remove+re-add.
             try:
                 self._table.update_cell(self._row_key, self._table.ordered_columns[0].key, text)
             except CellDoesNotExist:
                 self._row_key = None
             else:
                 return
-        # Padded to every column, not just the first: add_row() fills a
-        # missing trailing cell with None, and default_cell_formatter(None)
-        # renders the literal string "None" -- fine for BrowseScreen's own
-        # single-column version table, but a multi-column table like
-        # UnitScreen's own file table would otherwise show
-        # "{frame} Loading | None | None | ...".
+        # Padded to every column: a missing trailing cell would render as
+        # the literal string "None" in a multi-column table.
         blanks = ("",) * (len(self._table.ordered_columns) - 1)
         self._row_key = self._table.add_row(text, *blanks)
 
@@ -272,39 +217,20 @@ class DataTableLoadingRowSink:
 
 
 class DebouncedProgress:
-    """Owns one loading-indicator's debounced start/stop for the lifetime
-    of a single expensive call. Constructing this arms a ``delay``-second
-    timer; if ``stop`` is called before it fires, ``sink`` is never
-    touched at all — only a call still running past ``delay`` ever
-    animates anything.
+    """One call's debounced loading indicator. Constructing it arms a 300 ms
+    timer; if ``stop`` runs first, ``sink`` is never touched. As a context
+    manager, it stops on exit.
 
-    A context manager over that same lifetime — ``with
-    DebouncedProgress(self): ...`` calls ``stop()`` on the way out
-    regardless of how the block exits, the shape every call site needs."""
+    ``sink=None`` uses the breadcrumb, which needs ``screen`` to be a
+    ``NavigableScreen``; any other host passes a ``sink``."""
 
-    def __init__(
-        self, screen: _TimerHost | NavigableScreen, sink: _LoadingSink | None = None, *, delay: float | None = None
-    ) -> None:
+    def __init__(self, screen: _TimerHost | _BreadcrumbHost, sink: LoadingSink | None = None) -> None:
         self._screen = screen
-        # sink=None (the default breadcrumb) needs `screen` to actually be
-        # a NavigableScreen at runtime, even though the widened parameter
-        # type above accepts any _TimerHost -- unlike an explicit sink=,
-        # which works with a bare Widget/DOMNode, this one path still has
-        # no static check behind it (the runtime -> screens layering ban
-        # forbids narrowing the parameter type to prove it). A caller
-        # whose host isn't provably a NavigableScreen must pass an
-        # explicit sink=; every current default-sink call site is
-        # commented at its own use explaining why it's actually safe.
-        self._sink: _LoadingSink = sink if sink is not None else _BreadcrumbSink(screen)  # type: ignore[arg-type]
+        self._sink: LoadingSink = sink if sink is not None else _BreadcrumbSink(screen)  # type: ignore[arg-type]
         self._stopped = False
         self._frame = 0
         self._anim_timer: Timer | None = None
-        # Resolved here, not as `delay: float = _DEFAULT_DELAY` -- a
-        # default-argument expression is bound once at function-definition
-        # time, so a module-level `_DEFAULT_DELAY` override (e.g. a test's
-        # own autouse fixture) could never reach it that way.
-        resolved_delay = _DEFAULT_DELAY if delay is None else delay
-        self._timer: Timer = screen.set_timer(resolved_delay, self._start_animating)
+        self._timer: Timer = screen.set_timer(_DELAY, self._start_animating)
 
     def _start_animating(self) -> None:
         if self._stopped:  # pragma: no cover - defensive: stop() already cancels the timer

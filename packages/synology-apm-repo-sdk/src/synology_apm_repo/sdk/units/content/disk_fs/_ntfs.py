@@ -1,8 +1,5 @@
-"""NTFS support: cloud-sync-placeholder and EFS-encryption detection are
-NTFS-specific (unlike ext2/3/4/XFS/Btrfs/FAT, handled generically in
-``_posix_formats``), so this format gets its own module rather than
-folding into that one. Part of this package's read-only, per-file
-browsing/export view of a VM/PC/PS disk image via the Dissect framework.
+"""NTFS support, including cloud-sync-placeholder and EFS-encryption
+detection.
 """
 
 from __future__ import annotations
@@ -14,59 +11,49 @@ from ._base import _CLOUD_ONLY_REASON, _ENCRYPTED_REASON, _DirEntry, _Format, _m
 
 
 def _is_cloud_file(obj: object) -> bool:
-    """``obj.is_cloud_file()`` is a real IO_REPARSE_TAG_CLOUD* reparse-point
-    check dissect.ntfs exposes on both a full ``MftRecord`` and the
-    lighter-weight ``$FILE_NAME`` attribute a non-dereferenced listing
-    already holds -- same method name, same boolean meaning, different
-    objects, so this one guard is shared by both callers."""
+    """``obj.is_cloud_file()``, dissect.ntfs's IO_REPARSE_TAG_CLOUD*
+    reparse-point check, on either a full ``MftRecord`` or a listing's
+    ``$FILE_NAME`` attribute; ``False`` if it raises."""
     try:
         return bool(obj.is_cloud_file())  # type: ignore[attr-defined]
-    except Exception:
+    except Exception:  # noqa: BLE001
         return False
 
 
 def _ntfs_is_encrypted_attr(attr: object) -> bool:
-    """Cheap EFS check via the lighter-weight ``$FILE_NAME`` attribute's
-    own cached ``FileAttributes`` copy -- the same attribute
-    ``_ntfs_iterdir``'s own ``_is_cloud_file(attr)`` call already reads,
-    no ``MftRecord`` dereference needed. ``FILE_ATTRIBUTE.ENCRYPTED`` is
-    Microsoft's own confirmed marker, not a heuristic."""
+    """Cheap EFS check on a listing's ``$FILE_NAME`` attribute: its cached
+    ``FILE_ATTRIBUTE.ENCRYPTED`` bit, no ``MftRecord`` dereference
+    needed."""
     try:
         c_ntfs_module = _try_import("dissect.ntfs.c_ntfs")
         c_ntfs_defs = getattr(c_ntfs_module, "c_ntfs", None)
         if c_ntfs_defs is None:
             return False
         return bool(attr.file_attributes & c_ntfs_defs.FILE_ATTRIBUTE.ENCRYPTED)  # type: ignore[attr-defined]
-    except Exception:
+    except Exception:  # noqa: BLE001
         return False
 
 
 def _ntfs_is_encrypted(entry: object) -> bool:
-    """Confirmed EFS check for a full, already-dereferenced ``MftRecord``:
-    ``$STANDARD_INFORMATION``'s own ``FileAttributes`` ``ENCRYPTED`` bit
-    (the same flag ``_ntfs_is_encrypted_attr`` reads from ``$FILE_NAME``'s
-    cached copy), cross-checked against a present ``$EFS``-named
-    ``$LOGGED_UTILITY_STREAM`` attribute -- the structure actually
-    holding the DDF/DRF key-recovery blobs Windows creates alongside an
-    encrypted file. Same "flag plus structural signal" shape
-    ``_apfs.py``'s ``_apfs_is_dataless`` uses. Never lets a failure
-    checking either signal propagate -- this must degrade to "not
-    confirmed encrypted," not crash a caller that's only trying to find
-    out."""
+    """EFS check for a full ``MftRecord``: ``$STANDARD_INFORMATION``'s
+    ``ENCRYPTED`` bit, or a present ``$EFS``-named
+    ``$LOGGED_UTILITY_STREAM`` attribute (which holds the key-recovery
+    blobs of an encrypted file). A failure checking either signal reads as
+    not encrypted."""
     c_ntfs_module = _try_import("dissect.ntfs.c_ntfs")
     try:
         c_ntfs_defs = getattr(c_ntfs_module, "c_ntfs", None)
         stdinfo = entry.attributes.STANDARD_INFORMATION  # type: ignore[attr-defined]
         if c_ntfs_defs is not None and stdinfo and stdinfo.file_attributes & c_ntfs_defs.FILE_ATTRIBUTE.ENCRYPTED:
             return True
-    except Exception:
+    except Exception:  # noqa: BLE001
         pass
     try:
         attribute_type_code = getattr(c_ntfs_module, "ATTRIBUTE_TYPE_CODE", None)
         if attribute_type_code is None:
             return False
         return bool(entry.attributes.find("$EFS", attribute_type_code.LOGGED_UTILITY_STREAM))  # type: ignore[attr-defined]
-    except Exception:
+    except Exception:  # noqa: BLE001
         return False
 
 
@@ -78,49 +65,34 @@ def _ntfs_resolve(volume: object, path: str) -> object:
 def _ntfs_size(entry: object) -> int | None:
     try:
         return entry.size()  # type: ignore[attr-defined,no-any-return]
-    except Exception:
-        # A real NTFS system metadata file (e.g. $Secure, MFT record 9)
-        # can have no unnamed $DATA stream at all -- MftRecord.size()
-        # looks for exactly that stream and raises FileNotFoundError
-        # when it's missing. Same "report what's observed, don't crash"
-        # posture as everywhere else in this package.
+    except Exception:  # noqa: BLE001
+        # A system metadata file (e.g. $Secure, MFT record 9) can have no
+        # unnamed $DATA stream, which MftRecord.size() raises on.
         return None
 
 
 def _ntfs_entry_mtime(attr: object) -> datetime | None:
-    """Cheap mtime read off the same lightweight ``$FILE_NAME`` attribute
-    ``_ntfs_iterdir`` already reads ``name``/``is_dir``/``file_size`` from
-    -- no extra ``MftRecord`` dereference needed. Degrades to ``None``
-    rather than raising, matching every other entry field this package
-    reports."""
+    """The listing ``$FILE_NAME`` attribute's modification time, ``None``
+    if reading it raises."""
     try:
         return attr.last_modification_time  # type: ignore[attr-defined,no-any-return]
-    except Exception:
+    except Exception:  # noqa: BLE001
         return None
 
 
 def _ntfs_iterdir(entry: object) -> list[_DirEntry]:
-    # dereference=False reads each child's own embedded $FILE_NAME
-    # index-entry attribute directly instead of resolving every child to
-    # its own full MftRecord: NTFS's own $I30 index entries already
-    # carry a copy of the $FILE_NAME attribute (name/is_dir/size)
-    # inline, an order-of-magnitude cheaper listing than the
-    # dereferenced path. open_file() (in __init__.py) still needs the
-    # full dereferenced MftRecord to actually read $DATA, so this is
-    # listing-only.
+    # dereference=False reads the $FILE_NAME copy inline in each $I30 index
+    # entry instead of resolving every child's MftRecord: an
+    # order-of-magnitude cheaper listing. Reading content still resolves
+    # the full MftRecord (_ntfs_resolve).
     out = []
     for child in entry.iterdir(dereference=False, ignore_dos=True):  # type: ignore[attr-defined]
         attr = child.attribute
         name = attr.file_name
         if name in (".", ".."):
-            # A volume's own root directory (MFT record 5) has a
-            # self-referential $FILE_NAME index entry named "." whose
-            # own ParentDirectory points back at the root itself — left
-            # unfiltered, any canonical-ref resolution reaching into an
-            # NTFS subtree recurses into "." forever the first time it
-            # searches past the root level. ".." isn't known to occur in
-            # practice here but is filtered too, matching the same
-            # defensive posture FAT/ext already take.
+            # The root directory (MFT record 5) lists a self-referential
+            # "." entry; left in, ref resolution would recurse into it
+            # forever.
             continue
         is_dir = attr.is_dir()
         if is_dir:
@@ -148,14 +120,10 @@ def _ntfs_volume_label(volume: object) -> str | None:
 
 
 def _ntfs_content_unavailable(entry: object) -> str | None:
-    # ``entry`` is the full, already-dereferenced MftRecord _ntfs_resolve
-    # returns -- MftRecord.is_cloud_file() and the $STANDARD_INFORMATION-based
-    # _ntfs_is_encrypted check both look directly at the real $REPARSE_POINT/
-    # $EFS attributes, unlike _ntfs_iterdir's own attr-based
-    # checks above, which only have the lighter-weight $FILE_NAME
-    # attribute from its own non-dereferenced listing. CLOUD_ONLY takes
-    # priority: an evicted placeholder has no local bytes to even attempt
-    # reading, encrypted or not.
+    # ``entry`` is the full MftRecord, so these checks see the real
+    # $REPARSE_POINT/$EFS attributes rather than _ntfs_iterdir's $FILE_NAME
+    # copy. Cloud-only wins: an evicted placeholder has no local bytes,
+    # encrypted or not.
     if _is_cloud_file(entry):
         return _CLOUD_ONLY_REASON
     if _ntfs_is_encrypted(entry):

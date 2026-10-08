@@ -1,22 +1,22 @@
 """``FileMapTreeProvider``: a diagnostic fallback browsing axis straight
 off ``db/file_map``, reached via ``Repository.file_map_tree()`` and usable
-even when catalog metadata is missing or unhelpful — e.g.
-``apv-sample-3``'s empty ``copy_meta_file``. Building the child-index (see
-``FileMapTreeProvider._index``) costs one full-table scan of ``file_map``,
-done once and cached for the provider's lifetime — after that,
-``children()`` is a plain dict lookup, not a rescan.
+even when catalog metadata is missing or empty. Its child index costs one
+full-table scan of ``file_map``, done once per provider.
 
-This exposes internal ``file_map`` paths directly and is therefore
-**diagnostic-mode only** — never shown in the default, end-user-facing
-tree.
+It exposes internal ``file_map`` paths directly, so it is
+**diagnostic-mode only**, never shown in the default end-user tree.
 """
 
 from __future__ import annotations
 
+import dataclasses
 from collections import defaultdict
+from typing import override
 
+from .._util.closing import AsyncClosing
 from ..dedup.repository import DedupRepo
-from .base import Node, RestorableUnit, UnitKind, not_restorable, paginate
+from ..units.provider_kit import not_restorable, paginate
+from .base import Node, RestorableUnit, UnitKind
 from .node_ref import NodeRef
 
 # For one prefix ("" for the tree root, otherwise a "/"-joined ancestor
@@ -28,10 +28,25 @@ from .node_ref import NodeRef
 _ChildIndex = dict[str, tuple[set[str], dict[str, str]]]
 
 
-class FileMapTreeProvider:
-    """``UnitProvider`` that turns ``db/file_map``'s ``path`` column — treated
+@dataclasses.dataclass(frozen=True, slots=True)
+class _Prefix:
+    """``Node.handle`` of a directory: the ``file_map`` path prefix it lists."""
+
+    prefix: str
+
+
+@dataclasses.dataclass(frozen=True, slots=True)
+class _Path:
+    """``Node.handle`` of a leaf: its full ``file_map`` path."""
+
+    path: str
+
+
+class FileMapTreeProvider(AsyncClosing):
+    """``ClosableUnitProvider`` that turns ``db/file_map``'s ``path`` column — treated
     as ``/``-separated segments — directly into a browsable tree, one leaf
-    per row."""
+    per row. It reads through the repository's own connections, so closing
+    only drops its index."""
 
     def __init__(self, repo: DedupRepo) -> None:
         self._repo = repo
@@ -46,10 +61,8 @@ class FileMapTreeProvider:
         return self._paths
 
     async def _index(self) -> _ChildIndex:
-        """Every ancestor prefix of every ``file_map`` path, indexed once
-        and amortized across every call for this provider's lifetime.
-        ``children()`` is then an O(children at this level) dict
-        lookup."""
+        """Every ancestor prefix of every ``file_map`` path, built once per
+        provider."""
         if self._child_index is None:
             index: _ChildIndex = defaultdict(lambda: (set(), {}))
             for path in await self._all_paths():
@@ -65,18 +78,20 @@ class FileMapTreeProvider:
             self._child_index = index
         return self._child_index
 
+    @override
+    async def close(self) -> None:
+        self._paths = None
+        self._child_index = None
+
     def root(self) -> Node:
-        """Pure construction — no I/O, so this stays synchronous (see
-        ``UnitProvider``)."""
-        return Node(ref=NodeRef.raw(self._repo.layout.repo_root, ""), name="/", is_leaf=False, attrs={"prefix": ""})
+        """The ``file_map`` root. No I/O."""
+        return Node(ref=NodeRef.raw(self._repo.layout.repo_root, ""), name="/", is_leaf=False, handle=_Prefix(""))
 
     async def children(self, node: Node, offset: int = 0, limit: int | None = None) -> list[Node]:
-        prefix = node.attrs.get("prefix")
-        if prefix is None:
+        if not isinstance(node.handle, _Prefix):
             return []
-        # Re-normalized from the request's prefix string, since this
-        # lookup key must match exactly how _index() built its own
-        # prefix keys.
+        prefix = node.handle.prefix
+        # Normalized to match _index()'s prefix keys.
         prefix_parts = [p for p in prefix.split("/") if p]
         normalized_prefix = "/".join(prefix_parts)
 
@@ -90,7 +105,7 @@ class FileMapTreeProvider:
                     ref=NodeRef.raw(self._repo.layout.repo_root, child_prefix),
                     name=dirname,
                     is_leaf=False,
-                    attrs={"prefix": child_prefix},
+                    handle=_Prefix(child_prefix),
                 )
             )
         for basename, full_path in sorted(leaves.items()):
@@ -100,22 +115,14 @@ class FileMapTreeProvider:
                     name=basename,
                     is_leaf=True,
                     kind=UnitKind.RAW_OBJECT,
-                    attrs={"path": full_path},
+                    details={"path": full_path},
+                    handle=_Path(full_path),
                 )
             )
         return paginate(nodes, offset, limit)
 
     async def unit(self, node: Node) -> RestorableUnit:
-        path = node.attrs.get("path")
-        if path is None:
+        if not isinstance(node.handle, _Path):
             not_restorable("node", node.name)
-        content = await self._repo.open_file(path)
-        return RestorableUnit(
-            ref=node.ref,
-            name=node.name,
-            is_leaf=True,
-            kind=UnitKind.RAW_OBJECT,
-            size=content.size,
-            attrs=node.attrs,
-            content=content,
-        )
+        content = await self._repo.open_file(node.handle.path)
+        return RestorableUnit.of(node, content, kind=UnitKind.RAW_OBJECT, size=content.size)

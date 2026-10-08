@@ -1,226 +1,86 @@
-"""Unit tests for ``synology_apm_repo.sdk.dedup.dedup_file`` —
-synthetic composition + Pool data written to real files, no sample
-repositories required.
-
-Synthetic file layout used by most tests below (stream 7, session 3,
-comp_offset=64, size=45056):
-
-======  ==================  ============================================
-offset  kind                detail
-======  ==================  ============================================
-0       DATA (3 chunks)      bucket 0, chunks 0/1/2, map_num=3 repeat=0
-12288   ZERO (2 chunks)      zero_num=2
-20480   HOLE (1 chunk)       no record — gap before the next one
-24576   DATA (4 chunks)      bucket 0, chunks 3/4 templated, repeat=1
-                             (k=0,1,2,3 -> chunks 3,4,3,4 via advance())
-40960   HOLE (1 chunk)       trailing hole up to size=45056
-======  ==================  ============================================
-"""
+"""Unit tests for ``synology_apm_repo.sdk.dedup.dedup_file``. Most tests read
+``unit.sdk.dedup_export_fakes``'s standard file, whose layout
+``standard_entries()`` documents."""
 
 from __future__ import annotations
 
 import asyncio
 import os
-import struct
-import zlib
-from collections.abc import Sequence
+from collections.abc import Awaitable, Callable, Sequence
 from pathlib import Path
 
 import pytest
-import zstandard
-from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 
+from support.fakes import faithful_to
+from support.format_builders import (
+    chunk_map_record_bytes,
+    composition_header_bytes,
+    mapping_record,
+    record_head_bytes,
+    zero_record,
+)
+from support.repo_builders import (
+    write_bucket,
+    write_composition_entries,
+)
+from support.store_fakes import CountingStore
+from synology_apm_repo.sdk.dedup import chunk_walk
 from synology_apm_repo.sdk.dedup.composition_reader import CompositionReader
-from synology_apm_repo.sdk.dedup.dedup_file import DedupFile, ExtentKind
+from synology_apm_repo.sdk.dedup.dedup_file import (
+    MAX_SINGLE_READ_SIZE,
+    ByteRangeView,
+    DedupFile,
+    read_blocks,
+    validate_export_range,
+    validate_read_args,
+)
+from synology_apm_repo.sdk.dedup.export_sink import run_sink_export
+from synology_apm_repo.sdk.dedup.extent import DataExtent, ExportResult, ExtentKind, GapExtent
+from synology_apm_repo.sdk.dedup.local_file_sink import LocalFileSink
 from synology_apm_repo.sdk.dedup.pool import BucketReader, Pool
+from synology_apm_repo.sdk.errors import ResourceLimitExceededError
 from synology_apm_repo.sdk.format import addressing
-from synology_apm_repo.sdk.format.addressing import ChunkAddress
-from synology_apm_repo.sdk.format.bucket import MODE_CHUNK_CRC, MODE_COMPRESS
 from synology_apm_repo.sdk.format.chunkmap import ChunkMapKind
-from synology_apm_repo.sdk.format.compression import CompressType
-from synology_apm_repo.sdk.format.const import SUB_FILE_SIZE
-from synology_apm_repo.sdk.format.crypto import chunk_iv
-from synology_apm_repo.sdk.format.redundancy import redundancy_size
-from synology_apm_repo.sdk.identifiers import BucketId, ChunkIdx, SessionId, StreamId
+from synology_apm_repo.sdk.identifiers import BucketId, ChunkIdx, StreamId
 from synology_apm_repo.sdk.storage.dircache import DirCache
 from synology_apm_repo.sdk.storage.local import LocalFsStore
-
-_STREAM_ID = StreamId(7)
-_SESSION_ID = SessionId(3)
-_HEAD_OFF = 64
-_SIZE = 45056  # last record ends at 40960; a trailing 4096-byte HOLE follows
-
-_CHUNK_PLAINTEXTS = [bytes([i]) * 4096 for i in range(5)]  # bucket 0, chunks 0..4
-
-
-# -- composition sub-file builders (same approach as
-#    test_dedup_composition_reader.py) ----------------------------------
-
-
-def _chunk_map_record_bytes(*, kind_value: int, file_chunk_idx: int, addr_int: int, tail_u32: int) -> bytes:
-    type_byte = kind_value & 0x0F
-    idx_bytes = file_chunk_idx.to_bytes(7, "big")
-    return bytes([type_byte]) + idx_bytes + addr_int.to_bytes(8, "big") + tail_u32.to_bytes(4, "big")
+from synology_apm_repo.sdk.units.base import ContentSource
+from unit.sdk.dedup_export_fakes import (
+    CHUNK_PLAINTEXTS,
+    HEAD_OFF,
+    SESSION_ID,
+    SIZE,
+    STREAM_ID,
+    build_blocking_dedup_file,
+    dedup_file_at,
+    standard_entries,
+)
+from unit.sdk.pool_fakes import chunk_address
 
 
-def _mapping_record(file_offset: int, bucket_id: int, chunk_idx: int, map_num: int, repeat: int = 0) -> bytes:
-    addr_int = ChunkAddress(StreamId(0), BucketId(bucket_id), ChunkIdx(chunk_idx)).to_int()
-    return _chunk_map_record_bytes(
-        kind_value=ChunkMapKind.MAPPING.value,
-        file_chunk_idx=file_offset >> 12,
-        addr_int=addr_int,
-        tail_u32=(map_num << 16) | repeat,
+async def _export_to(
+    file_like: DedupFile | ByteRangeView,
+    dst: Path,
+    *,
+    sparse: bool = True,
+    progress: Callable[[int], Awaitable[None]] | None = None,
+) -> ExportResult:
+    """``export_range`` into an unstaged ``LocalFileSink`` at ``dst``, driven by ``run_sink_export``."""
+    _, _, size = file_like.export_window()
+    sink = LocalFileSink(dst, staged=False)
+    return await run_sink_export(
+        sink, size, sparse=sparse, body=lambda: file_like.export_range(sink, 0, size, sparse=sparse, progress=progress)
     )
-
-
-def _zero_record(file_offset: int, zero_num: int) -> bytes:
-    return _chunk_map_record_bytes(
-        kind_value=ChunkMapKind.ZERO.value, file_chunk_idx=file_offset >> 12, addr_int=0, tail_u32=zero_num
-    )
-
-
-def _composition_header_bytes() -> bytes:
-    header = bytearray(64)
-    header[0:4] = b"cMpS"
-    header[4:6] = (1).to_bytes(2, "big")
-    header[6:8] = (1).to_bytes(2, "big")
-    header[8:12] = SUB_FILE_SIZE.to_bytes(4, "big")
-    header[60:64] = (zlib.crc32(bytes(header[:60])) & 0xFFFFFFFF).to_bytes(4, "big")
-    return bytes(header)
-
-
-def _record_head_bytes(*, map_num: int, mode: int = 0x0001, attr_leng: int = 0) -> bytes:
-    head = bytearray(32)
-    head[0:2] = b"Mu"
-    head[6:14] = map_num.to_bytes(8, "big")
-    head[18:20] = mode.to_bytes(2, "big")
-    head[20:24] = attr_leng.to_bytes(4, "big")
-    head[28:32] = (zlib.crc32(bytes(head[:28])) & 0xFFFFFFFF).to_bytes(4, "big")
-    return bytes(head)
-
-
-def _write_standard_composition(comp_root: Path) -> None:
-    entries = (
-        _mapping_record(0, 0, 0, map_num=3)
-        + _zero_record(12288, zero_num=2)
-        + _mapping_record(24576, 0, 3, map_num=2, repeat=1)
-    )
-    record_bytes = _record_head_bytes(map_num=3) + entries
-    path = comp_root / str(_STREAM_ID) / f"{_SESSION_ID}.com" / "c0"
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_bytes(_composition_header_bytes() + record_bytes)
-
-
-# -- Pool/bucket builders (same approach as test_dedup_pool.py) --------
-
-
-def _encode_size_store(entries: list[tuple[int, int]]) -> bytes:
-    n = len(entries)
-    tight_len = (n * 15 + 7) >> 3
-    buf = bytearray(tight_len + 4)
-    for idx, (type_value, size) in enumerate(entries):
-        bit_off = idx * 15
-        byte_off = bit_off >> 3
-        bit_shift = 17 - (bit_off & 7)
-        blob = (type_value << 12) | size
-        window = int.from_bytes(buf[byte_off : byte_off + 4], "big")
-        window |= (blob << bit_shift) & 0xFFFFFFFF
-        buf[byte_off : byte_off + 4] = window.to_bytes(4, "big")
-    return bytes(buf[:tight_len])
-
-
-def _write_bucket(path: Path, plaintexts: list[bytes], *, vault_key: bytes | None = None) -> None:
-    compressor = zstandard.ZstdCompressor()
-    payloads: list[bytes] = []
-    entries: list[tuple[int, int]] = []
-    for chunk_idx, plain in enumerate(plaintexts):
-        compressed = compressor.compress(plain)
-        if vault_key is not None:
-            addr = ChunkAddress(StreamId(0), BucketId(0), ChunkIdx(chunk_idx))
-            encryptor = Cipher(algorithms.AES(vault_key), modes.CTR(chunk_iv(addr))).encryptor()
-            payload = encryptor.update(compressed) + encryptor.finalize()
-        else:
-            payload = compressed
-        payloads.append(payload)
-        entries.append((CompressType.ZSTD.value, len(payload)))
-
-    tight = _encode_size_store(entries)
-    chunk_size_crc = zlib.crc32(tight) & 0xFFFFFFFF
-    header = bytearray(64)
-    header[0:4] = b"bFiL"
-    header[4:6] = (3).to_bytes(2, "big")
-    header[8:12] = struct.pack(">I", MODE_COMPRESS | MODE_CHUNK_CRC)
-    header[12:16] = struct.pack(">I", len(plaintexts))
-    header[16:20] = struct.pack(">I", chunk_size_crc)
-    header[60:64] = (zlib.crc32(bytes(header[:60])) & 0xFFFFFFFF).to_bytes(4, "big")
-    sizestore_region = tight + b"\x00" * (16320 - len(tight))
-    trailer = os.urandom(4 * len(plaintexts) + redundancy_size((len(plaintexts) * 15 + 7) >> 3, 256))
-
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_bytes(bytes(header) + sizestore_region + b"".join(payloads) + trailer)
 
 
 @pytest.fixture
 def dedup_file(tmp_path: Path) -> DedupFile:
-    _write_standard_composition(tmp_path / "Composition")
-    _write_bucket(tmp_path / "Pool" / "0" / "0.buk", _CHUNK_PLAINTEXTS)
-    store = LocalFsStore(tmp_path)
-    dir_cache = DirCache(store)
-    comp_reader = CompositionReader(store, dir_cache, "Composition", _STREAM_ID, _SESSION_ID)
-    pool = Pool(store, "Pool", dir_cache)
-    return DedupFile(comp_reader, pool, _HEAD_OFF, size=_SIZE)
-
-
-class _BlockingStore:
-    """An ``ObjectStore`` wrapper that can be *armed* to park forever
-    inside its next ``read()``.
-
-    There is no ``cancel=`` parameter anywhere in the SDK; a cancellation
-    test parks the call at a real ``await`` point inside the SDK with
-    this and then cancels the surrounding ``asyncio.Task``, exactly
-    how a real caller (the CLI/TUI) cancels an in-flight read or export.
-    """
-
-    def __init__(self, backing: LocalFsStore) -> None:
-        self._backing = backing
-        self.armed = False
-        self.blocked = asyncio.Event()  # set once a read has actually parked
-        self._never_released = asyncio.Event()  # deliberately never set
-
-    async def read(self, path: str, offset: int = 0, length: int | None = None) -> bytes:
-        if self.armed:
-            self.blocked.set()
-            await self._never_released.wait()
-        return await self._backing.read(path, offset, length)
-
-    async def size(self, path: str) -> int:
-        return await self._backing.size(path)
-
-    async def exists(self, path: str) -> bool:
-        return await self._backing.exists(path)
-
-    async def listdir(self, path: str) -> list[str]:
-        return await self._backing.listdir(path)
-
-
-def _build_blocking_dedup_file(tmp_path: Path) -> tuple[DedupFile, _BlockingStore]:
-    """The standard fixture, but over a ``_BlockingStore`` so a test
-    can park the SDK mid-read and cancel it."""
-    _write_standard_composition(tmp_path / "Composition")
-    _write_bucket(tmp_path / "Pool" / "0" / "0.buk", _CHUNK_PLAINTEXTS)
-    store = _BlockingStore(LocalFsStore(tmp_path))
-    dir_cache = DirCache(store)
-    comp_reader = CompositionReader(store, dir_cache, "Composition", _STREAM_ID, _SESSION_ID)
-    pool = Pool(store, "Pool", dir_cache)
-    return DedupFile(comp_reader, pool, _HEAD_OFF, size=_SIZE), store
+    return dedup_file_at(tmp_path)
 
 
 class TestExtents:
-    """Deliberately calls the private ``_extents()`` directly
-    — this class tests that method's own chunk-map-parsing correctness
-    (kind classification, HOLE synthesis, template fields), which needs
-    the raw ``Extent`` objects themselves, not what any public method
-    built on top of it returns."""
+    """Calls the private ``_extents()`` directly: chunk-map parsing (kind
+    classification, HOLE synthesis, template fields) needs the raw ``Extent``s."""
 
     async def test_full_walk_kinds_and_offsets(self, dedup_file: DedupFile) -> None:
         extents = [e async for e in dedup_file._extents()]
@@ -235,100 +95,104 @@ class TestExtents:
 
     async def test_data_extent_carries_template_fields(self, dedup_file: DedupFile) -> None:
         first = await anext(dedup_file._extents())
+        assert isinstance(first, DataExtent)
         assert first.map_num == 3
         assert first.repeat == 0
-        assert first.addr == ChunkAddress(StreamId(0), BucketId(0), ChunkIdx(0))
+        assert first.addr == chunk_address(0, 0, 0)
 
-    async def test_zero_and_hole_extents_have_no_addr(self, dedup_file: DedupFile) -> None:
+    async def test_zero_and_hole_extents_are_gaps(self, dedup_file: DedupFile) -> None:
         extents = [e async for e in dedup_file._extents()]
-        zero_extent = extents[1]
-        hole_extent = extents[2]
-        assert zero_extent.addr is None
-        assert hole_extent.addr is None
+        assert [type(e) for e in extents[1:3]] == [GapExtent, GapExtent]
 
     async def test_no_trailing_hole_when_size_matches_last_record_end(self, tmp_path: Path) -> None:
-        _write_standard_composition(tmp_path / "Composition")
-        _write_bucket(tmp_path / "Pool" / "0" / "0.buk", _CHUNK_PLAINTEXTS)
+        write_composition_entries(
+            tmp_path / "Composition", standard_entries(), stream_id=STREAM_ID, session_id=SESSION_ID
+        )
+        write_bucket(tmp_path / "Pool" / "0" / "0.buk", CHUNK_PLAINTEXTS)
         store = LocalFsStore(tmp_path)
         dir_cache = DirCache(store)
-        comp_reader = CompositionReader(store, dir_cache, "Composition", _STREAM_ID, _SESSION_ID)
+        comp_reader = CompositionReader(store, dir_cache, "Composition", STREAM_ID, SESSION_ID)
         pool = Pool(store, "Pool", dir_cache)
-        exact_size_file = DedupFile(comp_reader, pool, _HEAD_OFF, size=40960)
+        exact_size_file = DedupFile(comp_reader, pool, HEAD_OFF, size=40960)
         extents = [e async for e in exact_size_file._extents()]
         assert extents[-1].kind is not ExtentKind.HOLE or extents[-1].offset != 40960
 
     async def test_zero_length_entry_is_skipped_not_yielded_as_an_empty_extent(self, tmp_path: Path) -> None:
-        # a ChunkMapKind.ZERO record with zero_num=0 carries no coverage at all —
-        # it must not produce a spurious zero-length Extent nor break the
-        # cursor tracking for the record that follows it.
+        # A ZERO record with zero_num=0 covers nothing: no empty Extent, and
+        # the following record is unaffected.
         entries = (
-            _mapping_record(0, 0, 0, map_num=1)
-            + _zero_record(4096, zero_num=0)
-            + _mapping_record(4096, 0, 1, map_num=1)
+            mapping_record(0, 0, 0, map_num=1) + zero_record(4096, zero_num=0) + mapping_record(4096, 0, 1, map_num=1)
         )
-        record_bytes = _record_head_bytes(map_num=3) + entries
-        comp_path = tmp_path / "Composition" / str(_STREAM_ID) / f"{_SESSION_ID}.com" / "c0"
+        record_bytes = record_head_bytes(map_num=3) + entries
+        comp_path = tmp_path / "Composition" / str(STREAM_ID) / f"{SESSION_ID}.com" / "c0"
         comp_path.parent.mkdir(parents=True, exist_ok=True)
-        comp_path.write_bytes(_composition_header_bytes() + record_bytes)
-        _write_bucket(tmp_path / "Pool" / "0" / "0.buk", _CHUNK_PLAINTEXTS)
+        comp_path.write_bytes(composition_header_bytes() + record_bytes)
+        write_bucket(tmp_path / "Pool" / "0" / "0.buk", CHUNK_PLAINTEXTS)
 
         store = LocalFsStore(tmp_path)
         dir_cache = DirCache(store)
-        comp_reader = CompositionReader(store, dir_cache, "Composition", _STREAM_ID, _SESSION_ID)
+        comp_reader = CompositionReader(store, dir_cache, "Composition", STREAM_ID, SESSION_ID)
         pool = Pool(store, "Pool", dir_cache)
-        file = DedupFile(comp_reader, pool, _HEAD_OFF, size=8192)
+        file = DedupFile(comp_reader, pool, HEAD_OFF, size=8192)
 
         extents = [e async for e in file._extents()]
         assert [(e.kind, e.offset, e.length) for e in extents] == [
             (ExtentKind.DATA, 0, 4096),
             (ExtentKind.DATA, 4096, 4096),
         ]
-        assert await file.read(0, 8192) == _CHUNK_PLAINTEXTS[0] + _CHUNK_PLAINTEXTS[1]
+        assert await file.read(0, 8192) == CHUNK_PLAINTEXTS[0] + CHUNK_PLAINTEXTS[1]
 
 
 async def test_stream_id_session_id_comp_offset_properties(dedup_file: DedupFile) -> None:
-    assert dedup_file.stream_id == _STREAM_ID
-    assert dedup_file.session_id == _SESSION_ID
-    assert dedup_file.comp_offset == _HEAD_OFF
+    assert dedup_file.stream_id == STREAM_ID
+    assert dedup_file.session_id == SESSION_ID
+    assert dedup_file.comp_offset == HEAD_OFF
 
 
 async def test_pool_property(dedup_file: DedupFile) -> None:
-    """``export_scheduler.py``'s bucket-major planning needs a ``DedupFile``'s
-    own ``Pool`` to schedule reads against a shared ``BucketReaderCache``."""
     assert isinstance(dedup_file.pool, Pool)
 
 
 class TestRead:
+    async def test_returns_a_fresh_buffer_the_caller_owns(self, dedup_file: DedupFile) -> None:
+        """The filled buffer is handed over uncopied, so each read must be a
+        new one: mutating it must not reach the cache or a later read."""
+        first = await dedup_file.read(0, 8192)
+        assert isinstance(first, bytearray)
+        first[:] = bytes(len(first))
+
+        assert await dedup_file.read(0, 8192) == CHUNK_PLAINTEXTS[0] + CHUNK_PLAINTEXTS[1]
+
     async def test_reads_a_single_data_chunk(self, dedup_file: DedupFile) -> None:
-        assert await dedup_file.read(0, 4096) == _CHUNK_PLAINTEXTS[0]
-        assert await dedup_file.read(4096, 4096) == _CHUNK_PLAINTEXTS[1]
+        assert await dedup_file.read(0, 4096) == CHUNK_PLAINTEXTS[0]
+        assert await dedup_file.read(4096, 4096) == CHUNK_PLAINTEXTS[1]
 
     async def test_reads_across_multiple_data_chunks(self, dedup_file: DedupFile) -> None:
         result = await dedup_file.read(2048, 4096)  # spans the boundary between chunk 0 and chunk 1
-        assert result == _CHUNK_PLAINTEXTS[0][2048:] + _CHUNK_PLAINTEXTS[1][:2048]
+        assert result == CHUNK_PLAINTEXTS[0][2048:] + CHUNK_PLAINTEXTS[1][:2048]
 
-    async def test_reads_zero_region_as_zero_bytes(self, dedup_file: DedupFile) -> None:
-        result = await dedup_file.read(12288, 8192)
-        assert result == b"\x00" * 8192
-
-    async def test_reads_hole_region_as_zero_bytes(self, dedup_file: DedupFile) -> None:
-        result = await dedup_file.read(20480, 4096)
-        assert result == b"\x00" * 4096
-
-    async def test_reads_trailing_hole_past_last_record(self, dedup_file: DedupFile) -> None:
-        assert await dedup_file.read(40960, 4096) == b"\x00" * 4096
+    @pytest.mark.parametrize(
+        ("offset", "length"),
+        [
+            pytest.param(12288, 8192, id="zero_region"),
+            pytest.param(20480, 4096, id="hole_region"),
+            pytest.param(40960, 4096, id="trailing_hole_past_last_record"),
+        ],
+    )
+    async def test_reads_as_zero_bytes(self, dedup_file: DedupFile, offset: int, length: int) -> None:
+        assert await dedup_file.read(offset, length) == b"\x00" * length
 
     async def test_reads_repeated_template_correctly(self, dedup_file: DedupFile) -> None:
         # map_num=2, repeat=1 at offset 24576: chunks [3, 4, 3, 4]
         result = await dedup_file.read(24576, 4 * 4096)
-        expected = _CHUNK_PLAINTEXTS[3] + _CHUNK_PLAINTEXTS[4] + _CHUNK_PLAINTEXTS[3] + _CHUNK_PLAINTEXTS[4]
+        expected = CHUNK_PLAINTEXTS[3] + CHUNK_PLAINTEXTS[4] + CHUNK_PLAINTEXTS[3] + CHUNK_PLAINTEXTS[4]
         assert result == expected
 
     async def test_reads_a_sub_range_within_a_repeated_chunk(self, dedup_file: DedupFile) -> None:
         # bytes [100, 200) of the 3rd repeated chunk (index 2 -> chunk 3 again)
         offset = 24576 + 2 * 4096 + 100
         result = await dedup_file.read(offset, 100)
-        assert result == _CHUNK_PLAINTEXTS[3][100:200]
+        assert result == CHUNK_PLAINTEXTS[3][100:200]
 
     async def test_reads_spanning_data_zero_and_hole(self, dedup_file: DedupFile) -> None:
         # last 100 bytes of chunk 2 (DATA) + all of ZERO + all of HOLE + first
@@ -336,7 +200,7 @@ class TestRead:
         start = 3 * 4096 - 100
         length = 100 + 8192 + 4096 + 100
         result = await dedup_file.read(start, length)
-        expected = _CHUNK_PLAINTEXTS[2][-100:] + b"\x00" * (8192 + 4096) + _CHUNK_PLAINTEXTS[3][:100]
+        expected = CHUNK_PLAINTEXTS[2][-100:] + b"\x00" * (8192 + 4096) + CHUNK_PLAINTEXTS[3][:100]
         assert result == expected
 
     async def test_default_length_reads_to_end_of_size(self, dedup_file: DedupFile) -> None:
@@ -347,10 +211,7 @@ class TestRead:
         assert await dedup_file.read(0, 0) == b""
 
     async def test_over_length_read_clamps_to_size_instead_of_zero_padding(self, dedup_file: DedupFile) -> None:
-        # A request extending past `size` returns only the bytes that
-        # exist (here, the trailing HOLE from 40960 to the 45056-byte
-        # end) rather than silently zero-padding further past the file's
-        # own declared end.
+        # Only the 4096 bytes up to size=45056 come back, not 8192.
         result = await dedup_file.read(40960, 8192)
         assert result == b"\x00" * 4096
 
@@ -367,51 +228,74 @@ class TestRead:
             await dedup_file.read(0, -1)
 
     async def test_read_without_length_raises_when_size_unknown(self, tmp_path: Path) -> None:
-        _write_standard_composition(tmp_path / "Composition")
-        _write_bucket(tmp_path / "Pool" / "0" / "0.buk", _CHUNK_PLAINTEXTS)
+        write_composition_entries(
+            tmp_path / "Composition", standard_entries(), stream_id=STREAM_ID, session_id=SESSION_ID
+        )
+        write_bucket(tmp_path / "Pool" / "0" / "0.buk", CHUNK_PLAINTEXTS)
         store = LocalFsStore(tmp_path)
         dir_cache = DirCache(store)
-        comp_reader = CompositionReader(store, dir_cache, "Composition", _STREAM_ID, _SESSION_ID)
+        comp_reader = CompositionReader(store, dir_cache, "Composition", STREAM_ID, SESSION_ID)
         pool = Pool(store, "Pool", dir_cache)
-        unsized = DedupFile(comp_reader, pool, _HEAD_OFF, size=None)
+        unsized = DedupFile(comp_reader, pool, HEAD_OFF, size=None)
         with pytest.raises(ValueError, match="size is unknown"):
             await unsized.read(0)
 
+    async def test_a_declared_size_past_the_single_read_ceiling_raises(self, tmp_path: Path) -> None:
+        # Raised before any extent is walked; only the declared size matters.
+        write_composition_entries(
+            tmp_path / "Composition", standard_entries(), stream_id=STREAM_ID, session_id=SESSION_ID
+        )
+        write_bucket(tmp_path / "Pool" / "0" / "0.buk", CHUNK_PLAINTEXTS)
+        store = LocalFsStore(tmp_path)
+        dir_cache = DirCache(store)
+        comp_reader = CompositionReader(store, dir_cache, "Composition", STREAM_ID, SESSION_ID)
+        pool = Pool(store, "Pool", dir_cache)
+        oversized = DedupFile(comp_reader, pool, HEAD_OFF, size=MAX_SINGLE_READ_SIZE + 1)
+        with pytest.raises(ResourceLimitExceededError, match="single-read safety ceiling"):
+            await oversized.read(0)
+
+    async def test_a_declared_size_at_the_single_read_ceiling_is_allowed(self, tmp_path: Path) -> None:
+        write_composition_entries(
+            tmp_path / "Composition", standard_entries(), stream_id=STREAM_ID, session_id=SESSION_ID
+        )
+        write_bucket(tmp_path / "Pool" / "0" / "0.buk", CHUNK_PLAINTEXTS)
+        store = LocalFsStore(tmp_path)
+        dir_cache = DirCache(store)
+        comp_reader = CompositionReader(store, dir_cache, "Composition", STREAM_ID, SESSION_ID)
+        pool = Pool(store, "Pool", dir_cache)
+        # Declared size exactly at the ceiling (the check is ``>``, not ``>=``),
+        # read within the small real data.
+        at_ceiling = DedupFile(comp_reader, pool, HEAD_OFF, size=MAX_SINGLE_READ_SIZE)
+        assert await at_ceiling.read(0, 4096) == CHUNK_PLAINTEXTS[0]
+
 
 class TestReadAcrossBuckets:
-    """``_fill_data_extent()``'s cross-bucket batch path, via
-    ``_resolve_bucket_group()``: more than one distinct chunk needed
-    within a single ``read()`` call is grouped by ``(stream_id, bucket_id)``
-    and resolved via one ``BucketReader.read_chunks()`` call per bucket
-    for whatever isn't already cached, instead of one ``Pool.read_chunk()``
-    per chunk — but still consults/backfills ``Pool``'s own cross-call
-    chunk cache."""
+    """``_fill_data_extent()``'s batch path via ``_resolve_bucket_group()``: several
+    distinct chunks in one ``read()`` are fetched with one
+    ``BucketReader.read_chunks()`` per bucket, still using ``Pool``'s chunk cache."""
 
     async def test_read_spanning_two_buckets_via_a_single_extents_carry(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """One DATA extent whose own ``map_num=2`` run carries from
-        (bucket 0, chunk 1) into (bucket 1, chunk 0) —
-        ``ChunkAddress.advance()``'s carry semantics, exercised here for real through
-        one ``_fill_data_extent()`` call needing two distinct chunks in
-        two different buckets. ``BUCKET_MAX_CHUNK_NUM`` is monkeypatched
-        down to 2 so this needs only two real chunks on disk, not a real
-        8192-chunk bucket."""
+        """With ``BUCKET_MAX_CHUNK_NUM`` patched to 2, one DATA extent with
+        ``map_num=2`` carries from (bucket 0, chunk 1) into (bucket 1, chunk 0),
+        so one ``_fill_data_extent()`` call needs chunks from two buckets."""
         monkeypatch.setattr(addressing, "BUCKET_MAX_CHUNK_NUM", 2)
-        entries = _mapping_record(0, 0, 1, map_num=2)
-        record_bytes = _record_head_bytes(map_num=1) + entries
-        comp_path = tmp_path / "Composition" / str(_STREAM_ID) / f"{_SESSION_ID}.com" / "c0"
+        monkeypatch.setattr(chunk_walk, "BUCKET_MAX_CHUNK_NUM", 2)
+        entries = mapping_record(0, 0, 1, map_num=2)
+        record_bytes = record_head_bytes(map_num=1) + entries
+        comp_path = tmp_path / "Composition" / str(STREAM_ID) / f"{SESSION_ID}.com" / "c0"
         comp_path.parent.mkdir(parents=True, exist_ok=True)
-        comp_path.write_bytes(_composition_header_bytes() + record_bytes)
-        _write_bucket(tmp_path / "Pool" / "0" / "0.buk", _CHUNK_PLAINTEXTS[:2])
+        comp_path.write_bytes(composition_header_bytes() + record_bytes)
+        write_bucket(tmp_path / "Pool" / "0" / "0.buk", CHUNK_PLAINTEXTS[:2])
         bucket_1_chunk0 = bytes([200]) * 4096
-        _write_bucket(tmp_path / "Pool" / "0" / "1.buk", [bucket_1_chunk0])
+        write_bucket(tmp_path / "Pool" / "0" / "1.buk", [bucket_1_chunk0])
 
         store = LocalFsStore(tmp_path)
         dir_cache = DirCache(store)
-        comp_reader = CompositionReader(store, dir_cache, "Composition", _STREAM_ID, _SESSION_ID)
+        comp_reader = CompositionReader(store, dir_cache, "Composition", STREAM_ID, SESSION_ID)
         pool = Pool(store, "Pool", dir_cache)
-        file = DedupFile(comp_reader, pool, _HEAD_OFF, size=2 * 4096)
+        file = DedupFile(comp_reader, pool, HEAD_OFF, size=2 * 4096)
 
         calls: list[int] = []
         real_read_chunk = Pool.read_chunk
@@ -423,17 +307,14 @@ class TestReadAcrossBuckets:
         monkeypatch.setattr(Pool, "read_chunk", counting_read_chunk)
 
         result = await file.read(0, 2 * 4096)
-        assert result == _CHUNK_PLAINTEXTS[1] + bucket_1_chunk0
-        # 2 distinct chunks needed -> the batch path (BucketReader.read_chunks()
-        # per bucket), never Pool.read_chunk() directly for the fetch itself.
+        assert result == CHUNK_PLAINTEXTS[1] + bucket_1_chunk0
+        # The batch path was used, not Pool.read_chunk().
         assert calls == []
-        # Both chunks this batch fetched are backfilled into Pool's own
-        # cross-call cache via _resolve_bucket_group's Pool.backfill_chunk.
-        assert pool._chunks[(StreamId(0), BucketId(0), ChunkIdx(1))] == _CHUNK_PLAINTEXTS[1]
+        # Both fetched chunks were backfilled into Pool's cache.
+        assert pool._chunks[(StreamId(0), BucketId(0), ChunkIdx(1))] == CHUNK_PLAINTEXTS[1]
         assert pool._chunks[(StreamId(0), BucketId(1), ChunkIdx(0))] == bucket_1_chunk0
 
-        # A later single-chunk Pool.read_chunk() for one of those same
-        # chunks is now a genuine cache hit: it never touches the store.
+        # A later Pool.read_chunk() for one of them is a cache hit.
         store_reads: list[int] = []
         real_store_read = LocalFsStore.read
 
@@ -442,48 +323,44 @@ class TestReadAcrossBuckets:
             return await real_store_read(self, *args, **kwargs)  # type: ignore[arg-type]
 
         monkeypatch.setattr(LocalFsStore, "read", counting_store_read)
-        again = await pool.read_chunk(ChunkAddress(StreamId(0), BucketId(0), ChunkIdx(1)))
-        assert again == _CHUNK_PLAINTEXTS[1]
+        again = await pool.read_chunk(chunk_address(0, 0, 1))
+        assert again == CHUNK_PLAINTEXTS[1]
         assert store_reads == []
 
     async def test_a_release_caches_racing_the_fetch_skips_the_backfill(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """Exercises the ``Pool.release_epoch`` guard directly: a
-        ``release_caches()`` landing while the multi-chunk batch fetch is
-        in flight must not resurrect a backfilled entry into the
-        now-emptied ``Pool``."""
+        """A ``release_caches()`` during the batch fetch (``Pool.release_epoch`` guard)
+        must not backfill entries into the emptied ``Pool``."""
         monkeypatch.setattr(addressing, "BUCKET_MAX_CHUNK_NUM", 2)
-        entries = _mapping_record(0, 0, 1, map_num=2)
-        record_bytes = _record_head_bytes(map_num=1) + entries
-        comp_path = tmp_path / "Composition" / str(_STREAM_ID) / f"{_SESSION_ID}.com" / "c0"
+        monkeypatch.setattr(chunk_walk, "BUCKET_MAX_CHUNK_NUM", 2)
+        entries = mapping_record(0, 0, 1, map_num=2)
+        record_bytes = record_head_bytes(map_num=1) + entries
+        comp_path = tmp_path / "Composition" / str(STREAM_ID) / f"{SESSION_ID}.com" / "c0"
         comp_path.parent.mkdir(parents=True, exist_ok=True)
-        comp_path.write_bytes(_composition_header_bytes() + record_bytes)
-        _write_bucket(tmp_path / "Pool" / "0" / "0.buk", _CHUNK_PLAINTEXTS[:2])
+        comp_path.write_bytes(composition_header_bytes() + record_bytes)
+        write_bucket(tmp_path / "Pool" / "0" / "0.buk", CHUNK_PLAINTEXTS[:2])
         bucket_1_chunk0 = bytes([200]) * 4096
-        _write_bucket(tmp_path / "Pool" / "0" / "1.buk", [bucket_1_chunk0])
+        write_bucket(tmp_path / "Pool" / "0" / "1.buk", [bucket_1_chunk0])
 
         store = LocalFsStore(tmp_path)
         dir_cache = DirCache(store)
-        comp_reader = CompositionReader(store, dir_cache, "Composition", _STREAM_ID, _SESSION_ID)
+        comp_reader = CompositionReader(store, dir_cache, "Composition", STREAM_ID, SESSION_ID)
         pool = Pool(store, "Pool", dir_cache)
-        file = DedupFile(comp_reader, pool, _HEAD_OFF, size=2 * 4096)
+        file = DedupFile(comp_reader, pool, HEAD_OFF, size=2 * 4096)
 
         real_read_chunks = BucketReader.read_chunks
 
         async def releasing_read_chunks(
             self: BucketReader,
-            requests: Sequence[tuple[int, ChunkAddress | None]],
+            stream_id: StreamId,
+            bucket_id: BucketId,
+            ranges: Sequence[tuple[int, int]],
             *,
             semaphore: asyncio.Semaphore | None = None,
-            verify_ciphertext_crc: bool | None = None,
         ) -> dict[int, bytes | memoryview]:
-            # Simulates a concurrent caller's release_caches() landing
-            # while this fetch (never itself tracked by Pool._chunks) was
-            # still in flight.
-            result = await real_read_chunks(
-                self, requests, semaphore=semaphore, verify_ciphertext_crc=verify_ciphertext_crc
-            )
+            # Simulates a concurrent release_caches() landing mid-fetch.
+            result = await real_read_chunks(self, stream_id, bucket_id, ranges, semaphore=semaphore)
             pool.release_caches()
             return result
 
@@ -491,51 +368,44 @@ class TestReadAcrossBuckets:
 
         result = await file.read(0, 2 * 4096)
 
-        assert result == _CHUNK_PLAINTEXTS[1] + bucket_1_chunk0  # correct regardless of the race
+        assert result == CHUNK_PLAINTEXTS[1] + bucket_1_chunk0  # correct despite the release
         assert (StreamId(0), BucketId(0), ChunkIdx(1)) not in pool._chunks
         assert (StreamId(0), BucketId(1), ChunkIdx(0)) not in pool._chunks
 
     async def test_read_spanning_two_separate_bucket_backed_extents(self, tmp_path: Path) -> None:
-        # bucket 0: chunk 0 at [0, 4096); bucket 1: chunk 0 at [4096, 8192)
-        # -- two separate DATA extents rather than one carrying run, so
-        # each individually takes _fill_data_extent()'s single-chunk fast
-        # path; what this test asserts is that the right *bucket* gets
-        # resolved for each, end to end through one read() call spanning
-        # both extents.
-        entries = _mapping_record(0, 0, 0, map_num=1) + _mapping_record(4096, 1, 0, map_num=1)
-        record_bytes = _record_head_bytes(map_num=2) + entries
-        comp_path = tmp_path / "Composition" / str(_STREAM_ID) / f"{_SESSION_ID}.com" / "c0"
+        # Two single-chunk DATA extents (bucket 0 at [0, 4096), bucket 1 at
+        # [4096, 8192)), each resolved to its own bucket by one read().
+        entries = mapping_record(0, 0, 0, map_num=1) + mapping_record(4096, 1, 0, map_num=1)
+        record_bytes = record_head_bytes(map_num=2) + entries
+        comp_path = tmp_path / "Composition" / str(STREAM_ID) / f"{SESSION_ID}.com" / "c0"
         comp_path.parent.mkdir(parents=True, exist_ok=True)
-        comp_path.write_bytes(_composition_header_bytes() + record_bytes)
-        _write_bucket(tmp_path / "Pool" / "0" / "0.buk", [_CHUNK_PLAINTEXTS[0]])
+        comp_path.write_bytes(composition_header_bytes() + record_bytes)
+        write_bucket(tmp_path / "Pool" / "0" / "0.buk", [CHUNK_PLAINTEXTS[0]])
         bucket_1_chunk0 = bytes([200]) * 4096
-        _write_bucket(tmp_path / "Pool" / "0" / "1.buk", [bucket_1_chunk0])
+        write_bucket(tmp_path / "Pool" / "0" / "1.buk", [bucket_1_chunk0])
 
         store = LocalFsStore(tmp_path)
         dir_cache = DirCache(store)
-        comp_reader = CompositionReader(store, dir_cache, "Composition", _STREAM_ID, _SESSION_ID)
+        comp_reader = CompositionReader(store, dir_cache, "Composition", STREAM_ID, SESSION_ID)
         pool = Pool(store, "Pool", dir_cache)
-        file = DedupFile(comp_reader, pool, _HEAD_OFF, size=8192)
+        file = DedupFile(comp_reader, pool, HEAD_OFF, size=8192)
 
         result = await file.read(0, 8192)
-        assert result == _CHUNK_PLAINTEXTS[0] + bucket_1_chunk0
+        assert result == CHUNK_PLAINTEXTS[0] + bucket_1_chunk0
 
 
 class TestStream:
     async def test_stream_reassembles_to_the_same_bytes_as_read(self, dedup_file: DedupFile) -> None:
-        whole = await dedup_file.read(0, _SIZE)
+        whole = await dedup_file.read(0, SIZE)
         reassembled = b"".join([chunk async for _offset, chunk in dedup_file.stream(block=1000)])
         assert reassembled == whole
 
     async def test_stream_offsets_are_contiguous_and_correct(self, dedup_file: DedupFile) -> None:
         offsets = [offset async for offset, _chunk in dedup_file.stream(block=8192)]
-        assert offsets == list(range(0, _SIZE, 8192))
+        assert offsets == list(range(0, SIZE, 8192))
 
     async def test_stream_is_cancellable_via_its_surrounding_task(self, tmp_path: Path) -> None:
-        """Cancelled via the surrounding Task, not a ``cancel=``
-        parameter — must propagate ``asyncio.CancelledError`` out of the
-        async generator's consumer."""
-        file, store = _build_blocking_dedup_file(tmp_path)
+        file, store = build_blocking_dedup_file(tmp_path)
 
         async def consume() -> list[int]:
             store.armed = True
@@ -548,13 +418,15 @@ class TestStream:
             await task
 
     async def test_stream_requires_known_size(self, tmp_path: Path) -> None:
-        _write_standard_composition(tmp_path / "Composition")
-        _write_bucket(tmp_path / "Pool" / "0" / "0.buk", _CHUNK_PLAINTEXTS)
+        write_composition_entries(
+            tmp_path / "Composition", standard_entries(), stream_id=STREAM_ID, session_id=SESSION_ID
+        )
+        write_bucket(tmp_path / "Pool" / "0" / "0.buk", CHUNK_PLAINTEXTS)
         store = LocalFsStore(tmp_path)
         dir_cache = DirCache(store)
-        comp_reader = CompositionReader(store, dir_cache, "Composition", _STREAM_ID, _SESSION_ID)
+        comp_reader = CompositionReader(store, dir_cache, "Composition", STREAM_ID, SESSION_ID)
         pool = Pool(store, "Pool", dir_cache)
-        unsized = DedupFile(comp_reader, pool, _HEAD_OFF, size=None)
+        unsized = DedupFile(comp_reader, pool, HEAD_OFF, size=None)
         with pytest.raises(ValueError, match="known size"):
             await anext(unsized.stream())
 
@@ -562,42 +434,37 @@ class TestStream:
 class TestExportTo:
     async def test_sparse_export_matches_read_content(self, dedup_file: DedupFile, tmp_path: Path) -> None:
         dst = tmp_path / "out.bin"
-        result = await dedup_file.export_to(dst, sparse=True)
-        assert dst.stat().st_size == _SIZE
-        assert dst.read_bytes() == await dedup_file.read(0, _SIZE)
-        assert result.logical_size == _SIZE
+        result = await _export_to(dedup_file, dst, sparse=True)
+        assert dst.stat().st_size == SIZE
+        assert dst.read_bytes() == await dedup_file.read(0, SIZE)
+        assert result.logical_size == SIZE
         assert result.bytes_written == 3 * 4096 + 4 * 4096
         assert result.zeros == 2 * 4096
         assert result.holes == 4096 + 4096
 
     async def test_non_sparse_export_matches_read_content(self, dedup_file: DedupFile, tmp_path: Path) -> None:
         dst = tmp_path / "out.bin"
-        result = await dedup_file.export_to(dst, sparse=False)
-        assert dst.stat().st_size == _SIZE
-        assert dst.read_bytes() == await dedup_file.read(0, _SIZE)
+        result = await _export_to(dedup_file, dst, sparse=False)
+        assert dst.stat().st_size == SIZE
+        assert dst.read_bytes() == await dedup_file.read(0, SIZE)
         assert result.bytes_written == 3 * 4096 + 4 * 4096
 
     async def test_export_reports_progress(self, dedup_file: DedupFile, tmp_path: Path) -> None:
-        calls: list[tuple[int, int]] = []
+        calls: list[int] = []
 
-        async def _progress(done: int, total: int) -> None:
-            calls.append((done, total))
+        async def _progress(written: int) -> None:
+            calls.append(written)
 
-        await dedup_file.export_to(tmp_path / "out.bin", progress=_progress)
-        assert calls  # at least one progress callback for the DATA extents
-        # Denominator is the real DATA-byte total, not the logical size —
-        # holes/zeros never count toward either side of the progress
-        # fraction (same convention physical order already used).
-        assert calls[-1] == (3 * 4096 + 4 * 4096, 3 * 4096 + 4 * 4096)
+        await _export_to(dedup_file, tmp_path / "out.bin", progress=_progress)
+        # One report per contiguous DATA write ([0,12288) and [24576,40960)); holes and zeros never count.
+        assert sorted(calls) == [3 * 4096, 4 * 4096]
 
     async def test_export_is_cancellable_and_still_closes_its_partial_output(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """Cancelled via the surrounding Task, not a ``cancel=``
-        parameter. The partial destination file must not leak an open
-        fd: ``export_scheduler.export_to()`` closes it in ``finally``,
-        which runs on ``asyncio.CancelledError`` too."""
-        file, store = _build_blocking_dedup_file(tmp_path)
+        """A cancelled export closes the destination fd: ``run_sink_export`` calls
+        ``LocalFileSink.abort()`` on ``asyncio.CancelledError`` too."""
+        file, store = build_blocking_dedup_file(tmp_path)
         dst = tmp_path / "out.bin"
 
         opened_fds: list[int] = []
@@ -620,7 +487,7 @@ class TestExportTo:
 
         async def do_export() -> object:
             store.armed = True
-            return await file.export_to(dst)
+            return await _export_to(file, dst)
 
         task = asyncio.create_task(do_export())
         await store.blocked.wait()
@@ -628,30 +495,26 @@ class TestExportTo:
         with pytest.raises(asyncio.CancelledError):
             await task
 
-        assert len(opened_fds) == 1  # the export really did get as far as opening its output
-        assert closed_fds == opened_fds  # ...and the cancelled export still closed it
-        assert dst.exists()
+        assert len(opened_fds) == 1  # the export reached opening its output
+        assert closed_fds == opened_fds  # ...and closed it despite the cancel
+        assert not dst.exists()  # nothing written, so no file is left
 
     async def test_export_clips_a_trailing_data_extent_that_runs_past_size(self, tmp_path: Path) -> None:
-        """``extents()`` doesn't truncate its own boundary entries to
-        size, so the logical-order export walk
-        must clip a trailing DATA extent that runs past the file's declared size —
-        reproduced here by cutting the standard fixture's size 100 bytes
-        into its last DATA extent (``[24576, 40960)``, not the trailing
-        HOLE) instead of using the fixture's own exactly-chunk-aligned
-        ``_SIZE``.
-        """
+        """``_extents()`` doesn't clip to size, so the export must clip a trailing
+        DATA extent past the declared size: here 100 bytes into ``[24576, 40960)``."""
         truncated_size = 40960 - 100
-        _write_standard_composition(tmp_path / "Composition")
-        _write_bucket(tmp_path / "Pool" / "0" / "0.buk", _CHUNK_PLAINTEXTS)
+        write_composition_entries(
+            tmp_path / "Composition", standard_entries(), stream_id=STREAM_ID, session_id=SESSION_ID
+        )
+        write_bucket(tmp_path / "Pool" / "0" / "0.buk", CHUNK_PLAINTEXTS)
         store = LocalFsStore(tmp_path)
         dir_cache = DirCache(store)
-        comp_reader = CompositionReader(store, dir_cache, "Composition", _STREAM_ID, _SESSION_ID)
+        comp_reader = CompositionReader(store, dir_cache, "Composition", STREAM_ID, SESSION_ID)
         pool = Pool(store, "Pool", dir_cache)
-        file = DedupFile(comp_reader, pool, _HEAD_OFF, size=truncated_size)
+        file = DedupFile(comp_reader, pool, HEAD_OFF, size=truncated_size)
 
         dst = tmp_path / "out.bin"
-        result = await file.export_to(dst)
+        result = await _export_to(file, dst)
 
         # [0,12288)=DATA, [12288,20480)=ZERO, [20480,24576)=HOLE,
         # [24576,40960)=DATA clipped to 40860 -> 16284 of its normal 16384.
@@ -663,31 +526,150 @@ class TestExportTo:
         assert dst.read_bytes() == await file.read(0, truncated_size)
 
     async def test_export_requires_known_size(self, tmp_path: Path) -> None:
-        _write_standard_composition(tmp_path / "Composition")
-        _write_bucket(tmp_path / "Pool" / "0" / "0.buk", _CHUNK_PLAINTEXTS)
+        write_composition_entries(
+            tmp_path / "Composition", standard_entries(), stream_id=STREAM_ID, session_id=SESSION_ID
+        )
+        write_bucket(tmp_path / "Pool" / "0" / "0.buk", CHUNK_PLAINTEXTS)
         store = LocalFsStore(tmp_path)
         dir_cache = DirCache(store)
-        comp_reader = CompositionReader(store, dir_cache, "Composition", _STREAM_ID, _SESSION_ID)
+        comp_reader = CompositionReader(store, dir_cache, "Composition", STREAM_ID, SESSION_ID)
         pool = Pool(store, "Pool", dir_cache)
-        unsized = DedupFile(comp_reader, pool, _HEAD_OFF, size=None)
+        unsized = DedupFile(comp_reader, pool, HEAD_OFF, size=None)
         with pytest.raises(ValueError, match="known size"):
-            await unsized.export_to(tmp_path / "out.bin")
+            await _export_to(unsized, tmp_path / "out.bin")
 
 
-class TestSupportsConcurrentExport:
-    async def test_dedup_file_supports_concurrent_export(self, dedup_file: DedupFile) -> None:
-        assert dedup_file.supports_concurrent_export is True
+async def _export_range_to(
+    file_like: DedupFile | ByteRangeView, dst: Path, start: int, end: int, *, sparse: bool = True
+) -> ExportResult:
+    """``export_range`` of ``[start, end)`` into an unstaged ``LocalFileSink`` at ``dst``."""
+    sink = LocalFileSink(dst, staged=False)
+    return await run_sink_export(
+        sink, end - start, sparse=sparse, body=lambda: file_like.export_range(sink, start, end, sparse=sparse)
+    )
 
-    async def test_byte_range_view_supports_concurrent_export(self, dedup_file: DedupFile) -> None:
-        view = dedup_file.view(24576, 4 * 4096)
-        assert view.supports_concurrent_export is True
+
+class TestExportRange:
+    async def test_a_sub_range_lands_at_offsets_relative_to_its_start(
+        self, dedup_file: DedupFile, tmp_path: Path
+    ) -> None:
+        dst = tmp_path / "out.bin"
+        result = await _export_range_to(dedup_file, dst, 4096, 24576, sparse=False)
+        assert dst.read_bytes() == await dedup_file.read(4096, 24576 - 4096)
+        assert result.logical_size == 24576 - 4096
+
+    async def test_a_view_sub_range_is_taken_in_the_views_own_coordinates(
+        self, dedup_file: DedupFile, tmp_path: Path
+    ) -> None:
+        view = dedup_file.view(8192, 24576)
+        dst = tmp_path / "out.bin"
+        result = await _export_range_to(view, dst, 4096, 12288, sparse=False)
+        assert dst.read_bytes() == await view.read(4096, 12288 - 4096)
+        assert result.logical_size == 12288 - 4096
+
+    async def test_the_whole_range_is_the_whole_export(self, dedup_file: DedupFile, tmp_path: Path) -> None:
+        dst = tmp_path / "out.bin"
+        result = await _export_range_to(dedup_file, dst, 0, SIZE)
+        assert dst.read_bytes() == await dedup_file.read(0, SIZE)
+        assert result.logical_size == SIZE
+
+    @pytest.mark.parametrize(("start", "end"), [(-1, 4096), (8192, 4096), (0, SIZE + 1)])
+    async def test_a_range_outside_the_file_is_rejected(
+        self, dedup_file: DedupFile, tmp_path: Path, start: int, end: int
+    ) -> None:
+        with pytest.raises(ValueError, match="is not inside"):
+            await dedup_file.export_range(LocalFileSink(tmp_path / "out.bin", staged=False), start, end)
+
+    @pytest.mark.parametrize(("start", "end"), [(-1, 4096), (8192, 4096), (0, 16385)])
+    async def test_a_range_outside_the_view_is_rejected(
+        self, dedup_file: DedupFile, tmp_path: Path, start: int, end: int
+    ) -> None:
+        view = dedup_file.view(8192, 16384)
+        with pytest.raises(ValueError, match="is not inside"):
+            await view.export_range(LocalFileSink(tmp_path / "out.bin", staged=False), start, end)
+
+    async def test_a_range_not_starting_on_a_chunk_boundary_is_rejected(
+        self, dedup_file: DedupFile, tmp_path: Path
+    ) -> None:
+        sink = LocalFileSink(tmp_path / "out.bin", staged=False)
+        with pytest.raises(ValueError, match="multiple of 4096"):
+            await dedup_file.export_range(sink, 100, 8192)
+        with pytest.raises(ValueError, match="multiple of 4096"):
+            await dedup_file.view(100, 20000).export_range(sink, 0, 4096)  # the view itself starts mid-chunk
+        await _export_range_to(dedup_file.view(4096, 20000), tmp_path / "ok.bin", 0, 4096)  # aligned in the base file
+
+    async def test_planned_bytes_counts_the_real_data_in_the_range(self, dedup_file: DedupFile) -> None:
+        assert await dedup_file.planned_bytes(0, SIZE) == 3 * 4096 + 4 * 4096
+        assert await dedup_file.planned_bytes(0, 0) == 0
+        view = dedup_file.view(8192, 24576)
+        assert await view.planned_bytes(0, 24576) == await dedup_file.planned_bytes(8192, 8192 + 24576)
+        assert await view.planned_bytes(4096, 8192) == await dedup_file.planned_bytes(12288, 16384)
+
+
+class TestExportRangeHelpers:
+    def test_a_range_inside_the_size_is_accepted(self) -> None:
+        size = 3
+        accepted: set[tuple[int, int]] = set()
+        for start in range(-1, size + 2):
+            for end in range(-1, size + 2):
+                try:
+                    validate_export_range(start, end, size)
+                except ValueError:
+                    continue
+                accepted.add((start, end))
+        assert accepted == {(s, e) for s in range(size + 1) for e in range(s, size + 1)}
+
+    @pytest.mark.parametrize(("start", "end", "size"), [(-1, 5, 10), (6, 5, 10), (0, 11, 10)])
+    def test_a_range_outside_the_size_is_rejected(self, start: int, end: int, size: int) -> None:
+        with pytest.raises(ValueError, match="is not inside"):
+            validate_export_range(start, end, size)
+
+    async def test_read_blocks_yields_range_relative_offsets_in_block_sized_reads(self) -> None:
+        reads: list[tuple[int, int | None]] = []
+
+        @faithful_to(ContentSource)
+        class _Source:
+            size = 100
+
+            async def read(self, offset: int = 0, length: int | None = None) -> bytes:
+                reads.append((offset, length))
+                return b"x" * (length or 0)
+
+        blocks = [(offset, len(data)) async for offset, data in read_blocks(_Source(), 10, 35, block=10)]
+        assert blocks == [(0, 10), (10, 10), (20, 5)]
+        assert reads == [(10, 10), (20, 10), (30, 5)]
+
+    async def test_read_blocks_advances_by_the_requested_length_when_a_read_comes_back_short(self) -> None:
+        @faithful_to(ContentSource)
+        class _Source:
+            size = 100
+
+            async def read(self, offset: int = 0, length: int | None = None) -> bytes:
+                return b"x"
+
+        assert [offset async for offset, _ in read_blocks(_Source(), 0, 25, block=10)] == [0, 10, 20]
+
+
+class TestValidateReadArgs:
+    def test_accepts_non_negative_arguments(self) -> None:
+        accepted: set[tuple[int, int | None]] = set()
+        for offset in (-2, -1, 0, 5):
+            for length in (-2, -1, 0, 10, None):
+                try:
+                    validate_read_args(offset, length)
+                except ValueError:
+                    continue
+                accepted.add((offset, length))
+        assert accepted == {(offset, length) for offset in (0, 5) for length in (0, 10, None)}
+
+    @pytest.mark.parametrize(("offset", "length"), [(-1, None), (0, -1), (-2, -2)])
+    def test_rejects_a_negative_argument(self, offset: int, length: int | None) -> None:
+        with pytest.raises(ValueError, match=r"read\(offset=.*\): offset/length must be non-negative"):
+            validate_read_args(offset, length)
 
 
 class TestByteRangeView:
     async def test_base_and_offset_properties(self, dedup_file: DedupFile) -> None:
-        """``export_scheduler.py``'s bucket-major planning needs a view's
-        own base file and window start to schedule against the base
-        file's ``Pool``."""
         view = dedup_file.view(24576, 4 * 4096)
         assert view.base is dedup_file
         assert view.offset == 24576
@@ -695,12 +677,12 @@ class TestByteRangeView:
     async def test_read_translates_coordinates(self, dedup_file: DedupFile) -> None:
         view = dedup_file.view(24576, 4 * 4096)  # the repeated-template DATA region
         assert view.size == 4 * 4096
-        assert await view.read(0, 4096) == _CHUNK_PLAINTEXTS[3]
-        assert await view.read(4096, 4096) == _CHUNK_PLAINTEXTS[4]
+        assert await view.read(0, 4096) == CHUNK_PLAINTEXTS[3]
+        assert await view.read(4096, 4096) == CHUNK_PLAINTEXTS[4]
 
     async def test_read_default_length_reads_to_view_end(self, dedup_file: DedupFile) -> None:
         view = dedup_file.view(0, 4096)
-        assert await view.read(0) == _CHUNK_PLAINTEXTS[0]
+        assert await view.read(0) == CHUNK_PLAINTEXTS[0]
 
     async def test_over_length_read_clamps_instead_of_raising(self, dedup_file: DedupFile) -> None:
         view = dedup_file.view(0, 100)
@@ -721,13 +703,10 @@ class TestByteRangeView:
     async def test_stream_reassembles_correctly(self, dedup_file: DedupFile) -> None:
         view = dedup_file.view(0, 12288)  # exactly the first DATA region
         reassembled = b"".join([chunk async for _offset, chunk in view.stream(block=1000)])
-        assert reassembled == b"".join(_CHUNK_PLAINTEXTS[0:3])
+        assert reassembled == b"".join(CHUNK_PLAINTEXTS[0:3])
 
     async def test_stream_is_cancellable_via_its_surrounding_task(self, tmp_path: Path) -> None:
-        """Same cancellation contract as ``TestStream``'s own test — a
-        view's stream must propagate ``asyncio.CancelledError``
-        just like the whole file's does."""
-        file, store = _build_blocking_dedup_file(tmp_path)
+        file, store = build_blocking_dedup_file(tmp_path)
         view = file.view(0, 12288)
 
         async def consume() -> list[int]:
@@ -743,21 +722,17 @@ class TestByteRangeView:
     async def test_export_to_writes_the_view_window_only(self, dedup_file: DedupFile, tmp_path: Path) -> None:
         view = dedup_file.view(24576, 4 * 4096)
         dst = tmp_path / "view.bin"
-        result = await view.export_to(dst, sparse=False)
+        result = await _export_to(view, dst, sparse=False)
         assert dst.stat().st_size == 4 * 4096
         assert dst.read_bytes() == await view.read(0, 4 * 4096)
         assert result.logical_size == 4 * 4096
         assert result.bytes_written == 4 * 4096
 
     async def test_export_to_clips_a_window_ending_mid_chunk(self, dedup_file: DedupFile, tmp_path: Path) -> None:
-        """Same trailing-extent clipping as ``TestExportTo``'s (the
-        underlying logical-order walk behaves identically for both
-        callers), for a view — the FS/SaaS common case: a file
-        window into a shared image, ending mid-chunk (the normal case
-        for a real file size)."""
+        """A view ending mid-chunk is clipped to its length, as in ``TestExportTo``."""
         view = dedup_file.view(24576, 4 * 4096 - 100)
         dst = tmp_path / "view.bin"
-        result = await view.export_to(dst)
+        result = await _export_to(view, dst)
         assert dst.stat().st_size == 4 * 4096 - 100
         assert dst.read_bytes() == await view.read(0, 4 * 4096 - 100)
         assert result.bytes_written == 4 * 4096 - 100
@@ -765,56 +740,33 @@ class TestByteRangeView:
 
 class TestBinarySearchPerformance:
     async def test_read_near_the_end_of_a_large_map_does_not_linear_scan(self, tmp_path: Path) -> None:
-        # 2000 sequential 1-chunk MAPPING records; reading near the very
-        # end must resolve via CompositionRecord's binary search, not a
-        # linear walk from record 0 — verified indirectly via a read-count
-        # ceiling, mirroring test_dedup_composition_reader.py's approach.
+        # With 2000 one-chunk MAPPING records, a read near the end must resolve by
+        # binary search, bounded via a store read-count ceiling.
         n = 2000
         parts = []
         for i in range(n):
-            # every record points at the same single chunk (bucket 0, chunk
-            # 0) — only file_chunk_idx (hence file_offset) varies, which is
-            # all this test needs to exercise the binary search.
-            addr = ChunkAddress(StreamId(0), BucketId(0), ChunkIdx(0)).to_int()
+            # Every record points at (bucket 0, chunk 0); only file_offset varies.
+            addr = chunk_address(0, 0, 0).to_int()
             parts.append(
-                _chunk_map_record_bytes(
+                chunk_map_record_bytes(
                     kind_value=ChunkMapKind.MAPPING.value, file_chunk_idx=i, addr_int=addr, tail_u32=(1 << 16)
                 )
             )
-        record_bytes = _record_head_bytes(map_num=n) + b"".join(parts)
-        comp_path = tmp_path / "Composition" / str(_STREAM_ID) / f"{_SESSION_ID}.com" / "c0"
+        record_bytes = record_head_bytes(map_num=n) + b"".join(parts)
+        comp_path = tmp_path / "Composition" / str(STREAM_ID) / f"{SESSION_ID}.com" / "c0"
         comp_path.parent.mkdir(parents=True, exist_ok=True)
-        comp_path.write_bytes(_composition_header_bytes() + record_bytes)
-        _write_bucket(tmp_path / "Pool" / "0" / "0.buk", [bytes([0]) * 4096] * 1)
+        comp_path.write_bytes(composition_header_bytes() + record_bytes)
+        write_bucket(tmp_path / "Pool" / "0" / "0.buk", [bytes([0]) * 4096] * 1)
 
         store = LocalFsStore(tmp_path)
-        counting_store = _CountingStore(store)
+        counting_store = CountingStore(store)
         dir_cache = DirCache(counting_store)
-        comp_reader = CompositionReader(counting_store, dir_cache, "Composition", _STREAM_ID, _SESSION_ID)
+        comp_reader = CompositionReader(counting_store, dir_cache, "Composition", STREAM_ID, SESSION_ID)
         pool = Pool(counting_store, "Pool", dir_cache)
-        file = DedupFile(comp_reader, pool, _HEAD_OFF, size=n * 4096)
+        file = DedupFile(comp_reader, pool, HEAD_OFF, size=n * 4096)
 
         target_offset = (n - 1) * 4096
         reads_before = counting_store.read_count
         await file.read(target_offset, 4096)
         reads_after = counting_store.read_count
         assert reads_after - reads_before < 25
-
-
-class _CountingStore:
-    def __init__(self, backing: LocalFsStore) -> None:
-        self._backing = backing
-        self.read_count = 0
-
-    async def read(self, path: str, offset: int = 0, length: int | None = None) -> bytes:
-        self.read_count += 1
-        return await self._backing.read(path, offset, length)
-
-    async def size(self, path: str) -> int:
-        return await self._backing.size(path)
-
-    async def exists(self, path: str) -> bool:
-        return await self._backing.exists(path)
-
-    async def listdir(self, path: str) -> list[str]:
-        return await self._backing.listdir(path)

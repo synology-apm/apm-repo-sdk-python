@@ -3,21 +3,22 @@ recording/replay machinery, used nowhere under ``tests/unit/``."""
 
 from __future__ import annotations
 
+import copy
 import dataclasses
-import importlib.util
-import sys
 from collections.abc import Awaitable, Callable, Iterator
 from pathlib import Path
-from types import ModuleType
+from typing import Any
 from unittest.mock import patch
 
 import pytest
 
+from support.recording import anonymize_catalog_metadata
+from support.recording.fixture_store import AliasedStore, RecordingStore, ReplayStore, write_fixture_text
+from support.recording.manifest import load_targets, sample_directory_renames
 from synology_apm_repo.sdk.dedup.pool import BucketReader
 from synology_apm_repo.sdk.storage.base import ObjectStore
 from synology_apm_repo.sdk.storage.local import LocalFsStore
-from synology_apm_repo.sdk.storage.recording import RecordingStore, ReplayStore, write_fixture_text
-from synology_apm_repo.sdk.units.base import ContentSource, RestorableUnit
+from synology_apm_repo.sdk.units.base import ContentSource, Node, RestorableUnit
 
 _FIXTURES = Path(__file__).parent.parent / "fixtures"
 
@@ -26,15 +27,12 @@ _CONTENT_GUARD_INSTALLED = pytest.StashKey[bool]()
 
 
 class ContentRecordingBlocked(RuntimeError):
-    """Raised during a ``--record-against`` session when a test reads real
-    backed-up content -- a unit's own bytes via ``RestorableUnit.open()``,
-    or a dedup chunk's own plaintext via ``BucketReader.read_chunk``/
-    ``read_chunks`` -- without declaring it needs to. See ``record_target``'s
-    ``allow_content`` parameter."""
+    """Raised when a test reads real backed-up content without
+    ``record_target(..., allow_content=True)``."""
 
 
 _BLOCKED_MESSAGE = (
-    "this test read real backed-up content during --record-against without record_target(..., "
+    "this test read real backed-up content without record_target(..., "
     "allow_content=True) -- per tests/CLAUDE.md, a replay test proves structural/addressing "
     "correctness, not content meaning: narrow the test to a structural check (kind/size/is_leaf) "
     "instead, or pass allow_content=True if it genuinely needs real content bytes as a structural "
@@ -42,43 +40,33 @@ _BLOCKED_MESSAGE = (
 )
 
 
-class _GuardedContentSource:
-    """Wraps a real ``ContentSource`` for the duration of a recording
-    session, refusing to materialize its actual bytes unless the owning
-    test opted in via ``record_target(..., allow_content=True)``.
-    ``size``/``supports_concurrent_export`` pass through unguarded -- they
-    carry no content, only metadata a provider already resolved without
-    reading real bytes."""
-
-    def __init__(self, inner: ContentSource) -> None:
-        self._inner = inner
-
-    @property
-    def size(self) -> int | None:
-        return self._inner.size
-
-    @property
-    def supports_concurrent_export(self) -> bool:
-        return self._inner.supports_concurrent_export
-
-    async def read(self, *args: object, **kwargs: object) -> bytes:
-        raise ContentRecordingBlocked(_BLOCKED_MESSAGE)
-
-    def stream(self, *args: object, **kwargs: object) -> object:
-        raise ContentRecordingBlocked(_BLOCKED_MESSAGE)
-
-    async def export_to(self, *args: object, **kwargs: object) -> object:
-        raise ContentRecordingBlocked(_BLOCKED_MESSAGE)
+async def _blocked_read(*args: object, **kwargs: object) -> object:
+    raise ContentRecordingBlocked(_BLOCKED_MESSAGE)
 
 
-#: Captured at import time, before any test can patch ``RestorableUnit.open``
-#: -- always the real, unwrapped implementation, regardless of how many
-#: guard layers get installed/torn down across the session.
-_real_restorable_unit_open = RestorableUnit.open
+def _blocked_stream(*args: object, **kwargs: object) -> object:
+    raise ContentRecordingBlocked(_BLOCKED_MESSAGE)
 
 
-def _guarded_restorable_unit_open(self: RestorableUnit) -> ContentSource:
-    return _GuardedContentSource(_real_restorable_unit_open(self))  # type: ignore[return-value]
+def _guarded_content(inner: ContentSource) -> ContentSource:
+    """A shallow copy of ``inner`` whose byte-reading methods refuse to run.
+    A copy rather than a wrapper, so ``isinstance`` checks and metadata
+    (``size``, a disk's fragments) still see the real type."""
+    guarded = copy.copy(inner)
+    for name in ("read", "planned_bytes", "export_range"):
+        setattr(guarded, name, _blocked_read)
+    setattr(guarded, "stream", _blocked_stream)  # noqa: B010 -- an instance-level override mypy can't type
+    return guarded
+
+
+#: The real ``RestorableUnit.of``, captured before any test can patch it.
+_real_restorable_unit_of = RestorableUnit.of.__func__  # type: ignore[attr-defined]
+
+
+def _guarded_restorable_unit_of(
+    cls: type[RestorableUnit], /, node: Node, content: ContentSource, **changes: Any
+) -> RestorableUnit:
+    return _real_restorable_unit_of(cls, node, _guarded_content(content), **changes)  # type: ignore[no-any-return]
 
 
 async def _guarded_bucket_read_chunk(self: object, *args: object, **kwargs: object) -> bytes:
@@ -90,30 +78,19 @@ async def _guarded_bucket_read_chunks(self: object, *args: object, **kwargs: obj
 
 
 def _install_content_guard(request: pytest.FixtureRequest) -> None:
-    """Installs the ``RestorableUnit.open()``/``BucketReader.read_chunk``/
-    ``read_chunks`` guard for the rest of this one test -- idempotent per
-    test node, since ``record_target`` may be called more than once (e.g.
-    a test recording against two fixture names). Two separate choke
-    points, not one: ``RestorableUnit.open()`` covers every ``units``-layer
-    consumer (``FsProvider``, ``DriveProvider``, ``MailProvider``, ...)
-    without touching each provider's own construction site;
-    ``BucketReader.read_chunk``/``read_chunks`` covers the dedup layer's
-    own real-content reads (a ``DedupFile`` built directly off
-    ``DedupRepo.open_file()``, or ``Pool.read_chunk()`` called
-    directly) -- neither choke point alone reaches the other layer. A raw
-    ``ObjectStore.read()`` call straight on a real backend (this project's
-    lowest-level crypto/format tests, e.g. ``test_crypto.py``'s real-bytes
-    chunk-decrypt regression test) is deliberately left unguarded: it
-    can't be distinguished from a catalog-metadata read without a path
-    heuristic, and by the time
-    a test is reaching for the raw store directly it has already made a
-    conscious, reviewable choice -- unlike the incidental
-    ``.unit(node).open().read()`` this guard exists to catch."""
+    """Installs the content guard for the rest of this one test (idempotent
+    per test node), on a replay and a recording alike, so a read the
+    recording never made (a background preview) fails the same way in both.
+    Two choke points cover the two layers that read real content:
+    ``RestorableUnit.of()`` (every unit a provider builds) and
+    ``BucketReader.read_chunk``/``read_chunks`` (the dedup layer, e.g. a
+    ``DedupFile`` from ``DedupRepo.open_file()``). A raw ``ObjectStore.read()``
+    stays unguarded: it can't be told apart from a catalog-metadata read."""
     if request.node.stash.get(_CONTENT_GUARD_INSTALLED, False):
         return
     request.node.stash[_CONTENT_GUARD_INSTALLED] = True
     for patcher in (
-        patch.object(RestorableUnit, "open", _guarded_restorable_unit_open),
+        patch.object(RestorableUnit, "of", classmethod(_guarded_restorable_unit_of)),
         patch.object(BucketReader, "read_chunk", _guarded_bucket_read_chunk),
         patch.object(BucketReader, "read_chunks", _guarded_bucket_read_chunks),
     ):
@@ -121,33 +98,21 @@ def _install_content_guard(request: pytest.FixtureRequest) -> None:
         request.addfinalizer(patcher.stop)
 
 
-#: Paths this session actually wrote via record_target() -- populated by
-#: pytest_sessionfinish's own write pass below (see _RECORDING_SESSIONS),
-#: consumed by that same hook's post-recording anonymize pass. A plain
-#: module-level set (not a fixture) since it must survive across every test
-#: in the session, not just one.
+#: Paths ``pytest_sessionfinish`` wrote this session, then anonymizes.
 _WRITTEN_FIXTURES: set[Path] = set()
 
 
 @dataclasses.dataclass
 class _RecordingSession:
-    """One fixture name's shared recording state for the whole
-    ``--record-against`` invocation -- shared, not built fresh per test, so
-    multiple tests recording into the same fixture accumulate into the one
-    store instead of each overwriting the other's work."""
+    """One fixture name's recording state, shared by every test in the
+    ``--record-against`` invocation that requests it."""
 
     store: RecordingStore
-    #: AND-reduced across every test that calls record_target() with this
-    #: fixture's name: stays True only if every one of them passes. A test
-    #: that never even touches this fixture leaves it alone.
+    #: True only if every test that requested this fixture passed.
     all_passed: bool = True
 
 
-#: Keyed by the fixture path each name resolves to, populated the first time
-#: any test in this invocation calls record_target(name) -- shared, not
-#: rebuilt per test, so multiple tests recording into the same fixture
-#: accumulate into one RecordingStore instead of each overwriting the
-#: other's work.
+#: Keyed by fixture path; populated the first time a test requests that name.
 _RECORDING_SESSIONS: dict[Path, _RecordingSession] = {}
 
 
@@ -159,7 +124,7 @@ def pytest_addoption(parser: pytest.Parser) -> None:
         help="Record every tests/fixtures/*.json.gz a test's own record_target() call "
         "asks for against a real backend, instead of replaying the committed one. "
         "'local:' uses the given path directly as the store root (absolute, or "
-        "relative to cwd); 'profile:' goes through profiles.build_store(). Run "
+        "relative to cwd); 'profile:' goes through profiles.store_from_profile(). Run "
         "pytest once per real root you want to record from, scoped to just the "
         "test(s) that root backs (e.g. -k or a node id) -- one invocation, one "
         "backend.",
@@ -168,68 +133,49 @@ def pytest_addoption(parser: pytest.Parser) -> None:
         "--no-anonymize",
         action="store_true",
         default=False,
-        help="With --record-against: skip the automatic scripts/anonymize_catalog_metadata.py "
+        help="With --record-against: skip the automatic tests/support/recording/anonymize_catalog_metadata.py "
         "pass this session would otherwise run (once, at session end) over exactly the "
         "fixtures this run actually wrote. Has no effect without --record-against -- a normal "
         "run never writes a fixture at all.",
     )
 
 
-def _load_anonymize_module() -> ModuleType:
-    """``scripts/`` isn't an installed package, so this loads it by path --
-    the same technique ``tests/unit/scripts/test_anonymize_catalog_metadata.py``
-    already uses. Registered in ``sys.modules`` before executing because
-    the module's ``@dataclass`` resolves its ``from __future__ import
-    annotations`` string annotations via ``sys.modules[cls.__module__]``
-    at class-definition time."""
-    script_path = Path(__file__).parent.parent.parent / "scripts" / "anonymize_catalog_metadata.py"
-    spec = importlib.util.spec_from_file_location("anonymize_catalog_metadata", script_path)
-    assert spec is not None and spec.loader is not None
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[spec.name] = module
-    spec.loader.exec_module(module)
-    return module
+def pytest_configure(config: pytest.Config) -> None:
+    """Refuses ``--record-against`` under xdist: each worker would keep its own
+    ``_RECORDING_SESSIONS`` and write, then anonymize, only its share of a
+    fixture's calls."""
+    # -n and --tx are xdist's two ways to start workers; --dist alone starts none.
+    distributed = config.getoption("numprocesses", None) or config.getoption("tx", None)
+    if config.getoption("--record-against") and distributed:
+        raise pytest.UsageError("--record-against records in one process; drop -n/--tx")
 
 
 def pytest_sessionfinish(session: pytest.Session, exitstatus: int) -> None:
-    """Writes every ``record_target()`` recording accumulated this session
-    (see ``_RECORDING_SESSIONS``/``record_target`` below) whose sharing
-    tests *all* passed, then runs ``scripts/anonymize_catalog_metadata.py``
-    once, in one batch, over exactly the fixtures this session actually
-    wrote -- so recording a fixture is anonymized by default rather than
-    relying on a separate manual step someone can forget (see
-    ``CONTRIBUTING.md``'s "Sample data" section). Both passes are a no-op
-    when nothing was recorded (every normal `make test`/CI run); the
-    anonymize pass alone is skipped if ``--no-anonymize`` was passed.
+    """Writes every recording whose sharing tests all passed, then runs
+    ``tests/support/recording/anonymize_catalog_metadata.py`` once over exactly the fixtures
+    written (skipped by ``--no-anonymize``); a no-op on a normal run.
 
-    One anonymize batch across every fixture this run wrote, not one call
-    per fixture right after each is written: some sensitive values only
-    survive as a path segment in *one* fixture while their own owning
-    catalog row lives in a *different* fixture recorded in the same run
-    -- anonymizing each in isolation as soon as it's written would miss
-    that."""
+    Anonymization is one batch, not per fixture: a sensitive value can
+    survive as a path segment in one fixture while its owning catalog row
+    lives in another fixture from the same run."""
     for path, recording in _RECORDING_SESSIONS.items():
         if recording.all_passed:
             write_fixture_text(path, recording.store.dump())
             _WRITTEN_FIXTURES.add(path)
         else:
-            print(f"skipped writing {path} -- at least one test sharing it failed this run")
+            print(f"skipped writing {path} -- at least one test sharing it failed this run")  # noqa: T201
 
     if not _WRITTEN_FIXTURES or session.config.getoption("--no-anonymize"):
         return
-    anonymize_module = _load_anonymize_module()
-    changed = anonymize_module.anonymize_fixtures(sorted(_WRITTEN_FIXTURES))
+    changed = anonymize_catalog_metadata.anonymize_fixtures(sorted(_WRITTEN_FIXTURES))
     for path in changed:
-        print(f"anonymized {path}")
+        print(f"anonymized {path}")  # noqa: T201
 
 
 @pytest.hookimpl(hookwrapper=True)
 def pytest_runtest_makereport(item: pytest.Item, call: pytest.CallInfo[None]) -> Iterator[None]:
-    """Stashes whether a test's own call phase passed, so ``record_target``'s
-    own finalizer (below) can mark a shared recording as not safe to write
-    when any test sharing it fails against the real backend it was pointed
-    at -- "if the sample fails, the recording fails," not silently kept or
-    patched around."""
+    """Stashes whether a test's call phase passed, so ``record_target``'s
+    finalizer can withhold a shared recording when any sharing test fails."""
     outcome = yield
     report = outcome.get_result()  # type: ignore[attr-defined]
     if report.when == "call":
@@ -246,12 +192,12 @@ async def _resolve_record_backend(spec: str) -> ObjectStore:
         root = Path(rest)
         if not root.is_dir():
             raise SystemExit(f"--record-against=local:{rest} -- {root} is not a directory")
-        return LocalFsStore(root)
+        return AliasedStore(LocalFsStore(root), sample_directory_renames(load_targets()))
     if kind == "profile":
-        from synology_apm_repo.sdk.profiles import build_store
+        from synology_apm_repo.sdk.profiles import store_from_profile
 
-        return await build_store(rest)
-    raise SystemExit(f"--record-against must be 'local:<name>' or 'profile:<name>', got {spec!r}")
+        return await store_from_profile(rest)
+    raise SystemExit(f"--record-against must be 'local:<path>' or 'profile:<name>', got {spec!r}")
 
 
 @pytest.fixture
@@ -259,56 +205,51 @@ def record_target(request: pytest.FixtureRequest) -> Callable[..., Awaitable[Obj
     """``store = await record_target("name.json.gz")`` -- the one call every
     ``tests/integration/**/test_*.py`` file makes to get its store.
 
-    ``allow_content=True`` opts one call out of the real-content recording
-    guard installed below (default: guarded) -- pass it only for a test
-    that genuinely needs to read real backed-up content as a structural
-    oracle (per ``tests/CLAUDE.md``'s own phrase); everything else gets
-    ``ContentRecordingBlocked`` at the moment it would have captured real
-    content into the fixture, instead of that mistake surfacing only in a
-    later manual audit.
+    Without ``--record-against``: returns ``ReplayStore.from_path(_FIXTURES /
+    name)``, and fails the test at teardown if it made any call the fixture
+    never recorded, even one the code under test caught. With it: a
+    ``RecordingStore`` around the real backend, shared by every test in the
+    invocation requesting the same ``name`` (see
+    ``_RECORDING_SESSIONS``), so tests whose calls don't subset each other
+    merge into one recording.
 
-    No ``--record-against``: returns ``ReplayStore.from_path(_FIXTURES /
-    name)`` directly (this is every normal ``make test``/CI run). With it:
-    wraps the real backend
-    ``--record-against`` resolves to in a ``RecordingStore`` -- shared
-    across every test in this invocation that requests the same ``name``
-    (see ``_RECORDING_SESSIONS``), not a fresh one per test. Multiple tests
-    whose own calls aren't a subset of each other (a common shape when one
-    fixture backs several scenarios) simply accumulate into the one shared
-    store instead of each overwriting the other's recording -- point
-    ``TEST=`` at every test sharing a fixture (or the whole file) in one
-    ``pytest --record-against=...`` invocation and it merges automatically;
-    no throwaway script needed.
+    The recording is written to ``tests/fixtures/name`` at session end
+    (``pytest_sessionfinish``) only if every test that touched the name
+    passed, and is then anonymized unless ``--no-anonymize`` is passed.
 
-    The shared recording is written to ``tests/fixtures/name`` once, at
-    session end (see ``pytest_sessionfinish`` above), only if *every* test
-    that touched this name during the run passed — one shared fixture is
-    one shared contract among every test backed by it, so one of them
-    failing withholds the whole write rather than committing a recording
-    known to be wrong for at least one sharing test. A test whose
-    assertions no longer hold against the real backend (moved, renamed,
-    restructured data) simply fails, like any other test failure, and
-    writes nothing — there is deliberately no fallback path that tries to
-    keep a stale recipe "working" against changed real data.
-
-    Every fixture actually written this way is anonymized automatically at
-    session end (see ``pytest_sessionfinish`` above) unless ``--no-
-    anonymize`` is passed — recording a real fixture and forgetting the
-    separate anonymize step is exactly the kind of mistake that puts real
-    data in a commit, so this isn't left to a person remembering it."""
+    ``allow_content=True`` opts one call out of the real-content guard
+    (``ContentRecordingBlocked``, installed on a replay too); pass it only
+    for a test that needs real content bytes as a structural oracle (see
+    ``tests/CLAUDE.md``)."""
     spec = request.config.getoption("--record-against")
 
     async def _target(name: str, *, allow_content: bool = False) -> ObjectStore:
-        if spec is None:
-            return ReplayStore.from_path(_FIXTURES / name)
         if not allow_content:
             _install_content_guard(request)
+        if spec is None:
+            replay = ReplayStore.from_path(_FIXTURES / name)
+
+            def _check_misses() -> None:
+                # Code under test may have caught the UnrecordedCallError.
+                if replay.misses:
+                    pytest.fail(
+                        f"{name} has no recording for {len(replay.misses)} call(s) this test made, "
+                        f"first: {replay.misses[0]} -- re-record it",
+                        pytrace=False,
+                    )
+
+            request.addfinalizer(_check_misses)
+            return replay
         path = _FIXTURES / name
+        # A fresh backend per call: a network store's client is bound to the
+        # event loop that built it, and each test runs in its own loop.
+        backend = await _resolve_record_backend(spec)
         recording = _RECORDING_SESSIONS.get(path)
         if recording is None:
-            backend = await _resolve_record_backend(spec)
             recording = _RecordingSession(store=RecordingStore(backend))
             _RECORDING_SESSIONS[path] = recording
+        else:
+            recording.store.rebind(backend)
 
         def _mark_result() -> None:
             if not request.node.stash.get(_PASSED, False):

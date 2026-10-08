@@ -1,10 +1,8 @@
-"""Real multi-core parallelism for CPU-bound work (decompress/decrypt/hash),
-via ``concurrent.futures.ProcessPoolExecutor`` rather than
-``asyncio.to_thread()``, which never gets more than one CPU core working
-under CPython's GIL. Owns worker-count sizing and dynamic-load-balanced
-dispatch to a pool — every such call site uses these rather than
-re-deriving its own.
-"""
+"""Multi-core parallelism for CPU-bound work (decompress/decrypt/hash)
+through a ``ProcessPoolExecutor`` (``asyncio.to_thread()`` stays on one
+core under the GIL): pool sizing and construction, load-balanced dispatch,
+worker-failure reporting and the worker-side event loop, plus
+``bounded_gather`` for I/O-bound fan-out."""
 
 from __future__ import annotations
 
@@ -13,23 +11,21 @@ import multiprocessing
 import os
 from collections.abc import Awaitable, Callable, Coroutine, Iterable, Sequence
 from concurrent.futures import ProcessPoolExecutor
+from concurrent.futures.process import BrokenProcessPool
 from multiprocessing import resource_tracker
-from typing import Any, TypeVar
+from typing import Any, NoReturn
 
-_T = TypeVar("_T")
-_R = TypeVar("_R")
+from ._util.closing import leaf_exceptions
+from .errors import WorkerProcessError
 
 _MAX_WORKERS = 8
 """Ceiling on ``default_worker_count()``'s clamp."""
 
 
 def default_worker_count() -> int:
-    """``clamp(os.cpu_count() // 2, 1, 8)`` — every ``ProcessPoolExecutor``
-    this SDK builds for CPU-bound decode work is sized by this, not a raw
-    ``os.cpu_count()``. Halving biases toward a machine's faster cores on a
-    hybrid (performance + efficiency) chip, since these call sites
-    synchronize a whole batch at a shared boundary and one slow-core task
-    drags the batch down regardless of added concurrency.
+    """``clamp(os.cpu_count() // 2, 1, 8)``, the size of every worker pool.
+    Halved because on a hybrid (performance + efficiency) chip a batch
+    waits for its slowest task, so efficiency cores add little.
     """
     cpu = os.cpu_count() or 1
     return max(1, min(_MAX_WORKERS, cpu // 2))
@@ -40,17 +36,12 @@ def new_process_pool(
     initializer: Callable[..., None] | None = None,
     initargs: Sequence[object] = (),
 ) -> ProcessPoolExecutor:
-    """A ``ProcessPoolExecutor`` sized by ``default_worker_count()``, using
-    an explicit ``multiprocessing.get_context("spawn")`` — never the
-    platform default, since Linux's default (``fork``) would duplicate a
-    parent process that may already hold a live asyncio event loop and
-    open ``aiosqlite`` background threads, neither of which survives a
-    fork correctly.
+    """A ``ProcessPoolExecutor`` sized by ``default_worker_count()``, always
+    with the ``spawn`` start method: ``fork`` (Linux's default) would copy
+    a live event loop and ``aiosqlite`` threads, which don't survive it.
     """
-    # typeshed's own ProcessPoolExecutor overloads pair a variadic
-    # initializer signature with a matching initargs tuple type, which a
-    # generic wrapper like this one — deliberately agnostic about any one
-    # caller's own initializer shape — can never satisfy exactly.
+    # typeshed pairs the initializer's signature with initargs' tuple type,
+    # which a wrapper generic over the initializer can't satisfy.
     return ProcessPoolExecutor(
         max_workers=default_worker_count(),
         mp_context=multiprocessing.get_context("spawn"),
@@ -59,18 +50,64 @@ def new_process_pool(
     )
 
 
+async def shutdown_pool(executor: ProcessPoolExecutor) -> None:
+    """Shuts ``executor`` down — queued items cancelled, running ones waited
+    for — off the event loop, so the wait doesn't freeze it."""
+    await asyncio.to_thread(executor.shutdown, wait=True, cancel_futures=True)
+
+
+def common_descriptor[T](descriptors: Sequence[T | None]) -> T | None:
+    """The one descriptor every entry equals, or ``None`` when ``descriptors``
+    is empty, holds a ``None``, or disagrees: whether several units of work
+    can share one worker pool, whose processes are bound to one descriptor
+    for their lifetime."""
+    if not descriptors or descriptors[0] is None:
+        return None
+    first = descriptors[0]
+    return first if all(descriptor == first for descriptor in descriptors) else None
+
+
+def first_failure(group: BaseExceptionGroup[BaseException], *, operation: str) -> BaseException:
+    """The failure a worker-dispatch exception group stands for: its first
+    exception that is not a cancellation, with a note counting the others.
+    A group of only cancellations is returned unchanged."""
+    failures = [exc for exc in leaf_exceptions(group) if not isinstance(exc, asyncio.CancelledError)]
+    if not failures:
+        return group
+    first, others = failures[0], failures[1:]
+    if others:
+        kinds = ", ".join(sorted({type(exc).__name__ for exc in others}))
+        noun = "failure" if len(others) == 1 else "failures"
+        first.add_note(f"{len(others)} other {operation} worker {noun}: {kinds}")
+    return first
+
+
+def raise_worker_failure(group: BaseExceptionGroup[BaseException], *, operation: str) -> NoReturn:
+    """Raises what a worker dispatch's exception group stands for:
+    ``first_failure``, or ``WorkerProcessError`` when a worker process died.
+
+    Raises:
+        WorkerProcessError: A worker process died.
+    """
+    failure = first_failure(group, operation=operation)
+    if isinstance(failure, BrokenProcessPool):
+        raise WorkerProcessError(
+            f"{operation} worker process died unexpectedly (it was killed or ran out of memory); "
+            f"the {operation} was aborted"
+        ) from failure
+    raise failure from None
+
+
 _worker_runner: asyncio.Runner | None = None
-"""A worker process's own persistent ``asyncio.Runner``, lazily created by
-the first ``run_in_worker_loop()`` call that process ever makes."""
+"""This worker process's persistent ``asyncio.Runner``, created by the
+first ``run_in_worker_loop()``."""
 
 
-def run_in_worker_loop(coro: Coroutine[Any, Any, _R]) -> _R:
-    """Runs ``coro`` on this worker process's own persistent event loop —
-    created once, on first call, and reused for every later call in the
-    same process — instead of ``asyncio.run()``'s throwaway-loop-per-call
-    shape, which would close a worker-lifetime resource's bound loop out
-    from under it. Call ``close_worker_loop()`` once, at worker shutdown,
-    to release this loop gracefully.
+def run_in_worker_loop[R](coro: Coroutine[Any, Any, R]) -> R:
+    """Runs ``coro`` on this worker process's persistent event loop, so
+    worker-lifetime resources bound to it survive between calls (unlike
+    ``asyncio.run()``'s loop per call). ``close_worker_loop()`` releases
+    it at worker shutdown.
     """
     global _worker_runner
     if _worker_runner is None:
@@ -79,11 +116,10 @@ def run_in_worker_loop(coro: Coroutine[Any, Any, _R]) -> _R:
 
 
 def close_worker_loop() -> None:
-    """Gracefully closes this worker process's persistent event loop — call
-    once, from an ``atexit`` hook a worker's own ``ProcessPoolExecutor``
-    initializer registers, after the worker's own resources are already
-    released through one final ``run_in_worker_loop()`` call. A no-op if
-    ``run_in_worker_loop()`` was never called in this process.
+    """Closes this worker process's persistent event loop, after its
+    resources were released through a last ``run_in_worker_loop()``; for
+    an ``atexit`` hook the pool initializer registers. A no-op if no loop
+    was created.
     """
     global _worker_runner
     if _worker_runner is None:
@@ -93,41 +129,34 @@ def close_worker_loop() -> None:
 
 
 def preload_resource_tracker() -> None:
-    """Launches multiprocessing's resource-tracker helper process now, using
-    whatever ``sys.stderr`` currently is. Call this before replacing
-    ``sys.stderr`` with a stream whose ``fileno()`` returns a sentinel
-    (Textual's own output capture does this) — the tracker's launch code
-    appends ``sys.stderr.fileno()`` unvalidated and crashes the first
-    ``ProcessPoolExecutor`` built afterward otherwise, with
-    ``ValueError: bad value(s) in fds_to_keep``.
-
-    No-op on non-POSIX platforms: the tracker's helper-process launch
-    relies on POSIX fd inheritance.
+    """Launches multiprocessing's resource-tracker process now. Call it
+    before replacing ``sys.stderr`` with a stream whose ``fileno()``
+    returns a sentinel (Textual's output capture does): launched later,
+    the tracker passes that fd on and the first process pool fails with
+    ``ValueError: bad value(s) in fds_to_keep``. A no-op off POSIX.
     """
     if os.name == "posix":
         resource_tracker.ensure_running()
 
 
-async def bounded_gather(
-    items: Iterable[_T],
-    worker: Callable[[_T], Awaitable[None]],
+async def bounded_gather[T](
+    items: Iterable[T],
+    worker: Callable[[T], Awaitable[None]],
     *,
     max_concurrent: int,
-    on_done: Callable[[_T], Awaitable[None]] | None = None,
+    on_done: Callable[[T], Awaitable[None]] | None = None,
 ) -> None:
-    """Runs ``worker(item)`` for every item in ``items``, concurrently,
-    bounded to at most ``max_concurrent`` in flight at once, inside one
-    ``asyncio.TaskGroup``. For I/O-bound async work that never leaves the
-    event loop; see ``dispatch_to_pool`` for CPU-bound work across a real
-    process pool.
+    """Runs ``worker(item)`` for every item, at most ``max_concurrent`` at
+    once, for I/O-bound work on the event loop (``dispatch_to_pool`` is
+    for CPU-bound work). ``on_done(item)`` runs after its slot is freed.
 
-    ``on_done(item)``, when given, is awaited once per item after
-    ``worker(item)`` completes and the semaphore slot is already
-    released, so it doesn't hold up the next item's dispatch.
+    Raises:
+        ExceptionGroup: One or more ``worker``/``on_done`` calls failed;
+            the rest were cancelled.
     """
     semaphore = asyncio.Semaphore(max_concurrent)
 
-    async def _bounded(item: _T) -> None:
+    async def _bounded(item: T) -> None:
         async with semaphore:
             await worker(item)
         if on_done is not None:
@@ -138,32 +167,29 @@ async def bounded_gather(
             tg.create_task(_bounded(item))
 
 
-async def dispatch_to_pool(
+async def dispatch_to_pool[T, R](
     executor: ProcessPoolExecutor,
-    worker_fn: Callable[[_T], _R],
-    items: Iterable[_T],
+    worker_fn: Callable[[T], R],
+    items: Iterable[T],
     *,
     max_concurrent: int,
-    on_result: Callable[[_T, _R], Awaitable[None]] | None = None,
-) -> list[_R]:
-    """Bounded, dynamically load-balanced dispatch of ``items`` to
-    ``worker_fn`` across ``executor``: at most ``max_concurrent`` in flight
-    at once, with a free worker always picking up the next not-yet-started
-    item via the executor's own task queue — self-correcting for uneven
-    per-item cost, unlike a static up-front partition.
+    on_result: Callable[[T, R], Awaitable[None]] | None = None,
+) -> list[R]:
+    """Runs ``worker_fn(item)`` on ``executor`` for every item, at most
+    ``max_concurrent`` at once, each free worker taking the next item, so
+    uneven per-item cost balances itself. ``on_result(item, result)`` is
+    awaited in this process as each one finishes. Results come back in
+    completion order, not ``items`` order.
 
-    ``on_result(item, result)``, when given, is awaited once per item as
-    its future resolves, for a caller's own parent-only bookkeeping.
-
-    Results are returned in **completion order**, not ``items``' own order
-    — a caller that needs input order preserved should zip its own index
-    onto ``items`` and sort afterward.
+    Raises:
+        ExceptionGroup: One or more items failed (see
+            ``raise_worker_failure``); the rest were cancelled.
     """
     sem = asyncio.Semaphore(max_concurrent)
     loop = asyncio.get_running_loop()
-    results: list[_R] = []
+    results: list[R] = []
 
-    async def _run(item: _T) -> None:
+    async def _run(item: T) -> None:
         async with sem:
             result = await loop.run_in_executor(executor, worker_fn, item)
         if on_result is not None:

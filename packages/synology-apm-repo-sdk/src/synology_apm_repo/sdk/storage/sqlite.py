@@ -1,26 +1,15 @@
-"""SQLite access helper — a free function, not an ``ObjectStore`` Protocol
-method, since WAL handling is shared logic every backend needs
-identically.
+"""Opening a SQLite database inside an ``ObjectStore``, for every backend.
 
-Two paths:
+- **Fast path** (``LocalFsStore`` only, the one place the SDK maps store
+  paths onto real files): with no non-empty ``-wal`` sidecar, open the file
+  read-only through an immutable ``file:`` URI.
+- **Slow path** (every other store, a non-empty ``-wal``, or a
+  ``transform``): copy the file and any ``-wal``/``-shm`` sidecars into a
+  temp directory and open that copy read-write, so SQLite replays the WAL
+  without touching the store. A non-empty ``-shm`` alone doesn't trigger it.
 
-- **Fast path**: no non-zero ``-wal`` sidecar present -> open directly via
-  a read-only, immutable ``file:`` URI. Only valid for ``LocalFsStore`` —
-  the only place in the SDK that assumes a store's paths map onto real
-  filesystem paths, which is why this is a free function rather than a
-  method every backend must implement; S3/Azure stores always take the
-  slow path.
-- **Slow path**: a non-zero ``-wal`` sidecar exists (real observed case:
-  ``copy_meta_file/target.db``) -> copy the main file plus any present
-  ``-wal``/``-shm`` sidecars into a temp directory and open *that* copy
-  read-write (letting SQLite's own recovery replay the WAL), so the
-  original store's bytes are never touched. Only ``-wal``'s size gates
-  this decision — a non-zero ``-shm`` alone does not trigger it.
-
-The read-only/read-write split between the two is the whole reason
-``apply_index_hint`` lives here rather than in ``storage/table.py``: only
-a connection onto a copy we own can be given an index, and this module is
-where that distinction is made.
+``apply_index_hint`` lives here because only the slow path's private copy
+can be given an index.
 """
 
 from __future__ import annotations
@@ -29,14 +18,29 @@ import asyncio
 import tempfile
 from collections.abc import Callable, Sequence
 from pathlib import Path
+from typing import BinaryIO
 
 import aiosqlite
 
+from .._util.closing import close_preserving, shield_or_undo
 from .base import ObjectStore
+from .disk_space import reserve_disk_space
 from .local import LocalFsStore
 
 _WAL_SUFFIX = "-wal"
 _SHM_SUFFIX = "-shm"
+
+
+async def _close(connection: aiosqlite.Connection | None) -> None:
+    if connection is not None:
+        await connection.close()
+
+
+async def connect(uri: str) -> aiosqlite.Connection:
+    """``aiosqlite.connect(uri, uri=True)``, closing the connection if it
+    opens anyway after the caller failed or was cancelled mid-connect: its
+    non-daemon thread would otherwise block interpreter exit."""
+    return await shield_or_undo(aiosqlite.connect(uri, uri=True), _close)
 
 
 async def open_sqlite(
@@ -44,61 +48,67 @@ async def open_sqlite(
     path: str,
     *,
     tmp_dir: Path | None = None,
-    transform: Callable[[bytes], bytes] | None = None,
+    transform: Callable[[bytes, BinaryIO], None] | None = None,
 ) -> tuple[aiosqlite.Connection, tempfile.TemporaryDirectory[str] | None]:
-    """Open an ``aiosqlite`` connection to ``path`` within ``store`` — read-only
-    on the fast path, read-write on the slow path's own private materialized
-    copy. The slow path is taken whenever ``transform`` is given, ``store``
-    isn't a ``LocalFsStore``, or a non-zero ``-wal`` sidecar is present;
-    the fast path is the ``LocalFsStore``-only case with none of those.
+    """Open an ``aiosqlite`` connection to ``path`` within ``store``,
+    read-only on the fast path, read-write on the slow path's private copy
+    (see the module docstring).
 
-    Returns ``(connection, materialized_tmp_dir)``. ``materialized_tmp_dir``
-    is ``None`` on the fast path (nothing extra was created); on the slow
-    path it is the ``tempfile.TemporaryDirectory`` backing the
-    materialized copy — the caller must keep a reference to it for as long
-    as ``connection`` is used, and should call ``.cleanup()`` (or simply let
-    it go out of scope) once done.
+    Args:
+        store: The store holding ``path``.
+        path: Store-relative path of the SQLite file.
+        tmp_dir: Parent directory for the slow path's temp directory
+            (default: the system temp directory).
+        transform: Applied independently to each file's raw bytes (main file
+            and any ``-wal``/``-shm``) before materializing, and forces the
+            slow path. It receives the raw bytes and an open destination
+            file and writes the result into it, so a decompressing transform
+            never holds its whole output in memory. It reserves its own
+            disk space (``disk_space``); an untransformed copy is reserved
+            here.
 
-    ``transform``, when given, is applied independently to each file's raw
-    bytes (main file, and any ``-wal``/``-shm`` sidecar) before materializing,
-    and forces the slow path regardless of WAL state.
+    Returns:
+        ``(connection, materialized_tmp_dir)``. ``materialized_tmp_dir`` is
+        ``None`` on the fast path; on the slow path it is the
+        ``TemporaryDirectory`` backing the copy, which the caller must keep
+        referenced while ``connection`` is used and then ``.cleanup()``.
 
-    ``aiosqlite`` pins each connection to one dedicated thread for its
-    lifetime, funnelling every statement — including ``close()`` —
-    through it, so ``check_same_thread`` is unnecessary.
+    Raises:
+        ResourceLimitExceededError: A file of the slow path's copy doesn't
+            fit in ``tmp_dir`` with ``disk_space``'s reserve left free.
     """
     wal_path = path + _WAL_SUFFIX
-    # The WAL-size check only gates the fast path, which is itself
-    # restricted to LocalFsStore — skipping it for any other store saves a
-    # real network round trip per db open on S3/Azure.
+    # Only the LocalFsStore fast path needs the WAL-size check; skipping it elsewhere saves a round trip.
     if transform is None and isinstance(store, LocalFsStore):
         needs_materialize = await store.exists(wal_path) and await store.size(wal_path) > 0
         if not needs_materialize:
-            real_path = store.root / path
+            real_path = store.local_path(path)
             uri = f"file:{real_path}?mode=ro&immutable=1"
-            return await aiosqlite.connect(uri, uri=True), None
+            return await connect(uri), None
 
     tmp = tempfile.TemporaryDirectory(dir=tmp_dir)
     try:
         dest_dir = Path(tmp.name)
         base_name = Path(path).name
 
+        def _write_dest(dest_path: Path, raw: bytes) -> None:
+            if transform is not None:
+                with open(dest_path, "wb") as f:
+                    transform(raw, f)
+            else:
+                with reserve_disk_space(dest_dir, len(raw)):
+                    dest_path.write_bytes(raw)
+
         async def _materialize(src_path: str, dest_name: str) -> None:
             raw = await store.read(src_path)
-            if transform is not None:
-                raw = await asyncio.to_thread(transform, raw)
-            # Local file writes have no native async form (see storage/local.py) —
-            # to_thread() for the same reason LocalFsStore uses it.
-            await asyncio.to_thread((dest_dir / dest_name).write_bytes, raw)
+            await asyncio.to_thread(_write_dest, dest_dir / dest_name, raw)
 
         async def _materialize_sidecar_if_present(suffix: str) -> None:
             side_path = path + suffix
             if await store.exists(side_path):
                 await _materialize(side_path, base_name + suffix)
 
-        # return_exceptions=True: waits for every task to finish before
-        # tmp.cleanup() below, so a failing task can't race a sibling still
-        # writing, and keeps the raised exception in its own type.
+        # return_exceptions=True: every task finishes before tmp.cleanup() can race a writer.
         results = await asyncio.gather(
             _materialize(path, base_name),
             *(_materialize_sidecar_if_present(suffix) for suffix in (_WAL_SUFFIX, _SHM_SUFFIX)),
@@ -108,22 +118,18 @@ async def open_sqlite(
             if isinstance(result, BaseException):
                 raise result
 
-        # Read-*write*: our own private copy, which is what lets
-        # apply_index_hint() build an index. ``rw`` not ``rwc``: a path
-        # SQLite can't resolve must fail here, not open as a new empty
-        # database whose missing tables surface later as DataCorruptError.
-        conn = await aiosqlite.connect(f"file:{dest_dir / base_name}?mode=rw", uri=True)
-    except Exception:
-        tmp.cleanup()
+        # Read-write on our private copy, so apply_index_hint() can build an index.
+        # ``rw`` not ``rwc``: an unresolvable path must fail here, not open an empty database.
+        conn = await connect(f"file:{dest_dir / base_name}?mode=rw")
+    except BaseException as exc:
+        await close_preserving(exc, [lambda: asyncio.to_thread(tmp.cleanup)])
         raise
     return conn, tmp
 
 
 async def _index_leading_columns(conn: aiosqlite.Connection, table: str) -> list[list[str]]:
-    """Every existing index on ``table``, each as its own ordered list of
-    column names (``PRAGMA index_info``'s own ``seqno`` order — the order
-    that actually matters for whether a leading-column prefix match is
-    valid)."""
+    """Every existing index on ``table`` as its ordered column names
+    (``PRAGMA index_info`` ``seqno`` order)."""
     cursor = await conn.execute(f"PRAGMA index_list({table})")
     index_names = [row[1] for row in await cursor.fetchall()]
     result: list[list[str]] = []
@@ -134,16 +140,11 @@ async def _index_leading_columns(conn: aiosqlite.Connection, table: str) -> list
 
 
 async def apply_index_hint(conn: aiosqlite.Connection, table: str, columns: Sequence[str]) -> None:
-    """A pure declaration of intent — "queries against ``table`` will
-    filter/sort by ``columns``" — never a command this is guaranteed to
-    fulfil. Safe to call even when ``columns`` is already indexed: the
-    leading-prefix check below makes that a cheap no-op.
-
-    Skips if an existing index already covers ``columns`` as a leading
-    prefix. Otherwise attempts ``CREATE INDEX IF NOT EXISTS`` and lets a
-    read-only connection's own ``OperationalError`` settle whether that's
-    even possible — caught here as "the hint quietly did nothing," any
-    other error still propagates.
+    """Declare that queries on ``table`` will filter or sort by ``columns``;
+    a hint, not a guarantee. Skips if an existing index already covers
+    ``columns`` as a leading prefix, otherwise tries ``CREATE INDEX IF NOT
+    EXISTS``. A read-only connection's "readonly database" error is swallowed
+    (the hint does nothing); any other error propagates.
     """
     existing = await _index_leading_columns(conn, table)
     wanted = list(columns)

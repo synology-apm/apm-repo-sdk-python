@@ -4,43 +4,50 @@ locally-mounted) filesystem tree."""
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import os
 import struct
 import sys
 from pathlib import Path, PurePosixPath
+from typing import override
 
-from ..errors import NotFoundError, PermissionDeniedError
+from ..errors import ApmRepoError, NotFoundError, PermissionDeniedError, StorageBackendError
+from ..positional_io import O_BINARY, pread
+from .base import Entry
 
-_O_BINARY = getattr(os, "O_BINARY", 0)
-
-# Readahead hint (``posix_fadvise(WILLNEED)`` on Linux, ``F_RDADVISE`` on macOS)
-# for the merged multi-chunk reads ``dedup/pool/_bucket_reader.py``'s
-# ``BucketReader`` issues — gated on a minimum length so it fires for those
-# genuinely-merged reads without adding a syscall to every routine small
-# read this store also serves (SQLite page reads, single-chunk-locator
-# reads, header reads, ...), which would cost more than the hint could ever
-# save on this store's overwhelming majority of callers.
-_FADVISE_MIN_LENGTH = 64 << 10  # 64 KiB — matches the merge gap tolerance
+# Readahead hint (``posix_fadvise(WILLNEED)`` on Linux, ``F_RDADVISE`` on
+# macOS) for the merged multi-chunk reads ``dedup/pool/_bucket_reader.py``
+# issues, gated on a minimum length so routine small reads pay no extra syscall.
+_FADVISE_MIN_LENGTH = 64 << 10  # 64 KiB
 _DARWIN_F_RDADVISE = 44  # <fcntl.h>'s F_RDADVISE — not exposed by Python's fcntl module
 
 
-def _pread(fd: int, length: int, offset: int) -> bytes:
-    """``os.pread()`` where available (POSIX); Windows has no positional
-    read, so this falls back to ``lseek``+``read`` — safe here because
-    ``fd`` is opened, read once, and closed within a single
-    ``_read_sync`` call, never shared with a concurrent reader."""
-    if sys.platform != "win32":
-        return os.pread(fd, length, offset)
-    os.lseek(fd, offset, os.SEEK_SET)
-    return os.read(fd, length)
+def _entry_size(entry: os.DirEntry[str]) -> int | None:
+    """A regular file's size in bytes; ``None`` for a directory, or for an
+    entry that vanished or cannot be stat'ed between listing and stat."""
+    try:
+        return entry.stat().st_size if entry.is_file() else None
+    except OSError:
+        return None
+
+
+def _mapped_os_error(exc: OSError, path: str, *, missing: str = "no such path") -> ApmRepoError:
+    """The ``ObjectStore`` error an ``OSError`` on ``path`` means; ``missing``
+    is the message for an absent path."""
+    if isinstance(exc, FileNotFoundError):
+        return NotFoundError(missing, ref=path)
+    if isinstance(exc, NotADirectoryError):
+        return NotFoundError("not a directory", ref=path)
+    if isinstance(exc, IsADirectoryError):
+        return NotFoundError("is a directory, not a file", ref=path)
+    if isinstance(exc, PermissionError):
+        return PermissionDeniedError("permission denied", ref=path)
+    return StorageBackendError(f"I/O error: {exc}", ref=path)
 
 
 def _hint_willneed(fd: int, offset: int, length: int) -> None:
-    """Best-effort readahead hint — purely advisory, so any failure
-    (unsupported platform, an fd type the call doesn't like) is
-    swallowed: an optimization that can't fire must never turn a working
-    read into a failure. No-op on any platform that is neither Linux
-    (has ``os.posix_fadvise``) nor macOS.
+    """Best-effort readahead hint; any failure is swallowed, since it must
+    never fail a working read. No-op off Linux and macOS.
     """
     try:
         if sys.platform == "linux":
@@ -48,31 +55,33 @@ def _hint_willneed(fd: int, offset: int, length: int) -> None:
         elif sys.platform == "darwin":
             import fcntl
 
-            # struct radvisory { off_t ra_offset; int ra_count; } — 8-byte
-            # off_t + 4-byte int, padded to 16 bytes for 8-byte struct
-            # alignment on both x86_64 and arm64 macOS.
+            # struct radvisory { off_t ra_offset; int ra_count; }, padded to 16 bytes.
             fcntl.fcntl(fd, _DARWIN_F_RDADVISE, struct.pack("qi4x", offset, length))
     except (OSError, ValueError):
-        # OSError: the platform/fd genuinely doesn't support the call.
-        # ValueError: fcntl.fcntl() raises this (not OSError) for some
-        # malformed-argument cases, e.g. a negative fd.
+        # fcntl.fcntl() raises ValueError, not OSError, for e.g. a negative fd.
         pass
+
+
+@dataclasses.dataclass(frozen=True, slots=True)
+class LocalFsStoreDescriptor:
+    """Picklable recipe for rebuilding an equivalent ``LocalFsStore``."""
+
+    root: str
+
+    def build(self) -> LocalFsStore:
+        return LocalFsStore(self.root)
 
 
 class LocalFsStore:
     """A local (or locally-mounted) filesystem tree, addressed by
     ``"/"``-separated paths relative to ``root``.
 
-    ``read()`` opens a fresh read-only fd per call, reads, and closes it —
-    no per-path state of its own, the same shape ``SmbStore`` already has.
-    Any caller whose own access pattern genuinely benefits from reusing an
-    open fd across several reads to the same path owns that reuse decision
-    itself, rather than this store deciding on its own, opaquely, whether
-    or how long to keep something cached.
+    ``read()`` opens a fresh read-only fd per call and closes it, keeping
+    no per-path state; a caller wanting fd reuse owns that itself.
 
-    **On the async interface**: this store's four methods are
-    ``asyncio.to_thread()`` wrappers around a synchronous body — local I/O
-    has no native async form in CPython to wrap instead.
+    Raises:
+        NotFoundError: ``root`` is not a directory.
+        PermissionDeniedError: ``root`` cannot be accessed.
     """
 
     def __init__(self, root: str | Path) -> None:
@@ -84,6 +93,14 @@ class LocalFsStore:
         if not is_dir:
             raise NotFoundError("store root is not a directory", ref=str(self._root))
 
+    async def close(self) -> None:
+        """Nothing to release: every call opens and closes its own fd."""
+
+    def descriptor(self) -> LocalFsStoreDescriptor:
+        """How a worker process rebuilds this store."""
+        return LocalFsStoreDescriptor(str(self.root))
+
+    @override
     def __repr__(self) -> str:
         return f"LocalFsStore({self._root!r})"
 
@@ -91,7 +108,13 @@ class LocalFsStore:
     def root(self) -> Path:
         return self._root
 
-    def _resolve(self, path: str) -> Path:
+    def local_path(self, path: str) -> Path:
+        """The OS path of store-relative ``path``, for a caller that opens
+        the file itself (``storage/sqlite.py``'s read-only fast path).
+
+        Raises:
+            NotFoundError: ``path`` is absolute or escapes the store root.
+        """
         rel = PurePosixPath(path)
         if rel.is_absolute() or ".." in rel.parts:
             raise NotFoundError("path escapes store root", ref=path)
@@ -100,7 +123,7 @@ class LocalFsStore:
     # -- ObjectStore ------------------------------------------------------
 
     async def read(self, path: str, offset: int = 0, length: int | None = None) -> bytes:
-        return await asyncio.to_thread(self._read_sync, path, offset, length)
+        return await asyncio.to_thread(self.read_sync, path, offset, length)
 
     async def size(self, path: str) -> int:
         return await asyncio.to_thread(self._size_sync, path)
@@ -108,29 +131,25 @@ class LocalFsStore:
     async def exists(self, path: str) -> bool:
         return await asyncio.to_thread(self._exists_sync, path)
 
-    async def listdir(self, path: str) -> list[str]:
+    async def listdir(self, path: str) -> list[Entry]:
         return await asyncio.to_thread(self._listdir_sync, path)
 
-    def _read_sync(self, path: str, offset: int = 0, length: int | None = None) -> bytes:
-        p = self._resolve(path)
+    def read_sync(self, path: str, offset: int = 0, length: int | None = None) -> bytes:
+        """``read``, blocking the calling thread (``storage.base.SyncReadable``)."""
+        p = self.local_path(path)
         try:
             # O_BINARY (0 off Windows) is not optional: Windows opens in text
             # mode by default, which collapses CRLF and stops the read dead at
             # the first 0x1A byte -- silently short, mangled repository bytes.
-            fd = os.open(p, os.O_RDONLY | _O_BINARY)
-        except FileNotFoundError as exc:
-            raise NotFoundError("no such file", ref=path) from exc
-        except IsADirectoryError as exc:
-            raise NotFoundError("is a directory, not a file", ref=path) from exc
+            fd = os.open(p, os.O_RDONLY | O_BINARY)
         except PermissionError as exc:
-            # On Windows, os.open() on a directory raises PermissionError
-            # directly (POSIX instead fails on the read below). Deliberately
-            # os.path.isdir(), not Path.is_dir(): the latter can re-raise
-            # PermissionError from its own stat(), which would escape here
-            # uncaught.
+            # Windows raises PermissionError from os.open() on a directory.
+            # os.path.isdir(), not Path.is_dir(), which can re-raise here.
             if os.path.isdir(p):
                 raise NotFoundError("is a directory, not a file", ref=path) from exc
-            raise PermissionDeniedError("permission denied", ref=path) from exc
+            raise _mapped_os_error(exc, path) from exc
+        except OSError as exc:
+            raise _mapped_os_error(exc, path, missing="no such file") from exc
         try:
             if length is None:
                 length = max(0, os.fstat(fd).st_size - offset)
@@ -138,48 +157,40 @@ class LocalFsStore:
                 return b""
             if length >= _FADVISE_MIN_LENGTH:
                 _hint_willneed(fd, offset, length)
-            return _pread(fd, length, offset)
-        except IsADirectoryError as exc:
-            # os.open() on a directory succeeds on both Linux and macOS
-            # (it's the read that fails) — unlike a missing file, which
-            # the os.open() above already caught.
-            raise NotFoundError("is a directory, not a file", ref=path) from exc
+            return pread(fd, length, offset)
+        except OSError as exc:
+            # IsADirectoryError lands here: os.open() on a directory succeeds
+            # on both Linux and macOS (it's the read that fails).
+            raise _mapped_os_error(exc, path) from exc
         finally:
             os.close(fd)
 
     def _size_sync(self, path: str) -> int:
-        p = self._resolve(path)
+        p = self.local_path(path)
         try:
             return p.stat().st_size
-        except FileNotFoundError as exc:
-            raise NotFoundError("no such path", ref=path) from exc
-        except PermissionError as exc:
-            raise PermissionDeniedError("permission denied", ref=path) from exc
+        except OSError as exc:
+            raise _mapped_os_error(exc, path) from exc
 
     def _exists_sync(self, path: str) -> bool:
         try:
-            p = self._resolve(path)
+            p = self.local_path(path)
         except NotFoundError:
-            # an escaping path simply "does not exist" from the caller's
-            # point of view; exists() never raises.
+            # An escaping path does not exist; exists() never raises.
             return False
         try:
             return p.exists()
         except PermissionError:
-            # A probe that can raise would abort a caller's whole candidate
-            # search over one irrelevant, inaccessible sibling — this reads
-            # as "not found" the same as pathlib's own
-            # ENOENT/ENOTDIR/EBADF/ELOOP handling inside Path.exists(), just
-            # extended to cover EACCES too.
+            # An inaccessible path reads as absent.
             return False
+        except OSError as exc:
+            raise _mapped_os_error(exc, path) from exc
 
-    def _listdir_sync(self, path: str) -> list[str]:
-        p = self._resolve(path)
+    def _listdir_sync(self, path: str) -> list[Entry]:
+        p = self.local_path(path)
         try:
-            return sorted(entry.name for entry in p.iterdir())
-        except FileNotFoundError as exc:
-            raise NotFoundError("no such directory", ref=path) from exc
-        except NotADirectoryError as exc:
-            raise NotFoundError("not a directory", ref=path) from exc
-        except PermissionError as exc:
-            raise PermissionDeniedError("permission denied", ref=path) from exc
+            with os.scandir(p) as it:
+                entries = [Entry(entry.name, _entry_size(entry)) for entry in it]
+        except OSError as exc:
+            raise _mapped_os_error(exc, path, missing="no such directory") from exc
+        return sorted(entries, key=lambda entry: entry.name)

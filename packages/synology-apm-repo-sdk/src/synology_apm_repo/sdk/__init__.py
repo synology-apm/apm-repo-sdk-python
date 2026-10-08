@@ -1,17 +1,21 @@
 """synology-apm-repo-sdk — offline, read-only SDK for the Synology
 APV/Object-Storage dedup repository on-disk format.
 
-``Session``/``Repository`` (the Repository Layer) are the intended entry
-point for a normal consumer — see ``ARCHITECTURE.md``'s "Repository Layer
-— ``api/``, the facade" for the full contract. Everything else exported
-here is either a type a consumer receives back from that facade
-(``Catalog``/``Connection``/``Workload``/``Version``, ``Node``/``RestorableUnit``,
-``DedupFile``/``ByteRangeView``, ``Progress``, ``Finding``/``VerifyLevel``
-from ``Repository.verify``, ``Frame`` from ``Repository.walk_human_ref``,
-``TraceEvent`` from ``Session.discover``'s
-``trace=`` callback) or a lower-layer building block (``ObjectStore`` and
-its implementations) for a consumer that genuinely needs to construct its
-own backend rather than let ``Session.discover()`` do it.
+This package is the SDK's public surface, together with four public
+modules: ``synology_apm_repo.sdk.export`` (the export-sink contract,
+``run_export`` and folder export), ``synology_apm_repo.sdk.presentation``
+(rendering helpers every frontend shares, ``Progress`` and the
+verify-report grouping among them), ``synology_apm_repo.sdk.profiles``
+(saved connection profiles, their form fields and their errors) and ``synology_apm_repo.sdk.diagnostics`` (format-level
+inspection). Every other module is internal.
+
+``Session``/``Repository``/``Catalog`` (the Repository Layer) are the entry
+point; see ``ARCHITECTURE.md``'s "Repository Layer — ``api/``, the facade".
+The other exports are the values that facade hands back and the helpers to
+read them (catalog/workload/version models and their ids, ``Node``/
+``RestorableUnit`` and the node helpers, the ``Frame`` union, verify
+findings), the error hierarchy, and the ``ObjectStore`` contract (with
+``TracingStore``) for a consumer writing its own backend.
 """
 
 from __future__ import annotations
@@ -19,72 +23,99 @@ from __future__ import annotations
 from importlib.metadata import PackageNotFoundError
 from importlib.metadata import version as _get_version
 
-from .api import Catalog, Finding, Frame, KeyStatus, Repository, Session, TraceEvent, VerifyLevel
-from .catalog.connection import Connection
-from .catalog.version import Version, VersionMeta
-from .catalog.workload import TargetType, Workload
-from .dedup.dedup_file import (
-    ByteRangeView,
-    DedupFile,
-    ExportResult,
-    Extent,
-    ExtentKind,
+from .api import (
+    Catalog,
+    CatalogFrame,
+    Connection,
+    Finding,
+    Frame,
+    KeyStatus,
+    KeyVerification,
+    NodeFrame,
+    RawView,
+    Repository,
+    RepositoryLayout,
+    RootFrame,
+    Session,
+    SetKeyResult,
+    Stage,
+    Symptom,
+    TraceEvent,
+    VerifyLevel,
+    Version,
+    VersionLocation,
+    Workload,
+    WorkloadFrame,
+    find_path_with_children,
 )
-from .dedup.keys import KeyMaterial, KeyVerification
+from .catalog.version import (
+    VersionMeta,
+)
+from .catalog.workload import (
+    SaasSubType,
+    TargetType,
+)
 from .errors import (
     ApmRepoError,
     ChunkCompactedError,
+    ContentUnavailableError,
     DataCorruptError,
     FormatError,
     KeyMaterialError,
     KeyMismatchError,
     KeyRequiredError,
     NotFoundError,
-    ProfileConfigCorruptError,
-    ProfileNotFoundError,
-    ProfileSecretBackendUnavailableError,
+    NotRestorableError,
+    PermissionDeniedError,
+    ResourceLimitExceededError,
+    StorageBackendError,
     UnsupportedDataFormatError,
     UnsupportedVersionError,
+    WorkerProcessError,
 )
-from .presentation.progress import Progress, ProgressMeter
-from .profiles import (
-    AzureProfileConfig,
-    BackendKind,
-    Profile,
-    ProfileSummary,
-    S3ProfileConfig,
-    SmbProfileConfig,
-    build_store,
-    client_kwargs_with_secrets,
-    delete_profile,
-    get_profile,
-    list_profiles,
-    list_remote_items,
-    load_profile,
-    save_profile,
-    store_from_config,
+from .identifiers import (
+    CatalogId,
+    ConnectionConfigId,
+    ConnectionId,
+    SaasVersionId,
+    SnapshotUuid,
+    StreamUuid,
+    TargetId,
+    VersionId,
+    VersionUid,
+    WorkloadId,
+    WorkloadUid,
 )
 from .storage import (
-    DirCache,
+    Entry,
     LocalFsStore,
     ObjectStore,
-    RepoKind,
-    RepoLayout,
-    RepositoryLayout,
-    catalog_repo_layouts,
-    detect_layout,
-    detect_repository_layout,
-    iter_layouts,
-    iter_repository_layouts,
+    TracingStore,
 )
 from .units.base import (
+    ClosableUnitProvider,
     ContentSource,
+    FileState,
+    ItemColumns,
     Node,
+    NodeRole,
     RestorableUnit,
     UnitKind,
     UnitProvider,
+    node_kind_label,
 )
-from .units.node_ref import NodeRef, RefKind, disambiguate
+from .units.node_ref import (
+    NodeRef,
+    RefKind,
+    disambiguate,
+    disambiguate_catalogs,
+    disambiguate_versions,
+    disambiguate_workloads,
+)
+from .units.saas.site import (
+    SiteListItems,
+    read_site_list_items,
+)
 
 try:
     __version__ = _get_version("synology-apm-repo-sdk")
@@ -93,23 +124,23 @@ except PackageNotFoundError:  # pragma: no cover - editable/dev checkout w/o met
 
 __all__ = [
     "ApmRepoError",
-    "AzureProfileConfig",
-    "BackendKind",
-    "ByteRangeView",
     "Catalog",
-    "Connection",
+    "CatalogFrame",
+    "CatalogId",
     "ChunkCompactedError",
+    "ClosableUnitProvider",
+    "Connection",
+    "ConnectionConfigId",
+    "ConnectionId",
     "ContentSource",
+    "ContentUnavailableError",
     "DataCorruptError",
-    "DedupFile",
-    "DirCache",
-    "ExportResult",
-    "Extent",
-    "ExtentKind",
+    "Entry",
+    "FileState",
     "Finding",
     "FormatError",
     "Frame",
-    "KeyMaterial",
+    "ItemColumns",
     "KeyMaterialError",
     "KeyMismatchError",
     "KeyRequiredError",
@@ -117,49 +148,55 @@ __all__ = [
     "KeyVerification",
     "LocalFsStore",
     "Node",
+    "NodeFrame",
     "NodeRef",
+    "NodeRole",
     "NotFoundError",
+    "NotRestorableError",
     "ObjectStore",
-    "Profile",
-    "ProfileConfigCorruptError",
-    "ProfileNotFoundError",
-    "ProfileSecretBackendUnavailableError",
-    "ProfileSummary",
-    "Progress",
-    "ProgressMeter",
+    "PermissionDeniedError",
+    "RawView",
     "RefKind",
-    "RepoKind",
-    "RepoLayout",
     "Repository",
     "RepositoryLayout",
+    "ResourceLimitExceededError",
     "RestorableUnit",
-    "S3ProfileConfig",
+    "RootFrame",
+    "SaasSubType",
+    "SaasVersionId",
     "Session",
-    "SmbProfileConfig",
+    "SetKeyResult",
+    "SiteListItems",
+    "SnapshotUuid",
+    "Stage",
+    "StorageBackendError",
+    "StreamUuid",
+    "Symptom",
+    "TargetId",
     "TargetType",
     "TraceEvent",
+    "TracingStore",
     "UnitKind",
     "UnitProvider",
     "UnsupportedDataFormatError",
     "UnsupportedVersionError",
     "VerifyLevel",
     "Version",
+    "VersionId",
+    "VersionLocation",
     "VersionMeta",
+    "VersionUid",
+    "WorkerProcessError",
     "Workload",
+    "WorkloadFrame",
+    "WorkloadId",
+    "WorkloadUid",
     "__version__",
-    "build_store",
-    "catalog_repo_layouts",
-    "client_kwargs_with_secrets",
-    "delete_profile",
-    "detect_layout",
-    "detect_repository_layout",
     "disambiguate",
-    "get_profile",
-    "iter_layouts",
-    "iter_repository_layouts",
-    "list_profiles",
-    "list_remote_items",
-    "load_profile",
-    "save_profile",
-    "store_from_config",
+    "disambiguate_catalogs",
+    "disambiguate_versions",
+    "disambiguate_workloads",
+    "find_path_with_children",
+    "node_kind_label",
+    "read_site_list_items",
 ]

@@ -1,0 +1,25 @@
+# Copy to targets.toml (untracked) and map each alias manifest.py's TARGETS
+# names (`sample:<alias>[/<subpath>]`) to the real `--record-against` value
+# that reaches it: "local:<path>" (absolute, or relative to the repository
+# root) or "profile:<name>" (a saved `synology-apm-repo-cli profile`).
+
+# The directory holding every local sample below side by side.
+all-local = "local:<path>"
+# Unencrypted vault: 2 catalogs, each with VM, FS, Google Workspace and Microsoft 365 workloads.
+vault-plain = "local:<path>"
+# Encrypted vault with the same workload mix as vault-plain.
+vault-encrypted = "local:<path>"
+# Unencrypted vault with one Microsoft 365 workload and an empty copy_meta_file.
+vault-m365 = "local:<path>"
+# Encrypted vault: one catalog with a VM workload, another with a Microsoft 365 workload.
+vault-vm-m365-encrypted = "local:<path>"
+# Encrypted object-store bucket: 2 repositories with VM, FS, Google Workspace and Microsoft 365 workloads.
+objstore-encrypted = "local:<path>"
+# Encrypted object-store bucket: 2 repositories, Microsoft 365 workloads only.
+objstore-m365-encrypted = "local:<path>"
+# Encrypted object-store bucket: 1 repository with one Microsoft 365 workload (recorded only within all-local).
+objstore-m365-single-encrypted = "local:<path>"
+# Remote bucket holding PC and PS workloads, one PC version of them healthy.
+pcps = "profile:<name>"
+# Encrypted remote bucket whose PC version's fids are missing from file_meta.
+pcps-encrypted = "profile:<name>"

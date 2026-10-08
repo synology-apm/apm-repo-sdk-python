@@ -1,9 +1,7 @@
-"""Connection / workload / version: purely cheap SQLite
-reads, nothing here ever touches Pool/Composition bytes. ``peel()``/
-``SqliteSource``/``Table`` are the shared plumbing every workload-DB
-accessor in this layer and above builds on — they live in ``storage``
-(the Storage Layer), not here, specifically so the Dedup Layer
-(``dedup/``) can depend on them too without an upward layer violation.
+"""Connection / workload / version: cheap SQLite reads that never touch
+Pool/Composition bytes. The SQLite plumbing they build on (``peel()``,
+``SqliteSource``, ``Table``) lives in ``storage`` so the Dedup Layer can use
+it too.
 """
 
 from __future__ import annotations

@@ -1,11 +1,9 @@
 """Chunk addressing and the two path-layering schemes that key off it
-(FORMAT-SPEC.md §3, its composition-splitting section).
+(FORMAT-SPEC.md: Pool path layering; Composition file splitting).
 
-Directory-name constants (``Pool``, ``Composition``, ...) are *not* decided
-here — those are repository-root layout constants that belong to the Dedup
-Layer's ``repository.py`` (FORMAT-SPEC.md: repo-root-layout's repository-root layout).
-This module only computes the id-layering *fragment* relative to whichever
-root the caller prepends.
+Directory-name constants (``Pool``, ``Composition``, ...) live in the Dedup
+Layer's ``repository.py`` (FORMAT-SPEC.md: directory layout). This module
+computes only the id-layering fragment relative to a caller-supplied root.
 """
 
 from __future__ import annotations
@@ -32,15 +30,12 @@ class ChunkAddress(NamedTuple):
     """A single ``uint64`` chunk address: ``streamID(8b) | bucketID(40b) |
     chunkIdx(16b)`` (FORMAT-SPEC.md: ChunkAddress).
 
-    Trusts its fields — neither construction nor ``from_int``
-    range-checks them. An out-of-range field either surfaces naturally
-    downstream (an over-capacity ``chunk_idx`` raises ``IndexError``; a
-    bogus ``bucket_id`` resolves to a missing path and raises
-    ``NotFoundError``) or is the job of ``units/verify_reachable.py``'s
-    dedicated, verify-only checks.
+    Fields are not range-checked on construction or by ``from_int``; an
+    out-of-range field surfaces downstream (``IndexError`` for an
+    over-capacity ``chunk_idx``, ``NotFoundError`` for a bogus ``bucket_id``)
+    or as a ``verify()`` finding.
 
-    Same deliberate ``NamedTuple``-not-``@dataclass(frozen=True)`` exception
-    as ``SizeStoreEntry`` — see there for the reasoning.
+    A ``NamedTuple``, not a frozen dataclass: built per chunk, where it is cheaper.
     """
 
     stream_id: StreamId
@@ -49,8 +44,7 @@ class ChunkAddress(NamedTuple):
 
     @classmethod
     def from_int(cls, data: int) -> ChunkAddress:
-        """Unpack a raw ``uint64`` chunk address — doesn't range-check the
-        result, same as construction (see the class docstring)."""
+        """Unpack a raw ``uint64`` chunk address (not range-checked)."""
         chunk_idx = data & _CHUNK_IDX_MASK
         addr_id = data >> CHUNK_BIT_NUM
         bucket_id = addr_id & _BUCKET_ID_MASK
@@ -62,14 +56,17 @@ class ChunkAddress(NamedTuple):
         )
 
     def to_int(self) -> int:
+        """Pack into the raw ``uint64`` form."""
         addr_id = (self.stream_id << BUCKET_ID_BIT_NUM) | self.bucket_id
         return (addr_id << CHUNK_BIT_NUM) | self.chunk_idx
 
     def advance(self, k: int) -> ChunkAddress:
         """Advance by ``k`` chunks, carrying into ``bucket_id`` when
-        ``chunk_idx`` would reach ``BUCKET_MAX_CHUNK_NUM`` (8192) — never
-        approximate this as "add k to the raw 64-bit integer", which would
-        carry at the packed field's 16-bit boundary instead.
+        ``chunk_idx`` reaches ``BUCKET_MAX_CHUNK_NUM`` (8192), not at the packed
+        field's 16-bit boundary.
+
+        Raises:
+            ValueError: ``k`` is negative.
         """
         if k < 0:
             raise ValueError(f"advance() does not support negative k ({k})")
@@ -83,10 +80,9 @@ class ChunkAddress(NamedTuple):
 
 
 def _id_layer_ancestors(id_: int) -> list[str]:
-    """Ancestor directory names for the 10-bit id-layering scheme, from
-    outermost to innermost, *excluding* the leaf itself —
-    FORMAT-SPEC.md: pool-path-layering: ``id >> 10``, ``>> 20``, ``>> 30``, ... until the quotient is 0.
-    Empty for any ``id_ < 1024`` (the common case in modest-sized repositories).
+    """Ancestor directory names of the 10-bit id-layering scheme, outermost
+    first, excluding the leaf: ``id >> 10``, ``>> 20``, ... until the quotient
+    is 0 (FORMAT-SPEC.md: Pool path layering). Empty for ``id_ < 1024``.
     """
     ancestors: list[str] = []
     shifted = id_ >> BUCKET_ID_LAYER_SHIFT
@@ -99,11 +95,11 @@ def _id_layer_ancestors(id_: int) -> list[str]:
 def pool_layer_path(stream_id: StreamId, bucket_id: BucketId) -> str:
     """Relative path (no ``Pool/`` prefix, no ``.buk``/``.inf``/... suffix)
     for ``bucket_id`` within ``stream_id``'s pool:
-    ``<streamID>/[ancestor layers.../]<bucketID>`` (FORMAT-SPEC.md: pool-path-layering).
+    ``<streamID>/[ancestor layers.../]<bucketID>`` (FORMAT-SPEC.md: Pool path
+    layering).
 
-    For a ``.inf``/``.fgp``/``.ref`` group path, pass the *group's starting*
-    bucket id (``bucket_id & ~(GROUP_BUCKET_NUM - 1)``),
-    not an individual bucket's own id.
+    For a ``.inf``/``.fgp``/``.ref`` group path, pass the group's starting
+    bucket id (``group_start_bucket_id``), not an individual bucket's.
     """
     return "/".join([str(stream_id), *_id_layer_ancestors(bucket_id), str(bucket_id)])
 
@@ -111,8 +107,8 @@ def pool_layer_path(stream_id: StreamId, bucket_id: BucketId) -> str:
 def composition_session_dir(stream_id: StreamId, session_id: SessionId) -> str:
     """Relative path (no ``Composition/`` prefix) to a session's directory:
     ``<streamID>/[ancestor layers.../]<sessionID>.com`` (FORMAT-SPEC.md:
-    composition-splitting) — the leaf component carries the ``.com`` suffix rather than being
-    a bare decimal number, unlike the Pool leaf.
+    Composition file splitting). Unlike the Pool leaf, the leaf carries a
+    ``.com`` suffix.
     """
     return "/".join([str(stream_id), *_id_layer_ancestors(session_id), f"{session_id}.com"])
 
@@ -120,7 +116,7 @@ def composition_session_dir(stream_id: StreamId, session_id: SessionId) -> str:
 def composition_path(stream_id: StreamId, session_id: SessionId, sub_id: int) -> str:
     """Full relative path (no ``Composition/`` prefix, no sequence-id
     suffix) to a composition sub-file: ``<sessionDir>/[ancestor
-    layers.../]c<subID>`` (FORMAT-SPEC.md: composition-splitting).
+    layers.../]c<subID>`` (FORMAT-SPEC.md: Composition file splitting).
     """
     session_dir = composition_session_dir(stream_id, session_id)
     return "/".join([session_dir, *_id_layer_ancestors(sub_id), f"c{sub_id}"])
@@ -128,21 +124,16 @@ def composition_path(stream_id: StreamId, session_id: SessionId, sub_id: int) ->
 
 def split_layer_leaf(layer_path: str) -> tuple[str, str]:
     """Split a ``pool_layer_path()``/``composition_path()`` result into
-    ``(dir_part, leaf)`` — the ancestor-layer directory and the final path
-    component, which every caller resolving a physical file under it
-    needs separately (a leaf-only suffix to append, a directory to
-    generation-resolve within). ``dir_part`` is ``""`` when ``layer_path``
-    has no ancestor layers (id fits in one layer); pass it to
-    ``join_path`` rather than concatenating with ``"/"`` directly, since
-    that tolerates the empty case."""
+    ``(dir_part, leaf)``. ``dir_part`` is ``""`` when there are no ancestor
+    layers; pass it to ``join_path``, which tolerates that."""
     dir_part, _, leaf = layer_path.rpartition("/")
     return dir_part, leaf
 
 
 def split_composition_offset(global_offset: int) -> tuple[int, int]:
     """Split a composition-record global offset into ``(sub_id,
-    offset_within_subfile)`` — ``sub_id = off >> 24``,
-    ``sub_off = off & (16MiB - 1)`` (FORMAT-SPEC.md: composition-splitting)."""
+    offset_within_subfile)``: ``off >> 24`` and ``off & (16 MiB - 1)``
+    (FORMAT-SPEC.md: Composition file splitting)."""
     return global_offset >> SUB_FILE_SIZE_SHIFT, global_offset & (SUB_FILE_SIZE - 1)
 
 

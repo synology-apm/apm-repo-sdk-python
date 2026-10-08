@@ -1,23 +1,24 @@
-"""``synology-apm-repo-cli export <ref> -o FILE`` — export one item to a real file.
+"""``synology-apm-repo-cli export <ref> -o FILE`` — export one item to a real file,
+or a folder's items to a directory.
 
 The output is written to ``<FILE>.part`` and only renamed to ``FILE`` on
-success: a truncated-but-plausible-looking output file is a safety-level
-problem for a restore tool, not just a UX nicety, so a failure or Ctrl-C
-leaves the ``.part`` file rather than a file named ``FILE`` that looks
-complete but isn't.
+success, so a failure or Ctrl-C never leaves a file named ``FILE`` that
+looks complete but isn't.
 
-Progress: ``ContentSource.export_to()``'s callback reports a *planned*-bytes
-total, adapted via ``reading_progress_callback`` into a ``Progress``
-snapshot fed to a ``ProgressMeter``.
+**A folder REF** exports every item below it to ``DIR/<path below the folder>``,
+one file at a time (``plan_tree_export`` decides what is left out). A name
+that is not a safe path component, or a path another item already takes, is
+skipped and reported, and the command then exits 1. The first failure stops
+the run; files already finished stay.
 
-**Ctrl-C**: the export body runs as its own ``asyncio.Task``, cancelled by
-SIGINT — first press cancels the Task for a clean unwind, second press
-exits immediately (``os._exit()``). ``--keep-partial`` controls whether
-the ``.part`` file survives a cancelled export.
+**Ctrl-C**: the export body runs as its own ``asyncio.Task``; the first
+SIGINT cancels it for a clean unwind, the second exits immediately
+(``os._exit()``). ``--keep-partial`` decides whether the ``.part`` file
+survives a cancel or failure.
 
-**Pre-existing destination**: an already-present ``FILE`` is refused,
-via ``destination_available()``, before anything is opened; ``--force``
-overrides.
+**Pre-existing destination**: an already-present ``FILE`` is refused
+before anything is opened; ``--force`` overrides. For a folder REF every
+file the export would replace is checked before the first one is written.
 """
 
 from __future__ import annotations
@@ -27,72 +28,57 @@ import os
 import signal
 from collections.abc import Callable
 from pathlib import Path
-from typing import TypeVar, cast
+from typing import Annotated
 
 import typer
-from rich.console import Console
 
 from synology_apm_repo.cli.asyncio_support import typer_async
-from synology_apm_repo.cli.browse import parse_ref_argument, resolve_restorable
-from synology_apm_repo.cli.errors import err_console, fail, fail_from_apm_error
-from synology_apm_repo.cli.options import KeyOption, ObjectDbIdOption, ProfileOption
-from synology_apm_repo.cli.profile_store import resolve_profile_store
+from synology_apm_repo.cli.browse import parse_ref_argument
+from synology_apm_repo.cli.consoles import console
+from synology_apm_repo.cli.errors import ExitCode, err_console, fail
+from synology_apm_repo.cli.options import KeyOption, ObjectDbIdOption, ProfileOption, raw_view
 from synology_apm_repo.cli.progress_render import build_progress_meter, finish_live_progress
-from synology_apm_repo.cli.repo_session import open_single_repo
+from synology_apm_repo.cli.repo_session import cli_session, open_repo
 from synology_apm_repo.cli.state import CliState
 from synology_apm_repo.cli.strings import (
     EXPORT_FORCE_HELP,
     EXPORT_KEEP_PARTIAL_HELP,
     EXPORT_OUTPUT_HELP,
     EXPORT_SPARSE_HELP,
-    REF_HELP_SINGLE_ITEM,
+    REF_HELP_EXPORT,
 )
-from synology_apm_repo.cli.trace_render import build_trace_callback
-from synology_apm_repo.sdk.api import ExportResult, Session
-from synology_apm_repo.sdk.errors import ApmRepoError
-from synology_apm_repo.sdk.presentation.export_target import (
-    destination_available,
-    finalize_export,
-    part_path_for,
-    resolve_cancelled_partial,
+from synology_apm_repo.sdk import NodeFrame
+from synology_apm_repo.sdk.export import (
+    ExportProgressCallback,
+    ExportResult,
+    LocalFileSink,
+    TreeExport,
+    TreeItem,
+    plan_tree_export,
+    preflight_tree,
+    run_export,
+    run_tree_export,
 )
-from synology_apm_repo.sdk.presentation.format import format_bytes
-from synology_apm_repo.sdk.presentation.progress import reading_progress_callback
-
-console = Console()
-
-_T = TypeVar("_T")
-
-
-def handle_cancelled(part_path: Path, *, keep_partial: bool) -> str:
-    """What to do with ``part_path`` once a cancelled export unwinds, and
-    the message to show for it — the CLI's own phrasing of
-    ``resolve_cancelled_partial()``'s shared decision. Split out from
-    ``export`` itself so it (unlike the actual SIGINT plumbing around it)
-    is unit-testable without a real signal."""
-    outcome = resolve_cancelled_partial(part_path, keep_partial=keep_partial)
-    if not outcome.ever_written:
-        # A cloud-sync placeholder's export_to() defers creating part_path
-        # until its first block reads successfully (unlike a dedup-backed
-        # export, which creates it immediately), so a cancellation that
-        # lands before that never writes it at all.
-        return "cancelled — no output file was ever written"
-    if outcome.kept:
-        return f"cancelled — partial file kept as {part_path.name}"
-    return "cancelled — partial file removed (use --keep-partial to keep it)"
+from synology_apm_repo.sdk.presentation import (
+    ExportTracker,
+    destination_state,
+    folder_destination_problem,
+    is_out_of_space,
+    pluralize,
+    reading_progress_callback,
+    safe,
+    single_destination_message,
+    single_destination_problem,
+    size_summary,
+)
 
 
-def _install_sigint_cancel(task: asyncio.Task[_T]) -> Callable[[], None]:
+def _install_sigint_cancel[T](task: asyncio.Task[T]) -> Callable[[], None]:
     """Routes SIGINT into ``task.cancel()``; returns the undo callable.
-    First Ctrl-C cancels the export Task for a clean unwind into
-    ``export``'s own ``except`` branch. Second Ctrl-C exits immediately
-    via ``os._exit()``.
+    The second Ctrl-C exits immediately via ``os._exit()``.
 
-    Uses ``signal.signal()`` rather than ``loop.add_signal_handler()`` so
-    the second-press force quit stays immediate even mid-synchronous-stretch;
-    ``task.cancel()`` itself still goes through
-    ``loop.call_soon_threadsafe()``, since it can't run inside a signal
-    handler."""
+    ``signal.signal()``, not ``loop.add_signal_handler()``, so the force quit
+    stays immediate even during a synchronous stretch."""
     loop = asyncio.get_running_loop()
     sigint_count = 0
 
@@ -105,7 +91,7 @@ def _install_sigint_cancel(task: asyncio.Task[_T]) -> Callable[[], None]:
         else:  # pragma: no cover - os._exit() below would kill pytest itself if this branch actually ran
             err_console.print("\n[red]force quit[/red]")
             # Bypasses all cleanup (atexit, finally blocks) — that's the point.
-            os._exit(130)
+            os._exit(ExitCode.CANCELLED)
 
     previous_handler = signal.signal(signal.SIGINT, _on_sigint)
 
@@ -115,89 +101,134 @@ def _install_sigint_cancel(task: asyncio.Task[_T]) -> Callable[[], None]:
     return _restore
 
 
+async def _export_tree(
+    frame: NodeFrame,
+    *,
+    output: Path,
+    sparse: bool,
+    keep_partial: bool,
+    force: bool,
+    state: CliState,
+    active: ExportTracker,
+) -> TreeExport:
+    """Exports every item below the folder ``frame`` resolved to into the directory ``output``."""
+    if (folder_problem := folder_destination_problem(output)) is not None:
+        fail(folder_problem)
+    plan = await plan_tree_export(frame.provider, frame.node, output)
+    # Nothing is written until every destination is known to be usable; --force only replaces files.
+    preflight = await asyncio.to_thread(preflight_tree, plan, output, force=force)
+    if (problem := preflight.problem) is not None:
+        fail(problem.message(force_hint=True))
+    active.total = len(plan.items)
+
+    def on_item_start(_index: int, item: TreeItem, sink: LocalFileSink) -> ExportProgressCallback:
+        active.item_started(sink, item.path, item.relative)
+        return reading_progress_callback(build_progress_meter(state))
+
+    def on_item_done(_item: TreeItem, _result: ExportResult) -> None:
+        finish_live_progress(state)
+        active.item_finished()
+
+    return await run_tree_export(
+        frame.provider,
+        plan,
+        output,
+        preflight=preflight,
+        sparse=sparse,
+        keep_partial=keep_partial,
+        on_item_start=on_item_start,
+        on_item_done=on_item_done,
+    )
+
+
+def _report_tree(done: TreeExport, output: Path, state: CliState) -> None:
+    """Prints the folder export's summary, which items are incomplete and what it skipped; exits 1
+    when anything was skipped."""
+    if not state.quiet:
+        files = f"{len(done.exported)} {pluralize(len(done.exported), 'file')}"
+        console.print(f"[green]exported[/green] {files} to {output} ({size_summary(done.totals)})")
+    for incomplete in done.incomplete:
+        err_console.print(f"[yellow]incomplete[/yellow] {safe(incomplete.relative)}: {safe(incomplete.reason)}")
+    for item in done.skipped:
+        err_console.print(f"[yellow]skipped[/yellow] {safe(item.relative)}: {item.reason.description}")
+    if done.skipped:
+        count = len(done.skipped)
+        fail(f"{count} {pluralize(count, 'item')} {pluralize(count, 'was', 'were')} not exported")
+
+
 @typer_async
 async def export(
     ctx: typer.Context,
-    ref: str = typer.Argument(..., help=REF_HELP_SINGLE_ITEM),
-    output: Path = typer.Option(..., "-o", "--output", help=EXPORT_OUTPUT_HELP),
+    ref: Annotated[str, typer.Argument(help=REF_HELP_EXPORT)],
+    output: Annotated[Path, typer.Option("-o", "--output", help=EXPORT_OUTPUT_HELP)],
     key: KeyOption = None,
-    sparse: bool = typer.Option(True, "--sparse/--no-sparse", help=EXPORT_SPARSE_HELP),
+    sparse: Annotated[bool, typer.Option("--sparse/--no-sparse", help=EXPORT_SPARSE_HELP)] = True,
     object_db_id: ObjectDbIdOption = None,
-    keep_partial: bool = typer.Option(False, "--keep-partial", help=EXPORT_KEEP_PARTIAL_HELP),
-    force: bool = typer.Option(False, "--force", help=EXPORT_FORCE_HELP),
+    keep_partial: Annotated[bool, typer.Option("--keep-partial", help=EXPORT_KEEP_PARTIAL_HELP)] = False,
+    force: Annotated[bool, typer.Option("--force", help=EXPORT_FORCE_HELP)] = False,
     profile: ProfileOption = None,
 ) -> None:
-    """Export REF's content to OUTPUT."""
+    """Export REF's content to OUTPUT: one item to a file, or a folder's items to a directory
+    (each at its path below the folder; an item whose name is not a safe file name here is
+    skipped and reported, and the command then exits 1)."""
     state: CliState = ctx.obj
     parsed = parse_ref_argument(ref)
-    # A separate concern from the .part-rename safety in the try/finally
-    # below, which only guards a crash/cancel *during* the write: this
-    # refuses an already-present OUTPUT before anything is even opened.
-    if not destination_available(output, force=force):
-        fail(f"{output} already exists — pass --force to overwrite it")
-    session = Session()
-    part_path = part_path_for(output)
-    discover_meter = build_progress_meter(state)
-    export_meter = build_progress_meter(state)
-    trace = build_trace_callback(state)
-    on_export_progress = reading_progress_callback(export_meter)
+    if destination_state(output) == "file" and not force:
+        fail(
+            f"{output} already exists — pass --force to overwrite it "
+            "(only for a single item; a folder REF needs a directory)"
+        )
+    active = ExportTracker(output)
+    on_export_progress = reading_progress_callback(build_progress_meter(state))
+    degraded: str | None = None
+    async with cli_session(state, error_prefix=lambda: f"{active.label}: " if active.label else "") as cli:
 
-    async def _do_export() -> ExportResult:
-        """Everything a Ctrl-C should be able to interrupt, in one
-        Task — discovery included, so a first press during a slow
-        repository scan cancels there too instead of only taking
-        effect once the export itself starts."""
-        store = await resolve_profile_store(profile) if profile is not None else None
-        repo = await open_single_repo(
-            session, parsed.fs_path, key, store=store, progress=discover_meter.update, trace=trace
-        )
-        resolved = await resolve_restorable(
-            repo,
-            parsed.node_ref,
-            ref=ref,
-            hint="export a specific item inside it instead",
-            object_db_id=object_db_id,
-        )
-        content = resolved.open()
-        output.parent.mkdir(parents=True, exist_ok=True)
-        # ContentSource.export_to()'s Protocol return type is ``object``,
-        # but every real implementation returns ExportResult — a
-        # display-only cast. No concurrency kwargs to forward here:
-        # export_to()'s own multiprocess dispatch isn't a CLI-facing knob.
-        return cast(
-            ExportResult,
-            await content.export_to(part_path, sparse=sparse, progress=on_export_progress),
-        )
+        async def _do_export() -> ExportResult | TreeExport:
+            """Everything a Ctrl-C should interrupt, discovery included."""
+            nonlocal degraded
+            repo = await open_repo(cli, parsed.fs_path, key, profile=profile)
+            frame = await repo.resolve(parsed.node_ref, raw=raw_view(object_db_id))
+            if frame.node.is_leaf:
+                if (problem := single_destination_problem(output, force=True)) is not None:
+                    fail(single_destination_message(output, problem))
+                unit = await frame.unit()
+                degraded = unit.degraded
+                active.sink = sink = LocalFileSink(output, staged=True, keep_partial=keep_partial)
+                return await run_export(unit.content, sink, sparse=sparse, progress=on_export_progress)
+            return await _export_tree(
+                frame,
+                output=output,
+                sparse=sparse,
+                keep_partial=keep_partial,
+                force=force,
+                state=state,
+                active=active,
+            )
 
-    task = asyncio.create_task(_do_export())
-    restore_sigint = _install_sigint_cancel(task)
-    try:
-        result = await task
-        finalize_export(part_path, output)
-    except asyncio.CancelledError:
-        # The first-Ctrl-C path. Cancellation is prompt on the
-        # single-process path; on the multiprocess path it widens to
-        # roughly one bucket group's decode time, since an already-running
-        # worker finishes its in-flight write rather than being torn down
-        # mid-write. This command manages its own Session/progress
-        # lifecycle instead of going through opened_repo, so it clears its
-        # own leftover progress line before each exit print.
-        finish_live_progress(state)
-        console.print(f"[yellow]{handle_cancelled(part_path, keep_partial=keep_partial)}[/yellow]")
+        task = asyncio.create_task(_do_export())
+        restore_sigint = _install_sigint_cancel(task)
+        try:
+            result = await task
+        except asyncio.CancelledError:
+            finish_live_progress(state)  # before printing, so the message doesn't land on the progress line
+            # run_export already aborted the sink; abort() is idempotent and repeats what it left.
+            leftover = await active.leftover(keep_partial_hint=True)
+            console.print(f"[yellow]cancelled — {leftover}[/yellow]" if leftover else "[yellow]cancelled[/yellow]")
+            if (files := active.files_note()) is not None:
+                console.print(f"[yellow]{files}[/yellow]")
+            raise typer.Exit(code=ExitCode.CANCELLED) from None
+        except OSError as exc:
+            if not is_out_of_space(exc):
+                raise  # any other OSError stays an unexpected failure
+            finish_live_progress(state)
+            fail(await active.out_of_space(exc, keep_partial_hint=True), cause=exc)
+        finally:
+            restore_sigint()
+
+    if isinstance(result, TreeExport):
+        _report_tree(result, output, state)
         return
-    except ApmRepoError as exc:
-        fail_from_apm_error(exc, state)
-    finally:
-        # Covers the success path and any exception not caught above (a
-        # bug, not an expected failure) — a harmless no-op if one of the
-        # branches above already cleared the line.
-        finish_live_progress(state)
-        restore_sigint()
-        await session.close()
-
     if not state.quiet:
-        console.print(
-            f"[green]exported[/green] {output} ({format_bytes(result.bytes_written)} written, "
-            f"{format_bytes(result.logical_size)} logical, {format_bytes(result.holes)} holes, "
-            f"{format_bytes(result.zeros)} zero-fill)"
-        )
+        console.print(f"[green]exported[/green] {output} ({size_summary(result)})")
+    if degraded is not None:
+        err_console.print(f"[yellow]incomplete:[/yellow] {safe(degraded)}")

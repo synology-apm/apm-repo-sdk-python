@@ -26,13 +26,9 @@ autodoc_default_options = {
     "undoc-members": False,
     "show-inheritance": True,
     "member-order": "bysource",
-    # Deliberately False: every base class here is a stdlib type
-    # (Enum/Exception/Protocol/NamedTuple/Mapping), so True pulls in their
-    # own C-implemented docstrings verbatim (e.g. dict.get's "D[k] if k in
-    # D, else d.  d defaults to None."), and Napoleon's property/attribute
-    # type-shorthand parsing (a bare "<words>: description" first line)
-    # misreads that prose as a type name with no docstring on our side able
-    # to fix it — the text comes from CPython itself.
+    # False: True would pull in stdlib base classes' own docstrings (e.g.
+    # dict.get's "D[k] if k in D, else d."), whose "<words>: text" first
+    # lines Napoleon misreads as type names.
     "inherited-members": False,
 }
 autodoc_typehints = "description"
@@ -50,29 +46,28 @@ intersphinx_mapping = {
 }
 
 nitpick_ignore = [
-    # AsyncKeyedCache's own type parameters, not real linkable objects.
-    ("py:obj", "synology_apm_repo.sdk.asynccache.K"),
-    ("py:obj", "synology_apm_repo.sdk.asynccache.V"),
-    # aiosqlite ships no Sphinx inventory to add to intersphinx_mapping.
+    # The async-context-manager mixins behind `async with`; _util gets no
+    # apidoc page, so show-inheritance's "Bases:" link has no target.
+    ("py:class", "synology_apm_repo.sdk._util.closing.AsyncClosing"),
+    # PEP 695 type parameters (`run_sink_export[T]`, `CacheManager.keyed[K, V]`,
+    # `SaasWorkloadConfig[StateT]`): Sphinx renders each as an unresolved
+    # class reference, and with postponed annotations earlier 3.12 patch
+    # releases (CI's 3.12.3) leave even `T` an unresolved string.
+    *(("py:class", name) for name in ("T", "K", "V", "StateT")),
+    # The same 3.12.3 postponed-annotation gap for SaasWorkloadConfig's own
+    # field types, tree_strategy's ``Row``/``Key`` aliases and ``TreeStrategy``;
+    # absent on 3.12.13, so ignored only below it.
+    *(("py:class", name) for name in ("Row", "Key", "TreeStrategy") if sys.version_info < (3, 12, 13)),
+    # aiosqlite, zstandard and cryptography ship no Sphinx inventory for intersphinx.
     ("py:class", "aiosqlite.core.Connection"),
-    # asyncio.Semaphore's own __module__ is the private asyncio.locks --
-    # CPython's docs.python.org inventory indexes it under the public
-    # asyncio.Semaphore path instead, so intersphinx can't resolve the
-    # fully-qualified name autodoc emits.
+    ("py:class", "cryptography.hazmat.primitives.ciphers.algorithms.AES"),
+    ("py:exc", "zstandard.ZstdError"),
+    # __module__ is the private asyncio.locks; docs.python.org's inventory
+    # indexes only the public asyncio.Semaphore path.
     ("py:class", "asyncio.locks.Semaphore"),
-    # Same shape as the asyncio.Semaphore case above, one level down:
-    # TreeStrategy's own __module__ is tree_strategy's private _base leaf
-    # (which gets no apidoc page of its own -- see units/content/disk_fs/
-    # for the same "no page for a leading-underscore submodule"
-    # convention), but it's re-exported at the public
-    # units.saas.tree_strategy path CategorizedGroupTree.__init__'s own
-    # `inner: TreeStrategy` parameter is documented under.
+    # __module__ is the private _base leaf (no apidoc page); the class is
+    # re-exported from units.saas.tree_strategy.
     ("py:class", "synology_apm_repo.sdk.units.saas.tree_strategy._base.TreeStrategy"),
-    # Same shape as the asyncio.Semaphore case above: ProcessPoolExecutor's
-    # own __module__ is the private concurrent.futures.process, but
-    # docs.python.org's inventory indexes it under the public
-    # concurrent.futures.ProcessPoolExecutor path instead.
-    ("py:class", "concurrent.futures.process.ProcessPoolExecutor"),
 ]
 
 html_theme = "furo"
@@ -84,32 +79,23 @@ html_copy_source = False
 exclude_patterns = [
     "_build",
     "api/synology_apm_repo.rst",  # namespace package root, nothing to document
-    # These __init__.py files are pure re-exports (docstring + imports + __all__,
-    # no functions/classes of their own) — an automodule page for them would just
-    # repeat what's already documented on the submodule each symbol comes from.
+    # Pure re-export __init__.py files: a page would repeat what each
+    # symbol's own submodule page already documents.
     "api/synology_apm_repo.sdk.rst",
     "api/synology_apm_repo.sdk.api.rst",
+    "api/synology_apm_repo.sdk.export.rst",
+    "api/synology_apm_repo.sdk.presentation.rst",
     "api/synology_apm_repo.sdk.storage.rst",
     "api/synology_apm_repo.sdk.units.saas.tree_strategy.rst",
-    # These __init__.py files hold only a module docstring (no imports, no
-    # functions/classes) — the docstring itself is real, but its content is
-    # already covered at more length by ARCHITECTURE.md's own per-layer
-    # section, and including the page would pull in sphinx-apidoc's own
-    # generated "Submodules" toctree, which would double-list every
-    # submodule below in apidoc's alphabetical order, right next to this
-    # same package's own deliberately-ordered (not alphabetical) flat list.
+    # Docstring-only __init__.py files: ARCHITECTURE.md covers each layer,
+    # and apidoc's alphabetical "Submodules" toctree would double-list the
+    # submodules index.rst already orders by hand.
     "api/synology_apm_repo.sdk.catalog.rst",
     "api/synology_apm_repo.sdk.dedup.rst",
     "api/synology_apm_repo.sdk.format.rst",
     "api/synology_apm_repo.sdk.units.content.rst",
-    # Same reasoning as the block above, plus a second, independent reason:
-    # its own generated toctree also references
-    # api/synology_apm_repo.sdk.units.saas.rst, which stays excluded below
-    # (a genuinely empty __init__.py) — including this page would raise
-    # its own "toctree contains reference to excluded document" warning.
+    # Same, and its toctree would also reference the excluded units.saas page.
     "api/synology_apm_repo.sdk.units.rst",
-    # Genuinely empty __init__.py (0 bytes: no docstring, no imports, no
-    # functions/classes) — an automodule page would render nothing at all.
-    "api/synology_apm_repo.sdk.presentation.rst",
+    # Empty __init__.py: a page would render nothing.
     "api/synology_apm_repo.sdk.units.saas.rst",
 ]

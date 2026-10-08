@@ -1,6 +1,6 @@
-"""Unit tests for ``synology_apm_repo.sdk.format.repo_info`` — synthetic
-bytes only (see ``tests/integration/sdk/test_repo_info.py`` for the
-byte-for-byte cross-check against a real sample)."""
+"""Unit tests for ``synology_apm_repo.sdk.format.repo_info``
+(``tests/integration/sdk/test_format_repo_info.py`` parses real samples'
+files)."""
 
 from __future__ import annotations
 
@@ -9,6 +9,7 @@ import zlib
 
 import pytest
 
+from support.format_builders import repo_info_bytes
 from synology_apm_repo.sdk.errors import DataCorruptError, FormatError
 from synology_apm_repo.sdk.format.repo_info import MAGIC, parse_repo_info
 
@@ -18,7 +19,7 @@ def _build(
     uuid: str = "abcdefghijklmnop",
     major: int = 2,
     minor: int = 2,
-    payload_obj: dict[str, object] | None = None,
+    payload_obj: object = None,
 ) -> bytes:
     assert len(uuid) == 16
     payload_obj = (
@@ -61,33 +62,38 @@ def test_parse_round_trip() -> None:
 def test_bad_magic_raises_data_corrupt() -> None:
     data = bytearray(_build())
     data[0:4] = b"XXXX"
-    with pytest.raises(DataCorruptError):
+    with pytest.raises(DataCorruptError, match="bad magic"):
         parse_repo_info(bytes(data))
 
 
-def test_bad_header_crc_raises_data_corrupt() -> None:
+@pytest.mark.parametrize(
+    "offset",
+    [
+        pytest.param(59, id="bad_header_crc"),  # inside the header-CRC-covered region
+        pytest.param(70, id="bad_payload_crc"),  # in the JSON payload, neither CRC updated
+    ],
+)
+def test_a_bad_crc_raises_data_corrupt(offset: int) -> None:
     data = bytearray(_build())
-    data[59] ^= 0xFF  # corrupt a byte inside the header-CRC-covered region
-    with pytest.raises(DataCorruptError):
-        parse_repo_info(bytes(data))
-
-
-def test_bad_payload_crc_raises_data_corrupt() -> None:
-    data = bytearray(_build())
-    # flip a byte in the JSON payload without updating either CRC
-    data[70] ^= 0xFF
-    with pytest.raises(DataCorruptError):
+    data[offset] ^= 0xFF
+    with pytest.raises(DataCorruptError, match="CRC mismatch"):
         parse_repo_info(bytes(data))
 
 
 def test_truncated_payload_raises_format_error() -> None:
     data = _build()
-    with pytest.raises(FormatError):
+    with pytest.raises(FormatError, match="repo_info payload truncated"):
         parse_repo_info(data[:-5])
 
 
+def test_a_non_ascii_uuid_raises_data_corrupt() -> None:
+    data = repo_info_bytes({}, uuid=bytes(15) + b"\x80")
+    with pytest.raises(DataCorruptError, match=r"repo_info uuid .* is not ASCII"):
+        parse_repo_info(data)
+
+
 def test_too_short_raises_format_error() -> None:
-    with pytest.raises(FormatError):
+    with pytest.raises(FormatError, match="header too short"):
         parse_repo_info(b"short")
 
 
@@ -101,14 +107,31 @@ def test_missing_optional_fields_default_to_none() -> None:
 
 
 def test_explicit_json_null_storage_algorithm_also_defaults_to_none() -> None:
-    """``raw.get("storage_algorithm") or {}`` (repo_info.py's own use of
-    the ``CLAUDE.md``-documented ``.get(key) or default`` convention)
-    must also handle the key being *present* with a JSON ``null``, not
-    just entirely absent (the case ``test_missing_optional_fields_default_to_none``
-    covers) -- a plain ``raw.get("storage_algorithm", {})`` would let a
-    JSON ``null`` through unchanged and crash on the next ``.get()``."""
+    """The key present with a JSON ``null`` reads like an absent one."""
     data = _build(payload_obj={"repo_type": 9, "storage_algorithm": None})
     info = parse_repo_info(data)
     assert info.repo_type == 9
     assert info.compress_algorithm is None
     assert info.encrypt_algorithm is None
+
+
+def test_a_payload_that_is_not_a_json_object_raises_data_corrupt() -> None:
+    with pytest.raises(DataCorruptError, match="expected an object"):
+        parse_repo_info(_build(payload_obj=[1, 2]))
+
+
+def test_body_fields_of_the_wrong_json_type_read_as_none() -> None:
+    info = parse_repo_info(
+        _build(
+            payload_obj={
+                "repo_type": "2",
+                "repo_flag": True,
+                "is_worm_supported": 1,
+                "storage_algorithm": "zstd",
+            }
+        )
+    )
+    assert info.repo_type is None
+    assert info.repo_flag is None
+    assert info.is_worm_supported is None
+    assert info.compress_algorithm is None

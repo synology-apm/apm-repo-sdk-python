@@ -1,15 +1,13 @@
 """``synology-apm-repo-cli dump bucket|composition|chunkmap <path>`` — raw format-level
 inspection of one physical file.
 
-Each subcommand takes a bare path to one physical file, not a ``NodeRef`` —
-these commands answer "what does this specific byte layout say" for one
-``.buk`` or composition sub-file, never routing through catalog/dispatch.
-The actual parsing lives in ``sdk.diagnostics``; this module is
-presentation only.
+Each subcommand takes a path to one ``.buk`` or composition sub-file, not a
+``NodeRef``, and never goes through the catalog. The parsing lives in
+``sdk.diagnostics``; this module only presents it.
 
 Without ``--profile``, ``path`` is a local filesystem path; with it, a
 store-relative sub-path instead — a ``.<N>`` sequence-id suffix
-(FORMAT-SPEC.md: sequence-id-suffix) is never resolved from a logical name
+(FORMAT-SPEC.md: Sequence-id suffix mechanism) is never resolved from a logical name
 in either case, so type the exact on-disk filename.
 """
 
@@ -20,28 +18,29 @@ import dataclasses
 import functools
 from collections.abc import AsyncIterator, Awaitable, Callable
 from pathlib import Path
-from typing import Protocol, TypeVar
+from typing import Annotated, Protocol
 
 import typer
-from rich.console import Console
 
 from synology_apm_repo.cli.asyncio_support import typer_async
-from synology_apm_repo.cli.errors import fail, fail_from_apm_error, unwrap
+from synology_apm_repo.cli.consoles import console
+from synology_apm_repo.cli.errors import fail_from_apm_error
 from synology_apm_repo.cli.options import ProfileOption
 from synology_apm_repo.cli.paging import render
-from synology_apm_repo.cli.profile_store import resolve_profile_store
 from synology_apm_repo.cli.state import CliState
 from synology_apm_repo.cli.strings import (
     DUMP_BUCKET_CHUNK_HELP,
     DUMP_BUCKET_PATH_HELP,
     DUMP_CHUNKMAP_OFFSET_HELP,
+    DUMP_CHUNKMAP_VERIFY_MAP_HELP,
     DUMP_COMPOSITION_PATH_HELP,
     DUMP_LIMIT_ENTRIES_HELP,
     DUMP_LIMIT_RECORDS_HELP,
     DUMP_OFFSET_WALK_HELP,
-    DUMP_VERIFY_HELP,
     DUMP_VERIFY_MAP_HELP,
 )
+from synology_apm_repo.cli.trace_render import build_trace_callback
+from synology_apm_repo.sdk import ApmRepoError, ObjectStore, TracingStore
 from synology_apm_repo.sdk.diagnostics import (
     BucketInspection,
     ChunkMapInspection,
@@ -51,93 +50,77 @@ from synology_apm_repo.sdk.diagnostics import (
     open_local,
     walk_composition,
 )
-from synology_apm_repo.sdk.errors import ApmRepoError
-from synology_apm_repo.sdk.storage.base import ObjectStore, aclose_if_possible
+from synology_apm_repo.sdk.presentation import safe
+from synology_apm_repo.sdk.profiles import store_from_profile
 
 app = typer.Typer(help="Raw format-level dump of one physical file.")
 
-console = Console()
 
 _DEFAULT_RECORD_LIMIT = 10
 _DEFAULT_ENTRY_LIMIT = 50
 
 
 class _HasPath(Protocol):
-    """Structural minimum ``_run_dump``'s own ``dataclasses.replace(result,
-    path=path)`` call needs — every real result type (``BucketInspection``,
-    ``CompositionWalk``, ``ChunkMapInspection``) is a frozen dataclass with
-    its own ``path: str`` field."""
+    """A frozen dataclass result with a ``path`` field, as
+    ``_run_dump``'s ``dataclasses.replace(result, path=path)`` needs."""
 
     @property
     def path(self) -> str: ...
 
 
-_ResultT = TypeVar("_ResultT", bound=_HasPath)
-
-
 def _badge(ok: bool, fail_word: str = "FAIL") -> str:
-    """``"[green]OK[/green]"``/``"[red]<fail_word>[/red]"`` — the pass/fail
-    rich-markup rendering shared by every check result this command family
-    prints (bucket size, chunk-map/RecordHead CRC)."""
+    """Rich markup for one check result: green ``OK`` or red ``fail_word``."""
     return "[green]OK[/green]" if ok else f"[red]{fail_word}[/red]"
 
 
 @contextlib.asynccontextmanager
 async def _resolved_store(path: str, profile: str | None, *, state: CliState) -> AsyncIterator[tuple[ObjectStore, str]]:
     """Resolve ``path``/``profile`` into an ``(ObjectStore, rel)`` pair,
-    mirroring ``repo_session.py``'s ``opened_repo`` at the store level
-    rather than the repository level, since this command family never
-    opens a ``Session``. An ``ApmRepoError`` raised while resolving the
-    store gets the same clean ``fail()`` exit as one raised while reading
-    through it. The ``--profile`` case closes its own ``ObjectStore``
-    here — unlike every other ``--profile`` command, there's no ``Session``
-    to do it for us."""
+    traced when ``--trace`` is given. An
+    ``ApmRepoError`` raised while resolving or reading through the store is
+    the CLI error exit; the store is closed here, since no ``Session`` owns
+    it."""
     store: ObjectStore | None = None
     try:
         if profile is None:
             store, rel = open_local(Path(path))
         else:
-            store = await resolve_profile_store(profile)
+            store = await store_from_profile(profile)
             rel = path
+        if (trace := build_trace_callback(state)) is not None:
+            store = TracingStore(store, trace)
         yield store, rel
     except ApmRepoError as exc:
         fail_from_apm_error(exc, state)
     finally:
         if store is not None:
-            await aclose_if_possible(store)
+            await store.close()
 
 
-async def _run_dump(
+async def _run_dump[ResultT: _HasPath](
     path: str,
     profile: str | None,
     state: CliState,
     *,
-    fetch: Callable[[ObjectStore, str], Awaitable[_ResultT]],
-    build_json: Callable[[_ResultT], object],
-    render_human: Callable[[_ResultT], None],
+    fetch: Callable[[ObjectStore, str], Awaitable[ResultT]],
+    build_json: Callable[[ResultT], object],
+    render_human: Callable[[ResultT], None],
 ) -> None:
-    """The shape ``bucket``/``composition``/``chunkmap`` each repeat:
-    resolve the store, run one ``sdk.diagnostics`` call via ``fetch``,
-    stamp the result with the original ``path`` argument (not the
-    store-relative ``rel`` actually read from), then dispatch through
-    ``paging.render()`` — ``build_json`` returns the payload rather than
-    printing it, so ``composition()``'s own hand-built ``--json`` dict and
-    the other two commands' plain ``dataclasses.asdict()`` both fit
-    ``render()``'s ``json`` parameter without special-casing."""
+    """Shared body of ``bucket``/``composition``/``chunkmap``: resolve the
+    store, run one ``sdk.diagnostics`` call via ``fetch``, stamp the result
+    with the original ``path`` argument (not the store-relative ``rel``
+    read from), then print it through ``paging.render()``; ``build_json``
+    returns the ``--json`` payload."""
     async with _resolved_store(path, profile, state=state) as (store, rel):
         result = await fetch(store, rel)
-    # mypy can't confirm dataclasses.replace() keeps _ResultT's concrete
+    # mypy can't confirm dataclasses.replace() keeps ResultT's concrete
     # type through the _HasPath protocol bound.
     result = dataclasses.replace(result, path=path)  # type: ignore[type-var]
     render(console, state, json=build_json(result), human=lambda: render_human(result), page=True)
 
 
 def _build_json(result: BucketInspection | ChunkMapInspection) -> object:
-    """``dataclasses.asdict(result)`` — shared by ``bucket()``'s and
-    ``chunkmap()``'s ``--json`` output, both plain ``asdict()`` dumps of
-    their own result dataclass. ``composition()``'s own
-    ``_build_composition_json`` stays separate: it builds a custom dict,
-    not a plain ``asdict()``."""
+    """``bucket()``'s and ``chunkmap()``'s ``--json`` payload."""
     return dataclasses.asdict(result)
 
 
@@ -149,13 +132,16 @@ def _render_bucket_human(result: BucketInspection) -> None:
     console.print(f"chunk_size_crc : {result.chunk_size_crc:#010x}")
     counts_str = " ".join(f"{k}={v}" for k, v in sorted(result.compress_type_counts.items()))
     console.print(f"sizestore      : {counts_str}")
-    check = _badge(result.size_check_ok, "MISMATCH")
-    console.print(f"expected_size  : {result.expected_size}")
-    console.print(f"actual_size    : {result.actual_size}  ({check})")
+    if result.size_check_ok is None:
+        console.print("expected_size  : n/a (uncompressed layout)")
+        console.print(f"actual_size    : {result.actual_size}")
+    else:
+        console.print(f"expected_size  : {result.expected_size}")
+        console.print(f"actual_size    : {result.actual_size}  ({_badge(result.size_check_ok, 'MISMATCH')})")
     if result.chunk is not None:
         c = result.chunk
         console.print(
-            f"chunk[{c.index}]      : compress={c.compress_type} stored_len={c.stored_len} "
+            f"{f'chunk[{c.index}]':<15}: compress={c.compress_type} stored_len={c.stored_len} "
             f"effective_len={c.effective_len} offset={c.offset} length={c.length}"
         )
 
@@ -163,8 +149,8 @@ def _render_bucket_human(result: BucketInspection) -> None:
 @typer_async
 async def bucket(
     ctx: typer.Context,
-    path: str = typer.Argument(..., help=DUMP_BUCKET_PATH_HELP),
-    chunk: int | None = typer.Option(None, "--chunk", help=DUMP_BUCKET_CHUNK_HELP),
+    path: Annotated[str, typer.Argument(help=DUMP_BUCKET_PATH_HELP)],
+    chunk: Annotated[int | None, typer.Option("--chunk", help=DUMP_BUCKET_CHUNK_HELP)] = None,
     profile: ProfileOption = None,
 ) -> None:
     """Dump a .buk file's header, SizeStore summary, and the
@@ -172,10 +158,7 @@ async def bucket(
     state: CliState = ctx.obj
 
     async def _fetch(store: ObjectStore, rel: str) -> BucketInspection:
-        try:
-            return await unwrap(inspect_bucket(store, rel, chunk=chunk), verbose=state.verbose)
-        except IndexError as exc:
-            fail(str(exc))
+        return await inspect_bucket(store, rel, chunk=chunk)
 
     await _run_dump(path, profile, state, fetch=_fetch, build_json=_build_json, render_human=_render_bucket_human)
 
@@ -190,7 +173,9 @@ def _build_composition_json(result: CompositionWalk) -> object:
 
 def _render_composition_human(result: CompositionWalk, *, limit: int) -> None:
     if result.stopped_with_error is not None:
-        console.print(f"[dim](stopped walking at offset {result.next_offset}: {result.stopped_with_error})[/dim]")
+        console.print(
+            f"[dim](stopped walking at offset {result.next_offset}: {safe(str(result.stopped_with_error))})[/dim]"
+        )
     console.print(f"file : {result.path}")
     if result.header is not None:
         major, minor = result.header
@@ -213,10 +198,10 @@ def _render_composition_human(result: CompositionWalk, *, limit: int) -> None:
 @typer_async
 async def composition(
     ctx: typer.Context,
-    path: str = typer.Argument(..., help=DUMP_COMPOSITION_PATH_HELP),
-    offset: int | None = typer.Option(None, "--offset", help=DUMP_OFFSET_WALK_HELP),
-    limit: int = typer.Option(_DEFAULT_RECORD_LIMIT, "--limit", help=DUMP_LIMIT_RECORDS_HELP),
-    verify_map: bool = typer.Option(False, "--verify-map", help=DUMP_VERIFY_MAP_HELP),
+    path: Annotated[str, typer.Argument(help=DUMP_COMPOSITION_PATH_HELP)],
+    offset: Annotated[int | None, typer.Option("--offset", help=DUMP_OFFSET_WALK_HELP)] = None,
+    limit: Annotated[int, typer.Option("--limit", help=DUMP_LIMIT_RECORDS_HELP)] = _DEFAULT_RECORD_LIMIT,
+    verify_map: Annotated[bool, typer.Option("--verify-map", help=DUMP_VERIFY_MAP_HELP)] = False,
     profile: ProfileOption = None,
 ) -> None:
     """Walk composition records in PATH, printing each RecordHead — the
@@ -226,9 +211,7 @@ async def composition(
     state: CliState = ctx.obj
 
     async def _fetch(store: ObjectStore, rel: str) -> CompositionWalk:
-        return await unwrap(
-            walk_composition(store, rel, offset=offset, limit=limit, verify_map=verify_map), verbose=state.verbose
-        )
+        return await walk_composition(store, rel, offset=offset, limit=limit, verify_map=verify_map)
 
     await _run_dump(
         path,
@@ -267,20 +250,20 @@ def _render_chunkmap_human(result: ChunkMapInspection) -> None:
 @typer_async
 async def chunkmap(
     ctx: typer.Context,
-    path: str = typer.Argument(..., help=DUMP_COMPOSITION_PATH_HELP),
-    offset: int = typer.Option(..., "--offset", help=DUMP_CHUNKMAP_OFFSET_HELP),
-    limit: int = typer.Option(_DEFAULT_ENTRY_LIMIT, "--limit", help=DUMP_LIMIT_ENTRIES_HELP),
-    verify: bool = typer.Option(False, "--verify", help=DUMP_VERIFY_HELP),
+    path: Annotated[str, typer.Argument(help=DUMP_COMPOSITION_PATH_HELP)],
+    offset: Annotated[int, typer.Option("--offset", help=DUMP_CHUNKMAP_OFFSET_HELP)],
+    limit: Annotated[int, typer.Option("--limit", help=DUMP_LIMIT_ENTRIES_HELP)] = _DEFAULT_ENTRY_LIMIT,
+    verify_map: Annotated[bool, typer.Option("--verify-map", help=DUMP_CHUNKMAP_VERIFY_MAP_HELP)] = False,
     profile: ProfileOption = None,
 ) -> None:
     """Dump the ChunkMapRecord array — the core read structure — of the
     record at --offset: each entry's kind, file/end offsets, inherit
-    flag, map number and repeat count, plus (with --verify) the
+    flag, map number and repeat count, plus (with --verify-map) the
     chunk-map CRC check result."""
     state: CliState = ctx.obj
 
     async def _fetch(store: ObjectStore, rel: str) -> ChunkMapInspection:
-        return await unwrap(inspect_chunk_map(store, rel, offset, limit=limit, verify=verify), verbose=state.verbose)
+        return await inspect_chunk_map(store, rel, offset, limit=limit, verify=verify_map)
 
     await _run_dump(path, profile, state, fetch=_fetch, build_json=_build_json, render_human=_render_chunkmap_human)
 

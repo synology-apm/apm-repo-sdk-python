@@ -1,15 +1,8 @@
-"""Pipes a command's human-mode console output through a pager when
-stdout is a real terminal — never for ``--json`` output (machine-consumable)
-or a non-tty stdout (piped/redirected — there's nothing to page). Used by
-``ls``/``tree``/``dump``/``verify``, whose output can scale unbounded;
-``doctor``/``key`` stay one-shot prints, deliberately — their output is
-bounded by catalog/workload/version *counts*, or a fixed handful of
-lines, never by raw item-tree content the way the other four commands'
-output can be.
-
-``render()`` is the shared ``--json``-or-human dispatch every command uses
-for its own final output — paging (when the command asks for it) is one
-part of that dispatch, not a separate step each command wires up itself.
+"""``render()``, every command's ``--json``-or-human final output, and the
+pager it optionally pipes human-mode output through when stdout is a
+terminal. Commands whose output scales with item-tree content
+(``ls``/``tree``/``dump``/``verify``) page; ``doctor``/``key``, whose output
+is bounded, don't.
 """
 
 from __future__ import annotations
@@ -19,6 +12,7 @@ import os
 import shlex
 import subprocess
 from collections.abc import Callable, Iterator
+from typing import override
 
 from rich.console import Console
 from rich.pager import Pager
@@ -26,45 +20,37 @@ from rich.pager import Pager
 from synology_apm_repo.cli.state import CliState
 
 _DEFAULT_PAGER = "less -FIRX"
-"""``-F``: don't page at all if the content already fits on one screen —
-the reason this needs no separate "is the output actually long" check of
-its own. ``-R``: pass through the ANSI color codes Rich already wrote
-instead of showing them as literal escape junk. ``-I``: case-insensitive
-search. ``-X``: leave the output in scrollback after the pager exits."""
+"""``-F``: don't page content that fits on one screen. ``-I``:
+case-insensitive search. ``-R``: pass Rich's ANSI colors through. ``-X``:
+leave the output in scrollback after the pager exits."""
 
 
 def pager_argv() -> list[str] | None:
-    """argv for the pager to shell out to, honoring ``$PAGER`` with a
-    sensible default when it's unset. ``None`` means "don't page" — only
-    when ``$PAGER`` is explicitly set to an empty string, the standard way
-    a user opts out of paging entirely."""
+    """The pager's argv from ``$PAGER`` (default ``_DEFAULT_PAGER``), or
+    ``None`` ("don't page") when ``$PAGER`` is set to an empty string."""
     raw = os.environ.get("PAGER", _DEFAULT_PAGER)
     return shlex.split(raw) if raw else None
 
 
 class _SubprocessPager(Pager):
-    """Rich's own ``Pager`` protocol is just a ``show(content: str) ->
-    None`` method — this shells ``content`` out to ``argv`` the same way
-    ``git``/``man`` do. Falls back to printing directly (no pager) if
-    ``argv[0]`` isn't an executable found on ``$PATH`` — a missing pager
-    must never crash the command it's wrapping."""
+    """A Rich ``Pager`` that pipes ``content`` to ``argv``, printing it
+    directly instead when ``argv[0]`` isn't found."""
 
     def __init__(self, argv: list[str]) -> None:
         self._argv = argv
 
+    @override
     def show(self, content: str) -> None:
         try:
             subprocess.run(self._argv, input=content, text=True, check=False)
         except FileNotFoundError:
-            print(content, end="")
+            print(content, end="")  # noqa: T201 - plain text, past Rich, for the pager
 
 
 @contextlib.contextmanager
 def paged(console: Console) -> Iterator[None]:
-    """Entered around a command's whole human-mode render block —
-    ``with paged(console): _render_human(...)``. A no-op (prints
-    normally) unless stdout is a real terminal and a pager is actually
-    resolved."""
+    """Page everything printed inside the block; a no-op unless stdout is a
+    terminal and ``pager_argv()`` resolves a pager."""
     if not console.is_terminal:
         yield
         return
@@ -77,14 +63,8 @@ def paged(console: Console) -> Iterator[None]:
 
 
 def render(console: Console, state: CliState, *, json: object, human: Callable[[], None], page: bool = False) -> None:
-    """``--json``-or-human output dispatch, shared by every command's own
-    final render step: ``console.print_json(data=json)`` under ``--json``,
-    else call ``human()`` — wrapped in ``paged(console)`` first when
-    ``page`` is true. A caller with its own JSON-building quirks (e.g.
-    ``dump.py``'s ``composition``, whose ``--json`` shape isn't a plain
-    ``dataclasses.asdict()``) still calls this the same way — ``json`` is
-    whatever payload the caller already built, this function only picks
-    which of the two ways to print it."""
+    """Print ``json`` under ``--json``, else call ``human()`` — inside
+    ``paged(console)`` when ``page`` is true."""
     if state.json:
         console.print_json(data=json)
         return

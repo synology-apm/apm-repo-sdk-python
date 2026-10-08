@@ -1,9 +1,7 @@
-"""Unit tests for ``synology_apm_repo.sdk.presentation.logging_setup`` --
-the mechanism shared by the CLI's and TUI's own entry points (``cli/main.py``
-and ``browser/app.py``). Each of those only calls ``configure_logging()``
-and is covered separately for that call itself
-(``test_cli_main.py``'s/``test_browser_app.py``'s own ordering tests);
-the actual behaviour is proven once, here."""
+"""Unit tests for ``synology_apm_repo.sdk.presentation.logging_setup``,
+shared by the CLI's and TUI's entry points (``cli/main.py``,
+``browser/app.py``), whose own tests only check that they call
+``configure_logging()``."""
 
 from __future__ import annotations
 
@@ -16,12 +14,9 @@ import pytest
 
 from synology_apm_repo.sdk.presentation import logging_setup
 
-#: Driven in a child process on purpose: pytest's own logging plugin
-#: installs handlers on the root logger for the duration of every test
-#: item, and ``Logger.callHandlers`` only falls back to the last-resort
-#: handler when it finds *no* handler at all. In-process, stderr therefore
-#: stays clean whether or not ``configure_logging()`` ran, so an in-process
-#: version of this test would pass with the fix deleted.
+#: Run in a child process: pytest's logging plugin keeps a handler on the
+#: root logger, so in-process the last-resort handler never writes to stderr
+#: and the test could not fail.
 _CHILD_PROGRAM = """
 import logging
 import sys
@@ -39,9 +34,8 @@ logging.getLogger("somedependency.transport").warning("noise a user cannot act o
 def test_configure_logging_is_what_keeps_stderr_clean(
     monkeypatch: pytest.MonkeyPatch, mode: str, reaches_stderr: bool
 ) -> None:
-    """Both halves in one test: the ``bare`` case is the behaviour being
-    fixed, the ``configured`` case is the fix, and running them the same way
-    is what makes the second one mean anything."""
+    """The ``bare`` run is the control: without ``configure_logging()`` the
+    warning does reach stderr."""
     monkeypatch.delenv(logging_setup.LOG_FILE_ENV, raising=False)
     result = subprocess.run(
         [sys.executable, "-c", _CHILD_PROGRAM, mode],
@@ -54,9 +48,8 @@ def test_configure_logging_is_what_keeps_stderr_clean(
 
 
 def test_the_env_var_routes_it_to_a_file_instead(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
-    """The escape hatch: nothing reaches the terminal either way, but a
-    backend can still be debugged — including one whose share or path names
-    are not ASCII, which the machine's locale encoding would mangle."""
+    """The log file is written as UTF-8, so non-ASCII share or path names
+    survive whatever the locale encoding is."""
     message = "noise about the share unicode-shäre-ø"
     log_file = tmp_path / "apm.log"
     monkeypatch.setenv(logging_setup.LOG_FILE_ENV, str(log_file))

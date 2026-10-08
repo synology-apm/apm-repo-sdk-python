@@ -1,26 +1,15 @@
-"""``Progress``/``ProgressMeter``: the one progress contract CLI and
-TUI both build on, so neither grows its own rate/ETA math that disagrees
-with the other's.
+"""``Progress``/``ProgressMeter``: the progress contract every frontend
+builds on, so rate/ETA math is computed once.
 
-Four rules, implemented here rather than left to each caller to reinvent:
-
-1. The denominator is planned work, not logical size — a caller's job;
-   this module just carries whatever ``total`` it's given (e.g. a sparse
-   image only needs the chunks a planning pass found, not its full
-   logical size).
-2. Rate is a windowed average over the last ``rate_window_seconds`` of
-   real elapsed time. ETA is suppressed until enough time/progress has
-   accumulated (a warm-up window), and reported quantized so it doesn't
+1. ``total`` is the planned work the caller passes in (a sparse image's
+   planned chunks, not its logical size).
+2. Rate is a windowed average over the last ``rate_window_seconds``. ETA
+   stays unknown through a warm-up window and is quantized so it doesn't
    jitter.
-3. New rate *samples* are taken no more often than
-   ``rate_sample_interval``, decoupling how often the windowed average is
-   recomputed from how often ``ProgressMeter.update`` is called — this is
-   what makes rule 2's fix actually hold, and keeps the sample deque
-   bounded regardless of real call frequency.
-4. Reporting itself is rate-limited inside the SDK — calling a UI callback
-   per chunk would cost more than the decode it measures.
-   ``ProgressMeter.update`` is cheap to call every tick; it only forwards
-   to the wrapped callback every ``min_interval`` seconds or ``min_delta``
+3. Rate samples are taken at most every ``rate_sample_interval``, however
+   often ``ProgressMeter.update`` is called, which bounds the sample deque.
+4. ``ProgressMeter.update`` is cheap to call per chunk; it forwards to the
+   wrapped callback only every ``min_interval`` seconds or ``min_delta``
    units, whichever comes first.
 """
 
@@ -31,40 +20,79 @@ from collections import deque
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from datetime import timedelta
+from typing import Literal
+
+from .format import format_duration, format_rate
+
+ProgressPhase = Literal["discovering", "reading", "verifying"]
+ProgressUnit = Literal["bytes", "items", "buckets"]
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class Progress:
     """One snapshot of a long-running operation's state.
 
     Attributes:
-        phase: ``"discovering"``, ``"planning"``, ``"reading"``,
-            ``"assembling"``, or ``"verifying"``.
+        phase: What the operation is doing.
         determinate: Whether ``total`` is meaningful.
+        done: How many ``unit``\\ s are finished.
         total: ``None`` when the total is unknown.
-        unit: ``"bytes"``, ``"items"``, ``"chunks"``, or ``"buckets"``.
+        unit: What ``done``/``total`` count.
         detail: The file/object currently being processed, for UI display.
         found: Incremental result count when ``total`` is unknown.
     """
 
-    phase: str
+    phase: ProgressPhase
     determinate: bool
     done: int = 0
     total: int | None = None
-    unit: str = "bytes"
+    unit: ProgressUnit = "bytes"
     detail: str = ""
     found: int | None = None
+
+
+type ProgressCallback = Callable[[Progress], Awaitable[None]]
+"""Receives each ``Progress`` snapshot of a long-running operation."""
+
+
+@dataclass(frozen=True, slots=True)
+class FormattedProgress:
+    """A ``ProgressMeter``'s rate, ETA and elapsed time as display text.
+
+    Attributes:
+        rate: ``""`` until a rate has been measured.
+        eta: ``""`` while unknown (no total, or still warming up).
+        elapsed: Always set.
+    """
+
+    rate: str
+    eta: str
+    elapsed: str
 
 
 class ProgressMeter:
     """Smooths raw ``Progress`` snapshots into a stable rate/ETA (rules
     2-3) and rate-limits how often the wrapped callback actually fires
     (rule 4). Construct one per operation; call ``update`` as often as
-    convenient (every chunk is fine)."""
+    convenient (every chunk is fine).
+
+    Args:
+        callback: Awaited with a ``Progress`` when the throttle fires;
+            ``None`` still tracks rate/ETA without notifying.
+        min_interval: Minimum seconds between callback invocations.
+        min_delta: Also notify once ``done`` has advanced this much since
+            the last notification; ``0`` disables the delta trigger.
+        rate_window_seconds: Span of the windowed rate average.
+        rate_sample_interval: Minimum seconds between rate samples.
+        eta_warmup_seconds: ETA stays unknown until this much time has
+            elapsed or ``eta_warmup_fraction`` of the total is done.
+        eta_warmup_fraction: See ``eta_warmup_seconds``.
+        now: Monotonic clock in seconds; injectable for tests.
+    """
 
     def __init__(
         self,
-        callback: Callable[[Progress], Awaitable[None]] | None = None,
+        callback: ProgressCallback | None = None,
         *,
         min_interval: float = 0.1,
         min_delta: int = 0,
@@ -84,9 +112,7 @@ class ProgressMeter:
         self._now = now
 
         self._start: float | None = None
-        # (time, done) samples spanning the last ``rate_window_seconds``
-        # of real elapsed time — see rules 2/3 above for why a new entry
-        # is only appended every ``rate_sample_interval``, not every call.
+        # (time, done) samples over the last ``rate_window_seconds`` (rules 2/3).
         self._samples: deque[tuple[float, int]] = deque()
         self._last_notify_time: float | None = None
         self._last_notify_done = 0
@@ -96,12 +122,9 @@ class ProgressMeter:
     async def update(self, progress: Progress) -> None:
         """Record ``progress`` and, if rule 4's throttle says so, notify.
 
-        ``async def`` even though the sampling arithmetic itself is pure:
-        the callback is ``Awaitable``, so making this method async (rather
-        than sync with a fire-and-forget Task) is what keeps back-pressure
-        intact — a slow UI callback slows the producer down instead of
-        piling up unawaited Tasks. The callback is awaited only when the
-        throttle decides to notify, so the per-tick cost stays cheap.
+        Awaits the callback inline, so a slow UI callback back-pressures the
+        producer rather than piling up tasks; it is awaited only when the
+        throttle fires.
         """
         t = self._now()
         if self._start is None:
@@ -118,10 +141,7 @@ class ProgressMeter:
             dt = t - oldest_t
             if dt > 0:
                 self._rate = (progress.done - oldest_done) / dt
-            # dt == 0 (the very first sample, or several samples that
-            # landed on the same clock tick) leaves ``_rate`` at whatever
-            # it already was — 0.0 initially, unchanged otherwise; never
-            # a divide-by-zero.
+            # dt == 0 leaves the previous rate unchanged.
 
         self._latest = progress
 
@@ -137,6 +157,7 @@ class ProgressMeter:
 
     @property
     def latest(self) -> Progress | None:
+        """The most recent snapshot passed to ``update``, notified or not."""
         return self._latest
 
     @property
@@ -146,9 +167,20 @@ class ProgressMeter:
 
     @property
     def elapsed(self) -> timedelta:
+        """Time since the first ``update``; zero before it."""
         if self._start is None:
             return timedelta(0)
         return timedelta(seconds=self._now() - self._start)
+
+    def formatted(self, unit: str) -> FormattedProgress:
+        """The current rate (per ``unit``), ETA and elapsed time as text."""
+        rate = self._rate
+        eta = self.eta
+        return FormattedProgress(
+            rate=format_rate(rate, unit) if rate > 0 else "",
+            eta=format_duration(eta.total_seconds()) if eta is not None else "",
+            elapsed=format_duration(self.elapsed.total_seconds()),
+        )
 
     @property
     def eta(self) -> timedelta | None:
@@ -186,12 +218,9 @@ def _quantize(seconds: float) -> float:
 
 
 def reading_progress_callback(meter: ProgressMeter) -> Callable[[int, int], Awaitable[None]]:
-    """Adapts ``meter`` to the raw ``(done, total)`` shape
-    ``ContentSource.export_to``'s own ``progress`` callback calls, as a
-    ``phase="reading"`` byte count — the one adapter both the CLI's
-    ``export`` command and the TUI's export screen need, so a UI-facing
-    "rate"/"ETA" can never disagree about what a raw export callback's
-    numbers mean."""
+    """Adapts ``meter`` to the raw ``(done, total)`` shape of an export's
+    ``progress`` callback (``run_export``), as a ``phase="reading"`` byte
+    count."""
 
     async def on_progress(done: int, total: int) -> None:
         await meter.update(Progress(phase="reading", determinate=True, done=done, total=total, unit="bytes"))

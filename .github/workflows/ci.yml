@@ -1,11 +1,12 @@
-# Quality gate on every push and pull request. `test` runs the full `make test`
-# (format check, lint, mypy, pytest with the 95% coverage gate, version-
-# consistency check) once on the newest supported Python; `test-compatible-python`
-# runs `make test-unit` (just the test suite — no coverage/lint/mypy, those are
-# Python-version-independent or already covered by `test`) across the older
-# supported versions, to catch compatibility breaks without re-running
-# version-independent checks on every matrix leg. release.yml reuses this
-# workflow (workflow_call) so a release re-verifies the same gate first.
+# Quality gate on every push and pull request, in three parts that run in
+# parallel where they can: `lint` runs the static checks once (`make lint`:
+# format, ruff, the check scripts, mypy for linux/win32/darwin); `pytest` runs
+# the suite on every supported OS and Python version, each leg recording
+# coverage data; `coverage` combines that data and enforces the 95% gate, so
+# platform- and version-branched code is measured where it runs. `test` only
+# reports whether all three passed — it is the required status check (branch
+# protection, Dependabot auto-merge), so it keeps that name. release.yml reuses
+# this workflow (workflow_call) so a release re-verifies the same gate first.
 name: CI
 
 on:
@@ -22,7 +23,7 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  test:
+  lint:
     runs-on: ubuntu-latest
 
     steps:
@@ -44,37 +45,31 @@ jobs:
           path: |
             .mypy_cache
             .ruff_cache
-          key: typecheck-${{ runner.os }}-${{ hashFiles('uv.lock') }}
+          # A run-unique key, so each run saves its updated caches; an exact
+          # key hit would restore without ever saving again.
+          key: typecheck-${{ runner.os }}-${{ hashFiles('uv.lock') }}-${{ github.sha }}
           restore-keys: |
+            typecheck-${{ runner.os }}-${{ hashFiles('uv.lock') }}-
             typecheck-${{ runner.os }}-
 
-      # Same command as the local pre-commit gate — the Makefile is the single
-      # source of truth for what CI runs.
-      - name: Quality gate (make test)
+      # The Makefile is the single source of truth for what CI runs.
+      - name: Static checks (make lint)
         env:
           NO_COLOR: "1"
           TERM: "dumb"
-        run: make test
+        run: make lint
 
-      - name: Upload coverage report
-        if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
-        with:
-          name: coverage-report
-          path: htmlcov/
-          retention-days: 14
+  pytest:
+    runs-on: ${{ matrix.os }}
 
-  test-compatible-python:
-    runs-on: ubuntu-latest
-
-    # Mirrors the `requires-python = ">=3.11"` floor and the classifiers in
-    # packages/*/pyproject.toml, minus the newest version already covered by the
-    # `test` job above — every version listed there must actually be exercised
-    # somewhere in CI, not just asserted in metadata.
+    # Every supported OS × every Python version in `requires-python = ">=3.12"`
+    # and the classifiers in packages/*/pyproject.toml: the code branches on
+    # both (sys.platform, sys.version_info), sometimes together.
     strategy:
       fail-fast: false
       matrix:
-        python-version: ["3.11", "3.12", "3.13"]
+        os: [ubuntu-latest, windows-latest, macos-latest]
+        python-version: ["3.12", "3.13", "3.14"]
 
     steps:
       - name: Checkout
@@ -89,8 +84,92 @@ jobs:
       - name: Install dependencies
         run: uv sync --all-packages --locked
 
-      - name: Compatibility gate (make test-unit)
+      # Same Makefile entry point as every other job; the Windows image may lack make.
+      - name: Ensure make
+        if: runner.os == 'Windows'
+        shell: bash
+        run: command -v make || choco install make --no-progress -y
+
+      # Hypothesis's example database: a failure one run found is replayed first by the next.
+      - name: Cache hypothesis examples
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
+        with:
+          path: .hypothesis
+          # Run-unique, like the lint job's cache key, so every run saves what it found.
+          key: hypothesis-${{ runner.os }}-${{ matrix.python-version }}-${{ github.sha }}
+          restore-keys: |
+            hypothesis-${{ runner.os }}-${{ matrix.python-version }}-
+            hypothesis-${{ runner.os }}-
+
+      - name: Test suite with coverage data (make test-cov)
+        shell: bash
         env:
           NO_COLOR: "1"
           TERM: "dumb"
-        run: make test-unit
+          HYPOTHESIS_PROFILE: "ci"  # tests/conftest.py's profiles
+        run: make test-cov && mv .coverage ".coverage.${{ runner.os }}-${{ matrix.python-version }}"
+
+      - name: Upload coverage data
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: coverage-data-${{ runner.os }}-${{ matrix.python-version }}
+          path: .coverage.${{ runner.os }}-${{ matrix.python-version }}
+          include-hidden-files: true
+          retention-days: 1
+
+  coverage:
+    needs: pytest
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+        with:
+          enable-cache: true
+          python-version: "3.14"
+
+      - name: Install dependencies
+        run: uv sync --all-packages --locked
+
+      - name: Download coverage data
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: coverage-data-*
+          merge-multiple: true
+
+      # `coverage report` exits non-zero below pyproject's fail_under (95).
+      - name: Combine and enforce the coverage gate
+        run: |
+          uv run coverage combine
+          uv run coverage html --fail-under=0
+          uv run coverage report --skip-covered
+
+      - name: Upload coverage report
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: coverage-report
+          path: htmlcov/
+          retention-days: 14
+
+  # Fails unless every job above succeeded. `if: always()` matters: without it
+  # this job would be *skipped* when one above fails, and a skipped required
+  # check counts as passing.
+  test:
+    if: always()
+    needs: [lint, pytest, coverage]
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Every gate passed
+        shell: bash  # the loop relies on bash word-splitting $RESULTS
+        env:
+          RESULTS: ${{ join(needs.*.result, ' ') }}
+        run: |
+          echo "needed jobs' results: $RESULTS"
+          for result in $RESULTS; do
+            [ "$result" = success ] || exit 1
+          done

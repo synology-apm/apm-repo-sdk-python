@@ -1,21 +1,10 @@
-"""Content inspection for embedded ``saas_obj`` objects.
+"""Content inspection for embedded ``saas_obj`` objects already located
+through the object-name index: ``open_service_db`` opens a service DB
+snapshot, ``sniff``/``inspect_object`` classify an object's bytes. Never
+used to discover where an object is.
 
-The SaaS application layer locates a service-level DB snapshot via the
-connector's own object-name index (see ``object_name_index.py``) — a top-down
-lookup into fixed, connector-written bookkeeping, never a guess. This
-module's role is different: given an already-located object's raw
-bytes, determine (``sniff``) or read (``inspect_object``) *what it is*
-— the corruption check every object-name-index caller still wants (confirm
-it decompresses, confirm it's really SQLite, confirm it defines the
-expected table), never discovery of an unknown object's location; every
-provider locates objects by direct index lookup because a schema-only
-scan couldn't reliably tell apart schema-identical tables (Archive
-Mail's ``mail_table`` from regular Mail's, say).
-
-Raw bytes classify into one of ``ServiceKind``'s members by a fixed
-prefix rule: ZSTD-framed SQLite, then a JSON object, then an RFC822
-header, else binary. (Real ``SnapshotDB`` reassembly is unavailable
-offline.)
+Bytes classify into ``ServiceKind`` by a fixed rule: ZSTD-framed SQLite,
+then a JSON object, then an RFC822 header, else binary.
 """
 
 from __future__ import annotations
@@ -23,36 +12,29 @@ from __future__ import annotations
 import asyncio
 import dataclasses
 import enum
-import json
+from typing import Any
 
 import zstandard
 
+from ..._util.jsonparse import try_parse_json_object
 from ...dedup.dedup_file import DedupFile
 from ...errors import DataCorruptError, KeyRequiredError
-from ...storage.sqlite_source import Envelope, SqliteSource, is_zstd_frame, peel
+from ...format.compression import is_zstd_frame, zstd_content_size
+from ...storage.sqlite_source import Envelope, SqliteSource, close_on_error, peel
 from .objectdb import name_object_id_pairs
 
 _SQLITE_MAGIC = b"SQLite format 3\x00"
 _RFC822_MARKERS = (b"Received:", b"From:", b"To:", b"MIME-Version:", b"Return-Path:", b"Date:", b"Subject:")
 _RFC822_SEARCH_WINDOW = 512
 
-# A decompressed payload past this cap is treated as a false-positive
-# zstd-magic match rather than materialized in full — a sniffing-only
-# backstop against genuinely pathological input, not a real ceiling on
-# service DB size: a healthy service DB with many large attachments can
-# legitimately decompress into the tens of MiB. Content reads that
-# already know they want a specific, already-identified object
-# (``decompress_service_db``) don't use this cap at all; this one only
-# ever gates *sniffing* an object nobody has confirmed the identity of
-# yet.
+# Sniffing only: a candidate decompressing past this is unclassifiable
+# rather than materialized. Not a ceiling on service DB size
+# (open_service_db has none).
 _MAX_SNIFF_DECOMPRESS = 128 << 20
 
-# Objects at or under this size get their zstd-magic checked against a
-# small head read first; only a genuine match triggers a second, full
-# read (``inspect_object``) — never for large objects generically.
-# Magic-gated, not a blind size cutoff, so a large real service DB
-# still gets classified correctly rather than misreported as
-# ``ServiceKind.BINARY``.
+# inspect_object reads an object up to this size whole; a larger one is
+# read whole only when its head is zstd-framed (a possible service DB),
+# otherwise just its first _HEAD_SIZE bytes are sniffed.
 _FULL_READ_CAP = 8 << 20
 _HEAD_SIZE = 4096
 
@@ -92,7 +74,7 @@ class ServiceKind(enum.Enum):
     BINARY = "binary"
 
 
-@dataclasses.dataclass(frozen=True)
+@dataclasses.dataclass(frozen=True, slots=True)
 class IndexEntry:
     """One entry in a connector's own index object: a display name paired
     with the backing object id."""
@@ -101,7 +83,7 @@ class IndexEntry:
     object_id: str
 
 
-@dataclasses.dataclass(frozen=True)
+@dataclasses.dataclass(frozen=True, slots=True)
 class SniffResult:
     """What sniffing a service-DB/index object's bytes found: its
     ``ServiceKind``, plus whichever of ``tables``/``service_name``/
@@ -113,50 +95,35 @@ class SniffResult:
     index_entries: tuple[IndexEntry, ...] = ()
 
 
-async def decompress_service_db(data: bytes) -> bytes:
-    """Decompress one service-level DB snapshot's raw bytes to plain
-    SQLite bytes — the half of ``open_service_db`` that callers holding
-    bytes directly need (``TeamsChatProvider``'s several short-lived
-    connections).
+def _read_head(path: str, n: int) -> bytes:
+    with open(path, "rb") as f:
+        return f.read(n)
 
-    Deliberately unbounded, unlike ``sniff``'s capped speculative
-    read: content here is already identified via the object-name index, so
-    a resolved-but-wrong location is caught by the schema check every
-    caller already does afterward, not by refusing to decompress
-    upfront. Also deliberately unbounded in *size* -- large real service
-    DBs are expected -- which is exactly why this is ``async`` and hops
-    to a real OS thread for the decrypt+decompress itself: ``peel()``
-    itself is pure, synchronous bytes work with no I/O, but leaving a
-    large decrypt+decompress on
-    the event loop would stall every other Task (TUI redraws, a
-    progress callback, a concurrent metadata read) for its duration —
-    the same responsiveness reasoning behind
-    ``dedup/pool/_bucket_reader.py``'s own per-chunk-vs-per-run
-    thread-hop split.
+
+async def open_service_db(data: bytes | bytearray) -> SqliteSource:
+    """Decompress one service-level DB snapshot's bytes into a temp file
+    and open it as SQLite; the caller closes the returned source. No fixed
+    size cap, since the object was already identified through the index; a
+    frame declaring no size is bounded by the free disk space above the
+    reserve.
 
     Raises:
         DataCorruptError: ``data`` isn't ZSTD-framed SQLite.
+        ResourceLimitExceededError: The decompressed size doesn't fit
+            in free disk space with the reserve left free.
     """
-    try:
-        payload, envelopes = await asyncio.to_thread(peel, data)
-    except (zstandard.ZstdError, KeyRequiredError) as exc:
-        raise DataCorruptError(f"service DB blob failed to decompress: {exc}") from exc
-    if Envelope.ZSTD not in envelopes:
-        raise DataCorruptError("service DB blob is not ZSTD-framed")
-    if payload[: len(_SQLITE_MAGIC)] != _SQLITE_MAGIC:
-        raise DataCorruptError("decompressed service DB blob is not a SQLite file")
-    return payload
+    source, envelopes = await SqliteSource.from_enveloped_bytes(data, max_output_size=None, what="service DB blob")
+    async with close_on_error(source):
+        if Envelope.ZSTD not in envelopes:
+            raise DataCorruptError("service DB blob is not ZSTD-framed")
+        assert source.path is not None  # from_enveloped_bytes always uses a temp file
+        head = await asyncio.to_thread(_read_head, source.path, len(_SQLITE_MAGIC))
+        if head != _SQLITE_MAGIC:
+            raise DataCorruptError("decompressed service DB blob is not a SQLite file")
+    return source
 
 
-async def open_service_db(data: bytes) -> SqliteSource:
-    """Decompress and open one service-level DB snapshot's raw bytes as a
-    live, queryable connection — the counterpart to ``sniff`` for
-    callers (the application-layer providers) that need to actually run
-    queries against the DB, not just inspect it."""
-    return await SqliteSource.from_bytes(await decompress_service_db(data))
-
-
-async def _table_names(sqlite_bytes: bytes) -> frozenset[str]:
+async def _table_names(sqlite_bytes: bytes | bytearray) -> frozenset[str]:
     async with await SqliteSource.from_bytes(sqlite_bytes) as source:
         cursor = await source.connection.execute("SELECT name FROM sqlite_master WHERE type='table'")
         rows = await cursor.fetchall()
@@ -164,20 +131,18 @@ async def _table_names(sqlite_bytes: bytes) -> frozenset[str]:
 
 
 def _service_name_for(tables: frozenset[str]) -> str | None:
-    for table in tables:
+    # Sorted: a DB holding tables for two hints must name the same service on every run.
+    for table in sorted(tables):
         hint = _SERVICE_TABLE_HINTS.get(table)
         if hint is not None:
             return hint
     return None
 
 
-def _index_entries(parsed: object) -> tuple[IndexEntry, ...] | None:
-    """Extract the INDEX shape's entries — the real GWS connector encodes
-    this as either a ``db_objects`` array of ``name``/``object_id``
-    pairs, or a ``db_infos_in_snapshot`` indirection name for the "too
-    long to inline" case. ``None`` when ``parsed`` matches neither."""
-    if not isinstance(parsed, dict):  # pragma: no cover - sniff() only calls this after a "{"-prefixed parse
-        return None
+def _index_entries(parsed: dict[str, Any]) -> tuple[IndexEntry, ...] | None:
+    """The INDEX shape's entries: a ``db_objects`` array of
+    ``name``/``object_id`` pairs, or a single ``db_infos_in_snapshot``
+    indirection entry. ``None`` when ``parsed`` matches neither."""
     entries = [
         IndexEntry(name=name, object_id=object_id) for name, object_id in name_object_id_pairs(parsed.get("db_objects"))
     ]
@@ -189,61 +154,63 @@ def _index_entries(parsed: object) -> tuple[IndexEntry, ...] | None:
     return None
 
 
-async def sniff(data: bytes) -> SniffResult:
-    """Classify one object's raw bytes into one of ``ServiceKind``'s
-    shapes. Pure function of ``data`` — touches no repository, no
-    store, no ``DedupFile`` — so it's cheap to unit test with synthetic
-    bytes and is reused as-is by ``inspect_object``; it is ``async``
-    because the ``SERVICE_DB`` branch opens the decompressed payload as
-    real SQLite to read its table names (that's I/O), and because the
-    speculative decompress attempt below hops to a real OS thread
-    rather than blocking the event loop — up to ``_MAX_SNIFF_DECOMPRESS``
-    (128 MiB) of synchronous work otherwise, on data this function
-    hasn't even confirmed is real SQLite yet. Never raises: a ``peel``
-    failure here means "not actually zstd-framed", not "sniff itself
-    failed"."""
+async def sniff(data: bytes | bytearray) -> SniffResult:
+    """Classify one object's raw bytes into a ``ServiceKind``. Touches no
+    repository; decompression runs off the event loop.
+
+    A zstd frame that fails to decompress, or declares a size over
+    ``_MAX_SNIFF_DECOMPRESS`` (checked before decompressing, since
+    ``data`` is untrusted), is unclassifiable rather than an error, as is
+    ``{``-prefixed data that doesn't parse as JSON (invalid, or nested
+    deeper than the decoder's recursion limit).
+
+    Raises:
+        sqlite3.DatabaseError: The payload has the SQLite magic but its
+            table list can't be read.
+        ResourceLimitExceededError: The decompressed SQLite payload doesn't
+            fit in free disk space with the reserve left free.
+    """
+    payload = data
     try:
-        payload, envelopes = await asyncio.to_thread(peel, data, max_zstd_output_size=_MAX_SNIFF_DECOMPRESS)
-    except (zstandard.ZstdError, KeyRequiredError):
-        envelopes = []
-    # peel() already returns data unchanged, no envelopes stripped, when
-    # the first 4 bytes aren't zstd magic, so this covers "wasn't
-    # zstd-framed at all" without a second, independent magic check.
+        declared = zstd_content_size(data)
+    except zstandard.ZstdError:
+        declared = None
+    if declared is not None and declared > _MAX_SNIFF_DECOMPRESS:
+        envelopes: list[Envelope] = []
+    else:
+        try:
+            payload, envelopes = await asyncio.to_thread(peel, data, max_zstd_output_size=_MAX_SNIFF_DECOMPRESS)
+        except (zstandard.ZstdError, KeyRequiredError, DataCorruptError):
+            envelopes = []
     if Envelope.ZSTD in envelopes:
         if payload[: len(_SQLITE_MAGIC)] == _SQLITE_MAGIC:
             tables = await _table_names(payload)
             return SniffResult(kind=ServiceKind.SERVICE_DB, tables=tables, service_name=_service_name_for(tables))
         return SniffResult(kind=ServiceKind.BINARY)
 
-    if data.lstrip()[:1] == b"{":
-        try:
-            parsed = json.loads(data)
-        except (ValueError, UnicodeDecodeError):
-            pass
-        else:
-            entries = _index_entries(parsed)
-            if entries is not None:
-                return SniffResult(kind=ServiceKind.INDEX, index_entries=entries)
-            return SniffResult(kind=ServiceKind.META_JSON)
+    parsed = try_parse_json_object(data) if data.lstrip()[:1] == b"{" else None
+    if parsed is not None:
+        entries = _index_entries(parsed)
+        if entries is not None:
+            return SniffResult(kind=ServiceKind.INDEX, index_entries=entries)
+        return SniffResult(kind=ServiceKind.META_JSON)
 
     window = data[:_RFC822_SEARCH_WINDOW]
     if any(window.startswith(marker) or marker in window for marker in _RFC822_MARKERS):
-        # Real reassembly finds a skeleton via mail_table.meta_object_id's
-        # own content_list, never by sniffing headers — this branch exists
-        # for generic/unknown-object inspection only, not the real restore
-        # path.
         return SniffResult(kind=ServiceKind.MAIL_SKELETON)
 
     return SniffResult(kind=ServiceKind.BINARY)
 
 
 async def inspect_object(dedup_file: DedupFile, offset: int, length: int) -> SniffResult:
-    """Read just enough of an already-located object's bytes to
-    classify (``sniff``) and validate it — never a step in
-    *finding* the object: ``offset``/``length`` always come from the
-    connector's own object-name index or from an already-resolved INDEX
-    object's own entries. Applies ``_FULL_READ_CAP`` (magic-gated, not a
-    blind size cutoff)."""
+    """``sniff`` an already-located object, reading only its head when
+    it's over ``_FULL_READ_CAP`` and not zstd-framed.
+
+    Raises:
+        sqlite3.DatabaseError: As ``sniff``.
+        ResourceLimitExceededError: As ``sniff``, or a zstd-framed object
+            is over ``DedupFile.read()``'s single-read ceiling.
+    """
     if length <= _FULL_READ_CAP:
         return await sniff(await dedup_file.read(offset, length))
     head = await dedup_file.read(offset, _HEAD_SIZE)

@@ -1,8 +1,6 @@
-"""``synology-apm-repo-cli doctor <repo>`` — one-page repository diagnosis
-built entirely on already-existing SDK calls. Available in both normal and
-``--verbose`` mode — normal mode shows only display names plus each
-workload's supported/unsupported status; ``--verbose`` additionally shows
-internal ids and format metadata (see ``_CatalogReport``).
+"""``synology-apm-repo-cli doctor <repo>`` — one-page repository diagnosis.
+The default view shows display names and each workload's supported status;
+``--verbose`` adds internal ids and format metadata.
 """
 
 from __future__ import annotations
@@ -11,28 +9,22 @@ import asyncio
 from typing import NotRequired, TypedDict
 
 import typer
-from rich.console import Console
 
 from synology_apm_repo.cli.asyncio_support import typer_async
+from synology_apm_repo.cli.consoles import console
 from synology_apm_repo.cli.options import KeyOption, ProfileOption, RepoArgument
 from synology_apm_repo.cli.paging import render
 from synology_apm_repo.cli.repo_session import opened_repo_or_profile
 from synology_apm_repo.cli.state import CliState
-from synology_apm_repo.sdk.api import Catalog, Repository, Workload
-from synology_apm_repo.sdk.presentation.markup import safe
-
-console = Console()
+from synology_apm_repo.sdk import Catalog, KeyStatus, Repository, Workload
+from synology_apm_repo.sdk.presentation import pluralize, safe
 
 
 class _KeyReport(TypedDict):
     status: str
-    #: Reported unconditionally, alongside ``status`` rather than
-    #: instead of it — ``status``'s ``no_key_provided`` value covers both
-    #: "confirmed encrypted, no key given yet" (``is_encrypted`` is
-    #: ``True``) and the rare "encryption status itself couldn't be
-    #: resolved" (``is_encrypted`` is ``None`` — see ``ARCHITECTURE.md``'s
-    #: Repository Layer section); without this field there is no way to
-    #: tell the two apart.
+    #: Always reported: it tells ``no_key_provided`` for an encrypted
+    #: repository (``True``) from one whose encryption status couldn't be
+    #: resolved (``None``).
     is_encrypted: bool | None
     gcm_ok: NotRequired[bool]
 
@@ -51,10 +43,9 @@ class _WorkloadReport(TypedDict):
 
 class _CatalogReport(TypedDict):
     """``catalog_id``/``namespaces``/``repo_uuid``/``repo_type`` are
-    ``--verbose`` only, and only ever set together. ``repo_uuid``/
-    ``repo_type`` are genuinely this catalog's own (object storage: each
-    repo-id has its own ``repo_info`` marker) — the same value repeated
-    for every sibling of a vault, which shares one ``repo_info``."""
+    ``--verbose`` only, and set together. ``repo_uuid``/``repo_type`` come
+    from the catalog's ``repo_info``: per repo-id on object storage, the
+    same for every catalog of a vault."""
 
     display_name: str
     workload_count: int
@@ -67,9 +58,7 @@ class _CatalogReport(TypedDict):
 
 
 class _DoctorReport(TypedDict):
-    """``repo_root`` is ``--verbose`` only — the one remaining piece of
-    internal repository-format metadata that's genuinely bucket/vault-wide, not
-    part of the default catalog/workload/version view."""
+    """``repo_root`` is ``--verbose`` only."""
 
     layout: str
     key: _KeyReport
@@ -78,9 +67,7 @@ class _DoctorReport(TypedDict):
 
 
 def _key_report(repo: Repository) -> _KeyReport:
-    # repo.key_status/.is_encrypted/.key_verification are plain, no-I/O
-    # properties — Session.discover()/.open() already resolved the key
-    # status up front when the repository was opened.
+    # No I/O: opening the repository already resolved its key status.
     report: _KeyReport = {"status": repo.key_status.value, "is_encrypted": repo.is_encrypted}
     verification = repo.key_verification
     if verification is not None:
@@ -121,8 +108,7 @@ async def _catalog_report(repo: Repository, catalog: Catalog, verbose: bool) -> 
 
 async def _build_report(repository: Repository, state: CliState) -> _DoctorReport:
     catalogs = await repository.catalogs()
-    # Concurrent, not serial — mirrors Repository.catalogs()'s own gather
-    # over the same catalog list; asyncio.gather preserves input order.
+    # asyncio.gather preserves input order.
     catalog_reports = await asyncio.gather(
         *(_catalog_report(repository, catalog, state.verbose) for catalog in catalogs)
     )
@@ -141,21 +127,20 @@ def _render_human(report: _DoctorReport, verbose: bool) -> None:
     if "repo_root" in report:
         console.print(f"[bold]repo_root[/bold]: {report['repo_root']}")
     key = report["key"]
-    console.print(f"[bold]key status[/bold]: {key['status']}")
+    console.print(f"[bold]key status[/bold]: {KeyStatus(key['status']).label}")
     if key["status"] == "no_key_provided" and key["is_encrypted"] is None:
         console.print("  [dim]encryption status could not be determined[/dim]")
     if key["status"] == "invalid":
         console.print(f"  gcm_ok={key.get('gcm_ok')}")
 
     cats = report["catalogs"]
-    console.print(f"\n[bold]{len(cats)} backup source(s)[/bold]")
+    console.print(f"\n[bold]{len(cats)} {pluralize(len(cats), 'backup source')}[/bold]")
     for cat in cats:
-        # Every display_name/subtitle/namespace below is real repo
-        # content, not structure -- escaped via safe() at interpolation
-        # time.
+        # display_name/subtitle/namespace are repository content: safe() them.
         console.print(
-            f"  [cyan]{safe(cat['display_name'])}[/cyan] — {cat['workload_count']} workload(s), "
-            f"{cat['version_count']} version(s)"
+            f"  [cyan]{safe(cat['display_name'])}[/cyan] — "
+            f"{cat['workload_count']} {pluralize(cat['workload_count'], 'workload')}, "
+            f"{cat['version_count']} {pluralize(cat['version_count'], 'version')}"
         )
         if verbose:
             console.print(f"    [dim]catalog_id={cat['catalog_id']}[/dim]")

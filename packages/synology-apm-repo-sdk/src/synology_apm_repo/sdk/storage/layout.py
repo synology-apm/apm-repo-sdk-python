@@ -1,16 +1,12 @@
-"""Repository layout detection (FORMAT-SPEC.md: repo-root-layout).
+"""Repository layout detection (FORMAT-SPEC.md: Locating the repository root).
 
-Two shapes exist, both placed by fixed, product-enforced logic — never
-nested arbitrarily deep:
+Two shapes exist, both at a fixed depth:
 
 - **Vault** (APV, or any local-filesystem Copy destination): a directory
-  (conventionally ``@ActiveProtectVault``, though the name itself isn't
-  load-bearing — detection is by content marker, not name) *is* the
-  repository root directly, created exactly one level under the
-  admin-chosen shared folder. Identified by the coexistence of
-  ``repo_info``, ``link.key`` and ``.fully_created`` at that exact path.
-  Exactly one repository per such root, and exactly one vault per shared
-  folder.
+  (conventionally ``@ActiveProtectVault``; detection is by marker, not name)
+  *is* the repository root, one level under the admin-chosen shared folder.
+  Identified by ``repo_info``, ``link.key`` and ``.fully_created`` together
+  at that path. One repository per root, one vault per shared folder.
 - **Object storage** (S3/Azure landed copies): the root contains an
   ``@ActiveProtectData/<12-char-repo-id>/`` subtree, possibly with several
   sibling ``<repo-id>`` directories, and a parallel
@@ -18,35 +14,33 @@ nested arbitrarily deep:
   ``@ActiveProtectData``. Each ``<repo-id>`` is an independent repository
   sharing the same key tree.
 
-  ``repo_info`` under an object-store repository root is **not** a reliable
-  marker by itself — it may carry a ``.<N>`` generation suffix and have no
-  bare-named file at all. ``db/`` and ``@data`` are both always present as
-  bare-named directories regardless of generation suffixing, so the pair
-  of them is the marker used here — requiring both, not just ``db``,
-  reduces the chance of a false positive on some unrelated directory that
-  merely happens to contain a ``db`` subdirectory of its own.
+  ``repo_info`` is not a reliable marker there (it may exist only as
+  ``repo_info.<N>``). ``db/`` and ``@data`` are always bare-named
+  directories, so the pair is the marker; requiring both guards against
+  unrelated directories that merely contain ``db``.
 
-Since neither shape is ever nested more than one level under whatever an
-admin actually provisioned (a shared folder, a bucket), a connection
-pointed anywhere from *that* level down to two levels *above* it still
-finds every repository. ``_DEFAULT_MAX_DEPTH`` bounds the walk at exactly
-that — not the fully open-ended search a misdirected scan of an unrelated
-directory tree could run away into, but not artificially limited to a
-single level either.
+Neither shape nests more than one level under what an admin provisioned (a
+shared folder, a bucket), so a connection pointed up to two levels above
+that still finds every repository. ``_DEFAULT_MAX_DEPTH`` bounds the walk at
+that, so a misdirected scan of an unrelated tree can't run away.
 """
 
 from __future__ import annotations
 
 import dataclasses
 import enum
-from collections.abc import AsyncIterator
+from collections.abc import AsyncGenerator
 
 from ..errors import NotFoundError
-from .base import ObjectStore, join_path
+from .base import ObjectStore, join_path, list_names
 
 _DATA_DIR = "@ActiveProtectData"
+_VAULT_DIR = "@ActiveProtectVault"
 _KEY_DIR = "@ActiveProtectKey"
-_VAULT_MARKERS = ("repo_info", "link.key", ".fully_created")
+REPO_INFO_NAME = "repo_info"
+"""The logical name of the repository-root ``repo_info`` file, as
+FORMAT-SPEC.md's repo_info section defines it."""
+_VAULT_MARKERS = (REPO_INFO_NAME, "link.key", ".fully_created")
 _DEFAULT_MAX_DEPTH = 2
 
 
@@ -58,13 +52,18 @@ class RepoKind(enum.Enum):
     OBJECT_STORE = "object_store"
 
 
-@dataclasses.dataclass(frozen=True)
+@dataclasses.dataclass(frozen=True, slots=True)
 class RepoLayout:
-    """Where one repository lives within an ``ObjectStore``.
+    """Where one catalog (a vault, or one ``<repo-id>`` directory) lives
+    within an ``ObjectStore``: what ``DedupRepo.open()`` takes. Built from a
+    ``RepositoryLayout`` by ``catalog_repo_layouts``.
 
-    ``repo_root`` and ``key_root`` are store-relative paths (``""`` means
-    "the store's own root"), never absolute paths — an ``ObjectStore``
-    has no such notion.
+    Attributes:
+        kind: Vault or object storage.
+        repo_root: Store-relative repository root (``""``: the store root).
+        key_root: Store-relative ``@ActiveProtectKey`` directory for object
+            storage, or ``None`` if not found or not applicable.
+        repo_id: The 12-character repository id for object storage, when known.
     """
 
     kind: RepoKind
@@ -81,30 +80,21 @@ async def _looks_like_vault_root(store: ObjectStore, path: str) -> bool:
 
 
 async def _looks_like_object_store_repo(store: ObjectStore, repo_root: str) -> bool:
-    # Both dirs are present regardless of repo_info suffixing; requiring
-    # both (rather than just "db") reduces the chance of a false positive
-    # on some unrelated directory that merely happens to contain a "db"
-    # subdirectory of its own.
     return await store.exists(join_path(repo_root, "db")) and await store.exists(join_path(repo_root, "@data"))
 
 
 async def _safe_listdir(store: ObjectStore, path: str) -> list[str]:
     try:
-        return await store.listdir(path)
+        return await list_names(store, path)
     except NotFoundError:
         return []
 
 
 def _data_dir_ancestor(root: str) -> tuple[str, str] | None:
-    """If ``root`` is itself an ``_DATA_DIR/<repo_id>`` path — a scan
-    narrowed straight to one object-store repository directory, without its
-    bucket-root ancestor — return ``(ancestor, repo_id)``, ``ancestor``
-    being the directory ``_DATA_DIR`` and its sibling ``_KEY_DIR`` both
-    live directly under.
-
-    Returns ``None`` when ``root`` doesn't have that shape (fewer than
-    two segments, or its parent segment isn't literally ``_DATA_DIR``) —
-    the genuinely ambiguous case where no key tree can be located at all.
+    """If ``root`` is a ``_DATA_DIR/<repo_id>`` path (a scan narrowed to one
+    repository directory), return ``(ancestor, repo_id)``, where ``ancestor``
+    holds both ``_DATA_DIR`` and ``_KEY_DIR``. Returns ``None`` otherwise,
+    when no key tree can be located.
     """
     segments = root.split("/")
     if len(segments) < 2 or segments[-2] != _DATA_DIR:
@@ -112,141 +102,37 @@ def _data_dir_ancestor(root: str) -> tuple[str, str] | None:
     return "/".join(segments[:-2]), segments[-1]
 
 
-async def _layouts_at(store: ObjectStore, root: str) -> list[RepoLayout] | None:
-    """Classify ``root`` itself, non-recursively — the one repository-root-marker
-    check ``iter_layouts``/``detect_layout`` both build on.
-
-    Returns ``None`` when ``root`` matches no recognized repository-root shape
-    at all — the caller decides what that means (``iter_layouts`` recurses
-    into children, ``detect_layout`` raises). Otherwise a list of the
-    layout(s) found directly at ``root``: always exactly one for a vault
-    root or for ``root`` itself being an individual object-store repository
-    directory, but possibly zero or several for an ``@ActiveProtectData``
-    parent — its own repo-id subdirectories may or may not each pass
-    ``_looks_like_object_store_repo``, and either way this is the end of
-    the walk along this branch (no repository nests inside another), never a
-    reason to recurse further.
-    """
-    if await _looks_like_vault_root(store, root):
-        return [RepoLayout(kind=RepoKind.VAULT, repo_root=root)]
-
+async def _bucket_at(store: ObjectStore, root: str) -> tuple[str | None, list[str]] | None:
+    """For a bucket root (one holding ``@ActiveProtectData``), its
+    ``@ActiveProtectKey`` directory (``None`` if absent) and its valid
+    repository ids, sorted; ``None`` when ``root`` is not a bucket root."""
     data_dir = join_path(root, _DATA_DIR)
-    if await store.exists(data_dir):
-        key_dir = join_path(root, _KEY_DIR)
-        resolved_key_dir = key_dir if await store.exists(key_dir) else None
-        layouts = []
-        for repo_id in sorted(await _safe_listdir(store, data_dir)):
-            repo_root = join_path(data_dir, repo_id)
-            if await _looks_like_object_store_repo(store, repo_root):
-                layouts.append(
-                    RepoLayout(
-                        kind=RepoKind.OBJECT_STORE, repo_root=repo_root, key_root=resolved_key_dir, repo_id=repo_id
-                    )
-                )
-        return layouts
-
-    if await _looks_like_object_store_repo(store, root):
-        # ``root`` is one object-store repository directory. Its sibling
-        # @ActiveProtectKey/ lives one level above @ActiveProtectData, so
-        # when `root` is an `@ActiveProtectData/<repoId>` path, look for it
-        # there instead. Otherwise the key tree is unreachable from here.
-        ancestor = _data_dir_ancestor(root)
-        key_root = ancestor[0] if ancestor is not None else root
-        narrowed_repo_id = ancestor[1] if ancestor is not None else None
-        key_dir = join_path(key_root, _KEY_DIR)
-        return [
-            RepoLayout(
-                kind=RepoKind.OBJECT_STORE,
-                repo_root=root,
-                key_root=key_dir if await store.exists(key_dir) else None,
-                repo_id=narrowed_repo_id,
-            )
-        ]
-
-    return None
+    if not await store.exists(data_dir):
+        return None
+    key_dir = join_path(root, _KEY_DIR)
+    resolved_key_dir = key_dir if await store.exists(key_dir) else None
+    repo_ids = [
+        repo_id
+        for repo_id in sorted(await _safe_listdir(store, data_dir))
+        if await _looks_like_object_store_repo(store, join_path(data_dir, repo_id))
+    ]
+    return resolved_key_dir, repo_ids
 
 
-async def iter_layouts(
-    store: ObjectStore,
-    root: str = "",
-    *,
-    max_depth: int = _DEFAULT_MAX_DEPTH,
-) -> AsyncIterator[RepoLayout]:
-    """Walk down from ``root`` looking for repository roots, yielding each
-    as it is found.
-
-    Cheap by construction: only ``exists()``/``listdir()`` calls at each
-    level, never a scan into ``Pool``/``Composition``/``db``. A vault root
-    or object-store bucket root ends the walk along that branch (no repository
-    nests inside another); ``max_depth`` bounds how far it goes otherwise, at
-    the 2-level default derived in this module's docstring above.
-
-    Total result count is unknowable in advance — callers doing interactive
-    discovery should treat this as an indeterminate-progress operation and
-    consume it lazily.
-    """
-    layouts = await _layouts_at(store, root)
-    if layouts is not None:
-        for layout in layouts:
-            yield layout
-        return
-
-    if max_depth <= 0:
-        return
-    for child in sorted(await _safe_listdir(store, root)):
-        # ``yield from`` is not available in an async generator — the async
-        # equivalent of delegating to a recursive sub-generator is this
-        # explicit ``async for`` re-yield loop.
-        async for layout in iter_layouts(store, join_path(root, child), max_depth=max_depth - 1):
-            yield layout
-
-
-async def detect_layout(store: ObjectStore, root: str = "") -> RepoLayout:
-    """Detect the single repository layout directly at ``root`` — for the
-    common case where the caller already knows ``root`` is exactly one
-    repository (e.g. it was chosen from a prior ``iter_layouts`` scan).
-
-    Raises ``NotFoundError`` if ``root`` is not itself a repository root, or is an
-    object-store bucket root containing more than one (or zero) repository ids —
-    callers facing that ambiguity should use ``iter_layouts`` instead.
-    """
-    layouts = await _layouts_at(store, root)
-    if layouts is None:
-        raise NotFoundError("no repository layout detected", ref=root)
-    if len(layouts) != 1:
-        raise NotFoundError(
-            f"contains {len(layouts)} valid repository id(s) under {_DATA_DIR} — ambiguous; "
-            "use iter_layouts() and pick one",
-            ref=root,
-        )
-    return layouts[0]
-
-
-# -- Repository/Catalog model ------------------------------------------
-#
-# `RepositoryLayout` is the Repository-level counterpart to `RepoLayout`
-# above: `RepoLayout` names one catalog-level location (one vault, or one
-# `<repo-id>` directory a caller has disambiguated down to); `RepositoryLayout`
-# names the Repository level (one vault, or one whole bucket), carrying
-# every sibling `<repo-id>` as `catalog_ids` instead of one already picked.
-# `api/session.py`/`api/repository.py` build on the functions below.
-
-
-@dataclasses.dataclass(frozen=True)
+@dataclasses.dataclass(frozen=True, slots=True)
 class RepositoryLayout:
     """Where one Repository (a bucket, or a vault's own shared folder)
     lives within an ``ObjectStore``.
 
-    ``repo_root``/``key_root`` are store-relative paths (``""`` means "the
-    store's own root"), never absolute.
-
-    ``catalog_ids`` is populated for ``OBJECT_STORE`` by listing
-    ``@ActiveProtectData/``'s children; ``None`` for ``VAULT`` (catalogs
-    are found later via ``db/connection_config``) and for the one
-    ambiguous ``OBJECT_STORE`` case (``root`` is an individual repository
-    directory with no derivable bucket-root ancestor — see
-    ``_data_dir_ancestor``). An empty list (vs. ``None``) means a real
-    ``@ActiveProtectData`` was found with zero valid repo-id children.
+    Attributes:
+        kind: Vault or object storage.
+        repo_root: Store-relative root (``""``: the store root).
+        key_root: Store-relative ``@ActiveProtectKey`` directory, or ``None``.
+        catalog_ids: For ``OBJECT_STORE``, the valid repo-id children of
+            ``@ActiveProtectData/`` (an empty list: none). ``None`` for
+            ``VAULT`` (catalogs come from ``db/connection_config``) and when
+            ``root`` is an individual repository directory with no derivable
+            bucket-root ancestor (see ``_data_dir_ancestor``).
     """
 
     kind: RepoKind
@@ -254,44 +140,35 @@ class RepositoryLayout:
     key_root: str | None = None
     catalog_ids: list[str] | None = None
 
+    @property
+    def display_root(self) -> str:
+        """``repo_root`` without its ``@ActiveProtectVault``/
+        ``@ActiveProtectData`` segments, at any depth: the part worth showing
+        a user (the folders above the repository, an object-storage repo
+        id); ``""`` for a vault at the store root."""
+        return "/".join(s for s in self.repo_root.split("/") if s not in (_VAULT_DIR, _DATA_DIR))
+
 
 async def _repository_layout_at(store: ObjectStore, root: str) -> RepositoryLayout | None:
-    """Classify ``root`` itself, non-recursively — the Repository-level
-    counterpart to ``_layouts_at``. Returns at most one ``RepositoryLayout``
-    per ``root`` (never several: a location is a vault, a bucket, or
-    nothing — never multiple distinct Repositories sharing one root).
-
-    Returns ``None`` when ``root`` matches no recognized repository-root shape
-    at all — same contract as ``_layouts_at``.
+    """Classify ``root`` itself, non-recursively. A root is a vault, a
+    bucket, or nothing, so there is at most one result; ``None`` means no
+    recognized shape.
     """
     if await _looks_like_vault_root(store, root):
         return RepositoryLayout(kind=RepoKind.VAULT, repo_root=root)
 
-    data_dir = join_path(root, _DATA_DIR)
-    if await store.exists(data_dir):
-        key_dir = join_path(root, _KEY_DIR)
-        resolved_key_dir = key_dir if await store.exists(key_dir) else None
-        catalog_ids = [
-            repo_id
-            for repo_id in sorted(await _safe_listdir(store, data_dir))
-            if await _looks_like_object_store_repo(store, join_path(data_dir, repo_id))
-        ]
-        return RepositoryLayout(
-            kind=RepoKind.OBJECT_STORE, repo_root=root, key_root=resolved_key_dir, catalog_ids=catalog_ids
-        )
+    if (bucket := await _bucket_at(store, root)) is not None:
+        key_root, repo_ids = bucket
+        return RepositoryLayout(kind=RepoKind.OBJECT_STORE, repo_root=root, key_root=key_root, catalog_ids=repo_ids)
 
     if await _looks_like_object_store_repo(store, root):
-        # `root` is one object-store catalog directory. If it's an
-        # `@ActiveProtectData/<repoId>` path, the real Repository is the
-        # bucket root two levels up — redirect there and list every
-        # sibling catalog, since the Repository is the same whole bucket
-        # regardless of which catalog a caller's scan started at.
+        # ``root`` is one catalog directory; if it is @ActiveProtectData/<repoId>,
+        # the Repository is the whole bucket two levels up.
         ancestor = _data_dir_ancestor(root)
         if ancestor is not None:
             bucket_root, _narrowed_repo_id = ancestor
             return await _repository_layout_at(store, bucket_root)
-        # No derivable bucket-root ancestor: report it as its own, single,
-        # unenumerable implicit catalog (`catalog_ids=None`).
+        # No bucket-root ancestor: a single catalog (`catalog_ids=None`).
         key_dir = join_path(root, _KEY_DIR)
         return RepositoryLayout(
             kind=RepoKind.OBJECT_STORE, repo_root=root, key_root=key_dir if await store.exists(key_dir) else None
@@ -305,15 +182,14 @@ async def iter_repository_layouts(
     root: str = "",
     *,
     max_depth: int = _DEFAULT_MAX_DEPTH,
-) -> AsyncIterator[RepositoryLayout]:
-    """Walk down from ``root`` looking for Repository roots (a bucket, or
-    a vault's own shared folder), yielding each as it is found — the
-    Repository-level counterpart to ``iter_layouts``.
+) -> AsyncGenerator[RepositoryLayout, None]:
+    """Walk down from ``root`` looking for Repository roots (a bucket, or a
+    vault's shared folder), yielding each as found. A bucket with several
+    catalogs yields one ``RepositoryLayout`` whose ``catalog_ids`` lists them.
 
-    Unlike ``iter_layouts``, a bucket holding several sibling catalogs
-    yields *one* ``RepositoryLayout`` (with ``catalog_ids`` listing every
-    sibling found), never several — there is no "which repository id" ambiguity
-    at this level to resolve.
+    Only ``exists()``/``listdir()`` calls, never a scan into ``Pool``/
+    ``Composition``/``db``. A found root ends the walk along its branch;
+    otherwise ``max_depth`` (default 2, see the module docstring) bounds it.
     """
     layout = await _repository_layout_at(store, root)
     if layout is not None:
@@ -328,24 +204,15 @@ async def iter_repository_layouts(
 
 
 def catalog_repo_layouts(layout: RepositoryLayout) -> list[RepoLayout]:
-    """The individual, directly-openable ``RepoLayout``\\(s) ``layout``
-    resolves to — exactly what ``DedupRepo.open()`` already consumes
-    unchanged; this is the *only* place ``RepositoryLayout`` and
-    ``RepoLayout`` meet.
+    """The ``RepoLayout``\\(s) ``layout`` resolves to, each openable by
+    ``DedupRepo.open()``.
 
-    A vault (or the one genuinely ambiguous ``OBJECT_STORE`` case —
-    ``catalog_ids`` is ``None``) opens as a single ``RepoLayout`` at
-    ``layout.repo_root`` itself: a vault's own catalogs come from
-    querying ``db/connection_config`` after opening, not a separate
-    directory per catalog. Object storage opens one ``RepoLayout`` per
-    ``catalog_ids`` entry, each rooted at that catalog's own
-    ``@ActiveProtectData/<repo-id>`` subdirectory — every sibling shares
-    ``layout.key_root``, since the key tree lives one level above
-    ``@ActiveProtectData``, not inside any one repo-id's own directory.
-
-    Returns an empty list only when ``layout.catalog_ids`` is itself a
-    real, empty list (a listable ``@ActiveProtectData`` with zero valid
-    repo-id children) — nothing to open at all in that case.
+    A vault, or an ``OBJECT_STORE`` layout with ``catalog_ids`` of ``None``,
+    yields one ``RepoLayout`` at ``layout.repo_root`` (a vault's catalogs
+    come from ``db/connection_config`` after opening). Otherwise one per
+    ``catalog_ids`` entry, rooted at its ``@ActiveProtectData/<repo-id>``
+    directory and sharing ``layout.key_root``. Empty only when
+    ``catalog_ids`` is an empty list.
     """
     if layout.kind is RepoKind.VAULT or layout.catalog_ids is None:
         return [RepoLayout(kind=layout.kind, repo_root=layout.repo_root, key_root=layout.key_root)]
@@ -362,27 +229,20 @@ def catalog_repo_layouts(layout: RepositoryLayout) -> list[RepoLayout]:
 
 
 def key_probe_layout(layout: RepositoryLayout) -> RepoLayout:
-    """A throwaway ``RepoLayout`` carrying only the fields ``dedup.keys``'
-    free functions (``probe_encrypted``/``resolve_vault_key``/``verify``)
-    read for key/encryption resolution, straight off a bucket-rooted
-    ``RepositoryLayout`` — safe to build with no catalog opened at all.
-    Used both before a ``Repository`` exists (``api.session``'s discovery
-    probe) and by ``Repository.set_key()``.
+    """A ``RepoLayout`` carrying only the fields ``dedup.keys`` reads for key
+    and encryption resolution (``probe_encrypted``/``resolve_vault_key``/
+    ``verify``), built from a ``RepositoryLayout`` without opening a catalog.
+    Used by discovery's key probe and ``Repository.set_key()``.
     """
     return RepoLayout(kind=layout.kind, repo_root=layout.repo_root, key_root=layout.key_root)
 
 
 async def detect_repository_layout(store: ObjectStore, root: str = "") -> RepositoryLayout:
-    """Detect the single Repository layout directly at ``root`` — the
-    Repository-level counterpart to ``detect_layout``.
+    """Detect the Repository layout at ``root``. A bucket's several
+    repository ids are not an error; they appear in ``catalog_ids``.
 
-    Raises ``NotFoundError`` if ``root`` is not itself a repository root.
-    Unlike ``detect_layout``, never raises for "several repository ids found"
-    — that's no longer ambiguous at the Repository level, it's
-    ``catalog_ids`` having length greater than one; a caller wanting a
-    single, already-disambiguated catalog picks one from ``catalog_ids``
-    (or queries them after opening, for a vault) rather than re-scanning
-    at a narrower root.
+    Raises:
+        NotFoundError: ``root`` is not a repository root.
     """
     layout = await _repository_layout_at(store, root)
     if layout is None:

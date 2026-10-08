@@ -2,25 +2,24 @@
 ``RepoInfo``/key material/``Pool``/``CompositionReader`` together behind
 ``open_file()``/``open_composition()``.
 
-Repository-root path constants (FORMAT-SPEC.md: repo-root-layout's fixed
-directory names) are **uniform across both layout kinds** —
+Repository-root path constants (FORMAT-SPEC.md: Locating the repository
+root, and directory layout) are **uniform across both layout kinds** —
 ``<repo_root>/@data/Pool``, ``<repo_root>/@data/Composition``,
 ``<repo_root>/db/``; only ``layout.repo_root`` itself differs (the vault
 root directly for ``RepoKind.VAULT``, or
 ``@ActiveProtectData/<repoId>`` for ``RepoKind.OBJECT_STORE``).
-These are the same relative paths ``pool`` and ``keys`` already use.
 """
 
 from __future__ import annotations
 
-import asyncio
 import dataclasses
-from types import TracebackType
-from typing import Self
+from typing import Self, override
 
 import aiosqlite
 
+from .._util.closing import RESOURCE_CLOSE_TIMEOUT, AsyncClosing, close_each, leaf_exceptions
 from ..asynccache import AsyncKeyedCache
+from ..cachemanager import DEFAULT_LIMITS, CacheLimits, CacheManager
 from ..errors import DataCorruptError, KeyRequiredError, NotFoundError
 from ..format.repo_info import RepoInfo, parse_repo_info
 from ..identifiers import CompOffset, SessionId, StreamId
@@ -32,38 +31,44 @@ from ..storage.generations import (
     SUPPL_TRANSACTION_IDS_DIR,
 )
 from ..storage.generations import resolve_generation as _resolve_generation
-from ..storage.layout import RepoKind, RepoLayout
+from ..storage.layout import REPO_INFO_NAME, RepoKind, RepoLayout
 from ..storage.seqid import resolve_seq_path
 from ..storage.sqlite_source import SqliteSource
 from ..storage.table import Column, Table
-from .composition_reader import CompositionReader
+from .composition_reader import CompositionReader, CompositionRecord
 from .dedup_file import DedupFile
 from .keys import KeyMaterial
-from .keys import probe_encrypted as _probe_encrypted
-from .pool import DEFAULT_BUCKET_CACHE_SIZE, DEFAULT_CHUNK_CACHE_SIZE, Pool
+from .pool import NO_VERIFY, Pool, VerifyPolicy
 
 POOL_ROOT = "@data/Pool"
 COMPOSITION_ROOT = "@data/Composition"
 DB_ROOT = "db"
-REPO_INFO_NAME = "repo_info"
 
-# Bounds one SqliteSource.close() call so a hung close doesn't block the
-# rest of _db_sources from ever getting a close attempt. Same value as
-# api.repository.Repository's own constant one layer up (not imported
-# from there — this module sits below api/).
-_RESOURCE_CLOSE_TIMEOUT = 10.0
+#: Every ``db/<name>`` ``DedupRepo.db()`` serves (``copy_target_file`` is
+#: aliased to ``copy_target_version`` before lookup). This closed set is what
+#: bounds ``_db_sources``: add a name here when a new caller needs one.
+DB_SOURCE_NAMES = frozenset(
+    {
+        "connection_config",
+        "copy_target_version",
+        "copy_target_version_meta",
+        "file_map",
+        "file_meta",
+        "vault_link_key",
+        "workload_config",
+    }
+)
 
 
 async def _resolve_versioned(
     store: ObjectStore, dir_cache: DirCache, layout: RepoLayout, dir_path: str, logical_name: str
 ) -> str:
-    """The generation-aware counterpart to ``resolve_seq_path``, for the
-    two logical names FORMAT-SPEC.md: generation-selection's
-    transaction-log algorithm governs (``repo_info``, ``db/<name>``) —
-    everything else keeps using plain ``resolve_seq_path``. Only branches
-    for ``RepoKind.OBJECT_STORE``: ``VAULT`` layouts never have
-    ``.<N>``-suffixed files, and ``resolve_generation`` already degrades
-    to the bare name when there's nothing to select between.
+    """The generation-aware counterpart to ``resolve_seq_path``, for the two
+    logical names FORMAT-SPEC.md: Multi-generation selection governs
+    (``repo_info``, ``db/<name>``). ``VAULT`` layouts have no
+    ``.<N>``-suffixed files, so only ``RepoKind.OBJECT_STORE`` takes the
+    generation path. ``dir_cache`` is the fixed-directory ``DirCache``, so
+    every listing either path needs is shared across resolutions.
     """
     if layout.kind is not RepoKind.OBJECT_STORE:
         return await resolve_seq_path(dir_cache, dir_path, logical_name)
@@ -73,24 +78,24 @@ async def _resolve_versioned(
         logical_name,
         transactions_dir=join_path(layout.repo_root, REPO_TRANSACTIONS_DIR),
         suppl_dir=join_path(layout.repo_root, SUPPL_TRANSACTION_IDS_DIR),
+        listdir=dir_cache.listdir,
     )
 
 
-#: ``db/file_map.status`` values (FORMAT-SPEC.md: file_map-status) — see
-#: ``locate_file``'s own ``Raises:`` section for how each is handled.
-#: ``FILE_MAP_STATUS_COMPLETE`` is public: ``units.saas.stream`` also needs
-#: it, to pre-filter forward-resolution's own generation candidates down
-#: to ones ``locate_file`` will actually accept.
+#: The ``db/file_map.status`` of a complete file, the only one
+#: ``locate_file`` accepts; see its Raises section for the others
+#: (FORMAT-SPEC.md: db/file_map). Public because ``units.saas.stream``
+#: pre-filters candidates with it.
 FILE_MAP_STATUS_COMPLETE = 2
 _FILE_MAP_STATUS_KNOWN_BAD = frozenset({4, 5})
 
 
-@dataclasses.dataclass(frozen=True)
+@dataclasses.dataclass(frozen=True, slots=True)
 class FileLocation:
     """One ``db/file_map`` row, resolved to what ``DedupRepo.open_composition``
     needs plus (when available) ``file_meta.file_size``. ``status`` is not
     carried here — ``locate_file`` already rejects every row except
-    Complete (FORMAT-SPEC.md: file_map-status) before constructing one."""
+    Complete (FORMAT-SPEC.md: db/file_map) before constructing one."""
 
     stream_id: StreamId
     session_id: SessionId
@@ -99,11 +104,16 @@ class FileLocation:
     file_size: int | None
 
 
-class DedupRepo:
-    """Rounds out the module-level ``Pool``/``CompositionReader`` machinery
-    with a small cache of read-only ``db/<name>`` sqlite connections —
-    together, what ``open_file``/``open_composition`` need to hand back a
-    ``DedupFile``.
+class DedupRepo(AsyncClosing):
+    """One opened repository: its ``Pool``, a cache of read-only ``db/<name>``
+    sqlite connections, and a repo-wide ``CompositionRecord`` cache shared by
+    every ``CompositionReader`` it builds. Hands back a ``DedupFile`` via
+    ``open_file``/``open_composition``. Async context manager; ``close()``
+    releases the connections and caches.
+
+    Attributes:
+        layout: The ``RepoLayout`` this repository was opened from.
+        info: The parsed ``repo_info``.
     """
 
     def __init__(
@@ -113,15 +123,30 @@ class DedupRepo:
         info: RepoInfo,
         dir_cache: DirCache,
         *,
+        fixed_dir_cache: DirCache | None = None,
         vault_key: bytes | None = None,
-        bucket_cache_size: int = DEFAULT_BUCKET_CACHE_SIZE,
-        chunk_cache_size: int = DEFAULT_CHUNK_CACHE_SIZE,
-        verify_fingerprint: bool = False,
+        limits: CacheLimits = DEFAULT_LIMITS,
+        verify: VerifyPolicy = NO_VERIFY,
     ) -> None:
         self._store = store
         self.layout = layout
         self.info = info
         self._dir_cache = dir_cache
+        self._fixed_dir_cache = (
+            fixed_dir_cache if fixed_dir_cache is not None else DirCache(store, maxsize=limits.dir_fixed)
+        )
+        self._limits = limits
+        #: Every cache this repository owns, by name; see ``CacheManager``.
+        self.caches = CacheManager()
+        self.caches.register(
+            "dir_scan", dir_cache.invalidate, lambda: {"dir_scan": dir_cache.stats()}, bounded_by="maxsize (LRU)"
+        )
+        self.caches.register(
+            "dir_fixed",
+            self._fixed_dir_cache.invalidate,
+            lambda: {"dir_fixed": self._fixed_dir_cache.stats()},
+            bounded_by="maxsize (LRU)",
+        )
         self._vault_key = vault_key
         self._comp_root = join_path(layout.repo_root, COMPOSITION_ROOT)
         self._db_root = join_path(layout.repo_root, DB_ROOT)
@@ -131,75 +156,67 @@ class DedupRepo:
             self._pool_root,
             dir_cache,
             vault_key=vault_key,
-            bucket_cache_size=bucket_cache_size,
-            chunk_cache_size=chunk_cache_size,
-            verify_fingerprint=verify_fingerprint,
+            limits=limits,
+            verify=verify,
         )
-        # AsyncKeyedCache, not a hand-rolled dict+lock: concurrent db()
-        # calls for different names only contend on the same key, so
-        # unrelated names build in parallel. Deliberately unbounded,
-        # unlike units.saas.stream.SaasStreamCache: this key space is a
-        # small, fixed set of logical db/<name> names per repository, not
-        # one per remote object, so it can't reproduce that cache's
-        # fd-exhaustion failure mode.
-        self._db_sources: AsyncKeyedCache[str, SqliteSource] = AsyncKeyedCache(self._build_db_source)
-        # probe_encrypted()'s cache and _get_file_meta_table()'s:
-        # single-value AsyncKeyedCache instances (a constant None key)
-        # rather than a hand-rolled bool/lock pair, since both results are
-        # legitimately None ("checked, found nothing") and
-        # AsyncKeyedCache's presence check caches that correctly instead
-        # of re-probing forever. Safe for this DedupRepo's whole
-        # lifetime: a read-only repository never rewrites its
-        # encryption-key record or file_meta shape mid-session.
-        self._probe_cache: AsyncKeyedCache[None, bool | None] = AsyncKeyedCache(
-            lambda _: _probe_encrypted(self._store, self.layout)
+        self.caches.register("pool", self._pool.release_caches, self._pool.cache_stats, bounded_by="maxsize (LRU)")
+        self._db_sources: AsyncKeyedCache[str, SqliteSource] = self.caches.keyed(
+            "db_sources",
+            self._build_db_source,
+            maxsize=None,
+            bounded_by="closed key set DB_SOURCE_NAMES",
+            on_invalidate=self._close_db_sources,
         )
-        self._file_meta_table_cache: AsyncKeyedCache[None, Table | None] = AsyncKeyedCache(self._build_file_meta_table)
+        # Single-value cache (constant None key) for _get_file_meta_table(); a
+        # None result ("checked, found nothing") is cached too. Read-only, so
+        # it stays valid until invalidated.
+        self._file_meta_table_cache: AsyncKeyedCache[None, Table | None] = self.caches.keyed(
+            "file_meta_table", self._build_file_meta_table, maxsize=1
+        )
+        self._composition_records: AsyncKeyedCache[tuple[StreamId, SessionId, int], CompositionRecord] = (
+            self.caches.keyed("composition_records", maxsize=limits.composition_records)
+        )
 
     @property
     def store(self) -> ObjectStore:
-        """The underlying ``ObjectStore`` this repository was opened
-        against — exposed for Catalog-Layer-and-above callers that
-        occasionally need a raw path read outside the
-        ``Pool``/``CompositionReader``/``db()`` machinery (e.g.
-        catalog's object-store link-key display-name lookup)."""
+        """The ``ObjectStore`` this repository was opened against, for callers
+        above Catalog that need a raw read outside ``Pool``/
+        ``CompositionReader``/``db()`` (e.g. catalog's link-key display-name
+        lookup)."""
         return self._store
 
     @property
     def vault_key(self) -> bytes | None:
-        """The resolved VaultKey, if any (``None`` for an unencrypted
-        repository or one opened without key material) — exposed for
-        Unit-Layer-and-above callers that need to decrypt something
-        outside the ``Pool``/``CompositionReader`` machinery (e.g.
-        ``DeviceProvider`` peeling an ``aHlT``-enveloped ``target.db``)."""
+        """The resolved VaultKey (``None`` for an unencrypted repository or
+        one opened without key material), for callers that decrypt outside
+        ``Pool`` (e.g. ``catalog.version.open_target_db`` peeling an
+        ``aHlT``-enveloped ``target.db``)."""
         return self._vault_key
 
     @property
     def dir_cache(self) -> DirCache:
-        """This repository's shared ``DirCache`` — exposed for a caller
-        outside ``Pool``/``CompositionReader`` (``verify_checks.
-        check_repo_info``, ``units/verify_reachable.py``'s top-down walk)
-        that needs to resolve a ``.<seqId>``-suffixed path itself,
-        without a second, uncached ``listdir``."""
+        """This repository's ``DirCache`` for bulk-scannable directories (Pool
+        leaves, Composition, a SaaS stream's ``db/``)."""
         return self._dir_cache
 
-    @property
-    def comp_root(self) -> str:
-        """``<repo_root>/@data/Composition`` — exposed so
-        ``units/verify_reachable.py``'s top-down walk can build its own
-        ``CompositionReader`` per visited record without
-        ``open_composition()``'s ``DedupFile`` wrapping (verify wants
-        the raw record/header, not a readable byte range)."""
-        return self._comp_root
+    async def repo_info_path(self) -> str:
+        """The store path of the ``repo_info`` generation this repository
+        uses — on object storage the committed one, as ``open`` reads it.
 
-    @property
-    def pool_root(self) -> str:
-        """``<repo_root>/@data/Pool`` — exposed for the same reason as
-        ``comp_root``: ``units/verify_reachable.py``'s top-down walk
-        constructs its own private ``Pool`` (forcing
-        ``verify_fingerprint``/``verify_ciphertext_crc`` on for the run,
-        rather than mutating this repository's shared one)."""
-        return self._pool_root
+        Raises:
+            NotFoundError: No usable ``repo_info`` exists.
+        """
+        return await _resolve_versioned(
+            self._store, self._fixed_dir_cache, self.layout, self.layout.repo_root, REPO_INFO_NAME
+        )
+
+    def new_pool(self, *, verify: VerifyPolicy) -> Pool:
+        """A separate ``Pool`` over this repository's chunks, with its own
+        caches (sized by this repository's ``CacheLimits``) and ``verify``
+        policy; it shares this repository's directory cache."""
+        return Pool(
+            self._store, self._pool_root, self._dir_cache, vault_key=self._vault_key, limits=self._limits, verify=verify
+        )
 
     @classmethod
     async def open(
@@ -208,27 +225,34 @@ class DedupRepo:
         layout: RepoLayout,
         keys: KeyMaterial | None = None,
         *,
-        bucket_cache_size: int = DEFAULT_BUCKET_CACHE_SIZE,
-        chunk_cache_size: int = DEFAULT_CHUNK_CACHE_SIZE,
-        verify_fingerprint: bool = False,
+        limits: CacheLimits = DEFAULT_LIMITS,
+        verify: VerifyPolicy = NO_VERIFY,
     ) -> Self:
-        """Open ``layout``. Cheap by construction — reads only
-        ``repo_info`` (and, if ``keys`` is given and the repository is
-        encrypted, whatever ``KeyMaterial.resolve_vault_key``
-        touches: one sqlite row or one small key file); never scans Pool
+        """Open ``layout``. Reads only ``repo_info`` and, given ``keys`` for an
+        encrypted repository, the wrapped VaultKey record; never scans Pool
         or Composition.
 
-        A ``keys`` whose GCM tag doesn't check out raises
-        ``KeyMismatchError`` immediately —
-        better to fail here than to hand back a repository that will
-        silently decrypt every chunk into garbage later (AES-CTR has no
-        integrity check of its own). ``verify_fingerprint=True`` makes
-        per-chunk ``.fgp`` verification this session's default for every
-        read through ``pool`` instead of it being off by default — or
-        pass it per-call there instead.
+        Args:
+            store: The repository's ``ObjectStore``.
+            layout: Where the repository root lives.
+            keys: Key material; ``None`` opens without a VaultKey.
+            limits: Bounds of every cache this repository owns: the
+                ``Pool``'s, the directory caches and the composition-record
+                cache.
+            verify: The per-chunk checks every ``Pool`` read runs.
+
+        Raises:
+            NotFoundError: ``repo_info`` is missing.
+            DataCorruptError: ``repo_info`` or the key record is corrupt.
+            FormatError: ``repo_info`` is truncated.
+            KeyMismatchError: ``keys`` fails the GCM tag check (raised here
+                because AES-CTR would otherwise decrypt to garbage silently).
+            KeyRequiredError: ``keys`` names a user key with no wrapped
+                VaultKey on record.
         """
-        dir_cache = DirCache(store)
-        info_path = await _resolve_versioned(store, dir_cache, layout, layout.repo_root, REPO_INFO_NAME)
+        dir_cache = DirCache(store, maxsize=limits.dir_scan)
+        fixed_dir_cache = DirCache(store, maxsize=limits.dir_fixed)
+        info_path = await _resolve_versioned(store, fixed_dir_cache, layout, layout.repo_root, REPO_INFO_NAME)
         info = parse_repo_info(await store.read(info_path))
 
         vault_key: bytes | None = None
@@ -244,59 +268,65 @@ class DedupRepo:
             layout,
             info,
             dir_cache,
+            fixed_dir_cache=fixed_dir_cache,
             vault_key=vault_key,
-            bucket_cache_size=bucket_cache_size,
-            chunk_cache_size=chunk_cache_size,
-            verify_fingerprint=verify_fingerprint,
+            limits=limits,
+            verify=verify,
         )
 
     async def db(self, name: str) -> aiosqlite.Connection:
         """Open (and cache) a connection to ``db/<name>``.
 
-        Read-only against the store either way: the fast path opens the
-        real file immutable, and the slow path opens a private
-        materialized copy read-write so an index hint can take effect —
-        writes there never reach the store.
+        Read-only against the store: the fast path opens the real file
+        immutable; the slow path opens a private materialized copy
+        read-write (so an index hint can take effect) whose writes never
+        reach the store.
 
-        ``name`` is resolved through ``PHYSICAL_NAME_ALIASES`` first
-        (e.g. ``"copy_target_file"`` has no on-disk object of its own;
-        its table lives inside whichever generation
-        ``"copy_target_version"`` resolves to), so requesting either
-        aliased name shares one connection.
+        ``name`` is first resolved through ``PHYSICAL_NAME_ALIASES``
+        (``"copy_target_file"`` lives inside ``"copy_target_version"``'s
+        file), so both names share one connection.
 
-        On a ``RepoKind.OBJECT_STORE`` layout, the real generation is
-        selected by FORMAT-SPEC.md: generation-selection's
-        transaction-log algorithm (``resolve_generation``), not the
-        naive "largest ``.<N>`` suffix" rule every other per-generation
-        file uses — a ``db/<name>.<N>`` generation can exist on disk
-        before the transaction referencing it commits.
+        On a ``RepoKind.OBJECT_STORE`` layout the generation is chosen by
+        FORMAT-SPEC.md: Multi-generation selection (``resolve_generation``),
+        not the largest ``.<N>`` suffix, since a generation can exist on disk
+        before its transaction commits. ``db/<name>`` is always raw (never
+        ``aHlT``/zstd-enveloped).
 
-        ``db/<name>`` is always raw (never ``aHlT``/zstd-enveloped), so
-        ``SqliteSource.from_raw_store`` skips straight to materializing
-        it, unlike every other envelope→SQLite path in this project.
+        Args:
+            name: Logical ``db/<name>``.
+
+        Returns:
+            The cached connection; ``close()`` owns its lifetime.
+
+        Raises:
+            NotFoundError: No such db file.
+            DataCorruptError: The file is not a readable sqlite database.
+            ResourceLimitExceededError: The slow path's private copy doesn't
+                fit in the temp directory with its free-space reserve left.
+            ValueError: ``name`` is not in ``DB_SOURCE_NAMES``.
         """
         name = PHYSICAL_NAME_ALIASES.get(name, name)
+        if name not in DB_SOURCE_NAMES:
+            raise ValueError(f"{name!r} is not a db name DedupRepo serves; add it to DB_SOURCE_NAMES")
         source = await self._db_sources.resolve(name)
         return source.connection
 
     async def _build_db_source(self, name: str) -> SqliteSource:
         """``self._db_sources``'s fetch — ``name`` is already alias-resolved
         by ``db`` before this runs."""
-        path = await _resolve_versioned(self._store, self._dir_cache, self.layout, self._db_root, name)
+        path = await _resolve_versioned(self._store, self._fixed_dir_cache, self.layout, self._db_root, name)
         return await SqliteSource.from_raw_store(self._store, path)
 
     async def locate_file(self, path: str) -> FileLocation:
         """Look up ``path`` in ``db/file_map`` and supplement it with
-        ``file_meta.file_size`` when a matching row exists there too.
-        ``file_meta.path`` is only unique per ``connection_config_id`` —
-        this takes the first match, fine for the common single-workload
-        case but a placeholder pending the Catalog Layer's proper
-        disambiguation.
+        ``file_meta.file_size`` when a matching row exists. ``file_meta.path``
+        is only unique per ``connection_config_id``; this takes the first
+        match.
 
         Raises:
             NotFoundError: no row for ``path`` at all, or its ``status`` is
                 Initialized/Written/Compacted (0/1/3) — not yet, or no
-                longer, resolvable content (FORMAT-SPEC.md: file_map-status).
+                longer, resolvable content (FORMAT-SPEC.md: db/file_map).
             DataCorruptError: the row's ``status`` is Corrupted/Tainted
                 (4/5) — the format itself flags this data as known-bad.
         """
@@ -314,12 +344,12 @@ class DedupRepo:
                 raise DataCorruptError(
                     f"file_map row for path {path!r} has status={status} (Corrupted/Tainted)",
                     ref=path,
-                    spec="FORMAT-SPEC.md: file_map-status",
+                    spec="FORMAT-SPEC.md: db/file_map",
                 )
             raise NotFoundError(
                 f"file_map row for path {path!r} has status={status}, not Complete",
                 ref=path,
-                spec="FORMAT-SPEC.md: file_map-status",
+                spec="FORMAT-SPEC.md: db/file_map",
             )
 
         file_size = await self._file_size_from_meta(path)
@@ -333,15 +363,12 @@ class DedupRepo:
         )
 
     async def file_map_paths_with_prefix(self, prefix: str, *, status: int | None = None) -> list[str]:
-        """Every ``db/file_map`` path starting with ``prefix``, via a
-        ``LIKE``-prefix scan — ``file_map.path`` is the table's own
-        primary key, so SQLite resolves this as an indexed range scan,
-        not a table scan. ``%``/``_``/``\\`` in ``prefix`` are escaped so
-        they match literally rather than as SQL wildcards.
+        """Every ``db/file_map`` path starting with ``prefix``, sorted.
+        ``%``/``_``/``\\`` in ``prefix`` match literally.
 
         ``status``, when given, restricts to rows at exactly that
-        ``file_map.status`` value (FORMAT-SPEC.md: file_map-status) — unlike
-        ``locate_file``, this method applies no status filtering on its own.
+        ``file_map.status`` value (FORMAT-SPEC.md: db/file_map); without it,
+        unlike ``locate_file``, no status filtering applies.
         """
         conn = await self.db("file_map")
         escaped = prefix.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
@@ -354,17 +381,9 @@ class DedupRepo:
         return [row[0] for row in await cursor.fetchall()]
 
     async def _get_file_meta_table(self) -> Table | None:
-        """The (cached) ``file_meta`` ``Table``, or ``None`` if this
-        repository shape has no ``file_meta`` db file, or has one
-        missing the table itself.
-
-        Cached (including the ``None`` outcome): building a ``Table``
-        costs two ``PRAGMA table_info`` queries, real repeated cost
-        under ``locate_file``'s concurrent per-fragment PC/PS disk
-        callers — going through ``AsyncKeyedCache`` (not a bare
-        attribute) means its in-flight de-duplication lets concurrent
-        fragments miss together and only one actually builds the
-        ``Table``.
+        """The cached ``file_meta`` ``Table``, or ``None`` if there is no
+        ``file_meta`` db file or it lacks the table. Concurrent callers share
+        one build.
         """
         return await self._file_meta_table_cache.resolve(None)
 
@@ -378,10 +397,8 @@ class DedupRepo:
         return await Table.create(conn, "file_meta", [Column("path"), Column("file_size", required=False)])
 
     async def _file_size_from_meta(self, path: str) -> int | None:
-        """``file_meta.file_size`` for ``path``, or ``None`` if
-        unavailable (no usable ``file_meta`` table at all, no matching
-        row, or a matching row with no ``file_size`` recorded) — see
-        ``_get_file_meta_table`` for what "unavailable" covers."""
+        """``file_meta.file_size`` for ``path``, or ``None`` without a usable
+        ``file_meta`` table, a matching row, or a recorded ``file_size``."""
         table = await self._get_file_meta_table()
         if table is None:
             return None
@@ -394,74 +411,75 @@ class DedupRepo:
         assert isinstance(value, int)
         return value
 
-    async def open_file(self, path: str) -> DedupFile:
-        """Resolve ``path`` via ``db/file_map`` (+ ``file_meta.file_size``
-        when available) and return a ready-to-read ``DedupFile``.
+    async def open_file(self, path: str, *, fallback_size: int | None = None) -> DedupFile:
+        """Resolve ``path`` via ``db/file_map`` and return a ready-to-read
+        ``DedupFile``, sized by ``file_meta.file_size``, or by
+        ``fallback_size`` when ``file_meta`` records none for it.
 
         Raises:
             NotFoundError: see ``locate_file``.
             DataCorruptError: see ``locate_file``.
         """
         location = await self.locate_file(path)
-        return self.open_composition(
-            location.stream_id, location.session_id, location.comp_offset, size=location.file_size
-        )
+        size = location.file_size if location.file_size is not None else fallback_size
+        return self.open_composition(location.stream_id, location.session_id, location.comp_offset, size=size)
 
     def open_composition(
         self, stream_id: StreamId, session_id: SessionId, comp_offset: CompOffset, size: int | None = None
     ) -> DedupFile:
-        """Construct a ``DedupFile`` directly from a
-        ``(stream_id, session_id, comp_offset)`` triple — the path any
-        workload-specific Unit Layer provider ultimately takes once it has
-        resolved its own metadata down to this triple."""
-        comp_reader = CompositionReader(self._store, self._dir_cache, self._comp_root, stream_id, session_id)
+        """A ``DedupFile`` for a ``(stream_id, session_id, comp_offset)``
+        triple, with ``size`` as its known size (``None``: unknown). Its
+        ``CompositionReader`` shares this repository's composition-record
+        cache."""
+        comp_reader = self.composition_reader(stream_id, session_id, shared_cache=True)
         return DedupFile(comp_reader, self._pool, comp_offset, size=size)
 
-    async def probe_encrypted(self) -> bool | None:
-        """Cheaply determine whether this repository is vault-encrypted —
-        no key needed, never raises ``KeyRequiredError``. See
-        ``keys.probe_encrypted`` for the mechanism; ``None`` means
-        "couldn't tell" (record absent), distinct from
-        confirmed-unencrypted (``False``).
+    def composition_reader(
+        self, stream_id: StreamId, session_id: SessionId, *, shared_cache: bool = False
+    ) -> CompositionReader:
+        """A ``CompositionReader`` for one session's Composition, caching its
+        records in this repository's shared cache only with ``shared_cache``."""
+        return CompositionReader(
+            self._store,
+            self._dir_cache,
+            self._comp_root,
+            stream_id,
+            session_id,
+            composition_cache=self._composition_records if shared_cache else None,
+        )
 
-        Cached for this ``DedupRepo``'s whole lifetime — repeated calls
-        cost nothing after the first.
+    async def _close_db_sources(self, cache: AsyncKeyedCache[str, SqliteSource]) -> None:
+        """``db_sources``' invalidate hook: settle in-flight fetches, then give
+        every source a close attempt (each bounded by a timeout) before the
+        cache is cleared.
+
+        Raises:
+            ExceptionGroup: One or more sources failed to settle or close.
         """
-        return await self._probe_cache.resolve(None)
-
-    async def close(self) -> None:
-        """Release every cached sqlite connection (and any temp file/
-        directory a slow-path materialization created), then drop this
-        repository's in-memory Pool caches.
-
-        Settles every in-flight ``db()`` fetch first, not just what's
-        already landed — a fetch cancelled mid-flight can still have
-        opened a real ``SqliteSource`` nothing else references, and
-        skipping to ``.values()`` would abandon its aiosqlite background
-        thread forever. Every source gets a close attempt regardless of
-        whether an earlier one raised or hung.
-        """
-        sources, errors = await self._db_sources.settle_all()
-        for source in sources.values():
-            try:
-                await asyncio.wait_for(source.close(), timeout=_RESOURCE_CLOSE_TIMEOUT)
-            except Exception as exc:
-                errors.append(exc)
-        self._db_sources.invalidate()
-        # Connections are only half of what this repository holds — the
-        # Pool's own decoded-chunk/bucket/allocation caches are plain
-        # memory nothing else ever drops.
-        self._pool.release_caches()
+        # A Table is bound to a connection about to be closed, so it goes first
+        # even when only db_sources was named (not just under invalidate_all()).
+        self._file_meta_table_cache.invalidate()
+        sources, errors = await cache.settle_all()
+        errors.extend(await close_each((s.close for s in sources.values()), per_close_timeout=RESOURCE_CLOSE_TIMEOUT))
+        cache.invalidate()
         if errors:
-            raise ExceptionGroup("DedupRepo.close() failed to close every tracked resource", errors)
+            raise ExceptionGroup("db source close failed", errors)
 
-    async def __aenter__(self) -> Self:
-        return self
+    @override
+    async def close(self) -> None:
+        """Close every cached sqlite connection (and any temp file or directory
+        a slow-path materialization created) and drop every other cache this
+        repository holds, via ``caches.invalidate_all()``.
 
-    async def __aexit__(
-        self,
-        exc_type: type[BaseException] | None,
-        exc: BaseException | None,
-        tb: TracebackType | None,
-    ) -> None:
-        await self.close()
+        In-flight fetches are settled first, and every resource gets a close
+        attempt, bounded by a timeout, even if an earlier one failed.
+
+        Raises:
+            ExceptionGroup: One or more resources failed to close.
+        """
+        try:
+            await self.caches.invalidate_all()
+        except ExceptionGroup as group:
+            raise ExceptionGroup(
+                "DedupRepo.close() failed to close every tracked resource", leaf_exceptions(group)
+            ) from None

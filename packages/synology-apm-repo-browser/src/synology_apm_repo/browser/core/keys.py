@@ -1,28 +1,38 @@
-"""Domain-identity keys a ``core.*`` model uses instead of ``id(TreeNode)``
-— ``NewType``s so mypy catches a mixed-up handle, plus small composite
-keys that uniquely address one catalog/workload/version.
+"""Domain-identity keys a ``core.*`` model uses instead of ``id(TreeNode)``:
+the two resource handles, ``NewType`` counters so mypy catches a mixed-up
+id, and composite keys addressing one catalog or workload.
 
-Every type here is safe as a ``dict``/``set`` key: none holds a field
-(like ``Workload.spec``/``Node.attrs``, both plain ``dict``s) that would
-make it unhashable at runtime despite mypy accepting it as one.
+Every type here is hashable at runtime: none holds a plain ``dict`` field
+(as ``Workload.spec``/``Node.details`` do), which mypy would accept as a key
+anyway.
 """
 
 from __future__ import annotations
 
 import dataclasses
 from collections.abc import Callable, Mapping
-from typing import NewType, Protocol, TypeVar
+from typing import NewType, Protocol
 
-from synology_apm_repo.sdk.identifiers import CatalogId, VersionUid, WorkloadUid
+from synology_apm_repo.sdk import CatalogId, WorkloadUid
 
-RepoHandle = NewType("RepoHandle", int)
-"""Opaque handle for a live, closable ``Repository``, minted by
-``runtime.resources.ResourceTable.put_repo`` — never the ``Repository``
-object itself, since a frozen model can't hold its live connection."""
 
-ProviderHandle = NewType("ProviderHandle", int)
-"""Opaque handle for a live, closable ``UnitProvider`` — same reasoning
-as ``RepoHandle``, minted by ``ResourceTable.put_provider``."""
+@dataclasses.dataclass(frozen=True, slots=True)
+class RepoHandle:
+    """Opaque handle for a live, closable ``Repository``, minted by
+    ``runtime.resources.ResourceTable.put_repo``; a frozen model holds this
+    instead of the object. Its own type, so a tree payload holding one can
+    be told apart from any other value."""
+
+    id: int
+
+
+@dataclasses.dataclass(frozen=True, slots=True)
+class ProviderHandle:
+    """Opaque handle for a live, closable ``UnitProvider``, minted by
+    ``ResourceTable.put_provider``."""
+
+    id: int
+
 
 RequestId = NewType("RequestId", int)
 """Per-``Slot`` sequence number a model allocates on every dispatch. A
@@ -63,57 +73,44 @@ def is_stale(
 
 
 class _HasNextRequest(Protocol):
-    """Structural minimum ``next_request`` needs: a dataclass with its own
-    ``next_request: RequestId`` field, declared read-only since a
-    ``frozen=True`` dataclass field has no setter."""
+    """A frozen dataclass with a ``next_request: RequestId`` field."""
 
     @property
     def next_request(self) -> RequestId: ...
 
 
-_ModelT = TypeVar("_ModelT", bound=_HasNextRequest)
-
-
-def next_request(model: _ModelT) -> tuple[RequestId, _ModelT]:
+def next_request[ModelT: _HasNextRequest](model: ModelT) -> tuple[RequestId, ModelT]:
     """Allocates the next ``RequestId`` for ``model``'s ``next_request``
     counter, returning it alongside the model with that counter incremented."""
     request = model.next_request
-    # mypy can't express "T is both this Protocol and some real dataclass"
-    # strongly enough for dataclasses.replace to accept it directly -- a
-    # type-checker gap, not a runtime one (every real caller is frozen).
+    # mypy can't see that ModelT is also a dataclass.
     return request, dataclasses.replace(model, next_request=RequestId(request + 1))  # type: ignore[type-var]
 
 
 class _HasFilterText(Protocol):
-    """Structural minimum a "narrowed by ``/``" filter state needs: a
-    dataclass with its own ``text: str`` field."""
+    """A ``/`` filter state: a frozen dataclass with a ``text: str`` field."""
 
     @property
     def text(self) -> str: ...
 
 
-_FilterStateT = TypeVar("_FilterStateT", bound=_HasFilterText)
-_M = TypeVar("_M")
-
-
-def filter_text_changed(
-    model: _M,
-    get_state: Callable[[_M], _FilterStateT | None],
-    apply_state: Callable[[_M, _FilterStateT], _M],
+def filter_text_changed[M, FilterStateT: _HasFilterText](
+    model: M,
+    get_state: Callable[[M], FilterStateT | None],
+    apply_state: Callable[[M, FilterStateT], M],
     text: str,
-) -> _M:
-    """The ``*FilterTextChanged`` case body every domain's filter state
-    repeats identically: a no-op (by identity) if no filter is open,
-    otherwise that state's ``text`` replaced."""
+) -> M:
+    """Every domain's ``*FilterTextChanged`` handling: ``model`` itself if
+    no filter is open, else that state's ``text`` replaced."""
     state = get_state(model)
     if state is None:
         return model
     return apply_state(model, dataclasses.replace(state, text=text))  # type: ignore[type-var]
 
 
-def filter_closed(model: _M, get_state: Callable[[_M], object | None], clear_state: Callable[[_M], _M]) -> _M:
-    """The ``*FilterClosed`` case body's identical guard+clear shape: a
-    no-op (by identity) if no filter is open, otherwise cleared."""
+def filter_closed[M](model: M, get_state: Callable[[M], object | None], clear_state: Callable[[M], M]) -> M:
+    """Every domain's ``*FilterClosed`` handling: ``model`` itself if no
+    filter is open, else cleared."""
     if get_state(model) is None:
         return model
     return clear_state(model)
@@ -121,10 +118,8 @@ def filter_closed(model: _M, get_state: Callable[[_M], object | None], clear_sta
 
 @dataclasses.dataclass(frozen=True, slots=True)
 class CatalogKey:
-    """Identifies one catalog across every repository a scan discovered.
-    ``repo`` is part of the key deliberately: ``CatalogId`` degrades to a
-    per-repository local autoincrement for a vault, which two
-    independently-opened repositories can legitimately share."""
+    """Identifies one catalog across every repository a scan discovered:
+    ``CatalogId`` is unique only within one repository."""
 
     repo: RepoHandle
     catalog_id: CatalogId
@@ -132,19 +127,7 @@ class CatalogKey:
 
 @dataclasses.dataclass(frozen=True, slots=True)
 class WorkloadKey:
-    """Identifies one workload within one catalog. ``workload_uid``, not a
-    bare ``Workload`` — its ``spec`` field is a plain ``dict``, making it
-    unhashable at runtime despite mypy accepting it as a key."""
+    """Identifies one workload within one catalog."""
 
     catalog: CatalogKey
     workload_uid: WorkloadUid
-
-
-@dataclasses.dataclass(frozen=True, slots=True)
-class VersionKey:
-    """Identifies one version within one workload, by ``version_uid``
-    rather than a bare ``Version``, keeping this key's shape consistent
-    with ``WorkloadKey`` above."""
-
-    workload: WorkloadKey
-    version_uid: VersionUid

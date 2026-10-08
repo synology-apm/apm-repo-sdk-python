@@ -1,4 +1,4 @@
-"""Shared filter-box mechanics."""
+"""The shared ``/`` filter box (``#filter-input``)."""
 
 from __future__ import annotations
 
@@ -12,12 +12,7 @@ from synology_apm_repo.browser.widgets.filter_debounce import Debouncer
 
 
 def show_filter_input(screen: Screen[Any]) -> None:
-    """Opens the shared ``#filter-input`` widget for ``/`` filtering:
-    clears its value, marks it ``active`` (the CSS class that actually
-    shows it), and focuses it — the identical three-line sequence
-    ``BrowseScreen``'s tree/version filters and ``UnitScreen``'s own
-    filter each open with. See ``close_filter_debounce`` below for the
-    matching close-half mechanics."""
+    """Clears, shows (CSS class ``active``) and focuses ``#filter-input``."""
     filter_input = screen.query_one("#filter-input", Input)
     filter_input.value = ""
     filter_input.add_class("active")
@@ -25,16 +20,8 @@ def show_filter_input(screen: Screen[Any]) -> None:
 
 
 def close_filter_debounce(screen: Screen[Any], debounce: Debouncer | None, dispatch_closed: Callable[[], None]) -> None:
-    """Closes the shared ``#filter-input`` widget back down: cancels
-    ``debounce`` (if one was ever armed), removes the ``active`` class,
-    then calls ``dispatch_closed`` — the identical mechanics
-    ``BrowseScreen``'s tree/version filters and ``UnitScreen``'s own
-    filter each close with. Each
-    screen still dispatches its own ``*Closed`` action ("empty filter
-    text restores the full list" differs by what's being filtered) via
-    ``dispatch_closed``, and still owns clearing its own debounce field
-    to ``None`` afterward — this function holds no reference to it, only
-    the ``Debouncer`` instance passed in."""
+    """Cancels ``debounce``, hides ``#filter-input``, then calls
+    ``dispatch_closed`` (the screen's ``*Closed`` message)."""
     if debounce is not None:
         debounce.cancel()
     screen.query_one("#filter-input", Input).remove_class("active")
@@ -42,18 +29,10 @@ def close_filter_debounce(screen: Screen[Any], debounce: Debouncer | None, dispa
 
 
 class FilterFieldController:
-    """Owns one filter box's own pending-text buffer and ``Debouncer``,
-    shared by ``BrowseScreen``'s tree and version filters and
-    ``UnitScreen``'s own filter instead of each holding its own
-    ``_pending_*_text``/``_*_debounce`` instance field pair plus a
-    ``_commit_*``/``_close_*`` method pair. *Opening* a filter stays each screen's own job — deciding
-    whether opening even applies (a workload-group node vs. a leaf, say)
-    and which domain ``*Opened`` message to dispatch differ too much
-    between call sites to share — only the commit/close half, which
-    never varies, moves here. Call ``open()`` right after dispatching
-    that domain-specific ``*Opened`` message, ``on_text_changed()`` from
-    ``on_input_changed``, and ``close()`` from the screen's own
-    ``_close_*`` binding."""
+    """One filter's pending text and ``Debouncer``. The screen decides
+    whether a filter opens and dispatches its ``*Opened`` message, then
+    calls ``open()``; it calls ``on_text_changed()`` from
+    ``on_input_changed`` and ``close()`` when the filter closes."""
 
     def __init__(
         self,
@@ -71,11 +50,7 @@ class FilterFieldController:
         self._debounce: Debouncer | None = None
 
     def open(self) -> None:
-        """Call once the screen's own domain-specific ``*Opened`` message
-        has been dispatched -- resets the pending-text buffer, arms a
-        fresh debounce for this filter session, and shows the shared
-        ``#filter-input`` widget (``show_filter_input``, the identical
-        three-line sequence every call site used to open with too)."""
+        """Starts a filter session and shows ``#filter-input``."""
         self.pending_text = ""
         self._debounce = Debouncer(self._screen, self._commit)
         show_filter_input(self._screen)

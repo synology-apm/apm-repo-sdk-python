@@ -1,9 +1,8 @@
 """Unit tests for ``synology_apm_repo.sdk.format.crypto``.
 
-Round-trips are constructed independently using the ``cryptography``
-library's *encrypt* side directly (not by calling back into any decrypt
-helper in this module), so a bug shared between encrypt-side test fixtures
-and decrypt-side implementation can't hide from these.
+Ciphertexts come from the ``cryptography`` library's encrypt side
+directly, never from a helper of ``crypto.py``'s decrypt side, so the two
+can't share a blind spot.
 """
 
 from __future__ import annotations
@@ -20,40 +19,38 @@ from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
 from synology_apm_repo.sdk.errors import DataCorruptError, KeyMaterialError, KeyMismatchError
-from synology_apm_repo.sdk.format.addressing import ChunkAddress
 from synology_apm_repo.sdk.format.crypto import (
     AES_KEY_SIZE,
+    ChunkDecryptor,
     ahlt_decrypt,
+    build_aes_algorithm,
     chunk_iv,
     decrypt_chunk,
     decrypt_version_spec,
+    is_ahlt,
     parse_key_string,
     unwrap_vault_key,
     version_spec_iv,
 )
-from synology_apm_repo.sdk.identifiers import BucketId, ChunkIdx, StreamId
-
-
-def _addr(stream_id: int, bucket_id: int, chunk_idx: int) -> ChunkAddress:
-    return ChunkAddress(StreamId(stream_id), BucketId(bucket_id), ChunkIdx(chunk_idx))
+from unit.sdk.pool_fakes import chunk_address
 
 
 class TestChunkIv:
     def test_iv_is_address_repeated_twice(self) -> None:
-        addr = _addr(1, 2, 3)
+        addr = chunk_address(1, 2, 3)
         iv = chunk_iv(addr)
         assert len(iv) == 16
         assert iv[0:8] == iv[8:16]
         assert iv[0:8] == addr.to_int().to_bytes(8, "big")
 
     def test_different_addresses_give_different_ivs(self) -> None:
-        assert chunk_iv(_addr(1, 2, 3)) != chunk_iv(_addr(1, 2, 4))
+        assert chunk_iv(chunk_address(1, 2, 3)) != chunk_iv(chunk_address(1, 2, 4))
 
 
 class TestDecryptChunk:
     def test_round_trip(self) -> None:
         key = os.urandom(AES_KEY_SIZE)
-        addr = _addr(132, 330, 17)
+        addr = chunk_address(132, 330, 17)
         plaintext = os.urandom(4096)
 
         encryptor = Cipher(algorithms.AES(key), modes.CTR(chunk_iv(addr))).encryptor()
@@ -62,16 +59,12 @@ class TestDecryptChunk:
         assert decrypt_chunk(key, addr, ciphertext) == plaintext
 
     def test_wrong_key_length_raises(self) -> None:
-        with pytest.raises(KeyMaterialError):
-            decrypt_chunk(b"short", _addr(1, 1, 1), b"\x00" * 16)
+        with pytest.raises(KeyMaterialError, match="vault_key must be 32 bytes, got"):
+            decrypt_chunk(b"short", chunk_address(1, 1, 1), b"\x00" * 16)
 
     def test_accepts_a_memoryview_ciphertext_without_copying_first(self) -> None:
-        # Cipher.decryptor().update() reads a memoryview via the buffer
-        # protocol with no copy needed, but always allocates a fresh
-        # output -- pins that a memoryview slice decrypts to the same
-        # plaintext a bytes object would.
         key = os.urandom(AES_KEY_SIZE)
-        addr = _addr(132, 330, 18)
+        addr = chunk_address(132, 330, 18)
         plaintext = os.urandom(4096)
         encryptor = Cipher(algorithms.AES(key), modes.CTR(chunk_iv(addr))).encryptor()
         ciphertext = encryptor.update(plaintext) + encryptor.finalize()
@@ -82,17 +75,38 @@ class TestDecryptChunk:
         assert decrypt_chunk(key, addr, view) == plaintext
 
     def test_wrong_key_gives_wrong_plaintext_not_an_exception(self) -> None:
-        # AES-CTR has no built-in integrity check — decrypting with the
-        # wrong key silently produces garbage, never raises. Verification
-        # against the .fgp fingerprint (a higher layer) is what catches
-        # this; this module has no way to detect it on its own.
+        # AES-CTR has no integrity check; the ``.fgp`` fingerprint check (a
+        # higher layer) is what catches a wrong key.
         key = os.urandom(AES_KEY_SIZE)
         wrong_key = os.urandom(AES_KEY_SIZE)
-        addr = _addr(1, 1, 1)
+        addr = chunk_address(1, 1, 1)
         plaintext = os.urandom(4096)
         encryptor = Cipher(algorithms.AES(key), modes.CTR(chunk_iv(addr))).encryptor()
         ciphertext = encryptor.update(plaintext) + encryptor.finalize()
         assert decrypt_chunk(wrong_key, addr, ciphertext) != plaintext
+
+
+class TestChunkDecryptor:
+    def test_one_instance_matches_decrypt_chunk_across_many_chunks(self) -> None:
+        # Lengths not a multiple of the 16-byte AES block: a re-nonce must not
+        # carry the previous chunk's partial keystream block into the next.
+        key = os.urandom(AES_KEY_SIZE)
+        decryptor = ChunkDecryptor(key)
+        for chunk_idx, length in enumerate([4096, 17, 1, 4095, 100, 4096, 33]):
+            addr = chunk_address(132, 330, chunk_idx)
+            ciphertext = os.urandom(length)
+            assert decryptor.decrypt(addr, memoryview(ciphertext)) == decrypt_chunk(key, addr, ciphertext)
+
+    def test_a_prebuilt_algorithm_replaces_the_key(self) -> None:
+        key = os.urandom(AES_KEY_SIZE)
+        addr = chunk_address(1, 2, 3)
+        ciphertext = os.urandom(4096)
+        decryptor = ChunkDecryptor(b"", algorithm=build_aes_algorithm(key))
+        assert decryptor.decrypt(addr, ciphertext) == decrypt_chunk(key, addr, ciphertext)
+
+    def test_wrong_key_length_raises(self) -> None:
+        with pytest.raises(KeyMaterialError, match="vault_key must be 32 bytes, got"):
+            ChunkDecryptor(b"short")
 
 
 class TestDecryptVersionSpec:
@@ -106,12 +120,8 @@ class TestDecryptVersionSpec:
         assert json.loads(decrypt_version_spec(ciphertext_b64, version_uid, key)) == {"some": "spec"}
 
     def test_iv_is_first_16_hex_characters_of_md5_not_the_raw_digest(self) -> None:
-        # Independent of version_spec_iv() itself: MD5's raw digest is
-        # also exactly 16 bytes, which makes grabbing it directly
-        # (instead of the first 16 *characters* of its hex text) an easy
-        # trap that a round trip built via version_spec_iv() itself
-        # can never catch. Build the expected IV by hand here and confirm
-        # decryption only works with that value, not with the raw digest.
+        # Built without version_spec_iv(): MD5's raw digest is also 16
+        # bytes, so a round trip through it couldn't tell the two IVs apart.
         key = os.urandom(AES_KEY_SIZE)
         version_uid = "some-real-looking-version-uid-1234"
         plaintext = json.dumps({"status": {"status": "COMPLETED"}}).encode("utf-8")
@@ -127,72 +137,92 @@ class TestDecryptVersionSpec:
 
         assert json.loads(decrypt_version_spec(ciphertext_b64, version_uid, key)) == {"status": {"status": "COMPLETED"}}
 
-        # Decrypting the same ciphertext with the raw-digest IV (the trap)
-        # must not silently succeed with the correct plaintext.
         wrong_decryptor = Cipher(algorithms.AES(key), modes.CTR(raw_digest[:16])).decryptor()
         wrong_plaintext = wrong_decryptor.update(base64.b64decode(ciphertext_b64)) + wrong_decryptor.finalize()
         assert wrong_plaintext != plaintext
 
     def test_wrong_key_length_raises(self) -> None:
-        with pytest.raises(KeyMaterialError):
+        with pytest.raises(KeyMaterialError, match="vault_key must be 32 bytes, got"):
             decrypt_version_spec("", "some-uid", b"short")
 
     def test_invalid_base64_raises_binascii_error(self) -> None:
-        with pytest.raises(binascii.Error):
+        with pytest.raises(binascii.Error, match="Only base64 data is allowed"):
             decrypt_version_spec("not-valid-base64!!!", "some-uid", os.urandom(AES_KEY_SIZE))
 
     def test_decrypting_non_utf8_plaintext_raises_unicode_decode_error(self) -> None:
-        # decrypt_version_spec's own documented failure mode for a wrong
-        # key/corrupt input: the AES-CTR output decodes fine as bytes but
-        # is not valid UTF-8. Round-tripped for real (rather than guessing
-        # at what a wrong key happens to produce) so the plaintext handed
-        # to .decode("utf-8") is deterministically invalid: 0x80 alone is a
-        # continuation byte with no leading byte, never valid UTF-8.
+        # A wrong key/corrupt input yields non-UTF-8 plaintext; a lone 0x80
+        # continuation byte is deterministically invalid.
         key = os.urandom(AES_KEY_SIZE)
         version_uid = "some-uid"
         encryptor = Cipher(algorithms.AES(key), modes.CTR(version_spec_iv(version_uid))).encryptor()
         ciphertext_b64 = base64.b64encode(encryptor.update(b"\x80") + encryptor.finalize()).decode("ascii")
-        with pytest.raises(UnicodeDecodeError):
+        with pytest.raises(UnicodeDecodeError, match="can't decode byte"):
             decrypt_version_spec(ciphertext_b64, version_uid, key)
 
 
 class TestParseKeyString:
     def test_valid_key_string(self) -> None:
-        user_key_id, user_key = parse_key_string("n0wohSZahiKc@fHKnM74RWUBQnfgv4DWhXGmmEzV3GGwFpiHt99pjPeM=")
-        assert user_key_id == "n0wohSZahiKc"
-        assert len(user_key) == 32
+        user_key_id, user_key = parse_key_string("AliceKey0001@" + base64.b64encode(bytes(range(32))).decode("ascii"))
+        assert user_key_id == "AliceKey0001"
+        assert user_key == bytes(range(32))
 
-    def test_missing_at_sign_raises(self) -> None:
-        with pytest.raises(KeyMaterialError):
-            parse_key_string("no-at-sign-here")
-
-    def test_wrong_length_user_key_id_raises(self) -> None:
-        with pytest.raises(KeyMaterialError):
-            parse_key_string("shortid@" + "AA==")
-
-    def test_invalid_base64_raises(self) -> None:
-        with pytest.raises(KeyMaterialError):
-            parse_key_string("abcdefghijkl@not-valid-base64!!!")
+    @pytest.mark.parametrize(
+        ("key_string", "message"),
+        [
+            pytest.param("no-at-sign-here", "key string is not", id="missing_at_sign"),
+            pytest.param("shortid@" + "AA==", "userKeyID must be 12 characters", id="wrong_length_user_key_id"),
+            pytest.param("abcdefghijkl@not-valid-base64!!!", "userKey is not valid base64", id="invalid_base64"),
+        ],
+    )
+    def test_malformed_key_string_raises(self, key_string: str, message: str) -> None:
+        with pytest.raises(KeyMaterialError, match=message):
+            parse_key_string(key_string)
 
     def test_wrong_decoded_length_raises(self) -> None:
         import base64
 
         short_key_b64 = base64.b64encode(b"too short").decode()
-        with pytest.raises(KeyMaterialError):
+        with pytest.raises(KeyMaterialError, match="userKey must decode to"):
             parse_key_string(f"abcdefghijkl@{short_key_b64}")
+
+    @pytest.mark.parametrize("separator", ["/", "\\"])
+    @pytest.mark.parametrize("position", [0, 5, 11])
+    def test_a_path_separator_in_the_user_key_id_raises(self, separator: str, position: int) -> None:
+        user_key_id = "abcdefghijkl"[:position] + separator + "abcdefghijkl"[position + 1 :]
+        assert len(user_key_id) == 12
+        b64 = base64.b64encode(os.urandom(32)).decode()
+
+        with pytest.raises(KeyMaterialError, match="userKeyID must not contain a path separator"):
+            parse_key_string(f"{user_key_id}@{b64}")
+
+    def test_a_non_ascii_user_key_id_raises(self) -> None:
+        b64 = base64.b64encode(bytes(32)).decode()
+        with pytest.raises(KeyMaterialError, match="userKeyID must be ASCII"):
+            parse_key_string(f"AliceKey000é@{b64}")
 
     def test_splits_on_last_at_sign(self) -> None:
         import base64
 
         user_key = os.urandom(32)
         b64 = base64.b64encode(user_key).decode()
-        # userKeyID itself contains an '@' — rsplit(..., 1) must still find
-        # the correct boundary (the *last* '@').
+        # A userKeyID may itself contain '@'; the key follows the last one.
         user_key_id_with_at = "ab@cdefghijk"
         assert len(user_key_id_with_at) == 12
         parsed_id, parsed_key = parse_key_string(f"{user_key_id_with_at}@{b64}")
         assert parsed_id == user_key_id_with_at
         assert parsed_key == user_key
+
+
+class TestBuildAesAlgorithm:
+    def test_accepts_a_32_byte_key(self) -> None:
+        algorithm = build_aes_algorithm(os.urandom(AES_KEY_SIZE))
+
+        assert algorithm.key_size == 256
+
+    @pytest.mark.parametrize("length", [0, 16, 24, 31, 33, 64])
+    def test_any_other_key_length_raises(self, length: int) -> None:
+        with pytest.raises(KeyMaterialError, match=f"vault_key must be 32 bytes, got {length}"):
+            build_aes_algorithm(os.urandom(length))
 
 
 class TestUnwrapVaultKey:
@@ -209,24 +239,27 @@ class TestUnwrapVaultKey:
     def test_wrong_user_key_raises_key_mismatch(self) -> None:
         user_key_id = "abcdefghijkl"
         wrapped = AESGCM(os.urandom(32)).encrypt(user_key_id.encode("ascii"), os.urandom(32), None)
-        with pytest.raises(KeyMismatchError):
+        with pytest.raises(KeyMismatchError, match="AES-256-GCM tag check failed"):
             unwrap_vault_key(user_key_id, os.urandom(32), wrapped)
 
     def test_wrong_user_key_id_raises_key_mismatch(self) -> None:
-        # correct key, but nonce (derived from userKeyID) does not match
-        # what it was wrapped with
+        # The right key, but the nonce (from userKeyID) differs from the wrapping one.
         user_key = os.urandom(32)
         wrapped = AESGCM(user_key).encrypt(b"originalid12", os.urandom(32), None)
-        with pytest.raises(KeyMismatchError):
+        with pytest.raises(KeyMismatchError, match="AES-256-GCM tag check failed"):
             unwrap_vault_key("differentid1", user_key, wrapped)
 
     def test_wrong_length_inputs_raise_key_material_error(self) -> None:
-        with pytest.raises(KeyMaterialError):
+        with pytest.raises(KeyMaterialError, match="userKey must be"):
             unwrap_vault_key("abcdefghijkl", b"short", b"\x00" * 48)
-        with pytest.raises(KeyMaterialError):
+        with pytest.raises(KeyMaterialError, match="userKeyID must be"):
             unwrap_vault_key("short", os.urandom(32), b"\x00" * 48)
-        with pytest.raises(KeyMaterialError):
+        with pytest.raises(KeyMaterialError, match="wrapped VaultKey must be"):
             unwrap_vault_key("abcdefghijkl", os.urandom(32), b"\x00" * 10)
+
+    def test_a_non_ascii_user_key_id_raises_key_material_error(self) -> None:
+        with pytest.raises(KeyMaterialError, match="userKeyID must be ASCII"):
+            unwrap_vault_key("abcdefghijké", os.urandom(32), b"\x00" * 48)
 
 
 class TestAhltDecrypt:
@@ -252,5 +285,11 @@ class TestAhltDecrypt:
         vault_key = os.urandom(32)
         data = bytearray(self._build_ahlt(vault_key, b"x" * 100))
         data[0:4] = b"XXXX"
-        with pytest.raises(DataCorruptError):
+        with pytest.raises(DataCorruptError, match="bad magic"):
             ahlt_decrypt(bytes(data), vault_key)
+
+
+def test_is_ahlt_checks_only_the_leading_magic() -> None:
+    assert is_ahlt(b"aHlT" + b"\x00" * 60)
+    assert not is_ahlt(b"\x28\xb5\x2f\xfd" + b"aHlT")
+    assert not is_ahlt(b"aHl")

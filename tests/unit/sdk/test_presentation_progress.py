@@ -5,10 +5,13 @@ from __future__ import annotations
 from collections.abc import Awaitable, Callable
 from datetime import timedelta
 
+import pytest
+
+from synology_apm_repo.sdk.presentation.format import format_duration, format_rate
 from synology_apm_repo.sdk.presentation.progress import Progress, ProgressMeter, reading_progress_callback
 
 
-class _FakeClock:
+class _ManualClock:
     """A manually-advanceable clock so tests never depend on real time."""
 
     def __init__(self, start: float = 1000.0) -> None:
@@ -26,14 +29,7 @@ def _progress(done: int, total: int | None = 1000, determinate: bool = True) -> 
 
 
 def _recording_callback() -> tuple[list[Progress], Callable[[Progress], Awaitable[None]]]:
-    """A recording callback plus the list it records into.
-
-    ``ProgressMeter``'s callback must be ``Callable[[Progress],
-    Awaitable[None]]`` and is ``await``ed, so a bare ``list.append``
-    can't be handed to it — the recorder has to be ``async def``. What
-    each throttling test below asserts: how many times the callback
-    actually fired.
-    """
+    """An ``async`` recording callback plus the list it records into."""
     calls: list[Progress] = []
 
     async def record(progress: Progress) -> None:
@@ -48,7 +44,7 @@ class TestElapsed:
         assert meter.elapsed == timedelta(0)
 
     async def test_tracks_time_since_first_update(self) -> None:
-        clock = _FakeClock()
+        clock = _ManualClock()
         meter = ProgressMeter(now=clock)
         await meter.update(_progress(0))
         clock.advance(5)
@@ -57,13 +53,13 @@ class TestElapsed:
 
 class TestRateSmoothing:
     async def test_rate_is_zero_on_first_sample(self) -> None:
-        clock = _FakeClock()
+        clock = _ManualClock()
         meter = ProgressMeter(now=clock)
         await meter.update(_progress(0))
         assert meter.rate == 0.0
 
     async def test_rate_converges_toward_a_steady_throughput(self) -> None:
-        clock = _FakeClock()
+        clock = _ManualClock()
         meter = ProgressMeter(now=clock)
         await meter.update(_progress(0))
         for i in range(1, 30):
@@ -72,10 +68,8 @@ class TestRateSmoothing:
         assert abs(meter.rate - 10.0) < 0.5
 
     async def test_rate_does_not_jump_instantly_to_a_new_rate(self) -> None:
-        """The windowed average blends old and new activity for as long
-        as the older sample stays inside the window — it isn't a plain
-        "current instantaneous rate", which would jump immediately."""
-        clock = _FakeClock()
+        """The rate is a windowed average, not the instantaneous rate."""
+        clock = _ManualClock()
         meter = ProgressMeter(now=clock, rate_window_seconds=3.0, rate_sample_interval=0.2)
         await meter.update(_progress(0))
         clock.advance(1.0)
@@ -83,23 +77,19 @@ class TestRateSmoothing:
         first_rate = meter.rate
         clock.advance(1.0)
         await meter.update(_progress(110))  # instantaneous rate jumps to 100/s
-        # The window still includes the t=0 sample, so the reported rate
-        # averages over the whole 2s span, not just the latest second —
-        # strictly between the old and new instantaneous rate.
+        # The window still includes the t=0 sample, so the rate averages over 2s.
         assert first_rate < meter.rate < 100.0
 
     async def test_zero_elapsed_between_samples_does_not_corrupt_rate(self) -> None:
-        clock = _FakeClock()
+        clock = _ManualClock()
         meter = ProgressMeter(now=clock)
         await meter.update(_progress(0))
         await meter.update(_progress(5))  # same timestamp, dt == 0
         assert meter.rate == 0.0  # no divide-by-zero, no crash
 
     async def test_rate_stays_stable_despite_a_burst_of_near_zero_dt_calls(self) -> None:
-        """A burst of near-zero-``dt`` calls (a run of already-cached/fast
-        chunks) must not move the rate, since it spans a negligible
-        fraction of the averaging window."""
-        clock = _FakeClock()
+        """A burst of near-zero-``dt`` calls adds no rate sample."""
+        clock = _ManualClock()
         meter = ProgressMeter(now=clock)
         await meter.update(_progress(0))
         done = 0
@@ -109,8 +99,7 @@ class TestRateSmoothing:
             await meter.update(_progress(done))
         steady_rate = meter.rate
 
-        # A burst of 1000 near-instant calls, tiny delta each — real
-        # elapsed time across the whole burst is still only 0.01s.
+        # 1000 calls spanning only 0.01s in total.
         for _ in range(1000):
             clock.advance(0.00001)
             done += 1
@@ -128,7 +117,7 @@ class TestEta:
         assert meter.eta is None
 
     async def test_none_when_indeterminate(self) -> None:
-        clock = _FakeClock()
+        clock = _ManualClock()
         meter = ProgressMeter(now=clock)
         await meter.update(_progress(10, total=None, determinate=False))
         clock.advance(5)
@@ -136,7 +125,7 @@ class TestEta:
         assert meter.eta is None
 
     async def test_none_when_total_is_none_even_if_determinate(self) -> None:
-        clock = _FakeClock()
+        clock = _ManualClock()
         meter = ProgressMeter(now=clock)
         await meter.update(_progress(10, total=None))
         clock.advance(5)
@@ -144,31 +133,34 @@ class TestEta:
         assert meter.eta is None
 
     async def test_none_during_warmup_window(self) -> None:
-        clock = _FakeClock()
+        clock = _ManualClock()
         meter = ProgressMeter(now=clock, eta_warmup_seconds=2.0, eta_warmup_fraction=0.01)
         await meter.update(_progress(0, total=1_000_000))
         clock.advance(0.5)  # under the 2s warmup AND under the 1% fraction
         await meter.update(_progress(1, total=1_000_000))
         assert meter.eta is None
 
-    async def test_available_once_past_the_time_warmup(self) -> None:
-        clock = _FakeClock()
-        meter = ProgressMeter(now=clock, eta_warmup_seconds=1.0, eta_warmup_fraction=0.5)
+    @pytest.mark.parametrize(
+        ("warmup_seconds", "warmup_fraction", "advance"),
+        [
+            # Past the 1s time warmup; rate = 10/s.
+            pytest.param(1.0, 0.5, 2.0, id="time_warmup"),
+            # Nowhere near the 100s time warmup, but 20% done is past the 10% fraction warmup.
+            pytest.param(100.0, 0.1, 1.0, id="fraction_warmup"),
+        ],
+    )
+    async def test_available_once_past_the_warmup(
+        self, warmup_seconds: float, warmup_fraction: float, advance: float
+    ) -> None:
+        clock = _ManualClock()
+        meter = ProgressMeter(now=clock, eta_warmup_seconds=warmup_seconds, eta_warmup_fraction=warmup_fraction)
         await meter.update(_progress(0, total=100))
-        clock.advance(2.0)  # past the 1s time warmup
-        await meter.update(_progress(20, total=100))  # rate = 10/s
-        assert meter.eta is not None
-
-    async def test_available_once_past_the_fraction_warmup(self) -> None:
-        clock = _FakeClock()
-        meter = ProgressMeter(now=clock, eta_warmup_seconds=100.0, eta_warmup_fraction=0.1)
-        await meter.update(_progress(0, total=100))
-        clock.advance(1.0)  # nowhere near the 100s time warmup
-        await meter.update(_progress(20, total=100))  # 20% done, past the 10% fraction warmup
+        clock.advance(advance)
+        await meter.update(_progress(20, total=100))
         assert meter.eta is not None
 
     async def test_zero_when_already_complete(self) -> None:
-        clock = _FakeClock()
+        clock = _ManualClock()
         meter = ProgressMeter(now=clock, eta_warmup_seconds=0.0, eta_warmup_fraction=0.0)
         await meter.update(_progress(0, total=100))
         clock.advance(1.0)
@@ -176,7 +168,7 @@ class TestEta:
         assert meter.eta == timedelta(0)
 
     async def test_zero_total_never_raises(self) -> None:
-        clock = _FakeClock()
+        clock = _ManualClock()
         meter = ProgressMeter(now=clock)
         await meter.update(_progress(0, total=0))
         clock.advance(1.0)
@@ -184,7 +176,7 @@ class TestEta:
         assert meter.eta is None
 
     async def test_none_when_rate_is_zero(self) -> None:
-        clock = _FakeClock()
+        clock = _ManualClock()
         meter = ProgressMeter(now=clock, eta_warmup_seconds=0.0, eta_warmup_fraction=0.0)
         await meter.update(_progress(0, total=100))
         clock.advance(1.0)
@@ -192,7 +184,7 @@ class TestEta:
         assert meter.eta is None
 
     async def test_roughly_matches_remaining_over_rate(self) -> None:
-        clock = _FakeClock()
+        clock = _ManualClock()
         meter = ProgressMeter(now=clock, eta_warmup_seconds=0.0, eta_warmup_fraction=0.0)
         await meter.update(_progress(0, total=1000))
         clock.advance(1.0)
@@ -202,9 +194,45 @@ class TestEta:
         assert 8.0 <= eta.total_seconds() <= 10.0
 
 
+class TestFormatted:
+    async def test_empty_rate_and_eta_before_anything_is_measured(self) -> None:
+        meter = ProgressMeter()
+        text = meter.formatted("bytes")
+        assert (text.rate, text.eta) == ("", "")
+        assert text.elapsed == "00:00"
+
+    async def test_rate_eta_and_elapsed_are_formatted_once_measurable(self) -> None:
+        clock = _ManualClock()
+        meter = ProgressMeter(now=clock)
+        for step in range(4):  # 1s apart, inside the 3s rate window: a steady 1,000,000/s
+            await meter.update(_progress(step * 1_000_000, total=10_000_000))
+            clock.advance(1.0)
+
+        text = meter.formatted("bytes")
+
+        assert text.rate == format_rate(meter.rate, "bytes")
+        assert text.rate != ""
+        eta = meter.eta
+        assert eta is not None
+        assert text.eta == format_duration(eta.total_seconds())
+        assert text.elapsed == format_duration(4.0)
+
+    async def test_eta_stays_empty_without_a_total(self) -> None:
+        clock = _ManualClock()
+        meter = ProgressMeter(now=clock)
+        for step in range(3):  # 1s apart: a steady 50/s
+            await meter.update(_progress(step * 50, total=None, determinate=False))
+            clock.advance(1.0)
+
+        text = meter.formatted("items")
+
+        assert text.rate == "50.0 items/s"
+        assert text.eta == ""
+
+
 class TestQuantization:
     async def test_short_etas_round_to_the_nearest_second(self) -> None:
-        clock = _FakeClock()
+        clock = _ManualClock()
         meter = ProgressMeter(now=clock, eta_warmup_seconds=0.0, eta_warmup_fraction=0.0)
         await meter.update(_progress(0, total=100))
         clock.advance(1.0)
@@ -214,7 +242,7 @@ class TestQuantization:
         assert eta == timedelta(seconds=1)
 
     async def test_medium_etas_round_to_a_5_second_step(self) -> None:
-        clock = _FakeClock()
+        clock = _ManualClock()
         meter = ProgressMeter(now=clock, eta_warmup_seconds=0.0, eta_warmup_fraction=0.0)
         await meter.update(_progress(0, total=1000))
         clock.advance(1.0)
@@ -225,7 +253,7 @@ class TestQuantization:
         assert eta.total_seconds() % 5 == 0
 
     async def test_long_etas_round_to_a_coarser_step(self) -> None:
-        clock = _FakeClock()
+        clock = _ManualClock()
         meter = ProgressMeter(now=clock, eta_warmup_seconds=0.0, eta_warmup_fraction=0.0)
         await meter.update(_progress(0, total=100_000))
         clock.advance(1.0)
@@ -238,14 +266,14 @@ class TestQuantization:
 class TestNotifyThrottling:
     async def test_first_update_always_notifies(self) -> None:
         calls, record = _recording_callback()
-        clock = _FakeClock()
+        clock = _ManualClock()
         meter = ProgressMeter(record, now=clock, min_interval=1.0)
         await meter.update(_progress(0))
         assert len(calls) == 1
 
     async def test_time_based_throttling_suppresses_rapid_updates(self) -> None:
         calls, record = _recording_callback()
-        clock = _FakeClock()
+        clock = _ManualClock()
         meter = ProgressMeter(record, now=clock, min_interval=1.0, min_delta=0)
         await meter.update(_progress(0))
         clock.advance(0.01)
@@ -254,36 +282,34 @@ class TestNotifyThrottling:
         await meter.update(_progress(2))  # still too soon
         assert len(calls) == 1
 
-    async def test_time_based_throttling_fires_after_the_interval(self) -> None:
+    @pytest.mark.parametrize(
+        ("min_interval", "min_delta", "advance", "second_done", "expected_calls"),
+        [
+            pytest.param(1.0, 0, 1.5, 1, 2, id="time_based_throttling_fires_after_the_interval"),
+            # Nowhere near the interval, but delta >= min_delta.
+            pytest.param(
+                100.0, 10, 0.001, 10, 2, id="delta_based_throttling_fires_before_the_interval_if_enough_progress"
+            ),
+            # Below both thresholds.
+            pytest.param(100.0, 10, 0.001, 5, 1, id="delta_based_throttling_does_not_fire_below_the_delta"),
+        ],
+    )
+    async def test_throttling_thresholds(
+        self, min_interval: float, min_delta: int, advance: float, second_done: int, expected_calls: int
+    ) -> None:
         calls, record = _recording_callback()
-        clock = _FakeClock()
-        meter = ProgressMeter(record, now=clock, min_interval=1.0, min_delta=0)
+        clock = _ManualClock()
+        meter = ProgressMeter(record, now=clock, min_interval=min_interval, min_delta=min_delta)
         await meter.update(_progress(0))
-        clock.advance(1.5)
-        await meter.update(_progress(1))
-        assert len(calls) == 2
-
-    async def test_delta_based_throttling_fires_before_the_interval_if_enough_progress(self) -> None:
-        calls, record = _recording_callback()
-        clock = _FakeClock()
-        meter = ProgressMeter(record, now=clock, min_interval=100.0, min_delta=10)
-        await meter.update(_progress(0))
-        clock.advance(0.001)  # nowhere near the 100s interval
-        await meter.update(_progress(10))  # but delta >= 10
-        assert len(calls) == 2
-
-    async def test_delta_based_throttling_does_not_fire_below_the_delta(self) -> None:
-        calls, record = _recording_callback()
-        clock = _FakeClock()
-        meter = ProgressMeter(record, now=clock, min_interval=100.0, min_delta=10)
-        await meter.update(_progress(0))
-        clock.advance(0.001)
-        await meter.update(_progress(5))  # below both thresholds
-        assert len(calls) == 1
+        clock.advance(advance)
+        await meter.update(_progress(second_done))
+        assert len(calls) == expected_calls
 
     async def test_no_callback_is_fine(self) -> None:
         meter = ProgressMeter()
-        await meter.update(_progress(0))  # must not raise
+        p = _progress(0)
+        await meter.update(p)  # must not raise
+        assert meter.latest is p  # still tracked with nothing to notify
 
 
 class TestLatest:
@@ -299,9 +325,7 @@ class TestLatest:
 
 
 class TestReadingProgressCallback:
-    """The ``export_to()``-shaped ``(done, total)`` adapter both the CLI's
-    ``export`` command and the TUI's export screen wrap their own
-    ``ProgressMeter`` with."""
+    """The ``(done, total)`` adapter over a ``ProgressMeter``."""
 
     async def test_forwards_a_reading_phase_byte_count_snapshot(self) -> None:
         meter = ProgressMeter()

@@ -27,7 +27,7 @@ flowchart TD
     end
 
     subgraph pool["Pool (§3.3)"]
-        BUK["Bucket (§4.3)"]
+        BUK["Bucket (§4)"]
         DECOMP["Decompress chunk(s)"]
     end
 
@@ -268,8 +268,8 @@ inputs, distinct from `repo_info`'s repository-wide metadata (§2.5).
 **On-disk `target_type`/`sub_type` values.** `workload_config.workload_type`
 and `copy_target_version.target_type` are always one of six literal
 strings: `VM`, `PC`, `PS`, `FS` (device workloads) or `GW`, `M365` (SaaS
-connector kinds — `GW` is Google Workspace, referred to informally as
-"GWS" but never spelled that way on disk). For a SaaS workload, a second
+connector kinds — `GW` is Google Workspace, abbreviated GWS everywhere
+else in this spec and in code, including the SDK's `TargetType.GWS`). For a SaaS workload, a second
 field distinguishes application: `workload_config.workload_spec`'s own
 `spec.workload_type` (see below) is one of `MAIL`, `CONTACT`, `CALENDAR`,
 `DRIVE`, `USER_DRIVE`, `SITE`, `USER_EXCHANGE`, `TEAMS`, `USER_CHAT`,

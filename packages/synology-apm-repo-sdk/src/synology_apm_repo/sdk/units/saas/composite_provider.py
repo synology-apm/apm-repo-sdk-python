@@ -1,42 +1,43 @@
-"""``CompositeSaasProvider``: bundles more than one already-built
-sub-provider behind one dispatch surface — composition, not one more
-workload built on ``provider.py``'s own ``SaasWorkloadProvider`` base
-(see the class docstring for the shape this covers). See
-``units/dispatch.py`` for its one construction site.
+"""``CompositeSaasProvider``: several already-built SaaS sub-providers
+behind one tree, built by ``units/dispatch.py``'s ``saas_provider_for``.
 """
 
 from __future__ import annotations
 
 import dataclasses
-from types import TracebackType
-from typing import Self
+from typing import override
 
+from ..._util.closing import AsyncClosing, close_all
 from ...catalog.version import Version
 from ...dedup.repository import DedupRepo
-from ..base import ClosableUnitProvider, Node, RestorableUnit, not_restorable, paginate
+from ...units.provider_kit import not_restorable, paginate
+from ..base import ClosableUnitProvider, Node, RestorableUnit
 from ..node_ref import NodeRef, canonical_ref_for
 
 
-class CompositeSaasProvider:
-    """``UnitProvider`` for the one shape no single-app provider covers:
-    M365's ``USER_EXCHANGE``/
-    ``GROUP_EXCHANGE`` sub_types bundle Mail, Contacts and Calendars as
-    three independently-populated services within the same version, all
-    reachable at once — not alternatives to pick between. Every other
-    SaaS sub_type maps 1:1 to one provider; this class is what a caller
-    gets instead when more than one sub-provider recognizes the same
-    version: a synthetic root (``"Exchange"``) whose children are each
-    sub-provider's own root as siblings, with every deeper
-    ``children()``/``unit()`` call routed back to whichever
-    sub-provider owns that node.
+@dataclasses.dataclass(frozen=True, slots=True)
+class _Tagged:
+    """``Node.handle`` of a composite node: the owning sub-provider's tag
+    and that sub-provider's own handle for it."""
 
-    **Ref/key prefixing, not object identity**: every ``Node`` handed
-    out gets ``attrs["key"]`` rewritten to ``(tag, *original_key)``
-    (and its ``ref`` rebuilt to match), with the ``tag`` segment
-    stripped back off before a node reaches the sub-provider that built
-    it — a ``NodeRef`` round-tripped through ``str()``/``parse()``
-    carries this prefix as an ordinary extra segment, so it resolves
-    correctly on a fresh lookup like any other multi-segment ref."""
+    tag: str
+    inner: object
+
+
+_ROOT = _Tagged("", None)
+
+
+class CompositeSaasProvider(AsyncClosing):
+    """``UnitProvider`` for a version more than one sub-provider recognizes
+    (M365 ``USER_EXCHANGE``/``GROUP_EXCHANGE``: Mail, Contacts, Calendars
+    and Archive Mail side by side). A synthetic ``"Exchange"`` root lists
+    each sub-provider's root; deeper calls route to the owning
+    sub-provider.
+
+    Every ``Node`` handed out has its ``ref`` prefixed with the
+    sub-provider's tag and its ``handle`` wrapped as ``_Tagged``, unwrapped
+    again before the node reaches that sub-provider, so a ref round-tripped
+    through a string still resolves. Closing closes every sub-provider."""
 
     def __init__(
         self,
@@ -48,49 +49,49 @@ class CompositeSaasProvider:
         self._version = version
         self._sub_providers = sub_providers
 
+    @override
     async def close(self) -> None:
-        for provider in self._sub_providers.values():
-            await provider.close()
-
-    async def __aenter__(self) -> Self:
-        return self
-
-    async def __aexit__(
-        self,
-        exc_type: type[BaseException] | None,
-        exc: BaseException | None,
-        tb: TracebackType | None,
-    ) -> None:
-        await self.close()
+        await close_all(
+            [p.close for p in self._sub_providers.values()],
+            "CompositeSaasProvider.close() failed to close every sub-provider",
+        )
 
     def _ref_for(self, extra: tuple[str, ...]) -> NodeRef:
         return canonical_ref_for(self._repo, self._version, extra)
 
-    def _tag_node(self, node: Node, tag: str, rest: tuple[str, ...]) -> Node:
-        key = (tag, *rest)
-        return dataclasses.replace(node, ref=self._ref_for(key), attrs={**node.attrs, "key": key})
+    def _tag_node(self, node: Node, tag: str) -> Node:
+        return dataclasses.replace(
+            node, ref=self._ref_for((tag, *node.ref.extra_segments)), handle=_Tagged(tag, node.handle)
+        )
+
+    def _route(self, node: Node) -> tuple[str, ClosableUnitProvider, Node] | None:
+        """The owning sub-provider and the node as it built it, or ``None``
+        for the root or a node no sub-provider owns."""
+        handle = node.handle
+        if not isinstance(handle, _Tagged) or handle is _ROOT:
+            return None
+        provider = self._sub_providers.get(handle.tag)
+        if provider is None:
+            return None
+        return handle.tag, provider, dataclasses.replace(node, handle=handle.inner)
 
     def root(self) -> Node:
-        return Node(ref=self._ref_for(()), name="Exchange", is_leaf=False, attrs={"key": ()})
+        return Node(ref=self._ref_for(()), name="Exchange", is_leaf=False, handle=_ROOT)
 
     async def children(self, node: Node, offset: int = 0, limit: int | None = None) -> list[Node]:
-        key = tuple(node.attrs.get("key", ()))
-        if key == ():
-            tops = [self._tag_node(provider.root(), tag, ()) for tag, provider in self._sub_providers.items()]
+        if node.handle is _ROOT:
+            tops = [self._tag_node(provider.root(), tag) for tag, provider in self._sub_providers.items()]
             return paginate(tops, offset, limit)
-        tag, *rest = key
-        provider = self._sub_providers.get(tag)
-        if provider is None:
+        routed = self._route(node)
+        if routed is None:
             return []
-        sub_node = dataclasses.replace(node, attrs={**node.attrs, "key": tuple(rest)})
-        children = await provider.children(sub_node, offset, limit)
-        return [self._tag_node(child, tag, tuple(child.attrs.get("key", ()))) for child in children]
+        tag, provider, sub_node = routed
+        return [self._tag_node(child, tag) for child in await provider.children(sub_node, offset, limit)]
 
     async def unit(self, node: Node) -> RestorableUnit:
-        key = tuple(node.attrs.get("key", ()))
-        if not key:
+        routed = self._route(node)
+        if routed is None:
             not_restorable("node", node.name)
-        tag, *rest = key
-        provider = self._sub_providers[tag]
-        sub_node = dataclasses.replace(node, attrs={**node.attrs, "key": tuple(rest)})
-        return await provider.unit(sub_node)
+        _tag, provider, sub_node = routed
+        # The sub-provider's unit carries its own untagged ref; keep the listed one.
+        return dataclasses.replace(await provider.unit(sub_node), ref=node.ref)

@@ -1,7 +1,4 @@
-"""Unit tests for ``browser.core.app.select.export_button_spec`` — pure
-text/state-building, no Textual/widget involved at all (unlike the Pilot
-test this selector is extracted from, which still exists to prove the
-*widget* side)."""
+"""Unit tests for ``browser.core.app.select.export_button_spec``."""
 
 from __future__ import annotations
 
@@ -35,9 +32,7 @@ def test_export_button_spec_with_a_queued_job_shows_cancel_but_progress_inactive
 
 
 def test_export_button_spec_with_a_finished_job_shows_export_primary_inactive() -> None:
-    """A job that just finished (cancelled, errored, or successful --
-    JobOutcome doesn't distinguish which for this purpose) resets the
-    button the same as no job at all."""
+    """Any finished outcome resets the button the same as no job at all."""
     outcome = JobOutcome(notify_message="done", notify_severity="information", status_text="[green]done[/green]")
     finished = FinishedJob(id=JobId(1), label="a.bin", outcome=outcome)
     assert export_button_spec(finished) == ExportButtonSpec(

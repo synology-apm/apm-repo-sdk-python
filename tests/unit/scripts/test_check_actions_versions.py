@@ -1,24 +1,19 @@
 """Tests for scripts/check_actions_versions.py.
 
-``scripts/`` isn't an installed package, so the module under test is loaded
-by path via ``importlib`` through the ``check_actions_versions`` fixture. No
-test here hits the network: ``_run_git_ls_remote`` (the single seam both
-tag-resolution and tag-listing funnel through) is monkeypatched with a fake
-that answers from an in-memory fixture instead. This checker's own
-real-repository pass needs live network access to github.com, so unlike a
-purely local checker, there's no offline "regression guard against the real
-repository files" test here.
+``_run_git_ls_remote`` is the one seam both tag resolution and tag listing go
+through; every test replaces it, so nothing here reaches the network. The
+real workflows need github.com, so no test runs the checker against them.
 """
 
 from __future__ import annotations
 
-import importlib.util
-import sys
 from collections.abc import Callable
 from pathlib import Path
 from types import ModuleType
 
 import pytest
+
+from support.modules import load_module
 
 _SCRIPT_PATH = Path(__file__).resolve().parents[3] / "scripts" / "check_actions_versions.py"
 
@@ -27,18 +22,9 @@ _SHA_B = "b" * 40
 _SHA_C = "c" * 40
 
 
-def _load_module() -> ModuleType:
-    spec = importlib.util.spec_from_file_location("check_actions_versions", _SCRIPT_PATH)
-    assert spec is not None and spec.loader is not None
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[spec.name] = module
-    spec.loader.exec_module(module)
-    return module
-
-
 @pytest.fixture
 def check_actions_versions() -> ModuleType:
-    return _load_module()
+    return load_module("check_actions_versions", _SCRIPT_PATH)
 
 
 def _write_workflow(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, module: ModuleType, name: str, text: str) -> Path:
@@ -286,9 +272,7 @@ class TestMain:
         _patch_ls_remote(
             monkeypatch,
             check_actions_versions,
-            # v8.3.2 has more components than the pinned v7 — the comparison is not
-            # restricted to same-shaped tags, and this also resolves to a genuinely
-            # different commit, so it must still be reported.
+            # More components than the pinned v7, and a different commit.
             tag_shas={("actions/checkout", "v7"): _SHA_A, ("actions/checkout", "v8.3.2"): _SHA_C},
             repo_tags={"actions/checkout": ["v6", "v7", "v8.3.2"]},
         )
@@ -308,9 +292,7 @@ class TestMain:
         _patch_ls_remote(
             monkeypatch,
             check_actions_versions,
-            # v7.0.1 outranks the pinned v7 by parsed version, but resolves to the
-            # exact same commit already pinned — not real drift, just a more
-            # specific alias for the same release, so this must not be flagged.
+            # v7.0.1 outranks the pinned v7 but names the same commit.
             tag_shas={("actions/checkout", "v7"): _SHA_A, ("actions/checkout", "v7.0.1"): _SHA_A},
             repo_tags={"actions/checkout": ["v6", "v7", "v7.0.1"]},
         )

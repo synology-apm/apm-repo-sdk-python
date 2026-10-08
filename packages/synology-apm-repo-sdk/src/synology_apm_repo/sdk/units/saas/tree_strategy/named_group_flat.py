@@ -1,36 +1,25 @@
-"""``NamedGroupFlatTree``: Calendar's shape — the flat-list variant of
-this package's two tree shapes: an outer table whose rows are the named
-groups, with a separately-queried flat leaf table grouped by a foreign
-key, rather than parent-pointer recursion (Drive, Site's document
-libraries, Contact folders).
+"""``NamedGroupFlatTree``: named groups from their own table, each holding
+flat leaves (Calendar).
 """
 
 from __future__ import annotations
 
 from collections.abc import Callable, Sequence
-from typing import TYPE_CHECKING
 
 from ....storage.table import Column
-from ._base import _flat_leaf_entries, _Key, _LazyTable, _NamedGroupTable, _Row
-
-if TYPE_CHECKING:
-    from ..provider import SaasWorkloadProvider
+from ._base import Key, Row, SupportsTable, TreeEntry, _flat_leaf_entries, _LazyTable, _NamedGroupTable
 
 
 class NamedGroupFlatTree:
-    """Calendar's shape: an outer table whose rows *are* the groups
-    (with their own display-name column); an inner table holds flat
-    leaves grouped by a foreign key. The outer listing is a one-shot
-    full scan + ``paginate`` slice (small, bounded — every real "level"
-    is the event count within one calendar, not the calendar count
-    itself); the leaf level gets a real ``WHERE``/``ORDER BY``/
-    ``LIMIT``/``OFFSET`` query. ``group_name_override`` lets a caller
-    replace a specific group's own name; unused (``None``) means every group
-    shows its ``group_name_column`` value verbatim."""
+    """Groups are the rows of ``group_table``; leaves are the rows of
+    ``leaf_table`` whose ``leaf_group_column`` names the group. The group
+    level is read in full and paginated in Python; each group's leaves
+    are paged in SQL. ``group_name_override`` may replace a group's
+    ``group_name_column`` value."""
 
     def __init__(
         self,
-        provider: SaasWorkloadProvider,
+        provider: SupportsTable,
         *,
         group_table: str,
         group_columns: list[Column],
@@ -40,9 +29,9 @@ class NamedGroupFlatTree:
         leaf_columns: list[Column],
         leaf_id_column: str,
         leaf_group_column: str,
-        display_name: Callable[[_Row], str],
+        display_name: Callable[[Row], str],
         order_by: Sequence[str],
-        group_name_override: Callable[[_Row], str | None] | None = None,
+        group_name_override: Callable[[Row], str | None] | None = None,
     ) -> None:
         self._provider = provider
         self._groups = _NamedGroupTable(
@@ -60,15 +49,12 @@ class NamedGroupFlatTree:
         self._leaf_lazy_table = _LazyTable(
             provider, table=leaf_table, columns=leaf_columns, index_hints=[[leaf_group_column]]
         )
-        self._rows: dict[_Key, _Row] = {}
 
-    async def children_of(
-        self, key: _Key, *, offset: int = 0, limit: int | None = None
-    ) -> list[tuple[_Key, str, bool]]:
+    async def children_of(self, key: Key, *, offset: int = 0, limit: int | None = None) -> list[TreeEntry]:
         if key == ():
             return await self._groups.list_top_level(offset=offset, limit=limit)
         if len(key) != 1:
-            return []  # a leaf's own key (2 segments) genuinely has no children
+            return []  # a leaf's key
         (group_id,) = key
         leaf_table = await self._leaf_lazy_table.get()
         return await _flat_leaf_entries(
@@ -82,8 +68,4 @@ class NamedGroupFlatTree:
             offset=offset,
             limit=limit,
             key_prefix=(group_id,),
-            rows=self._rows,
         )
-
-    def row_for(self, key: _Key) -> _Row | None:
-        return self._rows.get(key) if len(key) == 2 else None

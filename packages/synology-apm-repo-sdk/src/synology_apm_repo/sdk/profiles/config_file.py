@@ -1,13 +1,9 @@
-"""JSON persistence for a profile's non-secret fields.
+"""JSON persistence for profiles' non-secret fields, as synchronous file
+I/O (``profiles/__init__.py`` moves it off the event loop).
 
-Plain, synchronous file I/O — the async boundary for this whole package
-lives one layer up, in ``profiles/__init__.py``'s facade.
-
-One file, ``profiles.json``, under a per-user config directory shared by
-the CLI and TUI: ``$XDG_CONFIG_HOME/synology-apm-repo`` (falling back to
-``~/.config/synology-apm-repo``) on every platform, not a platform-native
-location — the three-distribution family name, not this SDK distribution's
-own name, since both other distributions read/write the same file.
+One ``profiles.json`` shared by the CLI and TUI, under
+``$XDG_CONFIG_HOME/synology-apm-repo`` (else ``~/.config/synology-apm-repo``)
+on every platform.
 """
 
 from __future__ import annotations
@@ -19,14 +15,8 @@ import tempfile
 from pathlib import Path
 from typing import Any
 
-from ..errors import ProfileConfigCorruptError
-from .model import (
-    AzureProfileConfig,
-    BackendKind,
-    Profile,
-    S3ProfileConfig,
-    SmbProfileConfig,
-)
+from .errors import ProfileConfigCorruptError
+from .model import BackendKind, Profile, config_from_json
 
 _SCHEMA_VERSION = 1
 _FILE_NAME = "profiles.json"
@@ -43,6 +33,7 @@ def _xdg_config_home() -> Path:
 
 
 def default_config_dir() -> Path:
+    """The per-user directory holding ``profiles.json``."""
     return _xdg_config_home() / "synology-apm-repo"
 
 
@@ -50,35 +41,20 @@ def _config_path(config_dir: Path | None) -> Path:
     return (config_dir if config_dir is not None else default_config_dir()) / _FILE_NAME
 
 
-def _decode_profile(name: str, raw: dict[str, Any]) -> Profile:
+def _decode_profile(name: str, raw: object) -> Profile:
+    if not isinstance(raw, dict):
+        raise ProfileConfigCorruptError(f"profile {name!r} is not a JSON object", ref=name)
     try:
         kind = BackendKind(raw["kind"])
     except (KeyError, ValueError) as exc:
         raise ProfileConfigCorruptError(f"profile {name!r} has an invalid or missing 'kind'", ref=name) from exc
     try:
-        if kind is BackendKind.S3:
-            config: S3ProfileConfig | AzureProfileConfig | SmbProfileConfig = S3ProfileConfig(
-                bucket=raw["bucket"],
-                endpoint=raw.get("endpoint"),
-                region=raw.get("region"),
-                verify_tls=raw.get("verify_tls", True),
-            )
-        elif kind is BackendKind.AZURE:
-            config = AzureProfileConfig(
-                container=raw["container"],
-                account_url=raw.get("account_url"),
-                verify_tls=raw.get("verify_tls", True),
-            )
-        else:
-            config = SmbProfileConfig(
-                server=raw["server"],
-                share=raw["share"],
-                port=raw.get("port", 445),
-                username=raw.get("username"),
-            )
+        config = config_from_json(kind, raw)
     except KeyError as exc:
         raise ProfileConfigCorruptError(f"profile {name!r} is missing required field {exc}", ref=name) from exc
-    return Profile(name=name, kind=kind, config=config)
+    except TypeError as exc:
+        raise ProfileConfigCorruptError(f"profile {name!r} has a malformed field: {exc}", ref=name) from exc
+    return Profile(name=name, config=config)
 
 
 def _encode_profile(profile: Profile) -> dict[str, Any]:
@@ -86,9 +62,12 @@ def _encode_profile(profile: Profile) -> dict[str, Any]:
 
 
 def read_profiles(*, config_dir: Path | None = None) -> dict[str, Profile]:
-    """Every saved profile, keyed by name. A missing file reads back as
-    empty — there is nothing to migrate from, this is a brand-new
-    mechanism."""
+    """Every saved profile, keyed by name; none when the file is missing.
+
+    Raises:
+        ProfileConfigCorruptError: The file is unreadable, not valid JSON,
+            of another schema version, or holds a malformed profile.
+    """
     path = _config_path(config_dir)
     if not path.exists():
         return {}
@@ -105,9 +84,8 @@ def read_profiles(*, config_dir: Path | None = None) -> dict[str, Profile]:
 
 
 def write_profiles(profiles: dict[str, Profile], *, config_dir: Path | None = None) -> None:
-    """Overwrite ``profiles.json`` with exactly ``profiles``, atomically —
-    a crash mid-write must never leave a truncated file behind, since every
-    profile lookup depends on this one file surviving intact."""
+    """Replace ``profiles.json`` with exactly ``profiles``, atomically, so a
+    crash never leaves a truncated file."""
     path = _config_path(config_dir)
     path.parent.mkdir(parents=True, exist_ok=True)
     payload = {

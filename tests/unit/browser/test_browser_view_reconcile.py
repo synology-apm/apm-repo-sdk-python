@@ -1,12 +1,7 @@
-"""Unit tests for ``browser.view.reconcile`` — a real ``Tree``/``TreeNode``
-throughout, but **no ``App``/``Pilot`` anywhere except the two
-``move_cursor_keyed`` tests at the end**: ``Tree.add``/``add_leaf``/
-``remove``/``remove_children``/``set_label``/``_tree_lines`` all run with
-no running App; only ``Tree.move_cursor`` itself raises
-``NoActiveAppError`` without one. A ``DataTable`` reconciler wouldn't be
-testable this way either — ``add_row`` can't insert at a position and
-``add_column`` needs a running ``App`` — which is why the source module
-has none.
+"""Unit tests for ``browser.view.reconcile`` on a real ``Tree``/``TreeNode``.
+Only the ``move_cursor_keyed``/``reconcile_and_restore_cursor`` tests at the
+end run an ``App``: ``Tree.move_cursor`` raises ``NoActiveAppError`` without
+one, while everything ``reconcile_children`` calls works on a bare ``Tree``.
 """
 
 from __future__ import annotations
@@ -132,9 +127,8 @@ def test_reconcile_inserts_a_new_node_at_the_front() -> None:
 
 
 def test_reconcile_below_threshold_does_not_set_rebuilt() -> None:
-    """Removing 1 of 5 (``1 * 2 <= 5``) stays under the bulk-removal
-    fallback's own threshold (more than half of the current managed
-    children would be removed)."""
+    """Removing 1 of 5 stays under the bulk-removal threshold (more than
+    half of the current managed children removed)."""
     tree = _tree()
     reconcile_children(tree.root, [_spec(k) for k in "abcde"])
     survivors_before = list(tree.root.children)[:1]  # just need identity of one to prove no rebuild
@@ -149,12 +143,9 @@ def test_reconcile_below_threshold_does_not_set_rebuilt() -> None:
 
 
 def test_reconcile_above_threshold_sets_rebuilt_and_recreates_every_node() -> None:
-    """Removing 3 of 4 (``3 * 2 > 4``) crosses the threshold -- every
-    node, including the one survivor by key, is a genuinely new
-    ``TreeNode`` object afterward (the honest cost of the fallback, not
-    a bug: it removes every child via ``remove_children()`` and re-adds
-    every wanted one fresh, trading survivor identity for one
-    invalidation instead of one per removed node)."""
+    """Removing 3 of 4 crosses the threshold: every node, the survivor by
+    key included, is a new ``TreeNode`` afterward -- the fallback trades
+    survivor identity for one ``remove_children()``."""
     tree = _tree()
     reconcile_children(tree.root, [_spec(k) for k in "abcd"])
     a_before = tree.root.children[0]
@@ -164,26 +155,20 @@ def test_reconcile_above_threshold_sets_rebuilt_and_recreates_every_node() -> No
     assert diff.rebuilt is True
     assert diff.removed == ("b", "c", "d")
     assert _keys(list(tree.root.children)) == ["a"]
-    assert tree.root.children[0] is not a_before  # identity NOT preserved through the fallback
+    assert tree.root.children[0] is not a_before
 
 
 def test_reconcile_above_threshold_with_a_foreign_child_present_falls_back_to_one_at_a_time() -> None:
-    """The bulk-removal path's own ``remove_children()`` wipes *every*
-    real Textual child unconditionally -- with a foreign (non-``Binding``)
-    child present, taking it would silently violate this module's own
-    precondition (a foreign child is never removed on ``parent``'s
-    behalf, per ``test_reconcile_leaves_a_foreign_non_binding_child_untouched``,
-    which only exercises the *below*-threshold case and so never caught
-    this). A foreign child anywhere under ``parent`` must force the
-    one-at-a-time path regardless of how many managed children would be
-    removed."""
+    """The bulk path's ``remove_children()`` would also remove a foreign
+    (non-``Binding``) child, which is never removed on ``parent``'s behalf,
+    so a foreign child forces the one-at-a-time path whatever the count."""
     tree = _tree()
     foreign = tree.root.add_leaf("unmanaged", data=None)
     reconcile_children(tree.root, [_spec(k) for k in "abcd"])
 
     diff = reconcile_children(tree.root, [_spec("a")])  # removes 3 of 4 -- above the threshold
 
-    assert foreign.parent is tree.root  # still there, never touched
+    assert foreign.parent is tree.root
     assert diff.rebuilt is False  # the bulk path was correctly skipped
     assert diff.removed == ("b", "c", "d")
     assert _keys([n for n in tree.root.children if n.data is not None]) == ["a"]
@@ -201,10 +186,8 @@ def test_reconcile_relabels_a_survivor_whose_text_changed() -> None:
 
 
 def test_reconcile_does_not_call_set_label_when_the_text_is_unchanged(monkeypatch: Any) -> None:
-    """Not just "the label looks the same afterward" -- proves the call
-    itself is skipped, since a called ``set_label()`` always bumps the
-    node's update counter and triggers a repaint, whether or not the
-    text actually changed."""
+    """The call itself is skipped: ``set_label()`` always repaints, even
+    with unchanged text."""
     tree = _tree()
     reconcile_children(tree.root, [_spec("a", "Same")])
     node = tree.root.children[0]
@@ -218,15 +201,9 @@ def test_reconcile_does_not_call_set_label_when_the_text_is_unchanged(monkeypatc
 
 
 def test_reconcile_does_not_wipe_a_foreign_live_suffix_when_the_stored_label_is_unchanged() -> None:
-    """A per-node loading spinner (``TreeNodeLoadingSink``) appends its
-    own suffix directly onto the live ``node.label`` without touching
-    ``node.data`` at all, so it's invisible to ``update_node``'s label
-    comparison, which checks the *stored* ``Binding.label``, not the live
-    widget text. A reconcile
-    triggered by something unrelated (a sibling's own fetch completing)
-    must not see that live suffix as a label change and wipe it mid-
-    animation; the comparison has to be against the *stored*
-    ``Binding.label``, not the live text ``set_label`` last wrote."""
+    """``TreeNodeLoadingSink`` appends its suffix to the live ``node.label``
+    without touching ``node.data``; an unrelated reconcile compares the
+    stored ``Binding.label``, so it must not wipe that suffix mid-animation."""
     tree = _tree()
     reconcile_children(tree.root, [_spec("a", "Repo")])
     node = tree.root.children[0]
@@ -290,9 +267,8 @@ def test_reconcile_recurses_into_a_brand_new_nodes_own_children() -> None:
 
 
 def test_on_diff_reports_the_top_level_keyed_by_the_roots_own_data() -> None:
-    """``tree.root`` here has no ``Binding`` of its own (a bare ``Tree``,
-    same as ``BrowseScreen``'s two permanent, non-domain tree roots) --
-    the top level's own diff is reported under ``None``."""
+    """A root without a ``Binding`` (like ``BrowseScreen``'s permanent tree
+    roots) has its top-level diff reported under ``None``."""
     tree = _tree()
     diffs: dict[str | None, Diff[str]] = {}
     reconcile_children(tree.root, [_spec("a"), _spec("b")], on_diff=diffs.__setitem__)
@@ -318,18 +294,16 @@ def test_on_diff_reports_a_nested_levels_own_diff_keyed_by_its_parent() -> None:
 
 
 def test_reconcile_leaves_a_foreign_non_binding_child_untouched() -> None:
-    """A child this module didn't create (``.data`` isn't a ``Binding``
-    -- every ``TreeNode`` this module reconciles must have been created
-    by a previous ``reconcile_children`` call) is neither counted as a
-    survivor nor removed on ``parent``'s behalf."""
+    """A child ``reconcile_children`` didn't create (``.data`` is ``None``)
+    is neither counted as a survivor nor removed on ``parent``'s behalf."""
     tree = _tree()
     foreign = tree.root.add_leaf("unmanaged", data=None)
 
     diff = reconcile_children(tree.root, [_spec("a")])
 
-    assert foreign.parent is tree.root  # still there, never touched
+    assert foreign.parent is tree.root
     assert _keys(list(tree.root.children)) == ["a"]
-    assert diff.removed == ()  # the foreign node was never "existing" to this call at all
+    assert diff.removed == ()
 
 
 # -- next_cursor_key ----------------------------------------------------------
@@ -394,8 +368,7 @@ def test_find_node_ignores_a_foreign_non_binding_child() -> None:
     assert find_node(tree.root, "anything") is None
 
 
-# -- move_cursor_keyed (needs a real running App -- Tree.move_cursor itself
-# raises NoActiveAppError without one) ---------------------------------------
+# -- move_cursor_keyed --------------------------------------------------------
 
 
 class _FakeApp(App[None]):
@@ -407,11 +380,8 @@ async def test_move_cursor_keyed_moves_the_cursor_to_a_different_node() -> None:
     app = _FakeApp()
     async with app.run_test():
         tree = app.query_one(Tree)
-        # a fresh Tree's own root defaults to collapsed, and move_cursor_keyed
-        # requires every ancestor up to tree.root expanded -- Tree.move_cursor
-        # silently no-ops on an unreachable node rather than raising, so an
-        # un-expanded root here would leave the cursor assertions below passing
-        # against a stale position instead of catching the bug.
+        # A fresh root is collapsed, and Tree.move_cursor silently ignores
+        # an unreachable node.
         tree.root.expand()
         reconcile_children(tree.root, [_spec("a"), _spec("b")])
         a_node, b_node = tree.root.children[0], tree.root.children[1]
@@ -438,8 +408,7 @@ async def test_move_cursor_keyed_is_a_no_op_when_already_there(monkeypatch: Any)
         assert calls == []
 
 
-# -- reconcile_and_restore_cursor (needs a real running App, same reason as
-# move_cursor_keyed above) ---------------------------------------------------
+# -- reconcile_and_restore_cursor --------------------------------------------
 
 
 async def test_reconcile_and_restore_cursor_follows_a_surviving_node() -> None:
@@ -459,10 +428,9 @@ async def test_reconcile_and_restore_cursor_follows_a_surviving_node() -> None:
 
 
 async def test_reconcile_and_restore_cursor_prefers_the_nearest_forward_sibling() -> None:
-    """Mirrors ``next_cursor_key``'s own forward-first preference,
-    wired all the way through a real reconcile this time -- filtering
-    out the cursored middle child of three leaves a sibling on each
-    side; the cursor must land on the *forward* one."""
+    """``next_cursor_key``'s forward-first preference, through a real
+    reconcile: filtering out the cursored middle of three leaves lands the
+    cursor on the forward sibling."""
     app = _FakeApp()
     async with app.run_test():
         tree = app.query_one(Tree)
@@ -478,14 +446,9 @@ async def test_reconcile_and_restore_cursor_prefers_the_nearest_forward_sibling(
 
 
 async def test_reconcile_and_restore_cursor_falls_back_to_the_parent_when_no_sibling_survives() -> None:
-    """When the cursored leaf's *entire* level is filtered out (no
-    surviving sibling for ``next_cursor_key`` to find either), the
-    cursor falls back to that level's own parent node -- never all the
-    way to the tree's root, and never drifting into an unrelated
-    sibling *group*'s own content the way trusting Textual's raw,
-    unclamped ``cursor_line`` position alone would: the group being
-    emptied out shifts every line below it up by one, so a stale
-    ``cursor_line`` would silently point at the next group over."""
+    """With the cursored leaf's whole level filtered out, the cursor lands
+    on that level's parent -- not the root, and not the next group over,
+    where a stale ``cursor_line`` would point once the lines below shift up."""
     app = _FakeApp()
     async with app.run_test():
         tree = app.query_one(Tree)
@@ -522,14 +485,9 @@ async def test_reconcile_and_restore_cursor_falls_back_to_the_parent_when_no_sib
 
 
 async def test_reconcile_and_restore_cursor_climbs_past_a_removed_immediate_parent() -> None:
-    """When the cursored leaf's own *immediate parent* is removed in the
-    same reconcile (not just the leaf's own level narrowed) -- e.g.
-    ``BrowseScreen``'s workload tree rebuilding wholesale on a catalog
-    switch, dropping the cursor's entire former group along with it --
-    the fallback must climb past that missing parent to the next
-    surviving ancestor, rather than stopping at the immediate parent
-    and leaving the cursor uncorrected because neither a sibling nor
-    the parent itself was ever visited this pass."""
+    """When the cursored leaf's immediate parent is removed in the same
+    reconcile (e.g. ``BrowseScreen``'s workload tree on a catalog switch),
+    the fallback climbs to the next surviving ancestor."""
     app = _FakeApp()
     async with app.run_test():
         tree = app.query_one(Tree)
@@ -564,13 +522,9 @@ async def test_reconcile_and_restore_cursor_climbs_past_a_removed_immediate_pare
 
 
 async def test_reconcile_and_restore_cursor_falls_back_to_root_when_a_non_domain_roots_top_level_is_wiped() -> None:
-    """``BrowseScreen``'s own trees have a permanent, non-domain root
-    (``tree.root.data`` stays ``None``) -- when the cursor sits on a
-    top-level item directly under that root and every top-level item is
-    removed at once (e.g. a rescan wiping every discovered repository),
-    there is no sibling and no domain-keyed parent to fall back to, but
-    the cursor must still land somewhere deliberate (the tree's own
-    root) rather than being left uncorrected."""
+    """Under a non-domain root (``tree.root.data`` is ``None``, as in
+    ``BrowseScreen``), wiping every top-level item (e.g. a rescan) leaves
+    no sibling or keyed ancestor, so the cursor lands on ``tree.root``."""
     app = _FakeApp()
     async with app.run_test():
         tree = app.query_one(Tree)
@@ -585,14 +539,9 @@ async def test_reconcile_and_restore_cursor_falls_back_to_root_when_a_non_domain
 
 
 async def test_reconcile_and_restore_cursor_falls_back_to_a_domain_keyed_tree_root() -> None:
-    """``UnitScreen``'s own tree root is itself a domain node (unlike
-    ``BrowseScreen``'s permanent non-domain roots) -- when the cursored
-    leaf's entire level is filtered out and its parent *is* the tree's
-    own root, the fallback must still find it. ``reconcile_children``'s
-    own ``on_node`` hook (what the fallback lookup uses instead of a
-    second ``find_node`` walk) only ever fires for a *child* spec, so
-    the root's own entry has to be seeded separately -- this is exactly
-    the case that seeding covers."""
+    """A domain-keyed root (as in ``UnitScreen``) is found as the fallback
+    ancestor: ``on_node`` never fires for the root itself, so
+    ``reconcile_and_restore_cursor`` seeds it separately."""
     app = _FakeApp()
     async with app.run_test():
         tree = app.query_one(Tree)
@@ -605,6 +554,3 @@ async def test_reconcile_and_restore_cursor_falls_back_to_a_domain_keyed_tree_ro
         reconcile_and_restore_cursor(tree, [])
 
         assert tree.cursor_node is tree.root
-
-
-__all__: list[str] = []

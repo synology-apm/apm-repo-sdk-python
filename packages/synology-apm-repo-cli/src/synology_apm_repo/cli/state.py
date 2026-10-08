@@ -10,39 +10,32 @@ import enum
 
 
 class ProgressMode(enum.Enum):
-    """See PROGRESS_HELP / progress_render.py — the three ``--progress``
-    values, as a Typer-option-compatible enum instead of a bare ``str``
-    checked by hand."""
+    """The three ``--progress`` values (PROGRESS_HELP, progress_render.py)."""
 
     AUTO = "auto"
     ALWAYS = "always"
     NEVER = "never"
 
 
-@dataclasses.dataclass(frozen=True)
+@dataclasses.dataclass(frozen=True, slots=True)
 class CliState:
-    #: See VERBOSE_HELP. Purely presentational — nothing hard-gates on
-    #: it; ``ls``/``tree``/``doctor`` use it to decide what extra
-    #: (internal-identifier) detail to show.
+    #: See VERBOSE_HELP. Purely presentational: it adds internal-identifier
+    #: detail and error-message tags, never refuses anything.
     verbose: bool = False
 
-    #: See JSON_HELP. Display text is not a stable dict key across
-    #: language/labeling changes.
+    #: See JSON_HELP.
     json: bool = False
 
     #: See PROGRESS_HELP / progress_render.py.
     progress: ProgressMode = ProgressMode.AUTO
 
-    #: See TRACE_HELP. Off by default — full-detail per-call tracing
-    #: isn't something a normal invocation should pay for.
+    #: See TRACE_HELP.
     trace: bool = False
 
-    #: See QUIET_HELP. Specifically gates ``export``'s summary line and
-    #: ``profile add``/``remove``'s green confirmations; ``--json``
-    #: output is unaffected either way.
+    #: See QUIET_HELP. Gates ``export``'s summary line and ``profile
+    #: add``/``remove``'s confirmations; ``--json`` output is unaffected.
     quiet: bool = False
 
     #: See NO_INPUT_HELP. ``profile add``/``profile remove`` are the only
-    #: commands that ever prompt; every other command already takes every
-    #: input via flags/arguments and needs no gate here.
+    #: commands that prompt.
     no_input: bool = False

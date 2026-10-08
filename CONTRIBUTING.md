@@ -6,14 +6,20 @@ section of [`README.md`](README.md) for environment setup.
 ## Commit Convention
 
 ```
-feat:  new feature        feat: add zstd dictionary support to ObjectStore
-fix:   bug fix            fix: correct CRC verification on multi-chunk reads
-docs:  documentation      docs: clarify RestorableUnit's extent invariant
-test:  tests              test: close coverage gap for dedup chunkmap dump
-chore: configuration      chore: bump uv.lock via make bump-external-versions
+feat:     new feature
+fix:      bug fix
+perf:     performance, same behaviour
+refactor: restructuring, same behaviour
+docs:     documentation
+test:     tests
+build:    build, lint and check tooling
+chore:    configuration, dependency bumps
 ```
 
-Body: describe what was actually verified, not just what changed.
+An optional scope names the distribution (`fix(sdk):`, `refactor(browser):`),
+and `!` marks a breaking change to the SDK's public surface
+(`refactor(sdk)!:`). Body: describe what was actually verified, not just
+what changed.
 
 ## Committing a subset while other changes are staged
 
@@ -26,15 +32,18 @@ so you can redo it correctly.
 
 ## Sample data
 
-See `tests/CLAUDE.md`'s "RecordingStore / ReplayStore" section for what a
-recorded fixture proves (repository structure, never backed-up content's
-own meaning), how to record one, and the anonymization-determinism details.
+See `tests/CLAUDE.md`'s "`RecordingStore` / `ReplayStore`" section for
+what a recorded fixture proves (repository structure, never backed-up
+content's own meaning), how to record one, how samples are named by alias
+(real names live only in the untracked
+`tests/support/recording/targets.toml`), and how a recording is anonymized.
 
 A recording's catalog-layer data (`db/connection_config`, `workload_config`,
 `copy_target_version`, `file_map`, `file_meta`, and similar SQLite files) is
-anonymized automatically at recording time — the exact fields are
-registered in `scripts/anonymize_catalog_metadata.py`'s `SENSITIVE_FIELDS`,
-and no real-to-fake mapping is stored anywhere.
+anonymized automatically when the recording session ends — the fields are
+registered in `tests/support/recording/anonymize_catalog_metadata.py`
+(`SENSITIVE_FIELDS` and the path columns beside it), and no real-to-fake
+mapping is stored anywhere.
 
 **Fixture storage**: `tests/fixtures/*.json.gz` cassettes are committed
 gzip-compressed. Run this one-time local setup to get a readable `git
@@ -83,21 +92,27 @@ configuration is what decides where a dependency's records go.
 make test
 ```
 
-See the `Makefile` for exactly what that runs (format check, lint, mypy,
-pytest with the 95% coverage gate enforced, version-consistency check,
-SDK import-boundary check) — the whole suite runs every time, no real
-external state needed. The 95% gate applies uniformly across the SDK,
-CLI, and TUI — there is no package-level
-carve-out. The only lines excluded from it are individual, justified
-`# pragma: no cover` markers, always scoped to the individual line, not a
-whole file or package, in one of three categories: real process/terminal
-I/O (e.g. `cli/main.py`'s and `browser/app.py`'s own `main()`, which call
-`sys.exit`/open a real terminal and so can't run under `CliRunner`/
-`App.run_test()` the way everything else does); a defensive/unreachable
-branch (a `NotImplementedError` stub every real subclass overrides, an
-exhaustiveness fallback after an already-exhaustive enum/`match`); or a
-real coverage.py false negative, confirmed directly via `sys.settrace`
-(bypassing coverage.py entirely) before reaching for the pragma — that
+See the `Makefile` for exactly what that runs (format check, lint,
+version-consistency check, SDK import-boundary check, SDK layer-direction
+and import-cycle check, browser layer check, mypy for three platforms in
+parallel, then pytest with the 95% coverage gate enforced; cheapest first,
+so a lint or boundary slip fails before the long steps) — the whole suite
+runs every time, no real external state needed. Coverage
+counts branches, not just lines, and pytest fails a test on any warning it
+raises (`ResourceWarning` excepted, see `pyproject.toml`). Every
+`except Exception` carries a `# noqa: BLE001` beside its reason. The 95% gate
+applies uniformly across the SDK, CLI, and TUI, with no package-level
+carve-out. Lines that exist only for the type checker or as a broken-invariant
+guard (`assert_never(...)`, `raise AssertionError`/`NotImplementedError`,
+`if TYPE_CHECKING:`, `if __name__ == "__main__":`) are excluded by
+`pyproject.toml`'s `exclude_also`. Anything else excluded carries an
+individual, justified `# pragma: no cover`, scoped to the line, in one of
+three categories: real process/terminal I/O (e.g. `cli/main.py`'s and
+`browser/app.py`'s own `main()`, which call `sys.exit`/open a real terminal
+and so can't run under `CliRunner`/`App.run_test()`); a defensive branch for
+a state its caller already rules out; or a real coverage.py false
+negative, confirmed directly via `sys.settrace` (bypassing coverage.py
+entirely) before reaching for the pragma — that
 confirmation is what justifies this last category, not a hunch that a line
 should already be covered. Cite the reason in the pragma's own inline
 comment either way.
@@ -112,15 +127,21 @@ comment either way.
 > the percentage.
 
 If the change touches a code path `tests/integration/` replays real bytes
-against, re-record the affected fixture by hand
-(`make record-fixture TARGET=local:<path> TEST=tests/integration/<path>/test_<name>.py::<test_function>`)
-— see [`tests/CLAUDE.md`](tests/CLAUDE.md)'s "RecordingStore / ReplayStore"
-section for when and why `make test` alone doesn't catch this.
+against, re-record the affected fixture by hand with the `make record-fixture`
+command `PYTHONPATH=tests uv run python -m support.recording.manifest`
+prints for it — see [`tests/CLAUDE.md`](tests/CLAUDE.md)'s "Detects
+call-sequence drift, not semantic drift" for why `make test` alone doesn't
+catch this.
 
-CI (`.github/workflows/ci.yml`) runs the same `make test` on every push and
-pull request, plus `make test-unit` across the older supported Python
-versions. `docs.yml` builds the Sphinx API docs the same way on every push/PR
-and, on push to `main`, deploys them to GitHub Pages. Before pushing a change
+CI (`.github/workflows/ci.yml`) runs `make test` split in two on every push
+and pull request: `make lint` once, and `make test-cov` on every
+supported OS and Python version in parallel; a final job combines their
+coverage data and enforces the 95% gate on the combined number, so
+platform- and version-specific branches count where they run. A local
+`make test` enforces the same gate on one platform's run alone, which is
+never higher than the combined one. `docs.yml` builds the Sphinx API docs
+(`make docs`) on every pull request and push to `main`, and on push to
+`main` deploys them to GitHub Pages. Before pushing a change
 that touches a workflow file itself, run `make github-act-simulation` (needs
 `act` and Docker) to exercise it locally.
 

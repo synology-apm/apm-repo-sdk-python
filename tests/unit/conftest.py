@@ -1,5 +1,4 @@
-"""Shared fixtures for ``tests/unit/`` -- ``fake_keyring`` is used only by
-``tests/unit/{cli,sdk}/`` profile tests, never under ``tests/integration/``."""
+"""Fixtures shared across ``tests/unit/``."""
 
 from __future__ import annotations
 
@@ -9,13 +8,8 @@ import pytest
 
 
 def _make_in_memory_keyring() -> object:
-    """A dict-backed ``keyring.backend.KeyringBackend`` subclass for real
-    round-trips in ``profiles/secrets.py`` tests with zero real OS-keyring
-    access, mirroring this project's fake-client house style
-    (``test_storage_s3.py``'s ``_FakeS3Client``, ``test_storage_azure.py``'s
-    mocked ``BlobServiceClient`` — never touch a real backend in a unit
-    test). Built lazily to avoid importing ``keyring`` at collection time
-    for tests that don't need it."""
+    """A dict-backed ``keyring.backend.KeyringBackend``, built lazily so
+    collection doesn't import ``keyring`` for tests that never use it."""
     import keyring.backend
     import keyring.errors
 

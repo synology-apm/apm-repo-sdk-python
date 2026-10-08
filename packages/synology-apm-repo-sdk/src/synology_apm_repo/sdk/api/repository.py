@@ -1,65 +1,77 @@
-"""``Repository``: one opened repository's catalog/provider facade, part of
-the Repository Layer (see ``api/__init__.py``). ``Session`` (discovery/lifetime) lives in the
-sibling ``api.session`` module; ``Catalog``/``Frame`` (one catalog's own
-workload/version/provider operations) live in the sibling ``api.catalog``
-module — this module holds ``Repository`` itself plus the meeting points
-that need both (``resolve()``'s canonical/human-ref dispatch, in
-particular).
-"""
+"""``Repository``: one opened repository's catalog/provider facade, and
+``locate()``/``resolve()``'s ref dispatch across its catalogs."""
 
 from __future__ import annotations
 
 import asyncio
 import dataclasses
-from collections.abc import Awaitable, Callable
-from concurrent.futures import ProcessPoolExecutor
-from typing import Self
+from collections.abc import Iterable
 
-from ..asynccache import AsyncKeyedCache
+from .._util.closing import RESOURCE_CLOSE_TIMEOUT, close_each, close_preserving
+from ..asynccache import AsyncKeyedCache, CacheStats
+from ..cachemanager import DEFAULT_LIMITS
 from ..catalog.connection import Connection, connections
-from ..catalog.version import Version
 from ..catalog.workload import Workload
 from ..dedup.keys import KeyMaterial, KeyVerification
-from ..dedup.pool import INTERACTIVE_BUCKET_CACHE_SIZE
-from ..dedup.pool_descriptor import PoolDescriptor
 from ..dedup.repository import DedupRepo
-from ..dedup.verify_checks import Finding as Finding
-from ..dedup.verify_checks import Stage as Stage
-from ..dedup.verify_checks import Symptom as Symptom
-from ..dedup.verify_checks import VerifyLevel as VerifyLevel
+from ..dedup.verify_bucket_check import shared_verify_executor
 from ..errors import NotFoundError
+from ..findings import Finding, VerifyLevel
 from ..identifiers import CatalogId
-from ..presentation.progress import Progress
+from ..presentation.format import pluralize
+from ..presentation.progress import ProgressCallback
 from ..storage.base import ObjectStore
-from ..storage.layout import RepoKind, RepositoryLayout, catalog_repo_layouts
-from ..units.base import ClosableUnitProvider, Node, RestorableUnit, UnitProvider
+from ..storage.layout import RepositoryLayout, catalog_repo_layouts
+from ..units.base import ClosableUnitProvider, Node, UnitProvider
 from ..units.dispatch import is_supported as _workload_is_supported
 from ..units.file_map_tree import FileMapTreeProvider
 from ..units.node_ref import NodeRef, RefKind, catalog_pairs
 from ..units.resolve import find_node
 from ..units.saas.stream import SaasStreamCache
-from ..units.verify_bucket_check import build_verify_executor
 from ..units.verify_reachable import verify_reachable
-from .catalog import Catalog, Frame, _match_or_raise
+from .catalog import Catalog, CatalogFrame, Frame, NodeFrame, RawView, RootFrame, VersionLocation, match_or_raise
 from .key_manager import KeyManager
 from .key_manager import KeyStatus as KeyStatus
+from .provider_registry import ProviderRegistry
 
-_RESOURCE_CLOSE_TIMEOUT = 10.0
-"""Bounds one tracked provider's/``DedupRepo``'s own ``close()`` call in
-``Repository.close()``'s and ``set_key()``'s "attempt every one, then
-report" sweeps — without it, one hung close (a stuck server, say) blocks
-every other resource's close and the interpreter's own exit along with it,
-since ``aiosqlite`` dedicates a non-daemon thread to each connection."""
+_INTERACTIVE_LIMITS = dataclasses.replace(DEFAULT_LIMITS, bucket_readers=DEFAULT_LIMITS.bucket_readers_interactive)
+"""The limits of the ``DedupRepo`` a ``Repository`` shares among interactive
+consumers: a larger bucket-reader cache (see ``CacheLimits.bucket_readers_interactive``)."""
 
 
-@dataclasses.dataclass(frozen=True)
+@dataclasses.dataclass(frozen=True, slots=True)
+class SetKeyResult:
+    """What ``Repository.set_key()`` decided, and what it could not finish.
+
+    Attributes:
+        verification: Whether the key verified. The repository's
+            ``key_status`` already reflects it.
+        reopen_errors: Failures re-opening or closing an already-opened
+            catalog while switching to a verified key. The key itself was
+            still accepted; empty when nothing went wrong.
+    """
+
+    verification: KeyVerification
+    reopen_errors: tuple[Exception, ...] = ()
+
+    @property
+    def warning(self) -> str | None:
+        """A display sentence for ``reopen_errors``, or ``None`` when there
+        were none."""
+        if not self.reopen_errors:
+            return None
+        detail = "; ".join(str(error) for error in self.reopen_errors)
+        count = len(self.reopen_errors)
+        catalogs = f"{count} open {pluralize(count, 'catalog')}"
+        return f"the key verified, but {catalogs} could not be switched to it: {detail}"
+
+
+@dataclasses.dataclass(frozen=True, slots=True)
 class _OpenCatalog:
-    """One opened catalog-layout index's resources, kept together so they
-    can never drift out of sync: a ``DedupRepo``, the ``SaasStreamCache``
-    built against that exact ``DedupRepo``, and its ``connections()``
-    listing. Lives on ``Repository``, not ``DedupRepo`` itself:
-    ``SaasStreamCache`` is a Unit-layer type, and ``DedupRepo`` importing
-    it back would be an upward/circular import."""
+    """One opened catalog layout's resources, kept together so they can't
+    drift apart: a ``DedupRepo``, the ``SaasStreamCache`` built on it, and
+    its ``connections()`` listing. Held here rather than on ``DedupRepo``
+    because ``SaasStreamCache`` is a Unit-layer type."""
 
     dedup_repo: DedupRepo
     saas_streams: SaasStreamCache
@@ -68,8 +80,9 @@ class _OpenCatalog:
 
 class Repository:
     """One opened repository: cheap metadata plus the catalog/provider
-    calls that turn it into a browsable tree. Never constructed directly
-    by callers — obtained from ``Session.discover``/``Session.open``.
+    calls that turn it into a browsable tree. Obtained from ``Session``'s
+    ``discover``/``open``, never constructed directly; the ``Session``
+    closes it (``Session.close_repo`` releases one early).
     """
 
     def __init__(
@@ -87,196 +100,152 @@ class Repository:
         # One RepoLayout per catalog for object storage, always exactly
         # one for a vault. Never exposed outside this class.
         self._catalog_layouts = catalog_repo_layouts(layout)
-        # Opened lazily: eager opening would waste I/O for an
-        # object-storage sibling a caller never touches.
+        # Lazy: an object-storage sibling a caller never touches costs no I/O.
         self._open_catalogs: AsyncKeyedCache[int, _OpenCatalog] = AsyncKeyedCache(self._open_catalog_resources)
-        # Every provider this Repository has handed out, so close() can
-        # release the sqlite connections they own (DeviceProvider's
-        # target.db, FsProvider's version.db, ...) which DedupRepo.close()
-        # doesn't know about.
-        self._providers: list[UnitProvider] = []
-        # A second close() call is a no-op, so Session.close() re-closing
-        # a repository a caller already closed early needs no bookkeeping.
+        self._providers = ProviderRegistry()
         self._closed = False
 
     async def _open_catalog_resources(self, index: int) -> _OpenCatalog:
-        """Build one catalog's ``_OpenCatalog`` bundle — the
-        ``_open_catalogs`` cache's own factory.
-
-        Guarded on ``_closed`` because ``close()`` invalidates that cache: a
-        resolve arriving afterwards would otherwise open a ``DedupRepo``
-        nothing will ever close again. A ``RuntimeError``, not an
-        ``ApmRepoError``: using a closed ``Repository`` is a caller bug.
-        """
+        """The ``_open_catalogs`` cache's factory. Refuses once closed: a
+        ``DedupRepo`` opened after ``_close()`` would never be closed."""
         if self._closed:
             raise RuntimeError("Repository is closed; open a new one rather than reusing this instance")
         dedup_repo = await DedupRepo.open(
             self._store,
             self._catalog_layouts[index],
             self._key_manager.keys,
-            bucket_cache_size=INTERACTIVE_BUCKET_CACHE_SIZE,
+            limits=_INTERACTIVE_LIMITS,
         )
         try:
             conns = await connections(dedup_repo)
-        except Exception:
-            # dedup_repo already opened real sqlite connections above --
-            # a failure here must not leak them.
-            await dedup_repo.close()
+        except BaseException as exc:
+            # Don't leak the connections dedup_repo opened.
+            await close_preserving(exc, [dedup_repo.close])
             raise
-        return _OpenCatalog(dedup_repo=dedup_repo, saas_streams=SaasStreamCache(dedup_repo), connections=conns)
-
-    async def _confirm_real(self) -> bool:
-        """``Session``'s own post-construction check: is this actually a
-        valid, openable repository, or a layout-detection false positive
-        that should be skipped? Trusts the marker check
-        ``iter_repository_layouts`` already performed rather than paying
-        for a real open — a specific catalog's own corrupt ``repo_info``
-        instead surfaces later, scoped to that catalog, the first time
-        ``catalogs()`` opens it."""
-        if self._layout.kind is RepoKind.VAULT:
-            return True
-        return self._layout.catalog_ids != []  # None (unenumerable) or non-empty: real; [] means nothing to browse
+        saas_streams = SaasStreamCache(dedup_repo)
+        # Registered last, so ``caches.invalidate_all()`` closes the streams
+        # before the db sources they read through.
+        dedup_repo.caches.register(
+            "saas_streams", saas_streams.close, saas_streams.cache_stats, bounded_by="maxsize (LRU)"
+        )
+        return _OpenCatalog(dedup_repo=dedup_repo, saas_streams=saas_streams, connections=conns)
 
     @property
     def layout(self) -> RepositoryLayout:
+        """Where and what kind of repository this is."""
         return self._layout
 
-    def owns_repo_path(self, repo_path: str) -> bool:
-        """Whether ``repo_path`` — a ``NodeRef.repo_path`` — names one of
-        this repository's own catalogs. Never compared against
-        ``self.layout.repo_root``: that's the bucket-level root, which
-        diverges from a catalog's own root once ``self.layout.catalog_ids``
-        is enumerable."""
+    def _owns_repo_path(self, repo_path: str) -> bool:
+        """Whether ``repo_path`` (a ``NodeRef.repo_path``) is one of this
+        repository's catalog roots, which on object storage differ from
+        ``layout.repo_root``."""
         return any(catalog_layout.repo_root == repo_path for catalog_layout in self._catalog_layouts)
 
     @property
     def is_encrypted(self) -> bool | None:
-        """Whether this repository is actually encrypted, or ``None`` when
-        that genuinely couldn't be determined."""
+        """Whether this repository is encrypted, or ``None`` when that
+        couldn't be determined."""
         return self._key_manager.is_encrypted
 
     @property
     def key_status(self) -> KeyStatus:
+        """Whether a key was supplied and accepted."""
         return self._key_manager.status
 
     @property
     def key_verification(self) -> KeyVerification | None:
+        """The latest key verification outcome; ``None`` when no key was
+        tried."""
         return self._key_manager.verification
 
-    async def set_key(self, key_string: str) -> KeyVerification:
-        """Try a new key string against this repository. On success, every
-        already-opened ``DedupRepo`` is closed and replaced (a catalog not
-        yet opened picks up the new key on its own eventual first open).
-        On failure, every already-open connection is left as it was —
-        ``key_status`` reports ``INVALID``, never reverting to
-        ``NO_KEY_PROVIDED``.
+    async def set_key(self, key_string: str) -> SetKeyResult:
+        """Try a key string against this repository. When it verifies, every
+        already-opened catalog is reopened under it, and one that fails to
+        switch is reported in ``reopen_errors`` rather than raised. When it
+        doesn't, open catalogs are left as they were and ``key_status``
+        becomes ``INVALID``.
+
+        Args:
+            key_string: ``"<userKeyID>@<base64 userKey>"``.
+
+        Returns:
+            The verification outcome plus any catalog reopen failures.
+
+        Raises:
+            KeyMaterialError: ``key_string`` is malformed.
+            DataCorruptError: The repository's key record is unreadable.
         """
         keys, verification = await self._key_manager.verify(self._store, self._layout, key_string)
         errors: list[Exception] = []
         if verification.ok:
             errors = await self._reopen_catalogs_under_new_key(keys)
-        # Recorded before any ExceptionGroup below is raised: a caller
-        # must see the true key_status even alongside a reopen failure.
         self._key_manager.record(keys, verification)
-        if errors:
-            raise ExceptionGroup("Repository.set_key() failed to fully switch every open catalog", errors)
-        return verification
+        return SetKeyResult(verification, tuple(errors))
 
     async def _reopen_catalogs_under_new_key(self, keys: KeyMaterial) -> list[Exception]:
-        """``set_key()``'s own effect on already-opened catalogs, once
-        ``keys`` has already verified ``ok`` — every already-opened
-        ``_OpenCatalog`` bundle is closed and eagerly rebuilt under
-        ``keys``. Returns every reopen/close failure instead of raising —
-        ``set_key()`` still records the verification outcome regardless."""
+        """Rebuild every already-opened catalog under the verified ``keys``
+        and close the old ones, returning failures instead of raising."""
         errors: list[Exception] = []
-        # Settle every in-flight fetch (started under the OLD key) before
-        # the snapshot below, or it would land pinned to the stale key.
+        # Settle fetches started under the old key before the snapshot.
         await self._open_catalogs.settle_all()
         already_opened = dict(self._open_catalogs.items())
-        # Adopted only on success: a rejected key must never poison a
-        # not-yet-opened sibling with a key already known to be wrong.
+        # Only a verified key is adopted, so unopened siblings never see a bad one.
         self._key_manager.adopt(keys)
         for index in already_opened:
             self._open_catalogs.invalidate(index)
-        # Re-open eagerly so a caller mid-iteration right after set_key()
-        # sees the new key's data, not a stale cache entry.
+        # Eager, so a catalog that fails to reopen lands in reopen_errors.
         for index in already_opened:
             try:
                 await self._open_catalogs.resolve(index)
-            except Exception as exc:
-                # Broad: any failure here must still fall through to the
-                # close loop below, or the old resources being replaced
-                # leak for the rest of this repository's lifetime.
+            except Exception as exc:  # noqa: BLE001
+                # Broad: the close loop below must still run.
                 errors.append(exc)
-        for old_opened in already_opened.values():
-            # saas_streams closed first: it must never outlive the
-            # dedup_repo it was built against.
-            try:
-                await asyncio.wait_for(old_opened.saas_streams.close(), timeout=_RESOURCE_CLOSE_TIMEOUT)
-            except Exception as exc:
-                errors.append(exc)
-            try:
-                await asyncio.wait_for(old_opened.dedup_repo.close(), timeout=_RESOURCE_CLOSE_TIMEOUT)
-            except Exception as exc:
-                errors.append(exc)
+        errors.extend(await _close_opened_catalogs(already_opened.values()))
         return errors
 
     # -- catalog ----------------------------------------------------------
 
-    def _require_key_verified(self) -> None:
-        """Raise before any catalog I/O if this repository is *confirmed*
-        encrypted and its key hasn't been verified yet — thin delegation to
-        ``KeyManager.require_verified``."""
-        self._key_manager.require_verified()
-
     def _build_catalog(self, opened: _OpenCatalog, connection: Connection) -> Catalog:
-        """The one shared place ``catalogs()``/``catalog_by_id()`` build a
-        ``Catalog`` wrapper around one opened catalog's resources."""
         return Catalog(
             opened.dedup_repo,
             connection,
             saas_streams=opened.saas_streams,
-            track=self._track,
-            require_key_verified=self._require_key_verified,
+            providers=self._providers,
+            keys=self._key_manager,
         )
 
-    async def catalogs(self) -> list[Catalog]:
-        """Every catalog this repository holds — a vault's own
-        ``connection_config`` rows, or one per independently-opened
-        object-storage sibling repo-id — wrapped uniformly as ``Catalog``.
-        Opens every not-yet-opened catalog concurrently via
-        ``asyncio.gather``.
-
-        Never gated on the key, unlike ``Catalog.workloads()``/
-        ``versions()``: the rows this reads are plaintext regardless of
-        encryption, and opening a ``DedupRepo`` itself never requires one
-        either — this also preserves the TUI's flow of showing catalog
-        names before any key prompt.
-
-        A specific catalog's own open failure is re-raised immediately,
-        never treated as "skip it and keep going" — a caller must never
-        mistake one broken sibling for a bucket with fewer catalogs than
-        it actually has.
-        """
+    async def _open_all_catalogs(self) -> list[_OpenCatalog]:
+        """Every catalog layout opened, concurrently. Each open runs to its
+        end before the first failure is raised, so none is left running."""
         results = await asyncio.gather(
             *(self._open_catalogs.resolve(i) for i in range(len(self._catalog_layouts))),
             return_exceptions=True,
         )
-        good_opened: list[_OpenCatalog] = []
         for opened_or_error in results:
             if isinstance(opened_or_error, BaseException):
                 raise opened_or_error
-            good_opened.append(opened_or_error)
-        return [self._build_catalog(opened, connection) for opened in good_opened for connection in opened.connections]
+        return [opened for opened in results if not isinstance(opened, BaseException)]
+
+    async def catalogs(self) -> list[Catalog]:
+        """Every catalog this repository holds: a vault's
+        ``connection_config`` rows, or those of each object-storage
+        sibling, opening the unopened ones concurrently.
+
+        Needs no key: these rows are plaintext, so catalog names can be
+        shown before a key prompt. A catalog that fails to open raises
+        rather than being skipped, so a short list is never mistaken for a
+        repository with fewer catalogs.
+        """
+        return [
+            self._build_catalog(opened, connection)
+            for opened in await self._open_all_catalogs()
+            for connection in opened.connections
+        ]
 
     async def catalog_by_id(self, catalog_id: CatalogId) -> Catalog | None:
-        """Resolve exactly the one ``Catalog`` matching ``catalog_id`` —
-        opening only the specific ``DedupRepo``(s) that could possibly
-        match, never every sibling the way ``catalogs()``'s own full
-        listing does (avoidable I/O on an object-storage bucket with
-        several). A candidate that fails to open is re-raised immediately,
-        same as ``catalogs()``, never treated as "not it, keep looking".
-        """
+        """The ``Catalog`` matching ``catalog_id``, or ``None``, opening only
+        the catalogs that could match. A candidate's open failure is
+        raised, as in ``catalogs()``."""
         for index, catalog_layout in enumerate(self._catalog_layouts):
             if catalog_layout.repo_id is not None and catalog_layout.repo_id != catalog_id:
                 continue
@@ -288,210 +257,270 @@ class Repository:
         return None
 
     def workload_is_supported(self, workload: Workload) -> bool:
-        """Whether ``workload`` has a chance at an application-layer
-        provider — ``True`` doesn't guarantee every version resolves, only
-        that the type is one ``provider_for``/``saas_provider_for``
-        recognize at all. Never import ``units.dispatch`` directly from
-        CLI/TUI code instead."""
+        """Whether ``workload``'s type has an application-layer provider;
+        ``True`` doesn't guarantee every version resolves."""
         return _workload_is_supported(workload)
 
-    async def file_map_tree(self) -> UnitProvider:
-        """The diagnostic fallback axis of last resort — browsable even
-        when catalog metadata is missing or unhelpful. Always the first
-        catalog: a ``RAW`` ref's grammar carries no catalog segment, so
-        this can't disambiguate between object-storage siblings."""
+    async def file_map_tree(self) -> ClosableUnitProvider:
+        """The diagnostic ``file_map`` tree, browsable even when catalog
+        metadata is missing. Always the first catalog's: a ``RAW`` ref has
+        no catalog segment to pick an object-storage sibling by. Tracked
+        like any provider."""
         opened = await self._open_catalogs.resolve(0)
-        return self._track(FileMapTreeProvider(opened.dedup_repo))
+        return self._providers.track(FileMapTreeProvider(opened.dedup_repo))
 
-    async def invalidate_directory_cache(self) -> None:
-        """Drop every cached directory listing for every catalog this
-        repository has opened so far, so the next provider/catalog call
-        re-scans the store instead of answering from an earlier listing."""
+    def cache_names(self) -> list[str]:
+        """The names ``invalidate_caches`` accepts: every cache of every
+        catalog opened so far, in registration order, without repeats."""
+        names: dict[str, None] = {}
         for opened in self._open_catalogs.values():
-            await opened.dedup_repo.dir_cache.invalidate()
+            names.update(dict.fromkeys(opened.dedup_repo.caches.names()))
+        return list(names)
 
-    async def resolve(self, ref: str | NodeRef, *, object_db_id: str | None = None) -> Node | RestorableUnit:
-        """Turn a ``NodeRef`` (or its string form) into a live node/unit,
-        re-derived from cheap catalog/provider-tree calls rather than
-        stored anywhere. ``ref.repo_path`` is ignored entirely (canonical/
-        human refs never need it).
+    def cache_stats(self) -> dict[str, CacheStats]:
+        """Counters of every cache of every catalog opened so far, keyed
+        ``<catalog index>.<cache name>``."""
+        return {
+            f"{index}.{name}": stats
+            for index, opened in self._open_catalogs.items()
+            for name, stats in opened.dedup_repo.caches.stats().items()
+        }
+
+    async def invalidate_caches(self, *names: str) -> None:
+        """Drop cached data so the next call re-reads the store: the named
+        caches (see ``cache_names``), or every cache when none is named.
+
+        Call this after the store changed; nothing else revalidates. Catalogs
+        stay valid: only their caches are rebuilt, and the connection list is
+        re-read when ``db_sources`` is dropped. Providers handed out earlier keep their own connections and
+        are not closed; fetch fresh ones to see new data.
+
+        No catalog or provider call may be in flight: db connections and
+        SaaS streams are closed and replaced. Does nothing while no catalog
+        has been opened, since nothing is cached yet.
+
+        Args:
+            names: Cache names to drop; none means all.
+
+        Raises:
+            KeyError: A name is not in ``cache_names()``, checked once a catalog
+                is open (nothing was dropped).
+            RuntimeError: The repository is closed.
+            ExceptionGroup: One or more resources failed to close or rebuild.
         """
-        node_ref = ref if isinstance(ref, NodeRef) else NodeRef.parse(ref)
-        # Normalize repo_path to this repository's own root: tree nodes
-        # carry layout.repo_root, but a CLI-supplied ref carries whatever
-        # path the user typed.
+        if self._closed:
+            raise RuntimeError("Repository is closed; open a new one rather than reusing this instance")
+        known = self.cache_names()
+        if not known:
+            return
+        unknown = [name for name in names if name not in known]
+        if unknown:
+            raise KeyError(f"unknown cache name(s): {', '.join(unknown)}")
+        opened_catalogs, errors = await self._open_catalogs.settle_all()
+        for index, opened in opened_catalogs.items():
+            try:
+                if names:
+                    await opened.dedup_repo.caches.invalidate(*names)
+                else:
+                    await opened.dedup_repo.caches.invalidate_all()
+                if not names or "db_sources" in names:
+                    conns = await connections(opened.dedup_repo)
+                    self._open_catalogs.put(index, dataclasses.replace(opened, connections=conns))
+            except Exception as exc:  # noqa: BLE001
+                errors.append(exc)
+        if errors:
+            raise ExceptionGroup("Repository.invalidate_caches() failed for one or more resources", errors)
+
+    async def release_provider(self, provider: ClosableUnitProvider) -> None:
+        """Close ``provider`` and stop tracking it, so the repository doesn't
+        keep it (and what it references) alive until its own close.
+
+        The close runs to completion even if this call is cancelled, and the
+        repository's close waits for it.
+        """
+        await self._providers.release(provider)
+
+    async def locate(self, ref: str | NodeRef, *, raw: RawView | None = None) -> Frame:
+        """Where ``ref`` lands. A human ref walks display names (with
+        ``disambiguate()`` suffixes) catalog -> workload -> version -> item
+        as far as its segments go, so it may stop above a node; a canonical
+        or raw ref always names a node. ``ref.repo_path`` is ignored.
+
+        A ``NodeFrame``'s ``provider`` is tracked until the repository
+        closes; a caller done with it earlier passes it to
+        ``release_provider``.
+
+        Args:
+            ref: A ``NodeRef`` or its string form.
+            raw: Forwarded to ``Catalog.provider``.
+
+        Returns:
+            The frame the ref reached.
+
+        Raises:
+            NotFoundError: A segment matches nothing or matches ambiguously,
+                or no node matches a canonical/raw ref.
+            KeyRequiredError: The ref goes below a catalog of an encrypted
+                repository and no key was supplied.
+            KeyMismatchError: As above, but the last key supplied was rejected.
+            ValueError: The string is not a parseable ref.
+        """
+        node_ref = NodeRef.coerce(ref)
+        # Tree nodes carry layout.repo_root; a user-typed ref may not.
         node_ref = dataclasses.replace(node_ref, repo_path=self.layout.repo_root)
         kind = node_ref.kind
         if kind is RefKind.RAW:
-            return await _resolve_in_provider(await self.file_map_tree(), node_ref)
+            provider = await self.file_map_tree()
+            return NodeFrame(provider, await self._find_or_release(provider, node_ref))
         if kind is RefKind.CANONICAL:
-            catalog, version = await self.version_for_ref(node_ref)
-            provider = await catalog.provider(version, object_db_id=object_db_id)
-            return await _resolve_in_provider(provider, node_ref)
-        # Human ref: walks display names instead -- catalog -> workload ->
-        # version -> item, applying the same collision-suffix
-        # disambiguate() scheme the CLI/TUI use when displaying names.
-        return await _resolve_human_ref(self, node_ref)
-
-    async def version_for_ref(self, node_ref: NodeRef) -> tuple[Catalog, Version]:
-        """Resolve a canonical ref's ``cat:``/``wl:``/``ver:`` prefix down
-        to its owning ``Catalog`` and ``Version`` — the first half of what
-        ``resolve`` does for a canonical ref, exposed for callers that need
-        the version's own ``provider`` rather than one specific node inside
-        it (e.g. the CLI's ``ls``/``tree``). The ``Catalog`` is part of the
-        result too: building a provider needs to know which catalog's
-        ``DedupRepo`` to dispatch against."""
-        return await _version_for_canonical_ref(self, node_ref)
-
-    async def walk_human_ref(self, segments: tuple[str, ...], *, object_db_id: str | None = None) -> Frame:
-        """Walk a human ref's ``segments`` as far as they go, through the
-        four levels catalog -> workload -> version -> item tree, raising
-        ``NotFoundError`` the moment a segment doesn't match anything at
-        its level — a bare catalog or workload name is not itself an
-        error, since ``cli/browse.py``'s ``ls``/``tree`` breadcrumbs also
-        need to stop at an intermediate depth. ``object_db_id`` is
-        forwarded to ``provider`` once ``segments`` reaches a version.
-
-        Only this first level (picking the ``Catalog``) lives here — the
-        rest is ``Catalog.walk_human_ref``'s job."""
+            location = await _locate_canonical_ref(self, node_ref)
+            provider = await location.catalog.provider(location.version, raw=raw)
+            node = await self._find_or_release(provider, node_ref)
+            return NodeFrame(
+                provider, node, catalog=location.catalog, workload=location.workload, version=location.version
+            )
+        segments = node_ref.segments
         if not segments:
-            return Frame(level="root")
-
+            return RootFrame()
         catalogs_list = await self.catalogs()
-        catalog = _match_or_raise(segments[0], catalog_pairs(catalogs_list), catalogs_list, kind="backup source")
+        catalog = match_or_raise(segments[0], catalog_pairs(catalogs_list), catalogs_list, kind="backup source")
         if len(segments) == 1:
-            return Frame(level="catalog", catalog=catalog)
-        return await catalog.walk_human_ref(segments[1:], object_db_id=object_db_id)
+            return CatalogFrame(catalog)
+        return await catalog.locate(segments[1:], raw=raw)
+
+    async def _find_or_release(self, provider: ClosableUnitProvider, node_ref: NodeRef) -> Node:
+        """``_find_or_raise``, releasing ``provider`` on failure: the caller
+        never sees it, so it can't release it."""
+        try:
+            return await _find_or_raise(provider, node_ref)
+        except BaseException as exc:
+            await self._providers.release_after(exc, provider)
+            raise
+
+    async def resolve(self, ref: str | NodeRef, *, raw: RawView | None = None) -> NodeFrame:
+        """``locate``, but ``ref`` must reach a node: a human ref names at
+        least a catalog, workload and version. ``NodeFrame.unit()`` turns a
+        leaf into its ``RestorableUnit``.
+
+        Args:
+            ref: A ``NodeRef`` or its string form.
+            raw: Forwarded to ``Catalog.provider``.
+
+        Returns:
+            The ``NodeFrame`` the ref reached.
+
+        Raises:
+            NotFoundError: No node matches the ref, or a human ref stops
+                above a version.
+            KeyRequiredError: The ref goes below a catalog of an encrypted
+                repository and no key was supplied.
+            KeyMismatchError: As above, but the last key supplied was rejected.
+            ValueError: The string is not a parseable ref.
+        """
+        node_ref = NodeRef.coerce(ref)
+        if node_ref.kind is RefKind.HUMAN and len(node_ref.segments) < 3:
+            raise NotFoundError(
+                "human ref must name at least a catalog, workload, and version "
+                f"(got {len(node_ref.segments)} {pluralize(len(node_ref.segments), 'segment')}): {node_ref}",
+                ref=str(node_ref),
+            )
+        frame = await self.locate(node_ref, raw=raw)
+        assert isinstance(frame, NodeFrame)  # three human segments always reach a version's root
+        return frame
+
+    async def version_for_ref(self, ref: str | NodeRef) -> VersionLocation:
+        """Resolve a canonical ref's catalog/workload/version prefix, for a
+        caller that wants the version's provider rather than one node in it.
+
+        Args:
+            ref: A canonical ``NodeRef`` or its string form.
+
+        Returns:
+            Where the version is; its ``catalog``'s ``provider()`` opens it.
+
+        Raises:
+            NotFoundError: The ref is malformed or names no such catalog or
+                version.
+            ValueError: The string is not a parseable ref.
+            KeyRequiredError: The ref goes below a catalog of an encrypted
+                repository and no key was supplied.
+            KeyMismatchError: As above, but the last key supplied was rejected.
+        """
+        return await _locate_canonical_ref(self, NodeRef.coerce(ref))
 
     async def verify(
         self,
         level: VerifyLevel = VerifyLevel.QUICK,
         *,
-        progress: Callable[[Progress], Awaitable[None]] | None = None,
+        progress: ProgressCallback | None = None,
     ) -> list[Finding]:
-        """Integrity check over every catalog this repository holds — each
-        *distinct* ``DedupRepo`` verified exactly once, not once per
-        ``Catalog`` (a vault's sibling catalogs share one physical pool).
-        Opens every not-yet-opened catalog first, same concurrent-open and
-        fail-fast posture as ``catalogs()``, then runs
-        ``units.verify_reachable.verify_reachable()`` once per opened
-        instance and concatenates every ``Finding``.
+        """Integrity check over every catalog, each distinct ``DedupRepo``
+        once (a vault's catalogs share one). Opens every catalog first; at
+        ``FULL`` level, catalogs over the same pool share one worker pool.
 
-        Gated on ``_require_key_verified()``: an encrypted repository
-        verified without a key would otherwise silently walk zero versions
-        and report a misleadingly clean result.
+        Args:
+            level: How deep to check.
+            progress: Receives a ``Progress`` snapshot as checking advances.
 
-        At FULL level with more than one catalog, shares **one**
-        multiprocess executor across every ``verify_reachable()`` call
-        when every catalog resolves to the identical ``PoolDescriptor``
-        (the common vault case) — falls back to each call building its own
-        otherwise (object-storage siblings can be genuinely separate
-        stores)."""
-        self._require_key_verified()
-        opened_catalogs = await asyncio.gather(
-            *(self._open_catalogs.resolve(i) for i in range(len(self._catalog_layouts)))
-        )
-        dedup_repos = [opened.dedup_repo for opened in opened_catalogs]
+        Returns:
+            Every ``Finding`` from every catalog.
+
+        Raises:
+            KeyRequiredError: The repository is encrypted and no key was
+                supplied (an unkeyed walk would read zero versions and look
+                clean).
+            KeyMismatchError: The last key supplied was rejected.
+            StorageBackendError: A store call failed mid-check.
+        """
+        self._key_manager.require_verified()
+        dedup_repos = [opened.dedup_repo for opened in await self._open_all_catalogs()]
         findings: list[Finding] = []
-        executor: ProcessPoolExecutor | None = None
-        if level is VerifyLevel.FULL and len(dedup_repos) > 1:
-            descriptors = [
-                PoolDescriptor.from_repo(repo, verify_fingerprint=True, verify_ciphertext_crc=True)
-                for repo in dedup_repos
-            ]
-            first = descriptors[0]
-            if first is not None and all(d == first for d in descriptors):
-                executor = build_verify_executor(first)
+        executor = shared_verify_executor(dedup_repos) if level is VerifyLevel.FULL and len(dedup_repos) > 1 else None
         try:
             for dedup_repo in dedup_repos:
                 findings.extend(await verify_reachable(dedup_repo, level, progress=progress, executor=executor))
         finally:
             if executor is not None:
-                # A plain blocking call, routed through to_thread() so it
-                # doesn't freeze this whole process's event loop for
-                # however long a still-running worker takes.
-                await asyncio.to_thread(executor.shutdown, wait=True, cancel_futures=True)
+                await executor.close()
         return findings
 
-    def _track(self, provider: UnitProvider) -> UnitProvider:
-        """Remember ``provider`` so ``close`` can release whatever sqlite
-        connections it opened — an abandoned one blocks interpreter exit
-        forever (see ``_RESOURCE_CLOSE_TIMEOUT``)."""
-        self._providers.append(provider)
-        return provider
-
-    async def close(self) -> None:
+    async def _close(self) -> None:
         """Close every tracked provider and ``DedupRepo``, on every path
-        including errors. Idempotent.
+        including errors. Idempotent; ``Session`` is the only caller.
 
-        Never touches this repository's own ``ObjectStore``: one
-        ``discover()``/``discover_remote()`` call's repositories can share
-        one store, so only ``Session`` can tell whether it's safe to
-        release — call ``Session.close_repo()`` instead of a bare
-        ``repo.close()`` to release the store early too.
+        Leaves the ``ObjectStore`` open, since repositories from one
+        discovery can share it; ``Session.close_repo()`` also releases the
+        store when no other repository uses it.
+
+        Raises:
+            ExceptionGroup: One or more resources failed to close (every
+                one was still attempted).
         """
         if self._closed:
             return
         self._closed = True
-        # Every tracked provider gets a close attempt regardless of
-        # whether an earlier one raised — a leaked aiosqlite connection
-        # blocks interpreter exit forever.
-        errors: list[Exception] = []
-        for provider in self._providers:
-            if isinstance(provider, ClosableUnitProvider):
-                try:
-                    await asyncio.wait_for(provider.close(), timeout=_RESOURCE_CLOSE_TIMEOUT)
-                except Exception as exc:
-                    errors.append(exc)
-        self._providers.clear()
-        # Settle every in-flight fetch (a catalogs()/verify() call racing
-        # this close()) before closing each one that lands, or it leaks.
+        errors = await self._providers.close()
+        # Settle in-flight fetches so none lands after the close loop.
         opened_catalogs, resolve_errors = await self._open_catalogs.settle_all()
         errors.extend(resolve_errors)
-        for opened in opened_catalogs.values():
-            # saas_streams closed before dedup_repo: its streams hold
-            # connections opened against this dedup_repo, so it must
-            # never outlive it.
-            try:
-                await asyncio.wait_for(opened.saas_streams.close(), timeout=_RESOURCE_CLOSE_TIMEOUT)
-            except Exception as exc:
-                errors.append(exc)
-            try:
-                await asyncio.wait_for(opened.dedup_repo.close(), timeout=_RESOURCE_CLOSE_TIMEOUT)
-            except Exception as exc:
-                errors.append(exc)
-        # Also forget each closed DedupRepo, not just close it, or the
-        # cache keeps it (and everything it references) alive indefinitely.
+        errors.extend(await _close_opened_catalogs(opened_catalogs.values()))
+        # Drop the closed DedupRepos from the cache.
         self._open_catalogs.invalidate()
         if errors:
-            raise ExceptionGroup("Repository.close() failed to close every tracked resource", errors)
-
-    async def __aenter__(self) -> Self:
-        return self
-
-    async def __aexit__(self, *exc: object) -> None:
-        await self.close()
+            raise ExceptionGroup("closing the repository failed to close every tracked resource", errors)
 
 
-async def _finish(provider: UnitProvider, node: Node) -> Node | RestorableUnit:
-    """The common tail of every ``resolve()`` path — a leaf node becomes
-    its full ``RestorableUnit`` via ``UnitProvider.unit``; an intermediate
-    node is returned as-is."""
-    return await provider.unit(node) if node.is_leaf else node
-
-
-async def _resolve_in_provider(provider: UnitProvider, node_ref: NodeRef) -> Node | RestorableUnit:
+async def _find_or_raise(provider: UnitProvider, node_ref: NodeRef) -> Node:
     node = await find_node(provider, node_ref)
     if node is None:
         raise NotFoundError(f"no node in provider tree matches ref: {node_ref}", ref=str(node_ref))
-    return await _finish(provider, node)
+    return node
 
 
-async def _version_for_canonical_ref(repo: Repository, node_ref: NodeRef) -> tuple[Catalog, Version]:
-    """Picks the right ``Catalog`` by the ref's own ``CatalogId`` first,
-    then searches only that catalog's ``workloads()``/``versions()`` —
-    never scanning by ``connection_config_id`` alone, which collides
-    across object-storage siblings."""
+async def _locate_canonical_ref(repo: Repository, node_ref: NodeRef) -> VersionLocation:
+    """Picks the ``Catalog`` by the ref's ``CatalogId`` first, then the
+    version within it: ``connection_config_id`` alone collides across
+    object-storage siblings."""
     ids = node_ref.canonical_ids
     if ids is None:
         raise NotFoundError(f"malformed canonical ref: {node_ref}", ref=str(node_ref))
@@ -499,29 +528,18 @@ async def _version_for_canonical_ref(repo: Repository, node_ref: NodeRef) -> tup
     catalog = await repo.catalog_by_id(catalog_id)
     if catalog is None:
         raise NotFoundError(f"no catalog with catalog_id={catalog_id!r}", ref=str(node_ref))
-    workload = next((w for w in await catalog.workloads() if w.workload_id == workload_id), None)
-    if workload is None:
-        raise NotFoundError(f"no workload with workload_id={workload_id}", ref=str(node_ref))
-    versions_list = await catalog.versions(workload, include_deleted=True)
-    version = next((v for v in versions_list if v.version_uid == version_uid), None)
-    if version is None:
-        raise NotFoundError(f"no version with version_uid={version_uid!r}", ref=str(node_ref))
-    return catalog, version
-
-
-async def _resolve_human_ref(repo: Repository, node_ref: NodeRef) -> Node | RestorableUnit:
-    """Adds the "at least catalog/workload/version" length check on top of
-    ``Repository.walk_human_ref`` (which alone would stop at an
-    intermediate ``Frame`` rather than raising, valid for ``ls``/``tree``
-    but not for ``resolve()``), then unwraps the final ``Frame`` into the
-    leaf/subtree ``resolve()`` promises."""
-    segments = node_ref.segments
-    if len(segments) < 3:
+    location = await catalog.version_by_uid(workload_id, version_uid)
+    if location is None:
         raise NotFoundError(
-            "human ref must name at least a catalog, workload, and version "
-            f"(got {len(segments)} segment(s)): {node_ref}",
-            ref=str(node_ref),
+            f"no version with version_uid={version_uid!r} under workload_id={workload_id}", ref=str(node_ref)
         )
-    frame = await repo.walk_human_ref(segments)
-    assert frame.node is not None and frame.provider is not None  # guaranteed once len(segments) >= 3
-    return await _finish(frame.provider, frame.node)
+    return location
+
+
+async def _close_opened_catalogs(opened: Iterable[_OpenCatalog]) -> list[Exception]:
+    """Close each opened catalog's ``saas_streams`` before its ``dedup_repo``
+    (the streams read through it), attempting every one."""
+    return await close_each(
+        (closer for o in opened for closer in (o.saas_streams.close, o.dedup_repo.close)),
+        per_close_timeout=RESOURCE_CLOSE_TIMEOUT,
+    )

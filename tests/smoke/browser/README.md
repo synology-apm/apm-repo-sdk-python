@@ -18,32 +18,24 @@ diagnostic-mode toggling.
 | `tests/smoke/sdk/` | `synology_apm_repo.sdk`'s public API, in-process | real repositories | no |
 | `tests/smoke/browser/` (this tool) | `ApmRepoBrowserApp`, `App.run_test()` | real repositories | no |
 
-No subprocess here (impossible/impractical for a real terminal UI) --
-`App.run_test()` is already the sanctioned in-process harness everywhere
-else in this package's own tests; this tool just points it at real
-content instead of a fake or replayed one.
-
 ## Out of scope (redundant with other layers)
 
 - Which connections/workloads/versions exist, decode correctness, real
   content bytes -- `tests/smoke/sdk/` already exercises this end to end.
-- `--no-sparse-export`'s own argv parsing -- `test_browser_app.py` covers
-  `_parse_args()` directly (a pure function); the sparse-write mechanism
-  itself (real disk-block savings) already has controlled-data coverage
-  in `test_browser_export_screen.py` and SDK-level `test_dedup_dedup_
-  file.py` -- `export_worklist.py` runs a single pass at the default
-  `default_sparse=True`, checking the background-job-lifecycle plumbing
-  instead.
+- `--no-sparse-export`'s argv parsing (`test_browser_app.py` covers
+  `_parse_args()`) and the sparse-write mechanism itself
+  (`test_browser_screens_export_screen.py`, `test_dedup_dedup_file.py`) --
+  `phases/_export_worklist.py` runs a single pass at the default
+  `default_sparse=True`, checking the background-job plumbing instead.
 
 ## Running it
 
 ```
-uv run python -m tests.smoke.browser [--group navigate|diagnostics_and_verbose|export_worklist|hex_preview|key_dialog|remote_connect|help_screen]
+uv run python -m tests.smoke.browser [--group navigate|diagnostics_and_verbose|export_worklist|export_folder|hex_preview|key_dialog|remote_connect|help_screen]
 ```
 
-or `make smoke-test` (runs `sdk`/`cli`/`browser` together; not part of
-`make test`/CI). Needs `../smoke_samples.toml` configured -- see
-`tests/smoke/README.md`.
+or `make smoke-test`; needs `../smoke_samples.toml` configured (see
+`../README.md`).
 
 ## Domains
 
@@ -58,6 +50,11 @@ or `make smoke-test` (runs `sdk`/`cli`/`browser` together; not part of
   real file lands on disk. Skips the worklist-specific check (not a
   failure) when a small real leaf finishes exporting before it could be
   backgrounded.
+- **`export_folder`** -- `e` on the folder holding the leaf `navigate` landed on
+  exports everything below it through the real `ExportScreen` and worker:
+  the job finishes without error, no `.part` file is left, and every planned
+  file is on disk with its planned size. Needs `navigate` in the same run;
+  a run past 300 s is cancelled and reported as skipped, not failed.
 - **`hex_preview`** -- `HexPreviewScreen` (`x`, diagnostic-mode only) on
   the same picked leaf, checking the dump *renders* in the expected
   offset/hex/ASCII shape -- not re-deriving byte correctness.
@@ -81,29 +78,21 @@ or `make smoke-test` (runs `sdk`/`cli`/`browser` together; not part of
 ## Session shape
 
 Every domain but `key_dialog`/`remote_connect` shares one `App.run_test()`
-session and one connected repository (`ctx.data["main_ref"]`, picked from
-`[[local]]` samples only since every one of these domains drives
-`ConnectDialog` via `connect_local()`, which takes a filesystem path;
-preferring an unencrypted sample so key-unlocking stays `key_dialog`'s own,
-deliberate job). `key_dialog` opens its own, separate session against
-`ctx.data["encrypted_ref"]` (also `[[local]]`-only, same reason) --
-`.._shared_refs.list_representative_refs` picks one representative, real
-leaf per (sample, workload type), preferring a readable repository and
-skipping any that's unkeyed or wrong-keyed; see also
-`tests/smoke/cli/README.md`'s "Ref
-selection and shared-bucket siblings" section for how a shared-bucket
-sibling now resolves via `--key` at its own `narrow_repo_ref` like any
-other repository. `remote_connect` opens one fresh session
-*per* configured `[[profile]]`/`[[remote_storage]]` sample
-(`ctx.data["remote_entries"]`), not one shared session looping over all of
-them: reconnecting a second source in the same session replaces the
-first's tree rather than adding to it (`BrowseScreen._reset_for_new_scan`
-clears the previous scan's repositories/tree), so each
-sample needs its own session to stay independent, the same reasoning
-`key_dialog`'s own separate session already has. It drives `ConnectDialog`
-directly from each sample's own config rather than from a
-`RepresentativeRef`, since neither kind's ref is a filesystem path
-`connect_local()` could use.
+session and one connected repository (`ctx.data["main_ref"]`). It is picked
+from `[[local]]` samples only, since these domains drive `ConnectDialog`
+via `connect_local()`, which takes a filesystem path, and prefers an
+unencrypted sample so key-unlocking stays `key_dialog`'s job. `key_dialog`
+opens its own session against `ctx.data["encrypted_ref"]` (also
+`[[local]]`-only). Both come from `../_shared_refs.py`'s
+`list_representative_refs` (one representative, real leaf per (sample,
+workload type), preferring a readable repository) and `pick_session_refs`.
+
+`remote_connect` opens one fresh session *per* configured `[[profile]]`/
+`[[remote_storage]]` sample (`ctx.data["remote_entries"]`): connecting a
+second source in the same session replaces the first's tree (a new scan's
+`RescanStarted` clears the previous repositories, `core/browse/update.py`).
+It drives `ConnectDialog` from each sample's own config, since neither
+kind's ref is a filesystem path `connect_local()` could use.
 
 ## How to extend
 
@@ -113,8 +102,9 @@ directly from each sample's own config rather than from a
    `DOMAINS` (`_context.py`) and `_ORDER` (`__main__.py`), plus
    `_MAIN_SESSION_PHASES` or, if it needs its own `App.run_test()`
    session the way `key_dialog`/`remote_connect` do (see "Session shape"
-   above), `_OWN_SESSION_PHASES`; add its coverage expectations to the
-   relevant sample(s)' comments in your `smoke_samples.toml`.
+   above), `_OWN_SESSION_PHASES` and its own session block in `_run()`;
+   add its coverage expectations to the relevant sample(s)' comments in
+   your `smoke_samples.toml`.
 3. **A new named sample surfaces** -- see `tests/smoke/sdk/README.md`'s
    "How to extend" for the shared `smoke_samples.toml.example` recipe;
    nothing about it is browser-specific.

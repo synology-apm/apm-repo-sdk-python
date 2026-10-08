@@ -1,9 +1,10 @@
-"""Unit tests for ``synology_apm_repo.sdk.storage.azure`` — the pieces
-specific to ``AzureStore`` itself (the lazy-import guard, status-code
-mapping, the ``walk_blobs`` shape) rather than the generic ``ObjectStore``
-contract, which lives in ``test_storage_object_store_contract.py``
-alongside ``LocalFsStore``/``S3Store``. Backed by a mocked
-``BlobServiceClient`` rather than a live Azurite instance.
+"""Unit tests for ``synology_apm_repo.sdk.storage.azure`` — what is
+specific to ``AzureStore`` and its helpers (the lazy-import guard,
+status-code mapping, the ``walk_blobs`` shape, client ownership and
+cancellation, ``list_containers``, shared-key credential resolution, default
+timeouts) rather than the generic ``ObjectStore`` contract, which
+``test_storage_object_store_contract.py`` runs against every backend.
+Backed by a mocked ``BlobServiceClient`` rather than a live Azurite instance.
 
 The mock models ``azure.storage.blob.aio``'s shapes, not the
 synchronous SDK's: ``download_blob``/``get_blob_properties``
@@ -21,9 +22,10 @@ from collections.abc import AsyncIterator
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
-from azure.core.exceptions import HttpResponseError, ResourceNotFoundError
+from azure.core.exceptions import HttpResponseError, ResourceNotFoundError, ServiceRequestError
 
-from synology_apm_repo.sdk.errors import NotFoundError
+from support.fakes import unchecked_fake
+from synology_apm_repo.sdk.errors import NotFoundError, PermissionDeniedError, StorageBackendError
 from synology_apm_repo.sdk.storage.azure import (
     AzureStore,
     _account_name_from_url,
@@ -32,6 +34,7 @@ from synology_apm_repo.sdk.storage.azure import (
     _with_default_timeouts,
     list_containers,
 )
+from synology_apm_repo.sdk.storage.base import Entry
 
 
 def _not_found() -> ResourceNotFoundError:
@@ -107,11 +110,12 @@ def _service_client_for(files: dict[str, bytes]) -> MagicMock:
                 if prefix in seen:
                     continue
                 seen.add(prefix)
-                item = MagicMock()
+                item = MagicMock(spec=["name"])  # a BlobPrefix has no size
                 item.name = prefix
             else:
                 item = MagicMock()
                 item.name = name
+                item.size = len(files[name])
             items.append(item)
         return _as_async_iter(items)
 
@@ -124,18 +128,14 @@ class TestLazyImportPropagatesImportError:
     def test_raises_importerror_when_the_sdk_is_missing_and_no_client_given(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """``sys.modules["azure.storage.blob.aio"] = None`` makes a
-        subsequent ``from azure.storage.blob.aio import BlobServiceClient``
-        raise ``ImportError`` — a real, documented CPython import system
-        behavior, simulating a broken/partial install without uninstalling
-        it from this dev environment. The ``.aio`` subpackage is named
-        explicitly (as well as its parent) because ``AzureStore``
-        imports from there, and a parent already cached in
-        ``sys.modules`` would otherwise not stop the child import from
-        resolving."""
+        """A ``None`` entry in ``sys.modules`` makes the import raise
+        ``ImportError``, simulating a missing install. The ``.aio``
+        subpackage ``AzureStore`` imports from is blocked too, since an
+        already-cached one would still resolve with only its parent
+        blocked."""
         monkeypatch.setitem(sys.modules, "azure.storage.blob", None)
         monkeypatch.setitem(sys.modules, "azure.storage.blob.aio", None)
-        with pytest.raises(ImportError):
+        with pytest.raises(ImportError, match=r"import of azure\.storage\.blob\.aio halted"):
             AzureStore("some-container")
 
     def test_does_not_import_the_sdk_when_a_client_is_given(self, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -143,9 +143,6 @@ class TestLazyImportPropagatesImportError:
         monkeypatch.setitem(sys.modules, "azure.storage.blob.aio", None)
         service_client = _service_client_for({})
         store = AzureStore("some-container", client=service_client)
-        # Reaching this line at all already proves no ImportError fired;
-        # the real claim this test makes is that the injected client is
-        # used as-is (not rewrapped) and marked as not owned by the store.
         assert store._service_client is service_client
         assert store._owns_client is False
 
@@ -157,12 +154,12 @@ class TestErrorMapping:
 
     async def test_read_missing_blob_raises_not_found(self) -> None:
         store = AzureStore("c", client=_service_client_for({}))
-        with pytest.raises(NotFoundError):
+        with pytest.raises(NotFoundError, match="no such blob"):
             await store.read("nope.txt")
 
     async def test_size_missing_blob_raises_not_found(self) -> None:
         store = AzureStore("c", client=_service_client_for({}))
-        with pytest.raises(NotFoundError):
+        with pytest.raises(NotFoundError, match="no such blob"):
             await store.size("nope.txt")
 
     async def test_exists_false_for_missing_blob_true_for_present(self) -> None:
@@ -170,7 +167,7 @@ class TestErrorMapping:
         assert await store.exists("f.txt") is True
         assert await store.exists("nope.txt") is False
 
-    async def test_a_non_404_non_416_error_propagates_unchanged(self) -> None:
+    async def test_a_403_is_a_permission_denied_error_from_exists(self) -> None:
         service_client = _service_client_for({})
         container = service_client.get_container_client.return_value
         blob_client = MagicMock()
@@ -179,10 +176,11 @@ class TestErrorMapping:
         blob_client.get_blob_properties = AsyncMock(side_effect=forbidden)
         container.get_blob_client.side_effect = lambda name: blob_client
         store = AzureStore("c", client=service_client)
-        with pytest.raises(HttpResponseError):
+        with pytest.raises(PermissionDeniedError, match=r"access denied \(HTTP") as excinfo:
             await store.exists("f.txt")
+        assert excinfo.value.__cause__ is forbidden
 
-    async def test_a_non_404_non_416_error_propagates_unchanged_from_read(self) -> None:
+    async def test_a_403_is_a_permission_denied_error_from_read(self) -> None:
         service_client = _service_client_for({})
         container = service_client.get_container_client.return_value
         blob_client = MagicMock()
@@ -191,10 +189,10 @@ class TestErrorMapping:
         blob_client.download_blob = AsyncMock(side_effect=forbidden)
         container.get_blob_client.side_effect = lambda name: blob_client
         store = AzureStore("c", client=service_client)
-        with pytest.raises(HttpResponseError):
+        with pytest.raises(PermissionDeniedError, match=r"access denied \(HTTP"):
             await store.read("f.txt")
 
-    async def test_a_non_404_error_propagates_unchanged_from_size(self) -> None:
+    async def test_a_403_is_a_permission_denied_error_from_size(self) -> None:
         service_client = _service_client_for({})
         container = service_client.get_container_client.return_value
         blob_client = MagicMock()
@@ -203,60 +201,80 @@ class TestErrorMapping:
         blob_client.get_blob_properties = AsyncMock(side_effect=forbidden)
         container.get_blob_client.side_effect = lambda name: blob_client
         store = AzureStore("c", client=service_client)
-        with pytest.raises(HttpResponseError):
+        with pytest.raises(PermissionDeniedError, match=r"access denied \(HTTP"):
             await store.size("f.txt")
 
+    async def test_a_service_error_is_a_storage_backend_error(self) -> None:
+        service_client = _service_client_for({})
+        container = service_client.get_container_client.return_value
+        blob_client = MagicMock()
+        unavailable = HttpResponseError(message="server busy")
+        unavailable.status_code = 503
+        blob_client.get_blob_properties = AsyncMock(side_effect=unavailable)
+        container.get_blob_client.side_effect = lambda name: blob_client
+        store = AzureStore("c", client=service_client)
+        with pytest.raises(StorageBackendError, match="503"):
+            await store.size("f.txt")
+
+    async def test_a_connection_failure_is_a_storage_backend_error(self) -> None:
+        service_client = _service_client_for({})
+        container = service_client.get_container_client.return_value
+        blob_client = MagicMock()
+        blob_client.download_blob = AsyncMock(side_effect=ServiceRequestError("connection refused"))
+        container.get_blob_client.side_effect = lambda name: blob_client
+        store = AzureStore("c", client=service_client)
+        with pytest.raises(StorageBackendError, match="connection refused"):
+            await store.read("f.txt")
+
+    async def test_a_zero_length_read_downloads_nothing_and_returns_empty_bytes(self) -> None:
+        service_client = _service_client_for({})
+        container = service_client.get_container_client.return_value
+        blob_client = MagicMock()
+        properties = MagicMock()
+        properties.size = 5
+        blob_client.get_blob_properties = AsyncMock(return_value=properties)
+        blob_client.download_blob = AsyncMock(side_effect=AssertionError("unexpected download_blob"))
+        container.get_blob_client.side_effect = lambda name: blob_client
+        store = AzureStore("c", client=service_client)
+        assert await store.read("f.txt", offset=2, length=0) == b""
+
     async def test_exists_true_for_a_directory_prefix_with_no_blob_of_its_own(self) -> None:
-        # "dir" itself is never an object (get_blob_properties() 404s for
-        # it), only a prefix with a real blob underneath -- exists()
-        # must still report True via the walk_blobs() fallback, same
-        # contract test_storage_s3.py's exists() pins down.
+        # "dir" is only a prefix (get_blob_properties() 404s for it);
+        # exists() reports True via the walk_blobs() fallback.
         store = AzureStore("c", client=_service_client_for({"dir/file.txt": b"x"}))
         assert await store.exists("dir") is True
 
     async def test_exists_false_for_a_similarly_named_sibling_blob_not_a_real_directory(self) -> None:
-        # "dirfile.txt" shares "dir" as a literal string prefix but isn't
-        # inside a "dir/" directory -- proves prefix_listing.as_list_prefix's
-        # trailing-slash disambiguation (name_starts_with="dir/", not "dir")
-        # is what actually keeps the walk_blobs() fallback from
-        # false-matching an unrelated sibling blob.
+        # "dirfile.txt" shares "dir" as a string prefix but isn't under
+        # "dir/": the fallback lists name_starts_with="dir/"
+        # (as_list_prefix), so it must not false-match the sibling blob.
         store = AzureStore("c", client=_service_client_for({"dirfile.txt": b"x"}))
         assert await store.exists("dir") is False
 
 
-class TestAcloseOwnedClient:
-    async def test_aclose_closes_a_client_this_store_built_itself(self) -> None:
-        # Every other test in this file injects a client=... (as
-        # AzureStore's constructor optionally accepts), so aclose()'s
-        # real body -- closing a client this store built and owns --
-        # never runs. account_url alone is enough to construct a real
-        # BlobServiceClient with no network I/O.
+class TestCloseOwnedClient:
+    async def test_close_closes_a_client_this_store_built_itself(self) -> None:
+        # account_url alone constructs a real BlobServiceClient with no
+        # network I/O.
         store = AzureStore("some-container", account_url="https://fakeaccount.blob.core.windows.net")
         assert store._owns_client is True
-        await store.aclose()
-        await store.aclose()  # idempotent - must not raise
+        await store.close()
+        await store.close()  # idempotent - must not raise
 
-    async def test_aclose_leaves_an_injected_client_untouched(self) -> None:
-        # aclose() only closes a client this class built itself -- an
-        # injected client belongs to whoever created it.
+    async def test_close_leaves_an_injected_client_untouched(self) -> None:
         service_client = _service_client_for({})
         store = AzureStore("some-container", client=service_client)
         assert store._owns_client is False
-        await store.aclose()
+        await store.close()
         service_client.close.assert_not_called()
 
 
 class TestCancellation:
-    """Mirrors ``test_storage_s3.py``'s own ``TestCancellation`` for the
-    identical hazard on the Azure side — but the fix looks different
-    here: there is no per-connection handle reachable from
-    ``downloader``/``blob_client`` at all (unlike S3's response body), so
-    the fix closes the shared top-level transport instead.
-    ``self._container``/``blob_client``'s own
-    ``._pipeline._transport`` is a deliberate no-op wrapper — this test
-    pins down that the fix reaches past it to
-    ``self._service_client._pipeline._transport`` specifically, not
-    just "some close() got called somewhere"."""
+    """A cancelled read must not return a half-read connection to the
+    pool. No per-connection handle is reachable from
+    ``downloader``/``blob_client``, and a child client's transport is a
+    no-op wrapper, so the read closes
+    ``self._service_client._pipeline._transport`` itself."""
 
     async def test_a_cancelled_read_closes_the_top_level_transport(self) -> None:
         service_client = _service_client_for({})
@@ -288,11 +306,8 @@ class TestCancellation:
 
 
 class TestForceCloseTransport:
-    """Direct tests of the helper ``TestCancellation`` above exercises
-    indirectly through a real cancelled ``read()`` — this covers its own
-    graceful-degradation fallback, which a real ``BlobServiceClient``
-    mock never exercises (its ``_pipeline._transport`` chain is always
-    present)."""
+    """``_force_close_transport``, including its fallback to the public
+    ``close()`` when the private ``_pipeline._transport`` chain is gone."""
 
     async def test_closes_the_pipeline_transport_when_present(self) -> None:
         service_client = MagicMock()
@@ -321,18 +336,26 @@ class TestListdir:
         files["dir/sub/nested.txt"] = b"x"
         store = AzureStore("c", client=_service_client_for(files))
         entries = await store.listdir("dir")
-        assert entries == sorted([f"file{i}.txt" for i in range(5)] + ["sub"])
+        assert [entry.name for entry in entries] == sorted([f"file{i}.txt" for i in range(5)] + ["sub"])
 
     async def test_listdir_on_missing_prefix_returns_empty_not_not_found(self) -> None:
         store = AzureStore("c", client=_service_client_for({}))
         assert await store.listdir("nope") == []
 
 
+class TestListdirSizes:
+    async def test_blobs_carry_their_size_and_a_virtual_directory_has_none(self) -> None:
+        files = {"dir/a.bin": b"12345", "dir/b.bin": b"", "dir/sub/nested.bin": b"x"}
+        store = AzureStore("c", client=_service_client_for(files))
+
+        assert await store.listdir("dir") == [Entry("a.bin", 5), Entry("b.bin", 0), Entry("sub", None)]
+
+
 class TestListContainers:
     async def test_list_containers_returns_every_container_visible_to_these_credentials(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        closed = False
+        close_calls = 0
 
         class _FakeContainerProperties:
             def __init__(self, name: str) -> None:
@@ -342,30 +365,57 @@ class TestListContainers:
             for name in ["container-b", "container-a"]:
                 yield _FakeContainerProperties(name)
 
+        @unchecked_fake("azure.storage.blob's async BlobServiceClient")
         class _FakeServiceClient:
             def __init__(self, **kwargs: object) -> None:
                 pass
 
             def list_containers(self) -> AsyncIterator[_FakeContainerProperties]:
-                # Real BlobServiceClient.aio.list_containers() is not a
-                # coroutine either — it returns something ``async for``'d
-                # over (the real ``AsyncItemPaged``), same shape as
-                # AzureStore's own ``walk_blobs()``.
+                # Like walk_blobs(), a plain call returning an
+                # AsyncItemPaged-shaped async iterator.
                 return _containers()
 
             async def close(self) -> None:
-                nonlocal closed
-                closed = True
+                nonlocal close_calls
+                close_calls += 1
 
         monkeypatch.setattr("azure.storage.blob.aio.BlobServiceClient", _FakeServiceClient)
         containers = await list_containers(account_url="https://example.blob.core.windows.net")
         assert containers == ["container-a", "container-b"]
-        assert closed, "the transient client must be closed before returning"
+        assert close_calls == 1, "the transient client must be closed before returning"
+
+    async def test_list_containers_maps_a_403_to_permission_denied_and_still_closes_the_client(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        close_calls = 0
+
+        async def _denied() -> AsyncIterator[object]:
+            err = HttpResponseError(message="denied")
+            err.status_code = 403
+            raise err
+            yield  # pragma: no cover - makes this an async generator
+
+        @unchecked_fake("azure.storage.blob's async BlobServiceClient")
+        class _FakeServiceClient:
+            def __init__(self, **kwargs: object) -> None:
+                pass
+
+            def list_containers(self) -> AsyncIterator[object]:
+                return _denied()
+
+            async def close(self) -> None:
+                nonlocal close_calls
+                close_calls += 1
+
+        monkeypatch.setattr("azure.storage.blob.aio.BlobServiceClient", _FakeServiceClient)
+        with pytest.raises(PermissionDeniedError, match=r"access denied \(HTTP"):
+            await list_containers(account_url="https://example.blob.core.windows.net")
+        assert close_calls == 1
 
     def test_raises_importerror_when_the_sdk_is_missing(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setitem(sys.modules, "azure.storage.blob", None)
         monkeypatch.setitem(sys.modules, "azure.storage.blob.aio", None)
-        with pytest.raises(ImportError):
+        with pytest.raises(ImportError, match=r"import of azure\.storage\.blob\.aio halted"):
             asyncio.run(list_containers())
 
 
@@ -376,20 +426,25 @@ class TestRepr:
 
 
 class TestSharedKeyCredentialResolution:
-    """``_resolve_shared_key_credential`` exists because azure-storage-blob's
-    own account-name sniffing (``StorageAccountHostsMixin.__init__`` in
-    ``azure.storage.blob._shared.base_client``) only recognizes a path-style
-    account URL's account name when the host is literally ``"localhost"``/
-    ``"127.0.0.1"`` — any other Azurite-style endpoint (a real hostname, a
-    remote IP, a docker service name) leaves it unable to determine the
-    account name at all, raising ``ValueError: Unable to determine account
-    name for shared key credential``."""
+    """azure-storage-blob recognizes a path-style account URL's account
+    name only when the host is ``localhost``/``127.0.0.1``; any other
+    Azurite-style endpoint raises ``ValueError: Unable to determine account
+    name for shared key credential`` unless
+    ``_resolve_shared_key_credential`` passes the name explicitly."""
 
-    def test_account_name_recovered_from_production_subdomain_url(self) -> None:
-        assert _account_name_from_url("https://myaccount.blob.core.windows.net") == "myaccount"
-
-    def test_account_name_recovered_from_path_style_url_on_a_non_localhost_host(self) -> None:
-        assert _account_name_from_url("http://192.0.2.10:10000/devstoreaccount1") == "devstoreaccount1"
+    @pytest.mark.parametrize(
+        ("url", "expected"),
+        [
+            pytest.param("https://myaccount.blob.core.windows.net", "myaccount", id="production_subdomain_url"),
+            pytest.param(
+                "http://192.0.2.10:10000/devstoreaccount1",
+                "devstoreaccount1",
+                id="path_style_url_on_a_non_localhost_host",
+            ),
+        ],
+    )
+    def test_account_name_recovered_from(self, url: str, expected: str) -> None:
+        assert _account_name_from_url(url) == expected
 
     def test_account_name_is_none_when_neither_form_matches(self) -> None:
         assert _account_name_from_url("http://192.0.2.10:10000") is None
@@ -414,13 +469,11 @@ class TestSharedKeyCredentialResolution:
     def test_azure_store_construction_passes_the_resolved_credential_to_the_real_client(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """End-to-end version of the two tests above: constructing
-        ``AzureStore`` against a path-style, non-localhost Azurite endpoint
-        must not raise, and the client actually receives the resolved
-        ``{"account_name": ..., "account_key": ...}`` dict rather than the
-        raw key string."""
+        """``AzureStore`` against a path-style, non-localhost endpoint hands
+        the client the resolved dict, not the raw key string."""
         captured: dict[str, object] = {}
 
+        @unchecked_fake("azure.storage.blob's async BlobServiceClient")
         class _FakeServiceClient:
             def __init__(self, **kwargs: object) -> None:
                 captured.update(kwargs)
@@ -434,9 +487,8 @@ class TestSharedKeyCredentialResolution:
 
 
 class TestDefaultTimeouts:
-    """Interactive callers (the TUI's connect dialog, in particular)
-    building a client against an unreachable account URL must not inherit
-    azure-core's own 300s connect/300s read defaults."""
+    """A client built against an unreachable account URL must not inherit
+    azure-core's 300s connect/300s read defaults."""
 
     def test_fills_in_short_connect_and_read_timeouts_when_caller_passes_none(self) -> None:
         merged = _with_default_timeouts({"account_url": "https://example.invalid"})
@@ -447,6 +499,4 @@ class TestDefaultTimeouts:
     def test_a_caller_supplied_timeout_is_not_overridden(self) -> None:
         merged = _with_default_timeouts({"connection_timeout": 1})
         assert merged["connection_timeout"] == 1
-        # read_timeout was never set by the caller, so it still falls back
-        # to this module's own default rather than azure-core's 300s one.
         assert merged["read_timeout"] < 300

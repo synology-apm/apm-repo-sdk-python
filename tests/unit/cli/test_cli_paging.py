@@ -1,8 +1,6 @@
-"""Unit tests for ``synology_apm_repo.cli.paging``. ``paged()``'s
-subprocess-invoking branch is deliberately never exercised here — a real
-``less`` process reading real stdin isn't something a unit test should
-shell out to.
-"""
+"""Unit tests for ``synology_apm_repo.cli.paging``. No test launches a real
+pager: ``_SubprocessPager.show``/``subprocess.run`` are replaced, or the
+pager named is a binary that doesn't exist."""
 
 from __future__ import annotations
 
@@ -32,8 +30,7 @@ class TestPagerArgv:
 
 class TestPaged:
     def test_is_a_no_op_when_stdout_is_not_a_terminal(self) -> None:
-        # Console(file=StringIO()) is never a terminal -- the shape every
-        # CliRunner-driven command test already runs under.
+        # Console(file=StringIO()) is never a terminal.
         buffer = StringIO()
         console = Console(file=buffer)
         with paged(console):
@@ -51,10 +48,6 @@ class TestPaged:
         assert "hello" in buffer.getvalue()
 
     def test_actually_pages_on_a_real_terminal_with_a_resolved_pager(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        # The one branch neither test above reaches: is_terminal True *and*
-        # a pager resolved -- console.pager()'s own PagerContext.__exit__
-        # calls Pager.show(), which we intercept here rather than shelling
-        # out to a real interactive pager from a unit test.
         shown: list[str] = []
         monkeypatch.setattr(_SubprocessPager, "show", lambda self, content: shown.append(content))
         console = Console(file=StringIO(), force_terminal=True)
@@ -64,12 +57,6 @@ class TestPaged:
 
 
 class TestRender:
-    """``render()`` is the shared ``--json``-or-human dispatch every
-    command's own final output goes through — ``paged()`` itself is
-    already fully covered above, so these only check ``render()``'s own
-    dispatch logic (which branch runs, and whether ``paged()`` gets
-    entered), not paging mechanics a second time."""
-
     def test_json_mode_prints_the_json_payload_and_never_calls_human(self) -> None:
         buffer = StringIO()
         console = Console(file=buffer)
@@ -100,8 +87,6 @@ class TestRender:
         assert shown and "paged output" in shown[0]
 
     def test_page_true_is_ignored_under_json(self) -> None:
-        # --json output is never paged, regardless of page=True -- the
-        # json branch returns before paging is even considered.
         buffer = StringIO()
         console = Console(file=buffer, force_terminal=True)
         calls: list[None] = []
@@ -114,7 +99,7 @@ class TestSubprocessPager:
     def test_shows_content_via_the_configured_pager(self, monkeypatch: pytest.MonkeyPatch) -> None:
         calls: list[tuple[list[str], str]] = []
 
-        def _fake_run(argv: list[str], *, input: str, text: bool, check: bool) -> object:
+        def _fake_run(argv: list[str], *, input: str, text: bool, check: bool) -> object:  # noqa: A002 - subprocess.run's own keyword
             calls.append((argv, input))
             return None
 
@@ -125,10 +110,5 @@ class TestSubprocessPager:
     def test_falls_back_to_printing_directly_when_the_pager_binary_is_missing(
         self, capsys: pytest.CaptureFixture[str]
     ) -> None:
-        # A pager that can't possibly exist on $PATH -- proves a missing
-        # pager never crashes the command it's wrapping.
         _SubprocessPager(["definitely-not-a-real-pager-binary"]).show("fallback content")
         assert capsys.readouterr().out == "fallback content"
-
-
-__all__: list[str] = []
