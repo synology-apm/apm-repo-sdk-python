@@ -350,11 +350,11 @@ module that uses it; `tests/unit/sdk/disk_fs_fakes.py`'s `raw_image`/
 
 ## Timezone-rendered assertions
 
-A version's `display_name` is its epoch rendered in the local timezone.
-`tests/conftest.py`'s session-scoped `_fixed_timezone` pins that to
-`Asia/Taipei` on every platform, so a replay test may hardcode a rendered
-timestamp — check a new one against the Asia/Taipei rendering, not your
-own machine's.
+A version's `display_name` and the browser's date cells are rendered in the
+local timezone by the SDK's `format_timestamp`. `tests/conftest.py`'s
+session-scoped `_fixed_timezone` pins that to `Asia/Taipei` on every
+platform, so a test may hardcode a rendered timestamp — check a new one
+against the Asia/Taipei rendering, not your own machine's.
 
 ## Rendered-output assertions
 

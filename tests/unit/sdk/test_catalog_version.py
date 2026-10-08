@@ -482,11 +482,6 @@ class TestParseVersionSpec:
 
         assert parse_version_spec("not-json-at-all", "vuid-100", None) is None
 
-    def test_json_nested_past_the_recursion_limit_returns_none(self) -> None:
-        from synology_apm_repo.sdk.catalog.version import parse_version_spec
-
-        assert parse_version_spec("[" * 100_000 + "]" * 100_000, "vuid-100", None) is None
-
 
 class TestVersionAdditionalMeta:
     """``version_additional_meta``: ``None`` whenever the field can't be

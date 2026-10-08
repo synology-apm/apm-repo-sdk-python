@@ -162,7 +162,7 @@ async def sniff(data: bytes | bytearray) -> SniffResult:
     ``_MAX_SNIFF_DECOMPRESS`` (checked before decompressing, since
     ``data`` is untrusted), is unclassifiable rather than an error, as is
     ``{``-prefixed data that doesn't parse as JSON (invalid, or nested
-    deeper than the decoder's recursion limit).
+    too deep for the decoder).
 
     Raises:
         sqlite3.DatabaseError: The payload has the SQLite magic but its

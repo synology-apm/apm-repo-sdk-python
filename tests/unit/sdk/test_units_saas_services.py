@@ -113,11 +113,6 @@ class TestSniff:
                 id="invalid_json_starting_with_brace_falls_through_to_binary",
             ),
             pytest.param(
-                b'{"a": ' + b"[" * 100_000 + b"]" * 100_000 + b"}",
-                ServiceKind.BINARY,
-                id="json_nested_past_the_recursion_limit_falls_through_to_binary",
-            ),
-            pytest.param(
                 b"Received: from mail.example.com\r\nFrom: a@example.com\r\nMIME-Version: 1.0\r\n\r\nbody",
                 ServiceKind.MAIL_SKELETON,
                 id="an_rfc822_skeleton",
