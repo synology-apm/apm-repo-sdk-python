@@ -326,7 +326,7 @@ def parse_version_spec(version_spec_raw: str, version_uid: str, vault_key: bytes
         )
         parsed: object = json.loads(raw)
     except (ValueError, UnicodeDecodeError, binascii.Error, KeyMaterialError, RecursionError):
-        # RecursionError: JSON nested deeper than the decoder's recursion limit.
+        # RecursionError: JSON nested too deep for the decoder.
         return None
     return parsed
 

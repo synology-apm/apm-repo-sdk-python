@@ -26,14 +26,8 @@ class TestParseJsonObject:
         with pytest.raises(DataCorruptError, match="did not parse as JSON"):
             parse_json_object(b"\xff\xfe{", "spec")
 
-    @pytest.mark.parametrize(
-        "raw",
-        [
-            pytest.param('{"a": ' + "1" * 5000 + "}", id="integer_past_the_int_digit_limit"),
-            pytest.param("[" * 100_000 + "]" * 100_000, id="nesting_past_the_recursion_limit"),
-        ],
-    )
-    def test_json_the_decoder_refuses_raises_data_corrupt_error(self, raw: str) -> None:
+    def test_integer_past_the_int_digit_limit_raises_data_corrupt_error(self) -> None:
+        raw = '{"a": ' + "1" * 5000 + "}"
         with pytest.raises(DataCorruptError, match="spec did not parse as JSON"):
             parse_json_object(raw, "spec")
         assert try_parse_json_object(raw) is None

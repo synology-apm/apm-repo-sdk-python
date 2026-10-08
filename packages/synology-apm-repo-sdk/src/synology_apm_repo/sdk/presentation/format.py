@@ -38,7 +38,9 @@ def format_timestamp(dt: datetime) -> str:
     """A timezone-aware ``datetime`` as ``"YYYY-MM-DD HH:MM:SS"`` in the
     machine's local timezone; ``Version.display_name`` uses the same
     format."""
-    return dt.astimezone().strftime("%Y-%m-%d %H:%M:%S")
+    # Through this module's ``datetime``, which tests/conftest.py patches
+    # where ``time.tzset()`` is missing.
+    return datetime.fromtimestamp(dt.timestamp()).strftime("%Y-%m-%d %H:%M:%S")
 
 
 def format_rate(rate: float, unit: str) -> str:

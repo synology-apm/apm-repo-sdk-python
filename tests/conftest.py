@@ -35,23 +35,26 @@ _FIXED_TZ_OFFSET = timezone(timedelta(hours=8))
 
 
 class _FixedLocalDatetime(datetime):
-    """``datetime`` whose *bare* ``astimezone()`` resolves to ``_FIXED_TZ_OFFSET``
-    rather than to whatever zone the running machine is in. Only used where
-    ``time.tzset()`` is unavailable — see ``_fixed_timezone``."""
+    """``datetime`` whose zone-less ``fromtimestamp()`` returns
+    ``_FIXED_TZ_OFFSET`` wall time rather than the running machine's — see
+    ``_fixed_timezone``."""
 
-    def astimezone(self, tz: tzinfo | None = None) -> Self:
-        return super().astimezone(_FIXED_TZ_OFFSET if tz is None else tz)
+    @classmethod
+    def fromtimestamp(cls, t: float, tz: tzinfo | None = None) -> Self:
+        if tz is None:
+            return super().fromtimestamp(t, _FIXED_TZ_OFFSET).replace(tzinfo=None)
+        return super().fromtimestamp(t, tz)
 
 
 @pytest.fixture(scope="session", autouse=True)
 def _fixed_timezone() -> Iterator[None]:
     """Pins local-time rendering to Asia/Taipei for the whole run, so an
-    assertion on a version's rendered ``display_name`` (``catalog/version.py``'s
-    ``_version_display_name()``) reproduces on any machine.
+    assertion on a ``format_timestamp`` result reproduces on any machine.
 
     Where ``time.tzset()`` exists, ``TZ`` pins every local-time call in the
     process. Windows has no ``tzset`` and its CRT ignores ``TZ``, so there the
-    ``datetime`` that one call site uses is patched instead.
+    ``datetime`` of ``presentation/format.py``, the SDK's one local-time
+    conversion, is patched instead.
     """
     if hasattr(time, "tzset"):
         previous = os.environ.get("TZ")
@@ -67,7 +70,7 @@ def _fixed_timezone() -> Iterator[None]:
             time.tzset()
     else:
         with pytest.MonkeyPatch.context() as patch:
-            patch.setattr("synology_apm_repo.sdk.catalog.version.datetime", _FixedLocalDatetime)
+            patch.setattr("synology_apm_repo.sdk.presentation.format.datetime", _FixedLocalDatetime)
             yield
 
 

@@ -13,7 +13,7 @@ from ..errors import DataCorruptError
 
 # ValueError covers JSONDecodeError, UnicodeDecodeError and an integer
 # literal longer than sys.get_int_max_str_digits(); RecursionError, nesting
-# deeper than the decoder's recursion limit.
+# too deep for the decoder.
 _JSON_ERRORS = (ValueError, RecursionError)
 
 
