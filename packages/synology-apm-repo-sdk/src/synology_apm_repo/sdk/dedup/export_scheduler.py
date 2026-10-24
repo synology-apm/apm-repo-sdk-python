@@ -2,16 +2,17 @@
 into bytes on an ``ExportWriter``.
 
 Groups ``DATA`` chunks by ``(stream_id, bucket_id)`` via ``chunk_walk`` and
-fetches each bucket's chunks with one merged ``BucketReader.read_chunks``
-call instead of one ``Pool.read_chunk`` per chunk, since dedup means
-logical offset order and Pool address order rarely match. When the store
-can be rebuilt in a fresh process (``PoolDescriptor.from_pool``) and the
-writer offers a ``worker_target``, each ``DATA`` group's decode+write can
-move to a ``ProcessPoolExecutor`` for multi-core parallelism (single-process
-decode stays under CPython's GIL; ``_WorkerPoolChoice`` decides per
-window; the worker side is ``export_workers``); gap/zero-fill writes always
-go through the writer in-process. ``ExportTuning`` holds the concurrency
-knobs.
+fetches each bucket's chunks with merged ``BucketReader.read_chunk_blocks``
+reads instead of one ``Pool.read_chunk`` per chunk, since dedup means
+logical offset order and Pool address order rarely match. By default the
+groups decode in this process, ``ExportTuning.max_concurrent_reads`` at a
+time, which hides a remote store's latency. With ``ExportTuning.workers``
+set, a store that can be rebuilt in a fresh process
+(``PoolDescriptor.from_pool``) and a writer offering a ``worker_target``,
+each ``DATA`` group's decode+write moves to a ``ProcessPoolExecutor``
+(``_WorkerPoolChoice`` decides per window; the worker side is
+``export_workers``); gap/zero-fill writes always go through the writer
+in-process.
 """
 
 from __future__ import annotations
@@ -22,7 +23,6 @@ from typing import TYPE_CHECKING
 
 from ..concurrency import (
     common_descriptor,
-    default_worker_count,
     dispatch_to_pool,
     raise_worker_failure,
 )
@@ -48,37 +48,97 @@ if TYPE_CHECKING:
     from .dedup_file import DedupContent, DedupFile
 
 
+MAX_EXPORT_WORKERS = 61
+"""The most ``ExportTuning.workers`` an export accepts: what ``ProcessPoolExecutor``
+allows on Windows, so a count valid on one platform is valid on all."""
+
+
 @dataclasses.dataclass(frozen=True, slots=True)
 class ExportTuning:
-    """Concurrency and caching knobs for one export; the defaults suit a
-    normal one.
+    """How an export of dedup-backed content decodes; the defaults suit most
+    exports.
+
+    Attributes:
+        workers: Worker processes decoding the content, at most
+            ``MAX_EXPORT_WORKERS``; ``0`` decodes in this process. Workers pay
+            off when one process can't keep up: a destination faster than one
+            process decodes, or one that each worker writes through its own
+            ``worker_target`` handle. Each holds its own decode buffers, so
+            memory grows with the count, and each export starts its own pool,
+            so a folder export pays the start-up once per file. Workers are
+            spawned and import the caller's ``__main__``: a script starting
+            such an export does so only under ``if __name__ == "__main__":``.
+        max_concurrent_reads: Bucket groups read and decoded at once in this
+            process (``1``: one at a time); several hide a remote store's
+            latency. A worker reads its own groups one at a time.
+
+    Raises:
+        ValueError: ``workers`` is outside ``0..MAX_EXPORT_WORKERS`` or
+            ``max_concurrent_reads`` is less than 1.
+    """
+
+    workers: int = 0
+    max_concurrent_reads: int = 4
+
+    def __post_init__(self) -> None:
+        if not 0 <= self.workers <= MAX_EXPORT_WORKERS:
+            raise ValueError(f"workers must be 0 to {MAX_EXPORT_WORKERS}, got {self.workers}")
+        if self.max_concurrent_reads < 1:
+            raise ValueError(f"max_concurrent_reads must be 1 or more, got {self.max_concurrent_reads}")
+
+
+@dataclasses.dataclass(frozen=True, slots=True)
+class SharedExportTuning(ExportTuning):
+    """``ExportTuning`` plus the planning knobs and the state the calls of one
+    logical export share (its segments, a disk's fragments). The SDK's own
+    callers pass one through ``ContentSource.export_range``, which forwards it
+    like any ``ExportTuning``; ``of`` turns any tuning into one.
 
     Attributes:
         window_entries: Chunks per planning window (see
             ``plan_chunks_windowed``).
         max_concurrent_opens: Prefetches upcoming bucket headers ahead of
-            the main loop on the in-process path (``None``: auto-derived as
-            ``1 + max_concurrent_reads``; ``1`` disables prefetch). See
-            ``_prefetch_bucket_opens``.
-        max_concurrent_reads: Concurrency of the in-process path only
-            (default 1: serial) — the multiprocess path's is
-            ``concurrency.default_worker_count()``. See ``exec_chunks``.
+            the main loop on the in-process path (``1`` disables it;
+            ``None``: off when ``max_concurrent_reads`` > 1, whose concurrent
+            reads already overlap their opens, else 2). The prefetch runs
+            through the whole window, so past the export cache's size it
+            evicts readers it opened and they are opened again.
         export_cache: A private ``BucketReaderCache`` for in-process reads,
-            kept separate from ``Pool``'s shared one (``None``: created per
-            call). Pass one instance across the calls of one logical export
-            to keep bucket-locality reuse.
+            kept separate from ``Pool``'s shared one; ``of`` fills it in, so
+            every call handed the same instance keeps bucket-locality reuse
+            across one logical export.
         executor: The multiprocess workers. ``None`` lets the call build
-            its own when it can, and close it afterwards (see
-            ``_WorkerPoolChoice``). A caller-supplied one serves every
-            window, is left open, and must match both the file's repository
-            and the writer's destination.
+            its own when ``workers`` asks for one, and close it afterwards. A
+            caller-supplied one serves every window, is left open, and must
+            match both the file's repository and the writer's destination;
+            ``workers`` is then ignored.
     """
 
     window_entries: int = DEFAULT_WINDOW_ENTRIES
     max_concurrent_opens: int | None = None
-    max_concurrent_reads: int = 1
     export_cache: BucketReaderCache | None = None
     executor: ExportExecutor | None = None
+
+    @classmethod
+    def of(cls, tuning: ExportTuning | None) -> SharedExportTuning:
+        """``tuning`` resolved for an export: a ``SharedExportTuning`` as
+        given, any other its settings (or the defaults), in both cases with
+        an ``export_cache``, a new one when it carried none."""
+        if isinstance(tuning, SharedExportTuning):
+            shared = tuning
+        else:
+            base = tuning or ExportTuning()
+            shared = cls(workers=base.workers, max_concurrent_reads=base.max_concurrent_reads)
+        if shared.export_cache is not None:
+            return shared
+        return dataclasses.replace(shared, export_cache=BucketReaderCache())
+
+    @property
+    def builds_workers(self) -> bool:
+        """Whether an export with these settings builds its own worker pool
+        (where its store and writer allow one): ``workers`` asks for one and
+        no ``executor`` was given."""
+        return self.executor is None and self.workers > 0
 
 
 class _ExportAccounting:
@@ -145,7 +205,7 @@ async def _dispatch_window_multiprocess(
         executor.process_pool,
         export_bucket_group_worker,
         items,
-        max_concurrent=default_worker_count(),
+        max_concurrent=executor.max_workers,
         on_result=_on_result,
     )
 
@@ -156,7 +216,7 @@ async def _walk_bucket_major(
     window_start: int,
     window_end: int,
     accounting: _ExportAccounting,
-    tuning: ExportTuning,
+    tuning: SharedExportTuning,
     *,
     workers: _WorkerPoolChoice,
     dst_offset: int,
@@ -173,11 +233,10 @@ async def _walk_bucket_major(
     """
     size = window_end - window_start
     export_cache = tuning.export_cache
-    if export_cache is None:
-        export_cache = BucketReaderCache()
+    assert export_cache is not None, "export_to_writer resolves tuning through SharedExportTuning.of"
     max_concurrent_opens = tuning.max_concurrent_opens
     if max_concurrent_opens is None:
-        max_concurrent_opens = 1 + tuning.max_concurrent_reads
+        max_concurrent_opens = 1 if tuning.max_concurrent_reads > 1 else 2
     holes = zeros = 0
     async for plan in plan_chunks_windowed(
         base,
@@ -221,23 +280,26 @@ class _WorkerPoolChoice:
     A caller-supplied executor serves every window. Otherwise a pool is built by the first
     window whose plan touches ``_MIN_WORKER_GROUPS`` bucket groups, reused by every later
     window and closed with the export; a window with fewer groups runs in-process. No pool
-    is built when the store cannot be rebuilt in a worker or the writer takes no worker writes.
+    is built when ``workers`` is ``0``, the store cannot be rebuilt in a worker or the writer
+    takes no worker writes.
 
     Raises:
-        ValueError: ``given`` was built for another repository or destination.
+        ValueError: ``tuning.executor`` was built for another repository or destination.
     """
 
     def __init__(
-        self, pool_descriptor: PoolDescriptor | None, target: WorkerTarget | None, given: ExportExecutor | None
+        self, pool_descriptor: PoolDescriptor | None, target: WorkerTarget | None, tuning: SharedExportTuning
     ) -> None:
+        given = tuning.executor
         if given is not None and not given.accepts(pool_descriptor, target):
             raise ValueError(
                 "executor was not built for this file's own repository/vault, or for this call's own destination: "
                 "its worker processes are bound to one repository and one destination when they spawn, and are "
                 "never re-initialized per task"
             )
-        self._pool_descriptor = pool_descriptor
+        self._pool_descriptor = pool_descriptor if tuning.builds_workers else None
         self._target = target
+        self._workers = tuning.workers
         self._executor = given
         self._owned = False
 
@@ -249,7 +311,7 @@ class _WorkerPoolChoice:
             and self._target is not None
             and len(plan.groups) >= _MIN_WORKER_GROUPS
         ):
-            self._executor = ExportExecutor(self._pool_descriptor, self._target.descriptor)
+            self._executor = ExportExecutor(self._pool_descriptor, self._target.descriptor, max_workers=self._workers)
             self._owned = True
         return self._executor
 
@@ -272,10 +334,9 @@ async def export_to_writer(
     the range's size and will commit or abort.
     ``DedupFile.export_range``/``ByteRangeView.export_range`` delegate here.
 
-    A failure inside a worker process is raised as itself (a further failure
-    is noted on it), and a worker that died as ``WorkerProcessError``; only the
-    opt-in concurrent in-process path (``ExportTuning.max_concurrent_reads
-    > 1``) raises an ``ExceptionGroup``.
+    A failure of a concurrent read or of a worker process is raised as itself
+    (a further failure is noted on it), never as an ``ExceptionGroup``, and a
+    worker that died as ``WorkerProcessError``.
 
     Args:
         file_like: The file or view to export.
@@ -286,17 +347,19 @@ async def export_to_writer(
             ``preallocated``.
         progress: Async callback receiving each newly written count of real
             ``DATA`` bytes, never holes/zeros.
-        tuning: Concurrency and caching knobs (default ``ExportTuning()``).
+        tuning: How the export decodes (default ``ExportTuning()``); a
+            ``SharedExportTuning`` also brings the state it shares with the
+            other calls of one logical export.
 
     Returns:
         The export's byte totals.
 
     Raises:
-        ValueError: ``tuning.executor`` was not built for this file's
-            repository and this writer's destination.
+        ValueError: A ``SharedExportTuning``'s ``executor`` was not built
+            for this file's repository and this writer's destination.
         WorkerProcessError: A worker process died.
     """
-    tuning = tuning or ExportTuning()
+    shared = SharedExportTuning.of(tuning)
     base, window_start, size = file_like.export_window()
     pool = base.pool
 
@@ -304,7 +367,7 @@ async def export_to_writer(
     accounting = _ExportAccounting(writer, write_zeros=needs_zero_fill(writer, sparse=sparse), progress=progress)
 
     target = writer.worker_target()
-    workers = _WorkerPoolChoice(PoolDescriptor.from_pool(pool), target, tuning.executor)
+    workers = _WorkerPoolChoice(PoolDescriptor.from_pool(pool), target, shared)
     try:
         holes, zeros = await _walk_bucket_major(
             base,
@@ -312,7 +375,7 @@ async def export_to_writer(
             window_start,
             window_end,
             accounting,
-            tuning,
+            shared,
             workers=workers,
             dst_offset=target.base_offset if target is not None else 0,
         )
@@ -335,13 +398,14 @@ async def export_fragments_to_writer(
     (opened by the caller) through ``export_to_writer``, each at its own
     ``start`` offset. ``tuning``'s concurrency applies within a fragment.
 
-    The fragments share one ``BucketReaderCache`` (``tuning.export_cache`` if
-    given) and, when every fragment's file resolves to the identical
+    The fragments share one ``BucketReaderCache`` (a ``SharedExportTuning``'s
+    ``export_cache`` if given) and, when every fragment's file resolves to the identical
     ``PoolDescriptor`` and the writer takes worker writes, one multiprocess
-    executor, built up front whatever the fragments' size (``tuning.executor``
-    if given and left open); otherwise each fragment's export decides for
-    itself. ``progress`` receives each newly written count of real ``DATA``
-    bytes.
+    executor, built up front whatever the fragments' size (a
+    ``SharedExportTuning``'s ``executor`` if given, left open; none when
+    ``tuning.workers`` is ``0``); otherwise
+    each fragment's export decides for itself. ``progress`` receives each
+    newly written count of real ``DATA`` bytes.
 
     Args:
         fragments: Disjoint ``(file, start, end)`` pieces, each inside ``span``.
@@ -357,25 +421,22 @@ async def export_fragments_to_writer(
         length, or the fragments' summed length without a ``span``.
 
     Raises:
-        ValueError: ``tuning.executor`` was not built for a fragment's
-            repository and this writer's destination, or a fragment lies
-            outside ``span``.
+        ValueError: A ``SharedExportTuning``'s ``executor`` was not built
+            for a fragment's repository and this writer's destination, or a
+            fragment lies outside ``span``.
     """
     origin = span[0] if span is not None else 0
     if span is not None and any(start < span[0] or end > span[1] for _, start, end in fragments):
         raise ValueError(f"fragments must lie inside span {span}")
-    tuning = tuning or ExportTuning()
-    export_cache = tuning.export_cache
-    if export_cache is None:
-        export_cache = BucketReaderCache()
-    executor = tuning.executor
+    given = SharedExportTuning.of(tuning)
+    executor = given.executor
     owns_executor = executor is None
-    if executor is None:
+    if given.builds_workers:
         pool_descriptor = common_descriptor([PoolDescriptor.from_pool(file.pool) for file, _, _ in fragments])
         target = writer.worker_target()
         if pool_descriptor is not None and target is not None:
-            executor = ExportExecutor(pool_descriptor, target.descriptor)
-    shared = dataclasses.replace(tuning, export_cache=export_cache, executor=executor)
+            executor = ExportExecutor(pool_descriptor, target.descriptor, max_workers=given.workers)
+    shared = dataclasses.replace(given, executor=executor)
 
     bytes_written = holes = zeros = size = 0
     try:

@@ -95,14 +95,14 @@ class TestChunkDecryptor:
         for chunk_idx, length in enumerate([4096, 17, 1, 4095, 100, 4096, 33]):
             addr = chunk_address(132, 330, chunk_idx)
             ciphertext = os.urandom(length)
-            assert decryptor.decrypt(addr, memoryview(ciphertext)) == decrypt_chunk(key, addr, ciphertext)
+            assert decryptor.decrypt(addr.to_int(), memoryview(ciphertext)) == decrypt_chunk(key, addr, ciphertext)
 
     def test_a_prebuilt_algorithm_replaces_the_key(self) -> None:
         key = os.urandom(AES_KEY_SIZE)
         addr = chunk_address(1, 2, 3)
         ciphertext = os.urandom(4096)
         decryptor = ChunkDecryptor(b"", algorithm=build_aes_algorithm(key))
-        assert decryptor.decrypt(addr, ciphertext) == decrypt_chunk(key, addr, ciphertext)
+        assert decryptor.decrypt(addr.to_int(), ciphertext) == decrypt_chunk(key, addr, ciphertext)
 
     def test_wrong_key_length_raises(self) -> None:
         with pytest.raises(KeyMaterialError, match="vault_key must be 32 bytes, got"):

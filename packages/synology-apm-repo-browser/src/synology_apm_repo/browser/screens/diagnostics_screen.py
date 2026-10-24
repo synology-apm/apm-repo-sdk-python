@@ -1,7 +1,7 @@
 """``DiagnosticsScreen``: ``Repository.verify``'s findings, opened with
 ``v``. A QUICK check runs on every mount; ``f`` runs FULL.
 
-FULL is screen-local (cancelled when the screen unmounts), not a ``Job``.
+FULL is screen-local (cancelled when the screen is removed), not a ``Job``.
 It must not overlap an export's process pool: ``action_run_full`` refuses
 while an export runs (``AppModel.export_occupied``) and dispatches
 ``VerifyFullStarted``, so an export started meanwhile queues.

@@ -11,6 +11,7 @@ import dataclasses
 import os
 import sqlite3
 from pathlib import Path
+from typing import Any
 
 import pytest
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
@@ -35,6 +36,7 @@ from synology_apm_repo.sdk.dedup.pool import FULL_VERIFY
 from synology_apm_repo.sdk.dedup.pool_descriptor import PoolDescriptor, build_worker_pool, close_worker_store
 from synology_apm_repo.sdk.dedup.repository import DB_SOURCE_NAMES, DedupRepo
 from synology_apm_repo.sdk.errors import DataCorruptError, KeyMismatchError, KeyRequiredError, NotFoundError
+from synology_apm_repo.sdk.format.composition import RecordHead
 from synology_apm_repo.sdk.identifiers import CompOffset, SessionId, StreamId
 from synology_apm_repo.sdk.storage.base import Entry, ObjectStore
 from synology_apm_repo.sdk.storage.dircache import DirCache
@@ -81,6 +83,28 @@ def _build_full_repo(tmp_path: Path, *, encryption_user_key_uuid: str = "NoEncry
     _write_file_meta(tmp_path / "db" / "file_meta", [(_PATH, 4096)])
     _write_composition(tmp_path / "@data" / "Composition")
     write_bucket(tmp_path / "@data" / "Pool" / "0" / "0.buk", [_PLAINTEXT])
+
+
+def _track_db_opens(
+    monkeypatch: pytest.MonkeyPatch, *, gate: asyncio.Event | None = None
+) -> tuple[list[SqliteSource], asyncio.Event]:
+    """Records every ``SqliteSource`` a ``db()`` opens; with ``gate``, a
+    ``file_map`` open waits on it after passing ``DedupRepo``'s own checks.
+    Returns the record and an event set once that open is waiting."""
+    created: list[SqliteSource] = []
+    waiting = asyncio.Event()
+    real_from_raw_store = SqliteSource.from_raw_store
+
+    async def tracked(store: ObjectStore, path: str, **kwargs: Any) -> SqliteSource:
+        if gate is not None and path.endswith("file_map"):
+            waiting.set()
+            await gate.wait()
+        source = await real_from_raw_store(store, path, **kwargs)
+        created.append(source)
+        return source
+
+    monkeypatch.setattr(SqliteSource, "from_raw_store", tracked)
+    return created, waiting
 
 
 @pytest.fixture
@@ -197,6 +221,19 @@ class TestDb:
             second = await repo.db("file_map")
             assert first is second
 
+    async def test_a_listed_db_gone_at_open_is_corrupt_not_absent(
+        self, tmp_path: Path, vault_layout: RepoLayout
+    ) -> None:
+        _build_full_repo(tmp_path)
+        store = LocalFsStore(tmp_path)
+        async with await DedupRepo.open(store, vault_layout) as repo:
+            # db/ is listed (and kept: a snapshot), then the file goes.
+            await repo._fixed_dir_cache.entry_sizes("db")
+            (tmp_path / "db" / "file_map").unlink()
+            with pytest.raises(DataCorruptError, match="no such file") as raised:
+                await repo.db("file_map")
+            assert (raised.value.safe_message, raised.value.ref) == ("no such file", "db/file_map")
+
     async def test_resolves_sequence_suffixed_db_file(self, tmp_path: Path, vault_layout: RepoLayout) -> None:
         _build_full_repo(tmp_path)
         (tmp_path / "db" / "file_map").rename(tmp_path / "db" / "file_map.42")
@@ -218,10 +255,12 @@ class TestDb:
             builds = 0
             real_from_raw_store = SqliteSource.from_raw_store.__func__  # type: ignore[attr-defined]
 
-            async def counting_from_raw_store(cls: type[SqliteSource], store: ObjectStore, path: str) -> SqliteSource:
+            async def counting_from_raw_store(
+                cls: type[SqliteSource], /, store: ObjectStore, path: str, **kwargs: Any
+            ) -> SqliteSource:
                 nonlocal builds
                 builds += 1
-                return await real_from_raw_store(cls, store, path)  # type: ignore[no-any-return]
+                return await real_from_raw_store(cls, store, path, **kwargs)  # type: ignore[no-any-return]
 
             monkeypatch.setattr(SqliteSource, "from_raw_store", classmethod(counting_from_raw_store))
 
@@ -243,11 +282,13 @@ class TestDb:
             release_file_map = asyncio.Event()
             real_from_raw_store = SqliteSource.from_raw_store.__func__  # type: ignore[attr-defined]
 
-            async def blocking_from_raw_store(cls: type[SqliteSource], store: ObjectStore, path: str) -> SqliteSource:
+            async def blocking_from_raw_store(
+                cls: type[SqliteSource], /, store: ObjectStore, path: str, **kwargs: Any
+            ) -> SqliteSource:
                 if path.endswith("file_map"):
                     file_map_started.set()
                     await release_file_map.wait()
-                return await real_from_raw_store(cls, store, path)  # type: ignore[no-any-return]
+                return await real_from_raw_store(cls, store, path, **kwargs)  # type: ignore[no-any-return]
 
             monkeypatch.setattr(SqliteSource, "from_raw_store", classmethod(blocking_from_raw_store))
 
@@ -515,10 +556,10 @@ class TestCloseAndContextManager:
         dedup_file = repo.open_composition(_STREAM_ID, _SESSION_ID, _HEAD_OFF, size=4096)
         real_build = dedup_file._comp_reader._build_record
 
-        async def _slow_build(head_off: int) -> CompositionRecord:
+        async def _slow_build(head_off: int, record_head: RecordHead | None) -> CompositionRecord:
             started.set()
             await release.wait()
-            return await real_build(head_off)
+            return await real_build(head_off, record_head)
 
         monkeypatch.setattr(dedup_file._comp_reader, "_build_record", _slow_build)
 
@@ -555,21 +596,8 @@ class TestCloseAndContextManager:
         store = LocalFsStore(tmp_path)
         repo = await DedupRepo.open(store, vault_layout)
 
-        started = asyncio.Event()
         release = asyncio.Event()
-        created: list[SqliteSource] = []
-        real_build = repo._build_db_source
-
-        async def _slow_build(name: str) -> SqliteSource:
-            started.set()
-            await release.wait()
-            source = await real_build(name)
-            created.append(source)
-            return source
-
-        # Rebind the fetch rather than replace the cache, which the
-        # repository's CacheManager owns.
-        repo._db_sources._fetch = _slow_build
+        created, started = _track_db_opens(monkeypatch, gate=release)
         real_settle_all = repo._db_sources.settle_all
         settling = asyncio.Event()
 
@@ -593,6 +621,64 @@ class TestCloseAndContextManager:
         assert len(created) == 1
         assert created[0]._closed is True
         assert repo._db_sources == {}
+
+    async def test_a_db_call_after_close_is_refused_and_opens_nothing(
+        self, tmp_path: Path, vault_layout: RepoLayout, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # A worker still running after its repository closed would otherwise
+        # open a source nothing ever closes.
+        _build_full_repo(tmp_path)
+        repo = await DedupRepo.open(LocalFsStore(tmp_path), vault_layout)
+        created, _ = _track_db_opens(monkeypatch)
+        await repo.close()
+        with pytest.raises(RuntimeError, match="DedupRepo is closed"):
+            await repo.db("file_map")
+        assert created == []
+
+    async def test_a_db_call_starting_while_close_settles_another_is_refused(
+        self, tmp_path: Path, vault_layout: RepoLayout, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        _build_full_repo(tmp_path)
+        repo = await DedupRepo.open(LocalFsStore(tmp_path), vault_layout)
+        gate = asyncio.Event()
+        created, waiting = _track_db_opens(monkeypatch, gate=gate)
+        first = asyncio.create_task(repo.db("file_map"))
+        await waiting.wait()
+        close_task = asyncio.create_task(repo.close())
+        await asyncio.sleep(0)  # close() is now settling file_map's open
+        with pytest.raises(RuntimeError, match="DedupRepo is closed"):
+            await repo.db("file_meta")
+        gate.set()
+        await first
+        await close_task
+        assert len(created) == 1 and created[0]._closed
+
+    async def test_a_close_cancelled_mid_sweep_still_closes_every_source(
+        self, tmp_path: Path, vault_layout: RepoLayout, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # The cache is already cleared, so a source the sweep skipped would leak.
+        _build_full_repo(tmp_path)
+        repo = await DedupRepo.open(LocalFsStore(tmp_path), vault_layout)
+        await repo.db("file_map")
+        await repo.db("file_meta")
+        first, second = repo._db_sources.values()
+        closing, release = asyncio.Event(), asyncio.Event()
+        real_close = first.close
+
+        async def slow_close() -> None:
+            closing.set()
+            await release.wait()
+            await real_close()
+
+        monkeypatch.setattr(first, "close", slow_close)
+        close_task = asyncio.create_task(repo.close())
+        await closing.wait()
+        close_task.cancel()
+        await asyncio.sleep(0)
+        release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await close_task
+        assert first._closed and second._closed
 
     async def test_close_reports_but_does_not_abort_when_one_source_fails_to_close(
         self, tmp_path: Path, vault_layout: RepoLayout, monkeypatch: pytest.MonkeyPatch
@@ -788,6 +874,26 @@ class TestCacheRegistry:
             assert len(repo._composition_records) == 0
             assert await (await repo.open_file(_PATH)).read(0, 4096) == _PLAINTEXT  # reopened on demand
             assert repo._db_sources["file_map"] is not first
+
+    async def test_a_db_call_starting_while_invalidate_all_settles_another_is_closed_too(
+        self, tmp_path: Path, vault_layout: RepoLayout, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        _build_full_repo(tmp_path)
+        async with await DedupRepo.open(LocalFsStore(tmp_path), vault_layout) as repo:
+            gate = asyncio.Event()
+            created, waiting = _track_db_opens(monkeypatch, gate=gate)
+            first = asyncio.create_task(repo.db("file_map"))
+            await waiting.wait()
+            invalidate = asyncio.create_task(repo.caches.invalidate_all())
+            await asyncio.sleep(0)  # invalidate_all() is now settling file_map's open
+            await repo.db("file_meta")  # opens while the settle is still waiting
+            gate.set()
+            await first
+            await invalidate
+
+            assert len(created) == 2 and all(source._closed for source in created)
+            assert len(repo._db_sources) == 0
+            assert await repo.db("file_meta") is not None  # reopened on demand
 
     async def test_invalidate_drops_the_file_meta_table_before_its_connection_is_closed(
         self, tmp_path: Path, vault_layout: RepoLayout

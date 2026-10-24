@@ -293,12 +293,15 @@ async def test_catalog_provider_is_tracked_by_the_owning_repository(
 
 
 async def test_catalog_verify_delegates_to_the_reachability_walk(monkeypatch: pytest.MonkeyPatch) -> None:
-    """``Catalog.verify()`` runs ``verify_reachable()`` on its shared ``DedupRepo``."""
-    calls: list[tuple[object, object]] = []
+    """``Catalog.verify()`` runs ``verify_reachable()`` on its shared ``DedupRepo``, with its tuning."""
+    calls: list[tuple[object, object, object]] = []
     sentinel = [Finding(stage=Stage.REPO_INFO, symptom=Symptom.MISMATCH, path="p", detail="d")]
+    tuning = api.VerifyTuning(max_concurrent_reads=3)
 
-    async def fake_verify_reachable(dedup_repo: object, level: object, *, progress: object = None) -> list[Finding]:
-        calls.append((dedup_repo, level))
+    async def fake_verify_reachable(
+        dedup_repo: object, level: object, *, progress: object = None, tuning: object = None
+    ) -> list[Finding]:
+        calls.append((dedup_repo, level, tuning))
         return sentinel
 
     fake_repo = FakeDedupRepo(vault_layout())
@@ -307,10 +310,10 @@ async def test_catalog_verify_delegates_to_the_reachability_walk(monkeypatch: py
     monkeypatch.setattr(api_catalog, "verify_reachable", fake_verify_reachable)
     (catalog,) = await repo.catalogs()
 
-    result = await catalog.verify(api.VerifyLevel.QUICK)
+    result = await catalog.verify(api.VerifyLevel.QUICK, tuning=tuning)
 
     assert result == sentinel
-    assert calls == [(fake_repo, api.VerifyLevel.QUICK)]
+    assert calls == [(fake_repo, api.VerifyLevel.QUICK, tuning)]
 
 
 # -- verify()'s own key gate ---------------------------------------------

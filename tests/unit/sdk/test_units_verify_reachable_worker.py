@@ -34,7 +34,7 @@ from support.repo_builders import (
 from support.store_fakes import LoopCheckingStore
 from synology_apm_repo.sdk import concurrency
 from synology_apm_repo.sdk.dedup import verify_bucket_check as verify_bucket_check_module
-from synology_apm_repo.sdk.dedup.pool import FULL_VERIFY, BucketReader, BucketReaderCache, Pool
+from synology_apm_repo.sdk.dedup.pool import FULL_VERIFY, BucketReader, Pool
 from synology_apm_repo.sdk.dedup.pool_descriptor import PoolDescriptor
 from synology_apm_repo.sdk.dedup.repository import DedupRepo
 from synology_apm_repo.sdk.dedup.verify_bucket_check import (
@@ -502,7 +502,7 @@ class TestFindingRef:
         finally:
             await repo.close()
         assert len(findings) == 1
-        assert findings[0].ref == "#cat:1/wl:10/ver:vuid-broken"
+        assert findings[0].ref == "#@cat:1/wl:10/ver:vuid-broken"
 
     async def test_a_deeper_stage_finding_carries_the_same_ref(self, tmp_path: Path) -> None:
         """A bucket-stage finding comes from ``check_all_buckets``, after
@@ -533,7 +533,7 @@ class TestFindingRef:
             await repo.close()
         assert len(findings) == 1
         assert findings[0].stage is Stage.BUCKET
-        assert findings[0].ref == "#cat:1/wl:10/ver:vuid-1"
+        assert findings[0].ref == "#@cat:1/wl:10/ver:vuid-1"
 
 
 class TestBucketBatchFlushing:
@@ -869,8 +869,8 @@ class TestMultiVersionBucketRefClaim:
         # the composition record.
         bucket_findings = {f.path: f for f in findings if f.stage is Stage.BUCKET}
         assert len(bucket_findings) == 2
-        assert bucket_findings["bucket 0/0"].ref == "#cat:1/wl:10/ver:vuid-1"
-        assert bucket_findings["bucket 0/1"].ref == "#cat:1/wl:11/ver:vuid-2"
+        assert bucket_findings["bucket 0/0"].ref == "#@cat:1/wl:10/ver:vuid-1"
+        assert bucket_findings["bucket 0/1"].ref == "#@cat:1/wl:11/ver:vuid-2"
 
 
 def _write_one_bucket_fs_repo(tmp_path: Path) -> None:
@@ -965,13 +965,12 @@ class TestMultiprocessExecutorTeardown:
 
 @pytest.fixture(autouse=True)
 def _reset_verify_worker_globals(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
-    """``verify_bucket_check``'s process-global ``_worker``/
-    ``_worker_bucket_cache`` and ``concurrency._worker_runner`` are set once
-    per worker process's lifetime: monkeypatch restores the first two after
-    a test runs the worker in-process, and the worker loop is closed."""
+    """``verify_bucket_check``'s process-global ``_worker`` and
+    ``concurrency._worker_runner`` are set once per worker process's
+    lifetime: monkeypatch restores the first after a test runs the worker
+    in-process, and the worker loop is closed."""
     monkeypatch.setattr(verify_bucket_check_module._worker, "pool", None)
     monkeypatch.setattr(verify_bucket_check_module._worker, "store", None)
-    monkeypatch.setattr(verify_bucket_check_module, "_worker_bucket_cache", None)
     yield
     if concurrency._worker_runner is not None:
         concurrency.close_worker_loop()
@@ -986,9 +985,7 @@ class TestVerifyWorkerLoopReuse:
     closed" corruption finding, hence the assertion on findings rather than
     ``pytest.raises``.
 
-    Run in-process with ``LoopCheckingStore``. The two bucket keys differ
-    because a repeated key would hit ``_worker_bucket_cache`` and never
-    reach the store."""
+    Run in-process with ``LoopCheckingStore``, over two buckets."""
 
     def test_second_bucket_in_the_same_worker_reuses_the_first_ones_loop(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -1000,7 +997,6 @@ class TestVerifyWorkerLoopReuse:
         dir_cache = DirCache(store)
         pool = Pool(store, "Pool", dir_cache)
         monkeypatch.setattr(verify_bucket_check_module._worker, "pool", pool)
-        monkeypatch.setattr(verify_bucket_check_module, "_worker_bucket_cache", BucketReaderCache())
         monkeypatch.setattr(verify_bucket_check_module._worker, "store", store)
 
         findings_a, _ = verify_bucket_worker((StreamId(0), BucketId(0)))

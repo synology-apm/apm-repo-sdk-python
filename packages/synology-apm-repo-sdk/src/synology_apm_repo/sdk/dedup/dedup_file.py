@@ -15,12 +15,15 @@ Every ``read()`` locates its starting chunk-map record by
 
 from __future__ import annotations
 
+import dataclasses
 from collections.abc import AsyncIterator, Iterable
 from typing import Protocol, override, runtime_checkable
 
+from ..concurrency import bounded_gather_first_error
 from ..errors import ResourceLimitExceededError
 from ..format.addressing import ChunkAddress
 from ..format.chunkmap import ChunkMapKind
+from ..format.composition import RecordHead
 from ..format.const import FIXED_CHUNK_LENGTH
 from ..identifiers import BucketId, ChunkIdx, SessionId, StreamId
 from . import export_scheduler
@@ -47,6 +50,17 @@ DEFAULT_STREAM_BLOCK = 8 << 20  # 8 MiB
 #: more uses ``stream()``, which allocates at most one
 #: ``DEFAULT_STREAM_BLOCK`` at a time.
 MAX_SINGLE_READ_SIZE = 1 << 30  # 1 GiB
+
+#: Buckets one ``read()`` fetches from at once, so a read spanning several
+#: costs about one storage round trip rather than one per bucket. Times
+#: ``VirtualDiskContentSource``'s 4 fragments, a PC/PS disk read has up to
+#: 32 store reads in flight, S3's whole connection pool; on SMB's 16
+#: sessions the rest queue.
+_READ_BUCKETS_IN_FLIGHT = 8
+
+#: Chunks (16 MiB) one ``read()`` plans before fetching them, so a large
+#: read holds the plan and tasks of one batch at a time.
+_READ_BATCH_CHUNKS = 4096
 
 
 @runtime_checkable
@@ -139,85 +153,135 @@ async def read_blocks[B: bytes | bytearray](
 async def _resolve_bucket_group(
     pool: Pool, stream_id: StreamId, bucket_id: BucketId, chunk_indices: Iterable[int]
 ) -> dict[int, bytes | memoryview]:
-    """Resolve every ``chunk_idx`` in ``chunk_indices`` (one ``(stream_id,
-    bucket_id)`` group of ``_fill_data_extent``) to its plaintext.
+    """Resolve every ``chunk_idx`` in ``chunk_indices`` (one ``_BucketGroup``'s
+    chunks) to its plaintext.
 
     Cached chunks (``Pool.cached_chunks``) are reused; the rest are decoded
     through ``Pool``'s own bucket cache (``chunk_walk.decode_bucket_chunks``)
     and backfilled (``Pool.backfill_chunks``) unless ``Pool.release_epoch``
-    moved mid-fetch. All are fingerprint-verified, cache hits included, as in
-    ``Pool.read_chunk()``.
+    moved mid-fetch, all under ``Pool.batch_fetch``, so a concurrent batch of
+    the same bucket is waited for rather than repeated. All are
+    fingerprint-verified, cache hits included, as in ``Pool.read_chunk()``.
     """
-    already_cached, still_needed = pool.cached_chunks(stream_id, bucket_id, chunk_indices)
-    decoded: dict[int, bytes | memoryview] = {}
-    if still_needed:
-        release_epoch = pool.release_epoch
-        reader = await pool.bucket(stream_id, bucket_id)
-        decoded = await decode_bucket_chunks(reader, stream_id, bucket_id, ascending_runs(still_needed), pool=pool)
-        # The epoch check stops a backfill from refilling a Pool that a
-        # concurrent release_caches() just emptied.
-        if pool.release_epoch == release_epoch:
-            pool.backfill_chunks(stream_id, bucket_id, decoded)
+    async with pool.batch_fetch(stream_id, bucket_id):
+        already_cached, still_needed = pool.cached_chunks(stream_id, bucket_id, chunk_indices)
+        decoded: dict[int, bytes | memoryview] = {}
+        if still_needed:
+            release_epoch = pool.release_epoch
+            reader = await pool.bucket(stream_id, bucket_id)
+            decoded = await decode_bucket_chunks(reader, stream_id, bucket_id, ascending_runs(still_needed), pool=pool)
+            # The epoch check stops a backfill from refilling a Pool that a
+            # concurrent release_caches() just emptied.
+            if pool.release_epoch == release_epoch:
+                pool.backfill_chunks(stream_id, bucket_id, decoded)
     if already_cached:
         # decode_bucket_chunks() verified what it decoded; cache hits are checked here.
         await pool.verify_fingerprints(stream_id, bucket_id, already_cached)
     return {**already_cached, **decoded}
 
 
-async def _fill_data_extent(
-    pool: Pool,
-    extent: DataExtent,
-    seg_start: int,
-    seg_end: int,
-    out: memoryview,
-    out_base: int,
-) -> None:
-    """Fill ``out[seg_start - out_base : seg_end - out_base]`` with the
-    plaintext bytes ``extent`` describes for ``[seg_start, seg_end)``, a
-    sub-range of the extent's span; a chunk shorter than
-    ``FIXED_CHUNK_LENGTH`` leaves the rest of its slot zero.
+@dataclasses.dataclass(frozen=True, slots=True)
+class _BucketGroup:
+    """The chunks one DATA extent needs from one bucket to fill
+    ``[seg_start, seg_end)``, a sub-range of the extent's span."""
 
-    A single chunk goes through ``Pool.read_chunk``; several are grouped by
-    ``(stream_id, bucket_id)`` and resolved via ``_resolve_bucket_group``.
-    Both paths use ``Pool``'s chunk cache.
-    """
+    stream_id: StreamId
+    bucket_id: BucketId
+    #: ``(chunk_idx_start, length, k_start)`` runs; a repeat region maps
+    #: several k's onto one physical chunk.
+    runs: tuple[tuple[int, int, int], ...]
+    #: ``runs``' chunk indices merged into ascending, non-overlapping ranges.
+    chunk_ranges: tuple[tuple[int, int], ...]
+    extent_offset: int
+    seg_start: int
+    seg_end: int
+    #: The extent needs exactly this one chunk, from this one bucket.
+    single_chunk: bool
+
+    @property
+    def chunks(self) -> int:
+        """Chunk slots the group fills, repeats counted."""
+        return sum(length for _, length, _ in self.runs)
+
+
+def _bucket_groups(extent: DataExtent, seg_start: int, seg_end: int) -> list[_BucketGroup]:
+    """``extent``'s chunks for ``[seg_start, seg_end)``, grouped by
+    ``(stream_id, bucket_id)``. No I/O."""
     assert extent.map_num > 0
     first_k, last_k = data_extent_k_bounds(extent, seg_start, seg_end)
-
-    # (chunk_idx_start, length, k_start) runs per bucket; a repeat region
-    # maps several k's onto one physical chunk.
     runs_by_bucket: dict[tuple[StreamId, BucketId], list[tuple[int, int, int]]] = {}
     for start_addr, run_len, k_start in iter_chunk_runs(extent.addr, extent.map_num, first_k, last_k):
         runs_by_bucket.setdefault((start_addr.stream_id, start_addr.bucket_id), []).append(
             (start_addr.chunk_idx, run_len, k_start)
         )
-
+    groups = []
     for (stream_id, bucket_id), runs in runs_by_bucket.items():
         merged = merge_overlapping_ranges((start, length) for start, length, _ in runs)
-        if len(runs_by_bucket) == 1 and len(merged) == 1 and merged[0][1] == 1:
-            chunk_idx = merged[0][0]
-            plain: dict[int, bytes | memoryview] = {
-                chunk_idx: await pool.read_chunk(ChunkAddress(stream_id, bucket_id, ChunkIdx(chunk_idx)))
-            }
-        else:
-            indices = [idx for start, length in merged for idx in range(start, start + length)]
-            plain = await _resolve_bucket_group(pool, stream_id, bucket_id, indices)
-        for chunk_idx_start, length, k_start in runs:
-            chunk_start = extent.offset + k_start * FIXED_CHUNK_LENGTH
-            for chunk_idx in range(chunk_idx_start, chunk_idx_start + length):
-                chunk = plain[chunk_idx]
-                chunk_end = chunk_start + len(chunk)
-                if seg_start <= chunk_start and chunk_end <= seg_end:
-                    # The whole chunk lies inside the segment: the common case.
-                    dest = chunk_start - out_base
-                    out[dest : dest + len(chunk)] = chunk
-                else:
-                    lo = max(seg_start - chunk_start, 0)
-                    hi = min(seg_end - chunk_start, len(chunk))
-                    if hi > lo:
-                        dest = chunk_start + lo - out_base
-                        out[dest : dest + hi - lo] = chunk[lo:hi]
-                chunk_start += FIXED_CHUNK_LENGTH
+        single_chunk = len(runs_by_bucket) == 1 and len(merged) == 1 and merged[0][1] == 1
+        groups.append(
+            _BucketGroup(
+                stream_id, bucket_id, tuple(runs), tuple(merged), extent.offset, seg_start, seg_end, single_chunk
+            )
+        )
+    return groups
+
+
+async def _fetch_group(pool: Pool, group: _BucketGroup) -> dict[int, bytes | memoryview]:
+    """``group``'s plaintext by ``chunk_idx``. A single chunk goes through
+    ``Pool.read_chunk``; several through ``_resolve_bucket_group``. Both
+    paths use ``Pool``'s chunk cache."""
+    if group.single_chunk:
+        chunk_idx = group.chunk_ranges[0][0]
+        return {chunk_idx: await pool.read_chunk(ChunkAddress(group.stream_id, group.bucket_id, ChunkIdx(chunk_idx)))}
+    indices = [idx for start, length in group.chunk_ranges for idx in range(start, start + length)]
+    return await _resolve_bucket_group(pool, group.stream_id, group.bucket_id, indices)
+
+
+def _copy_group(group: _BucketGroup, plain: dict[int, bytes | memoryview], out: memoryview, out_base: int) -> None:
+    """Copy ``group``'s chunks into ``out`` (file offset ``out_base`` at
+    index 0), clipped to ``[seg_start, seg_end)``; a chunk shorter than
+    ``FIXED_CHUNK_LENGTH`` leaves the rest of its slot zero."""
+    seg_start, seg_end = group.seg_start, group.seg_end
+    for chunk_idx_start, length, k_start in group.runs:
+        chunk_start = group.extent_offset + k_start * FIXED_CHUNK_LENGTH
+        for chunk_idx in range(chunk_idx_start, chunk_idx_start + length):
+            chunk = plain[chunk_idx]
+            chunk_end = chunk_start + len(chunk)
+            if seg_start <= chunk_start and chunk_end <= seg_end:
+                # The whole chunk lies inside the segment: the common case.
+                dest = chunk_start - out_base
+                out[dest : dest + len(chunk)] = chunk
+            else:
+                lo = max(seg_start - chunk_start, 0)
+                hi = min(seg_end - chunk_start, len(chunk))
+                if hi > lo:
+                    dest = chunk_start + lo - out_base
+                    out[dest : dest + hi - lo] = chunk[lo:hi]
+            chunk_start += FIXED_CHUNK_LENGTH
+
+
+async def _fill_groups(pool: Pool, groups: list[_BucketGroup], out: memoryview, out_base: int) -> None:
+    """Fetch every group and copy it into ``out`` as soon as it arrives.
+
+    One bucket's groups are fetched in order, so a later one finds the
+    chunks an earlier one cached; different buckets are fetched side by
+    side, at most ``_READ_BUCKETS_IN_FLIGHT`` at once. Groups fill
+    disjoint parts of ``out``. A failure is raised as a serial loop would
+    raise it: the error of the first failing bucket in file order, bare.
+    """
+    by_bucket: dict[tuple[StreamId, BucketId], list[_BucketGroup]] = {}
+    for group in groups:
+        by_bucket.setdefault((group.stream_id, group.bucket_id), []).append(group)
+
+    async def fill_bucket(bucket_groups: list[_BucketGroup]) -> None:
+        for group in bucket_groups:
+            _copy_group(group, await _fetch_group(pool, group), out, out_base)
+
+    if len(by_bucket) <= 1:
+        for bucket_groups in by_bucket.values():
+            await fill_bucket(bucket_groups)
+        return
+    await bounded_gather_first_error(by_bucket.values(), fill_bucket, max_concurrent=_READ_BUCKETS_IN_FLIGHT)
 
 
 class DedupContent:
@@ -331,11 +395,12 @@ class DedupFile(DedupContent):
         """The ``Pool`` this file's chunks resolve through."""
         return self._pool
 
-    async def cached_record(self) -> CompositionRecord:
+    async def cached_record(self, *, record_head: RecordHead | None = None) -> CompositionRecord:
         """This file's own ``CompositionRecord``, fetched on first call and
-        cached for this file's life."""
+        cached for this file's life; a given ``record_head`` (the
+        already-parsed head) saves that first fetch reading it."""
         if self._record is None:
-            self._record = await self._comp_reader.record(self._comp_offset)
+            self._record = await self._comp_reader.record(self._comp_offset, record_head=record_head)
         return self._record
 
     async def _extents(self, start: int = 0, end: int | None = None) -> AsyncIterator[Extent]:
@@ -413,13 +478,21 @@ class DedupFile(DedupContent):
         end = offset + length
         out = bytearray(length)
         view = memoryview(out)
+        groups: list[_BucketGroup] = []
+        planned = 0
         async for extent in self._extents(offset, end):
             seg_start = max(extent.offset, offset)
             seg_end = min(extent.end, end)
             if seg_end <= seg_start:  # pragma: no cover - defensive: _extents() invariants rule this out
                 continue
             if extent.kind is ExtentKind.DATA:
-                await _fill_data_extent(self._pool, extent, seg_start, seg_end, view, offset)
+                for group in _bucket_groups(extent, seg_start, seg_end):
+                    groups.append(group)
+                    planned += group.chunks
+                if planned >= _READ_BATCH_CHUNKS:
+                    await _fill_groups(self._pool, groups, view, offset)
+                    groups, planned = [], 0
+        await _fill_groups(self._pool, groups, view, offset)
         # Handed over, not copied: nothing else holds ``out``.
         return out
 

@@ -1,9 +1,4 @@
-"""``Pilot``-driven coverage of ``ExportScreen`` against fake ``ContentSource``s.
-
-Scenarios that leave a blocked export running cancel it before returning:
-otherwise ``run_test()``'s teardown cancels it, racing widget teardown and
-occasionally raising ``NoMatches``.
-"""
+"""``Pilot``-driven coverage of ``ExportScreen`` against fake ``ContentSource``s."""
 
 from __future__ import annotations
 
@@ -21,7 +16,7 @@ from textual.widgets import Button, Input, ProgressBar, Static
 
 from support.content_fakes import BlockingContentSource
 from support.fakes import faithful_to
-from support.pilot import RUN_TEST_SIZE, SDK_TIMEOUT, UI_TIMEOUT, settle, wait_for_screen, wait_until
+from support.pilot import RUN_TEST_SIZE, SDK_TIMEOUT, UI_TIMEOUT, settle, step_until_pruned, wait_for_screen, wait_until
 from synology_apm_repo.browser.app import ApmRepoBrowserApp
 from synology_apm_repo.browser.core.app.model import Job, JobStatus
 from synology_apm_repo.browser.core.app.msg import CancelJobRequested
@@ -847,6 +842,65 @@ def test_export_screen_background_action_wording_for_a_queued_job(
     message = asyncio.run(scenario())
     assert "continuing export in the background" not in message, message
     assert "queued" in message.lower(), message
+
+
+async def _queue_b_behind_a_running_export(
+    tmp_path: Path,
+    app: ApmRepoBrowserApp,
+    pilot: Pilot[None],
+    export_screen_a: ExportScreen,
+    content_a: BlockingContentSource,
+) -> ExportScreen:
+    """Starts ``export_screen_a``'s export of ``content_a``, which blocks,
+    then pushes an ``ExportScreen`` for a second unit and starts it,
+    ``QUEUED`` behind the first; returns that second screen, now active."""
+    export_screen_a.query_one("#export-dst", Input).value = str(tmp_path / "a_out.bin")
+    export_screen_a.query_one("#export-start", Button).press()
+    await wait_until(pilot, lambda: content_a.started, timeout=SDK_TIMEOUT)
+    content_b = _InstantContentSource()
+    unit_b = RestorableUnit(
+        ref=NodeRef("repo", ("b",)), name="b.bin", is_leaf=True, size=content_b.size, content=content_b
+    )
+    app.push_screen(ExportScreen(unit_b))
+    await wait_until(
+        pilot,
+        lambda: isinstance(app.screen, ExportScreen) and app.screen.is_mounted and app.screen is not export_screen_a,
+        timeout=UI_TIMEOUT,
+        interval=0.02,
+        message="the second ExportScreen never became the active screen",
+    )
+    export_screen_b = app.screen
+    assert isinstance(export_screen_b, ExportScreen), export_screen_b
+    export_screen_b.query_one("#export-dst", Input).value = str(tmp_path / "b_out.bin")
+    export_screen_b.query_one("#export-start", Button).press()
+    await wait_until(pilot, lambda: export_screen_b._job_id is not None)
+    return export_screen_b
+
+
+def _unit_of(content: BlockingContentSource) -> RestorableUnit:
+    return RestorableUnit(ref=NodeRef("repo", ("a",)), name="a.bin", is_leaf=True, size=content.size, content=content)
+
+
+def test_a_job_update_while_a_backgrounded_export_screen_is_being_removed_does_not_render_into_it(
+    tmp_path: Path, open_export_screen: _OpenExportScreen
+) -> None:
+    """The app store, unlike a ``StoreScreen``'s, outlives the screen."""
+
+    async def scenario() -> None:
+        content_a = BlockingContentSource()
+        async with open_export_screen(_unit_of(content_a)) as (app, pilot, export_screen_a):
+            export_screen_b = await _queue_b_behind_a_running_export(tmp_path, app, pilot, export_screen_a, content_a)
+
+            export_screen_b.action_background()
+            await step_until_pruned(export_screen_b, "#export-status")
+            # Promotes b's QUEUED job to RUNNING.
+            app.store.dispatch(CancelJobRequested(job_id=next(iter(app.jobs))))
+
+            await wait_until(
+                pilot, lambda: not app.jobs, timeout=SDK_TIMEOUT, interval=0.02, message="job never finished"
+            )
+
+    asyncio.run(scenario())
 
 
 def test_export_screen_does_not_rewrite_status_text_on_repeated_running_renders(

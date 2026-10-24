@@ -21,8 +21,9 @@ from support.format_builders import (
 from support.repo_builders import (
     write_bucket,
     write_composition_entries,
+    write_inf_and_fgp,
 )
-from support.store_fakes import BlockingStore, WrappingStore
+from support.store_fakes import BlockingStore, CountingStore, WrappingStore
 from synology_apm_repo.sdk.dedup.chunk_walk import (
     _MAX_MERGED_RUN,
     ChunkPlan,
@@ -40,11 +41,13 @@ from synology_apm_repo.sdk.dedup.chunk_walk import (
     iter_chunk_runs,
     merge_overlapping_ranges,
     plan_chunks_windowed,
+    read_verified_blocks,
 )
 from synology_apm_repo.sdk.dedup.composition_reader import CompositionReader
 from synology_apm_repo.sdk.dedup.dedup_file import DedupFile
 from synology_apm_repo.sdk.dedup.extent import ExtentKind, GapExtent
-from synology_apm_repo.sdk.dedup.pool import BucketReader, Pool
+from synology_apm_repo.sdk.dedup.pool import DECODE_BLOCK_CHUNKS, BucketReader, BucketReaderCache, Pool, VerifyPolicy
+from synology_apm_repo.sdk.errors import DataCorruptError
 from synology_apm_repo.sdk.format.const import FIXED_CHUNK_LENGTH
 from synology_apm_repo.sdk.identifiers import BucketId, StreamId
 from synology_apm_repo.sdk.storage.dircache import DirCache
@@ -687,18 +690,18 @@ class TestExecChunks:
         assert bytes(out[36864:40960]) == CHUNK_PLAINTEXTS[4]  # repeat
 
     async def test_overlapping_chunk_runs_for_one_bucket_produce_correct_bytes_with_no_redundant_read(
-        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+        self, tmp_path: Path
     ) -> None:
         """Record 2's chunks 3-7 are a subset of record 1's chunks 0-7 in one
-        bucket: both destinations get correct bytes from a single
-        ``BucketReader._read_run`` call."""
+        bucket: both destinations get correct bytes from a single store read
+        of the bucket's chunks."""
         plaintexts = [bytes([i]) * 4096 for i in range(8)]  # bucket 0, chunks 0..7
         entries = mapping_record(0, 0, 0, map_num=8) + mapping_record(  # dest [0,32768): chunks 0-7
             8 * 4096, 0, 3, map_num=5
         )  # dest [32768,53248): chunks 3-7 (subset, overlapping)
         write_composition_entries(tmp_path / "Composition", entries, session_id=SESSION_ID, stream_id=STREAM_ID)
         write_bucket(tmp_path / "Pool" / "0" / "0.buk", plaintexts)
-        store = LocalFsStore(tmp_path)
+        store = CountingStore(LocalFsStore(tmp_path))
         dir_cache = DirCache(store)
         comp_reader = CompositionReader(store, dir_cache, "Composition", STREAM_ID, SESSION_ID)
         pool = Pool(store, "Pool", dir_cache)
@@ -711,19 +714,111 @@ class TestExecChunks:
         async def _on_run(off: int, data: bytes | memoryview) -> None:
             out[off : off + len(data)] = data
 
-        real_read_run = BucketReader._read_run
-        calls: list[object] = []
-
-        async def _tracking_read_run(self: BucketReader, address: object, run: object, result: object) -> None:
-            calls.append(run)
-            await real_read_run(self, address, run, result)  # type: ignore[arg-type]
-
-        monkeypatch.setattr(BucketReader, "_read_run", _tracking_read_run)
-        await exec_chunks(plan, pool=file._pool, on_run=_on_run, size=size)
+        export_cache = BucketReaderCache()
+        await pool.bucket(StreamId(0), BucketId(0), cache=export_cache)  # the header reads (Pool/0/0.buk)
+        reads_before = store.read_count
+        await exec_chunks(plan, pool=pool, on_run=_on_run, size=size, export_cache=export_cache)
 
         assert bytes(out[0:32768]) == b"".join(plaintexts[0:8])
         assert bytes(out[32768:53248]) == b"".join(plaintexts[3:8])
-        assert len(calls) == 1
+        assert store.read_count - reads_before == 1
+
+    async def test_runs_crossing_a_decode_block_are_written_one_block_at_a_time(self, tmp_path: Path) -> None:
+        """A run spanning several decode blocks, and a dedup repeat straddling
+        a block boundary, both land correctly, and no write carries more than
+        one block's chunks."""
+        block = DECODE_BLOCK_CHUNKS
+        plaintexts = [i.to_bytes(4, "big") * 1024 for i in range(2 * block + 52)]
+        repeat_start, repeat_len = block - 24, 100
+        entries = mapping_record(0, 0, 0, map_num=len(plaintexts)) + mapping_record(
+            len(plaintexts) * 4096, 0, repeat_start, map_num=repeat_len
+        )
+        write_composition_entries(tmp_path / "Composition", entries, session_id=SESSION_ID, stream_id=STREAM_ID)
+        write_bucket(tmp_path / "Pool" / "0" / "0.buk", plaintexts)
+        store = LocalFsStore(tmp_path)
+        dir_cache = DirCache(store)
+        comp_reader = CompositionReader(store, dir_cache, "Composition", STREAM_ID, SESSION_ID)
+        pool = Pool(store, "Pool", dir_cache)
+        size = (len(plaintexts) + repeat_len) * 4096
+        file = DedupFile(comp_reader, pool, HEAD_OFF, size=size)
+        plan = await _reference_plan_chunks(file, 0, size, 0, write_zero_fill=None)
+        out = bytearray(size)
+        write_lengths: list[int] = []
+
+        async def _on_run(off: int, data: bytes | memoryview) -> None:
+            write_lengths.append(len(data))
+            out[off : off + len(data)] = data
+
+        await exec_chunks(plan, pool=pool, on_run=_on_run, size=size)
+
+        expected = b"".join(plaintexts) + b"".join(plaintexts[repeat_start : repeat_start + repeat_len])
+        assert bytes(out) == expected
+        assert max(write_lengths) <= block * FIXED_CHUNK_LENGTH
+
+
+class _PathLog(WrappingStore):
+    """Records the path of every ``read()``."""
+
+    def __init__(self, backing: LocalFsStore) -> None:
+        super().__init__(backing)
+        self.read_paths: list[str] = []
+
+    async def read(self, path: str, offset: int = 0, length: int | None = None) -> bytes:
+        self.read_paths.append(path)
+        return await super().read(path, offset, length)
+
+
+class TestReadVerifiedBlocks:
+    """``read_verified_blocks``: per-block fingerprint checks off one
+    ``.fgp`` read, made after the request's ranges are checked."""
+
+    @staticmethod
+    async def _blocks_of(
+        tmp_path: Path, wrong_digest_idx: int | None = None
+    ) -> tuple[list[list[tuple[int, int]]], list[bytes], _PathLog, Exception | None]:
+        plaintexts = [i.to_bytes(4, "big") * 1024 for i in range(2 * DECODE_BLOCK_CHUNKS + 52)]
+        write_bucket(tmp_path / "Pool" / "0" / "0.buk", plaintexts)
+        write_inf_and_fgp(tmp_path / "Pool", plaintexts, wrong_digest_idx=wrong_digest_idx)
+        store = _PathLog(LocalFsStore(tmp_path))
+        pool = Pool(store, "Pool", DirCache(store), verify=VerifyPolicy(fingerprint=True))
+        reader = await pool.bucket(StreamId(0), BucketId(0))
+        blocks: list[list[tuple[int, int]]] = []
+
+        async def _on_block(ranges: list[tuple[int, int]], chunks: dict[int, bytes | memoryview]) -> None:
+            assert all(bytes(data) == plaintexts[idx] for idx, data in chunks.items())
+            blocks.append(ranges)
+
+        try:
+            await read_verified_blocks(reader, StreamId(0), BucketId(0), [(0, len(plaintexts))], _on_block, pool=pool)
+        except DataCorruptError as exc:
+            return blocks, plaintexts, store, exc
+        return blocks, plaintexts, store, None
+
+    async def test_a_multi_block_request_reads_its_fingerprints_once(self, tmp_path: Path) -> None:
+        blocks, _plaintexts, store, error = await self._blocks_of(tmp_path)
+        assert error is None
+        assert len(blocks) == 3
+        assert sum(path.endswith(".fgp") for path in store.read_paths) == 1
+
+    async def test_an_out_of_range_request_fails_before_any_fingerprint_read(self, tmp_path: Path) -> None:
+        plaintexts = [bytes([i]) * 4096 for i in range(3)]
+        write_bucket(tmp_path / "Pool" / "0" / "0.buk", plaintexts)
+        write_inf_and_fgp(tmp_path / "Pool", plaintexts)
+        store = _PathLog(LocalFsStore(tmp_path))
+        pool = Pool(store, "Pool", DirCache(store), verify=VerifyPolicy(fingerprint=True))
+        reader = await pool.bucket(StreamId(0), BucketId(0))
+
+        async def _on_block(_ranges: list[tuple[int, int]], _chunks: dict[int, bytes | memoryview]) -> None:
+            raise AssertionError("no block should be decoded")
+
+        with pytest.raises(DataCorruptError, match="are outside"):
+            await read_verified_blocks(reader, StreamId(0), BucketId(0), [(0, 4)], _on_block, pool=pool)
+        assert not any(path.endswith((".fgp", ".inf")) for path in store.read_paths)
+
+    async def test_a_wrong_digest_fails_its_block_after_the_earlier_ones_are_handed_over(self, tmp_path: Path) -> None:
+        blocks, _plaintexts, _store, error = await self._blocks_of(tmp_path, wrong_digest_idx=DECODE_BLOCK_CHUNKS + 5)
+        assert error is not None and "chunk fingerprint mismatch" in str(error)
+        assert blocks == [[(0, DECODE_BLOCK_CHUNKS)]]
 
 
 class TestExecChunksMultiBucket:
@@ -997,8 +1092,8 @@ def _build_split_run_dedup_file(tmp_path: Path, *, expected_peak: int) -> tuple[
     """Three read sources over two buckets: bucket 0's chunk_idx 0 and 2
     (1 unreferenced, so with ``_GAP_TOLERANCE`` at 0 they are two merge runs)
     and bucket 1's chunk 0. With ``max_concurrent_reads=2`` the two outer
-    per-bucket permits exhaust the semaphore, so bucket 0's second run only
-    proceeds through the ``exec_chunks``/``read_chunks`` permit hand-off."""
+    per-bucket permits exhaust the semaphore, so bucket 0 reads its second
+    run on its own permit after its first."""
     entries = (
         mapping_record(0, 0, 0, map_num=1)  # bucket 0, chunk_idx 0 -> dest [0, 4096)
         + mapping_record(4096, 0, 2, map_num=1)  # bucket 0, chunk_idx 2 -> dest [4096, 8192), skips chunk_idx 1
@@ -1033,6 +1128,36 @@ class TestExecChunksCombinedConcurrencyCeiling:
         assert bytes_run == size
         assert store.peak <= 2, f"expected at most 2 concurrent reads, observed a peak of {store.peak}"
         assert store.peak == 2, "expected the 3 available sources to actually reach the ceiling, not undershoot it"
+
+    async def test_groups_each_needing_two_reads_never_deadlock_on_the_permits(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Both groups hold a permit and need a second read: that read must
+        not wait for a permit while its own group holds one."""
+        monkeypatch.setattr("synology_apm_repo.sdk.dedup.pool._bucket_reader._GAP_TOLERANCE", 0)
+        entries = b""
+        for b in range(2):  # chunk_idx 0 and 2 of each bucket: two merge runs, chunk_idx 1 unreferenced
+            entries += mapping_record(2 * b * 4096, b, 0, map_num=1) + mapping_record(
+                (2 * b + 1) * 4096, b, 2, map_num=1
+            )
+            write_bucket(tmp_path / "Pool" / "0" / f"{b}.buk", [bytes([b, i]) * 2048 for i in range(3)])
+        write_composition_entries(tmp_path / "Composition", entries, session_id=SESSION_ID, stream_id=STREAM_ID)
+        store = LocalFsStore(tmp_path)
+        dir_cache = DirCache(store)
+        comp_reader = CompositionReader(store, dir_cache, "Composition", STREAM_ID, SESSION_ID)
+        size = 4 * 4096
+        file = DedupFile(comp_reader, Pool(store, "Pool", dir_cache), HEAD_OFF, size=size)
+        plan = await _reference_plan_chunks(file, 0, size, 0, write_zero_fill=None)
+        out = bytearray(size)
+
+        async def _on_run(off: int, data: bytes | memoryview) -> None:
+            out[off : off + len(data)] = data
+
+        await asyncio.wait_for(
+            exec_chunks(plan, pool=file._pool, on_run=_on_run, size=size, max_concurrent_reads=2), timeout=10
+        )
+
+        assert bytes(out) == b"".join(bytes([b, i]) * 2048 for b in range(2) for i in (0, 2))
 
 
 def test_ascending_runs_groups_consecutive_indices() -> None:

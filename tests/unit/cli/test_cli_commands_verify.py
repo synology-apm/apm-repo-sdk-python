@@ -14,7 +14,7 @@ from rich.console import Console
 import synology_apm_repo.cli.commands.verify as verify_cmd
 from support.cli import invoke
 from support.fakes import faithful_to
-from synology_apm_repo.sdk.api import Finding, Repository, Stage, Symptom, VerifyLevel
+from synology_apm_repo.sdk.api import Finding, Repository, Stage, Symptom, VerifyLevel, VerifyTuning
 from synology_apm_repo.sdk.presentation import ProgressCallback
 from unit.cli.session_fakes import install_fake_session
 
@@ -24,16 +24,22 @@ _SENSITIVE_DETAIL = "path points at report.docx which is missing"
 
 @faithful_to(Repository)
 class _VerifyingRepo:
-    """``verify()`` returns ``findings``, recording each level it was asked for."""
+    """``verify()`` returns ``findings``, recording each level and tuning it was asked for."""
 
     def __init__(self, findings: list[Finding]) -> None:
         self._findings = findings
         self.levels: list[VerifyLevel] = []
+        self.tunings: list[VerifyTuning | None] = []
 
     async def verify(
-        self, level: VerifyLevel = VerifyLevel.QUICK, *, progress: ProgressCallback | None = None
+        self,
+        level: VerifyLevel = VerifyLevel.QUICK,
+        *,
+        progress: ProgressCallback | None = None,
+        tuning: VerifyTuning | None = None,
     ) -> list[Finding]:
         self.levels.append(level)
+        self.tunings.append(tuning)
         return list(self._findings)
 
 
@@ -100,7 +106,7 @@ class TestRefVerboseGating:
     """``Finding.ref`` (a canonical ``cat:/wl:/ver:`` ref) is an internal
     identifier: hidden by default, shown under ``--verbose``."""
 
-    _REF = "/repo#cat:1/wl:2/ver:abc-uid"
+    _REF = "/repo#@cat:1/wl:2/ver:abc-uid"
 
     @pytest.fixture(autouse=True)
     def _fake_session_with_ref(self, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -143,7 +149,7 @@ class TestRefVerboseGating:
       "symptom": "DataMissing",
       "path": "alice/Documents/report.docx",
       "detail": "path points at report.docx which is missing",
-      "ref": "/repo#cat:1/wl:2/ver:abc-uid"
+      "ref": "/repo#@cat:1/wl:2/ver:abc-uid"
     }
   ]
 }
@@ -162,7 +168,7 @@ class TestRefVerboseGating:
         assert result.stdout == snapshot("""\
 1 finding in 1 group at level=quick
   [DataMissing] Version: path points at report.docx which is missing (1 version)
-    - alice/Documents/report.docx (/repo#cat:1/wl:2/ver:abc-uid)
+    - alice/Documents/report.docx (/repo#@cat:1/wl:2/ver:abc-uid)
 """)
 
 
@@ -357,3 +363,37 @@ occurrence)
         coloured = self._colour_stdout(monkeypatch)
         invoke(["verify", str(tmp_path)], exit_code=3)
         assert coloured.getvalue().startswith("\x1b[31m1 finding\x1b[0m in 2 groups")
+
+
+def test_concurrent_reads_flag_forwards_a_verify_tuning(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    repo = _patch_verify_findings(monkeypatch, [])
+    invoke(["verify", str(tmp_path), "--concurrent-reads", "4"])
+    assert repo.tunings == [VerifyTuning(max_concurrent_reads=4)]
+
+
+def test_without_concurrent_reads_the_sdk_default_applies(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    repo = _patch_verify_findings(monkeypatch, [])
+    invoke(["verify", str(tmp_path)])
+    assert repo.tunings == [None]
+
+
+def test_concurrent_decodes_flag_forwards_a_verify_tuning(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    repo = _patch_verify_findings(monkeypatch, [])
+    invoke(["verify", str(tmp_path), "--concurrent-decodes", "2"])
+    assert repo.tunings == [VerifyTuning(max_concurrent_decodes=2)]
+
+
+def test_both_concurrency_flags_forward_one_verify_tuning(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    repo = _patch_verify_findings(monkeypatch, [])
+    invoke(["verify", str(tmp_path), "--concurrent-reads", "8", "--concurrent-decodes", "2"])
+    assert repo.tunings == [VerifyTuning(max_concurrent_reads=8, max_concurrent_decodes=2)]
+
+
+@pytest.mark.parametrize("flag", ["--concurrent-reads", "--concurrent-decodes"])
+def test_a_concurrency_flag_below_one_is_a_usage_error(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, flag: str
+) -> None:
+    repo = _patch_verify_findings(monkeypatch, [])
+    result = invoke(["verify", str(tmp_path), flag, "0"], exit_code=2)
+    assert flag in result.output
+    assert repo.levels == []

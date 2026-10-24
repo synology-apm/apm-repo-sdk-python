@@ -7,9 +7,11 @@ from __future__ import annotations
 
 import array
 import asyncio
+import collections
 import dataclasses
 import re
-from collections.abc import Callable, Sequence
+from collections.abc import Awaitable, Callable, Coroutine, Sequence
+from typing import Any
 
 from cryptography.hazmat.primitives.ciphers import algorithms
 
@@ -41,6 +43,13 @@ _SPEC = "FORMAT-SPEC.md: ChunkCrcStore & Redundancy"
 #: ``ObjectStore.read``, trading read amplification for fewer reads. A merged
 #: run has no size cap; the bucket's chunk count bounds it.
 _GAP_TOLERANCE = 1 << 20  # 1 MiB
+
+DECODE_BLOCK_CHUNKS = 1024
+"""Chunk indices per ``read_chunk_blocks`` block: at most 4 MiB of plaintext."""
+
+ChunkBlockCallback = Callable[[list[tuple[int, int]], dict[int, bytes | memoryview]], Awaitable[None]]
+"""``read_chunk_blocks``' consumer: ``(ranges, chunks)``, the ``[a, b)``
+chunk-index ranges of one block and their plaintext keyed by ``chunk_idx``."""
 
 
 async def _attempt_size_store_repair(
@@ -86,12 +95,30 @@ _NON_COMPACTED_RUN = re.compile(b"[^" + re.escape(bytes([COMPRESS_TYPE_COMPACTED
 
 @dataclasses.dataclass(frozen=True, slots=True)
 class _IndexRun:
-    """One merged read of ``read_chunks``/``read_raw_chunks``: the stored byte span
+    """One merged read (``_plan_index_runs``): the stored byte span
     ``[start, end)`` and the chunk-index subranges ``[a, b)`` decoded from it."""
 
     start: int
     end: int
     chunks: list[tuple[int, int]]
+
+
+def _split_into_blocks(chunks: list[tuple[int, int]]) -> list[list[tuple[int, int]]]:
+    """Ascending ``[a, b)`` chunk-index ranges regrouped by
+    ``DECODE_BLOCK_CHUNKS``-aligned block, a range crossing a block boundary
+    split there."""
+    blocks: list[list[tuple[int, int]]] = []
+    current_block = -1
+    for start, end in chunks:
+        while start < end:
+            block = start // DECODE_BLOCK_CHUNKS
+            stop = min(end, (block + 1) * DECODE_BLOCK_CHUNKS)
+            if block != current_block:
+                blocks.append([])
+                current_block = block
+            blocks[-1].append((start, stop))
+            start = stop
+    return blocks
 
 
 class BucketReader:
@@ -129,7 +156,7 @@ class BucketReader:
         self.sizestore_repaired = sizestore_repaired
         self.known_file_size = known_file_size
         self._vault_key = vault_key
-        # Pool's cached key schedule, reused by every decrypt_chunk() call.
+        # Pool's cached key schedule, reused by every decrypt.
         self._algorithm = algorithm
         # Whether every chunk read checks its ChunkCrcStore entry first.
         self._verify_ciphertext_crc = verify_ciphertext_crc
@@ -236,7 +263,7 @@ class BucketReader:
     def _check_ciphertext_crc(self, chunk_idx: int, raw: bytes | memoryview) -> None:
         """``raw`` against chunk ``chunk_idx``'s ChunkCrcStore entry; the
         caller has awaited ``ensure_chunk_crc_store()`` (sync, so a worker
-        thread's ``_decode_run`` can call it)."""
+        thread's ``_decode_chunks`` can call it)."""
         assert self._chunk_crc_values is not None and self._chunk_crc_positions is not None, (
             "ensure_chunk_crc_store() must run before a ciphertext CRC check"
         )
@@ -305,8 +332,13 @@ class BucketReader:
         """Chunk ``chunk_idx``'s ``CompressType`` from the raw arrays.
 
         Raises:
+            DataCorruptError: ``chunk_idx`` is past this bucket's chunks.
             ChunkCompactedError: The chunk is ``COMPACTED``.
         """
+        if not 0 <= chunk_idx < len(self.index.compress_types):
+            raise DataCorruptError(
+                f"chunk {chunk_idx} is outside {self.path!r}'s {len(self.index.compress_types)}", ref=self.path
+            )
         ctype_value = self.index.compress_types[chunk_idx]
         if ctype_value == COMPRESS_TYPE_COMPACTED_VALUE:
             raise ChunkCompactedError(
@@ -331,8 +363,8 @@ class BucketReader:
         Raises:
             ChunkCompactedError: The chunk is ``COMPACTED``.
             KeyRequiredError: The bucket is encrypted and no vault key was given.
-            DataCorruptError: The CRC check fails or the chunk doesn't
-                decompress to 4096 bytes.
+            DataCorruptError: ``chunk_idx`` is past this bucket's chunks, the
+                CRC check fails or the chunk doesn't decompress to 4096 bytes.
         """
         self._resolve_compress_type(chunk_idx)  # fail fast on COMPACTED, before spending a real read
         offset = self.index.offsets[chunk_idx]
@@ -355,6 +387,7 @@ class BucketReader:
         (FORMAT-SPEC.md: ChunkCrcStore & Redundancy).
 
         Raises:
+            DataCorruptError: ``chunk_idx`` is past this bucket's chunks.
             ChunkCompactedError: ``chunk_idx`` is ``COMPACTED``.
         """
         self._resolve_compress_type(chunk_idx)
@@ -370,6 +403,7 @@ class BucketReader:
             chunk_indices: Sorted ascending and deduplicated.
 
         Raises:
+            DataCorruptError: A chunk is past this bucket's chunks.
             ChunkCompactedError: A chunk is ``COMPACTED``; raised before any read.
         """
         result: dict[int, bytes | memoryview] = {}
@@ -389,77 +423,139 @@ class BucketReader:
         stream_id: StreamId,
         bucket_id: BucketId,
         ranges: Sequence[tuple[int, int]],
-        *,
-        semaphore: asyncio.Semaphore | None = None,
     ) -> dict[int, bytes | memoryview]:
         """Batch form of ``read_chunk``: locator byte-ranges within
-        ``_GAP_TOLERANCE`` of each other share one ``ObjectStore.read``;
-        decrypt is per chunk and decompress is batched per merged run
-        (``_decode_run``/``decompress_many``).
+        ``_GAP_TOLERANCE`` of each other share one ``ObjectStore.read``, the
+        merged reads issued one after another; decrypt is per chunk and
+        decompress is batched per merged run (``_decode_chunks``/``decompress_many``).
 
         Args:
             stream_id: This bucket's stream, for an encrypted chunk's IV.
             bucket_id: This bucket's id, likewise.
             ranges: ``(chunk_idx_start, length)`` runs, sorted ascending and
                 non-overlapping (not re-sorted here).
-            semaphore: Shared read-concurrency bound (``None``: serial), the
-                one ``exec_chunks()`` draws from. The caller has already
-                acquired one permit for this call, which the first merged run
-                spends; each further physically separate run acquires its own.
 
         Returns:
             Plaintext by ``chunk_idx``. A value may be a ``memoryview`` into
-            a buffer its whole run shares; holding it keeps that buffer
-            alive (copy with ``bytes()`` to keep one chunk).
+            a buffer it shares with other chunks of its run; holding it keeps
+            that buffer alive (copy with ``bytes()`` to keep one chunk).
 
         Raises:
-            IndexError: A range runs past this bucket's chunks.
             ChunkCompactedError: A requested chunk is ``COMPACTED``; raised
                 before any read.
             KeyRequiredError: The bucket is encrypted and no vault key was given.
-            DataCorruptError: A CRC check fails or a chunk doesn't decompress
-                to 4096 bytes.
+            DataCorruptError: A range runs past this bucket's chunks, a CRC
+                check fails or a chunk doesn't decompress to 4096 bytes.
         """
         result: dict[int, bytes | memoryview] = {}
+        address = (stream_id, bucket_id)
+
+        async def _read(run: _IndexRun) -> None:
+            await self._read_run(address, run, result)
+
+        await self._each_run(ranges, _read, None)
+        return result
+
+    async def read_chunk_blocks(
+        self,
+        stream_id: StreamId,
+        bucket_id: BucketId,
+        ranges: Sequence[tuple[int, int]],
+        on_block: ChunkBlockCallback,
+        *,
+        semaphore: asyncio.Semaphore | None = None,
+    ) -> None:
+        """``read_chunks``' merged reads, each read's chunks decoded and handed
+        to ``on_block`` one ``DECODE_BLOCK_CHUNKS``-aligned block at a time and
+        dropped once it returns. A block's chunks can arrive in several calls,
+        one per merged read covering them; calls for different reads may run
+        concurrently.
+
+        Args:
+            stream_id: This bucket's stream, for an encrypted chunk's IV.
+            bucket_id: This bucket's id, likewise.
+            ranges: As for ``read_chunks``.
+            on_block: Receives each block; a chunk may be a view into its
+                read's buffer, as ``read_chunks`` describes.
+            semaphore: Shared read-concurrency bound (``None``: serial), the
+                one ``exec_chunks()`` draws from. The caller has already
+                acquired one permit for this call, which reads its merged runs
+                in turn; a further run is read alongside only on a permit that
+                is free when the call starts, never one it waits for. A permit
+                is held while its read's blocks are decoded and handed over.
+
+        Raises:
+            ChunkCompactedError: A requested chunk is ``COMPACTED``; raised
+                before any read.
+            KeyRequiredError: The bucket is encrypted and no vault key was given.
+            DataCorruptError: A range runs past this bucket's chunks, a CRC
+                check fails or a chunk doesn't decompress to 4096 bytes.
+        """
+        address = (stream_id, bucket_id)
+
+        async def _read(run: _IndexRun) -> None:
+            await self._read_run_by_block(address, run, on_block)
+
+        await self._each_run(ranges, _read, semaphore)
+
+    async def _each_run(
+        self,
+        ranges: Sequence[tuple[int, int]],
+        read_run: Callable[[_IndexRun], Coroutine[Any, Any, None]],
+        semaphore: asyncio.Semaphore | None,
+    ) -> None:
+        """Checks ``ranges``, plans their merged reads and runs ``read_run`` on
+        each, fanned out under ``semaphore`` (see ``read_chunk_blocks``)."""
         if not ranges:
-            return result
+            return
 
         if self._verify_ciphertext_crc:
-            # _decode_run() runs on a worker thread and cannot await this.
+            # _decode_chunks() runs on a worker thread and cannot await this.
             await self.ensure_chunk_crc_store()
 
         compress_types = memoryview(self.index.compress_types)
         for start, length in ranges:
             if start < 0 or start + length > len(compress_types):
-                raise IndexError(
-                    f"chunks [{start}, {start + length}) are outside {self.path!r}'s {len(compress_types)}"
+                raise DataCorruptError(
+                    f"chunks [{start}, {start + length}) are outside {self.path!r}'s {len(compress_types)}",
+                    ref=self.path,
                 )
             compacted = compress_types[start : start + length].tobytes().find(COMPRESS_TYPE_COMPACTED_VALUE)
             if compacted >= 0:
                 self._resolve_compress_type(start + compacted)  # raises ChunkCompactedError
 
         runs = self._plan_index_runs(ranges)
-        address = (stream_id, bucket_id)
 
         if semaphore is None or len(runs) <= 1:
             # Fast path, no TaskGroup: len(runs) <= 1 means the one permit
             # the caller already acquired covers this single run.
             for run in runs:
-                await self._read_run(address, run, result)
+                await read_run(run)
         else:
             # Several physically separate regions need several reads anyway;
-            # fan the extra runs out to overlap their latency.
-            async def _read_extra(run: _IndexRun) -> None:
-                async with semaphore:
-                    await self._read_run(address, run, result)
+            # helpers on permits free right now overlap their latency. Waiting
+            # for a permit while holding the caller's would deadlock once every
+            # permit is held by a call doing the same.
+            queue = collections.deque(runs)
+
+            async def _drain() -> None:
+                # Runs cover disjoint chunks, so their results never collide.
+                while queue:
+                    await read_run(queue.popleft())
+
+            async def _helper() -> None:
+                try:
+                    await _drain()
+                finally:
+                    semaphore.release()
 
             async with asyncio.TaskGroup() as tg:
-                # runs[0] spends the caller's permit. Runs write disjoint keys
-                # of ``result``, so no lock is needed.
-                tg.create_task(self._read_run(address, runs[0], result))
-                for run in runs[1:]:
-                    tg.create_task(_read_extra(run))
-        return result
+                for _ in range(len(runs) - 1):
+                    if semaphore.locked():
+                        break
+                    await semaphore.acquire()  # a free permit: returns without waiting
+                    tg.create_task(_helper())
+                await _drain()  # on the caller's permit
 
     def _plan_index_runs(self, ranges: Sequence[tuple[int, int]]) -> list[_IndexRun]:
         """Merges chunk-index ranges into runs in one pass, without I/O, so
@@ -496,15 +592,15 @@ class BucketReader:
         thread so a multi-MB decode doesn't stall the event loop; a
         ``SyncReadable`` store's read happens on that same thread, one hop
         per run instead of two. ``read_chunk`` does not hop: one 4096-byte
-        decode costs less than the hop. ``read_chunks`` has already loaded
-        the ChunkCrcStore.
+        decode costs less than the hop. ``_each_run`` has already loaded the
+        ChunkCrcStore.
         """
         if isinstance(self._store, SyncReadable):
             await asyncio.to_thread(self._read_and_decode_run, self._store.read_sync, address, run, result)
             return
         merged = await self._store.read(self.path, run.start, run.end - run.start)
         # A memoryview makes every per-chunk slice a zero-copy view of this buffer.
-        await asyncio.to_thread(self._decode_run, address, run, memoryview(merged), result)
+        await asyncio.to_thread(self._decode_chunks, address, run.start, memoryview(merged), run.chunks, result)
 
     def _read_and_decode_run(
         self,
@@ -515,38 +611,59 @@ class BucketReader:
     ) -> None:
         """``_read_run``'s body on one worker thread, for a ``SyncReadable`` store."""
         merged = read_sync(self.path, run.start, run.end - run.start)
-        self._decode_run(address, run, memoryview(merged), result)
+        self._decode_chunks(address, run.start, memoryview(merged), run.chunks, result)
 
-    def _decode_run(
+    async def _read_run_by_block(
+        self, address: tuple[StreamId, BucketId], run: _IndexRun, on_block: ChunkBlockCallback
+    ) -> None:
+        """``_read_run`` for ``read_chunk_blocks``: the same single read, then
+        one decode hop and one ``on_block`` call per block of ``run``."""
+        length = run.end - run.start
+        if isinstance(self._store, SyncReadable):
+            merged = await asyncio.to_thread(self._store.read_sync, self.path, run.start, length)
+        else:
+            merged = await self._store.read(self.path, run.start, length)
+        view = memoryview(merged)
+        for block in _split_into_blocks(run.chunks):
+            decoded: dict[int, bytes | memoryview] = {}
+            await asyncio.to_thread(self._decode_chunks, address, run.start, view, block, decoded)
+            await on_block(block, decoded)
+
+    def _decode_chunks(
         self,
         address: tuple[StreamId, BucketId],
-        run: _IndexRun,
+        base_offset: int,
         merged: memoryview,
+        chunk_ranges: list[tuple[int, int]],
         result: dict[int, bytes | memoryview],
     ) -> None:
         """Check (when opened with ``verify_ciphertext_crc``) and decrypt each
-        chunk in ``run``, own IV per chunk, then decompress the whole run with
-        one ``decompress_many`` call."""
+        chunk in ``chunk_ranges`` (bytes of ``merged``, read from
+        ``base_offset``), own IV per chunk, then decompress them with one
+        ``decompress_many`` call."""
         offsets, lengths, compress_types = self.index.offsets, self.index.effective_lens, self.index.compress_types
         verify = self._verify_ciphertext_crc
         encrypted = self.header.is_vault_encrypted
-        # Built per call (_decode_run runs on worker threads, and a context
+        # Built per call (_decode_chunks runs on worker threads, and a context
         # isn't thread-safe), at the first decrypt: a chunk's ciphertext CRC
         # is checked before a missing key is reported, as for a single chunk.
         decryptor: ChunkDecryptor | None = None
-        stream_id, bucket_id = address
+        bucket_address = 0
         chunk_idxs: list[int] = []
         items: list[tuple[CompressType, bytes | memoryview]] = []
-        for sub_start, sub_end in run.chunks:
+        for sub_start, sub_end in chunk_ranges:
             for chunk_idx in range(sub_start, sub_end):
-                local_off = offsets[chunk_idx] - run.start
+                local_off = offsets[chunk_idx] - base_offset
                 raw: bytes | memoryview = merged[local_off : local_off + lengths[chunk_idx]]
                 if verify:
                     self._check_ciphertext_crc(chunk_idx, raw)
                 if encrypted:
                     if decryptor is None:
                         decryptor = self._chunk_decryptor()
-                    raw = decryptor.decrypt(ChunkAddress(stream_id, bucket_id, ChunkIdx(chunk_idx)), raw)
+                        # to_int() ORs chunk_idx into its low bits, so OR-ing it into
+                        # chunk 0's address gives the same value per chunk.
+                        bucket_address = ChunkAddress(*address, ChunkIdx(0)).to_int()
+                    raw = decryptor.decrypt(bucket_address | chunk_idx, raw)
                 chunk_idxs.append(chunk_idx)
                 items.append((COMPRESS_TYPE_BY_VALUE[compress_types[chunk_idx]], raw))
         result.update(zip(chunk_idxs, decompress_many(items), strict=True))

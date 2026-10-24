@@ -20,7 +20,7 @@ from support.modules import load_module
 
 _SCRIPT_PATH = Path(__file__).resolve().parents[3] / "scripts" / "bench_export.py"
 _MIB = 1 << 20
-_REF = "cat:3/wl:3/ver:vuid-1/device:5/object:1"
+_REF = "@cat:3/wl:3/ver:vuid-1/device:5/object:1"
 
 # The script imports ``resource``, which Windows lacks.
 pytestmark = pytest.mark.skipif(sys.platform == "win32", reason="scripts/bench_export.py is POSIX only")
@@ -75,6 +75,7 @@ class TestParsing:
         assert args.command == "run"
         assert (args.repo, args.sample, args.ref, args.mode) == ("/repo", "", _REF, "default")
         assert (args.window_entries, args.workers, args.view_mib, args.view_offset_mib) == (0, 0, 0, 0)
+        assert args.max_concurrent_reads == 0
         assert (args.sink_mib_s, args.sink_model) == (0.0, "queued")
         assert (args.segment_mib, args.buffered_segments, args.storage) == (64, 2, "memory")
         assert not any((args.count_calls, args.dev_null, args.dense, args.no_progress, args.hash))
@@ -103,6 +104,8 @@ class TestParsing:
             "128",
             "--workers",
             "3",
+            "--max-concurrent-reads",
+            "4",
             "--view-mib",
             "16",
             "--view-offset-mib",
@@ -126,6 +129,7 @@ class TestParsing:
         args = _parse(bench, argv, monkeypatch)
         assert (args.sample, args.mode, args.workdir) == ("nas-a", "segmented", "/scratch")
         assert (args.window_entries, args.workers, args.view_mib, args.view_offset_mib) == (128, 3, 16, 4)
+        assert args.max_concurrent_reads == 4
         assert (args.sink_mib_s, args.sink_model) == (12.5, "inline")
         assert (args.segment_mib, args.buffered_segments, args.storage) == (8, 4, "spool")
         assert all((args.count_calls, args.dev_null, args.dense, args.no_progress, args.hash))
@@ -248,6 +252,7 @@ class TestMatrixCommand:
             "--workdir": "/scratch",
             "--window-entries": "0",
             "--workers": "0",
+            "--max-concurrent-reads": "0",
             "--view-mib": "0",
             "--view-offset-mib": "0",
             "--sink-mib-s": "50.0",

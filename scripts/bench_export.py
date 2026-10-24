@@ -9,10 +9,11 @@ so ``matrix`` discards ``--warmup`` leading runs.
 
 Modes (``--mode``):
 
-* ``default`` — ``export_range()`` into an unstaged ``LocalFileSink``:
-  multiprocess when the store can be rebuilt in a worker, as the CLI and TUI
-  exports are.
-* ``inprocess`` — the same call with multiprocess dispatch disabled.
+* ``default`` — ``export_range()`` into an unstaged ``LocalFileSink`` with the
+  SDK's defaults, as the CLI and TUI exports are: in-process unless
+  ``--workers`` asks for worker processes.
+* ``inprocess`` — the same call with ``workers=0`` whatever ``--workers`` says, so
+  without ``--workers`` it measures exactly what ``default`` does.
 * ``stream`` — ``ContentSource.stream()`` copied into a file (no bucket-major
   planning; the baseline a user-written sink gets for free).
 * ``sink-parent`` — ``export_range()`` into a sink that only accepts writes
@@ -26,7 +27,7 @@ Modes (``--mode``):
 Usage::
 
     uv run python scripts/bench_export.py matrix --repo PATH \\
-        --ref 'cat:3/wl:3/ver:<uid>/device:5/object:1' --repeat 5
+        --ref '@cat:3/wl:3/ver:<uid>/device:5/object:1' --repeat 5
 
 ``--sample NAME`` opens a ``[[remote_storage]]`` entry of the gitignored
 ``tests/smoke/smoke_samples.toml`` instead of ``--repo`` (then ``--ref`` is the
@@ -169,25 +170,6 @@ def _fresh_output_dir(workdir: Path) -> Path:
     return workdir
 
 
-def _disable_multiprocess() -> None:
-    from synology_apm_repo.sdk.dedup import export_scheduler
-
-    class _NoDescriptor:
-        @staticmethod
-        def from_pool(pool: object) -> None:
-            return None
-
-    vars(export_scheduler)["PoolDescriptor"] = _NoDescriptor
-
-
-def _set_workers(workers: int) -> None:
-    from synology_apm_repo.sdk import concurrency
-    from synology_apm_repo.sdk.dedup import export_scheduler
-
-    vars(concurrency)["default_worker_count"] = lambda: workers
-    vars(export_scheduler)["default_worker_count"] = lambda: workers
-
-
 def _parent_only_sink(dst: Path, sink_mib_s: float = 0.0, sink_model: str = "queued") -> Any:
     """A sink whose writes must all happen in this process — a local file with
     its ``worker_target`` removed. ``sink_mib_s`` > 0 also caps how fast it
@@ -283,15 +265,11 @@ async def _stream_to_file(content: Any, dst: Path) -> tuple[int, int]:
 
 
 async def _measure(args: argparse.Namespace) -> RunResult:
-    from synology_apm_repo.sdk.dedup.export_scheduler import ExportTuning
+    from synology_apm_repo.sdk.dedup.export_scheduler import SharedExportTuning
     from synology_apm_repo.sdk.dedup.export_sink import run_sink_export
     from synology_apm_repo.sdk.dedup.local_file_sink import LocalFileSink
     from synology_apm_repo.sdk.export import run_export
 
-    if args.workers:
-        _set_workers(args.workers)
-    if args.mode == "inprocess":
-        _disable_multiprocess()
     calls: list[Any] | None = [] if args.count_calls else None
     session, content = await _open_content(args, calls)
     try:
@@ -301,8 +279,12 @@ async def _measure(args: argparse.Namespace) -> RunResult:
         dst = _DEV_NULL if args.dev_null else workdir / "bench.out"
 
         kwargs: dict[str, Any] = {"sparse": not args.dense}
+        tuning: dict[str, Any] = {"workers": 0 if args.mode == "inprocess" else args.workers}
         if args.window_entries:
-            kwargs["tuning"] = ExportTuning(window_entries=args.window_entries)
+            tuning["window_entries"] = args.window_entries
+        if args.max_concurrent_reads:
+            tuning["max_concurrent_reads"] = args.max_concurrent_reads
+        kwargs["tuning"] = SharedExportTuning(**tuning)
 
         async def on_bytes(written: int) -> None:
             return None
@@ -415,12 +397,15 @@ def _add_run_options(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--repo", default="", help="repository path (local); or use --sample")
     parser.add_argument("--sample", default="", help="name of a [[remote_storage]] entry in smoke_samples.toml")
     parser.add_argument(
-        "--ref", required=True, help="canonical node ref after the '#', e.g. cat:3/wl:3/ver:.../object:1"
+        "--ref", required=True, help="canonical node ref after the '#', e.g. @cat:3/wl:3/ver:.../object:1"
     )
     parser.add_argument("--mode", choices=MODES, default="default")
     parser.add_argument("--workdir", default=tempfile.gettempdir(), help="where the (sparse) output file goes")
     parser.add_argument("--window-entries", type=int, default=0, help="override DEFAULT_WINDOW_ENTRIES (chunks)")
-    parser.add_argument("--workers", type=int, default=0, help="override default_worker_count()")
+    parser.add_argument("--workers", type=int, default=0, help="worker processes (0: decode in this process)")
+    parser.add_argument(
+        "--max-concurrent-reads", type=int, default=0, help="in-process reads in flight (0: the SDK's default)"
+    )
     parser.add_argument("--view-mib", type=int, default=0, help="export only this many MiB (a small export)")
     parser.add_argument("--view-offset-mib", type=int, default=0)
     parser.add_argument(
@@ -477,6 +462,8 @@ def _matrix_command(args: argparse.Namespace) -> int:
         str(args.window_entries),
         "--workers",
         str(args.workers),
+        "--max-concurrent-reads",
+        str(args.max_concurrent_reads),
         "--view-mib",
         str(args.view_mib),
         "--view-offset-mib",

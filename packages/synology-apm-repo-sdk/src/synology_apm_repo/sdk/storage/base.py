@@ -75,7 +75,7 @@ class ObjectStore(Protocol):
         """Return the total byte length of ``path``.
 
         Raises:
-            NotFoundError: ``path`` does not exist.
+            NotFoundError: ``path`` does not exist or is a directory.
             PermissionDeniedError: Access was denied.
             StorageBackendError: The backend failed to serve the request.
         """

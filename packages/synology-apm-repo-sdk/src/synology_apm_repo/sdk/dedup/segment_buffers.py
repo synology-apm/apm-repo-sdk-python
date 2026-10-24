@@ -17,6 +17,7 @@ from multiprocessing import shared_memory
 from pathlib import Path
 from typing import Any, override
 
+from .._util.closing import run_to_completion
 from ..positional_io import O_BINARY, pread, pwrite
 from .export_sink import SinkCaps, SinkDescriptor, WorkerTarget, WorkerWriter
 from .local_file_io import create_presized, write_zeros_at, zero_range
@@ -179,7 +180,7 @@ class SharedPool(SlotPool):
     async def _close(self) -> None:
         shm, self._shm = self._shm, None
         if shm is not None:
-            await asyncio.to_thread(self._release, shm)
+            await run_to_completion(asyncio.to_thread(self._release, shm))
 
     @staticmethod
     def _release(shm: shared_memory.SharedMemory) -> None:
@@ -246,9 +247,12 @@ class Spool(SlotPool):
 
     @override
     async def _close(self) -> None:
-        if self._pending:
-            await asyncio.gather(*self._pending, return_exceptions=True)
-        await asyncio.to_thread(self._close_file)
+        # Closes the fd even if cancelled, after run()'s pending writes.
+        try:
+            if self._pending:
+                await run_to_completion(asyncio.gather(*self._pending, return_exceptions=True))
+        finally:
+            await run_to_completion(asyncio.to_thread(self._close_file))
 
     def _close_file(self) -> None:
         if self._fd is not None:

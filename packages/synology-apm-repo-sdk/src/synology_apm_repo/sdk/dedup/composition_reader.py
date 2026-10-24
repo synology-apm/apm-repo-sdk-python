@@ -116,16 +116,18 @@ class CompositionReader:
         raw = await self.read_at(0, HEADER_LEN)
         return parse_composition_header(raw)
 
-    async def record(self, head_off: int) -> CompositionRecord:
+    async def record(self, head_off: int, *, record_head: RecordHead | None = None) -> CompositionRecord:
         """Open the composition record at global offset ``head_off``
         (``db/file_map.comp_offset``) — reads only the 32-byte
         ``RecordHead``, not the (potentially huge) chunk-map array that
-        follows it.
+        follows it, and not even that when ``record_head`` (the record's
+        already-parsed head) is given.
 
         With a ``composition_cache``, every caller sharing the same
         ``(stream_id, session_id, head_off)`` gets the identical
-        ``CompositionRecord`` (page cache warm) until the entry is
-        LRU-evicted; the next call then builds a new one.
+        ``CompositionRecord`` (page cache warm), whatever ``record_head`` it
+        passes, until the entry is LRU-evicted; the next call then builds a
+        new one.
 
         Raises:
             NotFoundError: the sub-file is missing.
@@ -135,13 +137,13 @@ class CompositionReader:
             UnsupportedVersionError: the record lacks the ``Redundancy`` mode bit.
         """
         if self._composition_cache is None:
-            return await self._build_record(head_off)
+            return await self._build_record(head_off, record_head)
         key = (self.stream_id, self.session_id, head_off)
-        return await self._composition_cache.resolve(key, lambda _k: self._build_record(head_off))
+        return await self._composition_cache.resolve(key, lambda _k: self._build_record(head_off, record_head))
 
-    async def _build_record(self, head_off: int) -> CompositionRecord:
-        raw = await self.read_at(head_off, RECORD_HEAD_LENGTH)
-        record_head = parse_record_head(raw)
+    async def _build_record(self, head_off: int, record_head: RecordHead | None) -> CompositionRecord:
+        if record_head is None:
+            record_head = parse_record_head(await self.read_at(head_off, RECORD_HEAD_LENGTH))
         return CompositionRecord(head_off=head_off, record_head=record_head, reader=self)
 
 
@@ -167,6 +169,7 @@ class CompositionRecord:
     and cached in ``_pages`` as raw bytes, bounded to
     ``_DEFAULT_PAGE_CACHE_MAXSIZE`` pages (LRU beyond that); a page's
     ``ChunkMapEntry`` values are decoded only as a caller consumes them.
+    ``prime_pages`` fills the cache from an array a caller already read;
     ``seed_pages_from_array`` switches every page, cached or not, to
     already-repaired bytes.
     """
@@ -181,7 +184,7 @@ class CompositionRecord:
         compare=False,
     )
     _page_end_offsets: dict[int, int] = dataclasses.field(default_factory=dict, repr=False, compare=False)
-    """Each fetched page's last ``end_offset``, by ``page_idx``. Never
+    """Each fetched or primed page's last ``end_offset``, by ``page_idx``. Never
     evicted, unlike ``_pages``, so ``_locate``'s search over it needs no
     I/O."""
     _contiguous_scanned: int = dataclasses.field(default=0, repr=False, compare=False)
@@ -192,10 +195,10 @@ class CompositionRecord:
     given; a page missing from ``_pages`` is cut from it, never re-read from
     the corrupted on-disk copy."""
     _page_locks: dict[int, asyncio.Lock] = dataclasses.field(default_factory=dict, repr=False, compare=False)
-    """One lock per page index, held by ``_get_page`` and
-    ``seed_pages_from_array`` so a fetch and a reseed of the same page never
-    interleave (the record is shared repo-wide). Bounded by
-    ``_page_count``."""
+    """One lock per page index, held by ``_get_page``,
+    ``seed_pages_from_array`` and ``prime_pages`` so a fetch, a reseed and a
+    prime of the same page never interleave (the record is shared
+    repo-wide). Bounded by ``_page_count``."""
 
     def _lock_for_page(self, page_idx: int) -> asyncio.Lock:
         lock = self._page_locks.get(page_idx)
@@ -275,17 +278,17 @@ class CompositionRecord:
         holds ``_lock_for_page(page_idx)``.
         """
         page_bytes = await self._pages.resolve(page_idx, fetch)
-        count = len(page_bytes) // CHUNK_MAP_RECORD_LENGTH
-        last_entry_off = (count - 1) * CHUNK_MAP_RECORD_LENGTH
-        last_entry = parse_chunk_map_record(page_bytes[last_entry_off : last_entry_off + CHUNK_MAP_RECORD_LENGTH])
         # Unconditional: a seed_pages_from_array() reseed must replace a pre-repair value.
-        self._page_end_offsets[page_idx] = last_entry.end_offset
+        self._note_page_end(page_idx, page_bytes[-CHUNK_MAP_RECORD_LENGTH:])
+        return page_bytes
+
+    def _note_page_end(self, page_idx: int, last_record: bytes) -> None:
+        self._page_end_offsets[page_idx] = parse_chunk_map_record(last_record).end_offset
         if page_idx == self._contiguous_scanned:
             # Also absorb pages already fetched out of order just past this one.
             self._contiguous_scanned += 1
             while self._contiguous_scanned in self._page_end_offsets:
                 self._contiguous_scanned += 1
-        return page_bytes
 
     async def _get_page(self, page_idx: int) -> bytes:
         """Page ``page_idx``'s raw bytes: one ``read_at()`` on a miss,
@@ -302,13 +305,7 @@ class CompositionRecord:
             ValueError: ``array_raw`` is not ``map_num *
                 CHUNK_MAP_RECORD_LENGTH`` bytes.
         """
-        expected_len = self.map_num * CHUNK_MAP_RECORD_LENGTH
-        if len(array_raw) != expected_len:
-            raise ValueError(
-                f"seed_pages_from_array: array_raw is {len(array_raw)} bytes, expected "
-                f"{expected_len} (map_num={self.map_num})"
-            )
-
+        self._check_array_length("seed_pages_from_array", array_raw)
         self._repaired_array = array_raw
 
         async def _repaired_page(page_idx: int) -> bytes:
@@ -319,6 +316,48 @@ class CompositionRecord:
                 # resolve() keeps an already-settled key, so drop the pre-repair page first.
                 self._pages.invalidate(page_idx)
                 await self._resolve_page(page_idx, _repaired_page)
+
+    async def prime_pages(self, array_raw: bytes, start: int, end: int) -> None:
+        """Cache the pages of ``array_raw`` (this record's whole chunk-map
+        array, already read and trusted by the caller) that overlap the
+        file-offset window ``[start, end)``, within the page cache's free
+        room: nothing is evicted and ``array_raw`` is not kept.
+        Every page's end-offset up to the window's end is recorded, so
+        ``_locate`` reaches the window with no I/O. Pages already cached, and
+        a record ``seed_pages_from_array`` repaired, are left as they are.
+
+        Raises:
+            ValueError: ``array_raw`` is not ``map_num *
+                CHUNK_MAP_RECORD_LENGTH`` bytes.
+        """
+        self._check_array_length("prime_pages", array_raw)
+        for page_idx in range(self._page_count):  # ascending order keeps _contiguous_scanned advancing correctly
+            start_entry, count = self._page_bounds(page_idx)
+            first_off = start_entry * CHUNK_MAP_RECORD_LENGTH
+            if parse_chunk_map_record(array_raw[first_off : first_off + CHUNK_MAP_RECORD_LENGTH]).file_offset >= end:
+                return  # file offsets ascend with page index, so no later page overlaps either
+            if page_idx not in self._page_end_offsets:
+                last_off = first_off + (count - 1) * CHUNK_MAP_RECORD_LENGTH
+                self._note_page_end(page_idx, array_raw[last_off : last_off + CHUNK_MAP_RECORD_LENGTH])
+            if self._page_end_offsets[page_idx] <= start:
+                continue
+            async with self._lock_for_page(page_idx):
+                maxsize = self._pages.maxsize
+                # Checked under the lock: a concurrent fetch may have filled the page or the room,
+                # or a reseed repaired the record.
+                if (
+                    self._repaired_array is None
+                    and page_idx not in self._pages
+                    and (maxsize is None or len(self._pages) < maxsize)
+                ):
+                    self._pages.put(page_idx, self._page_of_array(array_raw, page_idx))
+
+    def _check_array_length(self, caller: str, array_raw: bytes) -> None:
+        expected_len = self.map_num * CHUNK_MAP_RECORD_LENGTH
+        if len(array_raw) != expected_len:
+            raise ValueError(
+                f"{caller}: array_raw is {len(array_raw)} bytes, expected {expected_len} (map_num={self.map_num})"
+            )
 
     async def extent(self) -> tuple[int, int]:
         """``(start, end)``: the file-offset range this record covers, from

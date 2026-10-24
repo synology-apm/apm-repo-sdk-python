@@ -26,7 +26,12 @@ from synology_apm_repo.browser.core.app.select import ExportButtonSpec, export_b
 from synology_apm_repo.browser.core.keys import JobId
 from synology_apm_repo.browser.keymap import COMMON_BINDINGS
 from synology_apm_repo.browser.runtime.store import Subscription
-from synology_apm_repo.browser.screens._shared import AppStateMixin, DelegatesCommonActions, modal_box_css
+from synology_apm_repo.browser.screens._shared import (
+    AppStateMixin,
+    DelegatesCommonActions,
+    ReleasesOnPrune,
+    modal_box_css,
+)
 from synology_apm_repo.browser.strings import (
     EXPORT_BACKGROUNDED_TITLE,
     EXPORT_DST_LABEL,
@@ -42,7 +47,7 @@ from synology_apm_repo.sdk.export import safe_file_name
 from synology_apm_repo.sdk.presentation import format_bytes, safe
 
 
-class ExportScreen(AppStateMixin, DelegatesCommonActions, ModalScreen[None]):
+class ExportScreen(ReleasesOnPrune, AppStateMixin, DelegatesCommonActions, ModalScreen[None]):
     """``DelegatesCommonActions`` routes ``COMMON_BINDINGS``' ``q``/``d``/``?``
     to the App, which this modal's truncated binding chain wouldn't reach."""
 
@@ -116,9 +121,15 @@ class ExportScreen(AppStateMixin, DelegatesCommonActions, ModalScreen[None]):
         app = self.app_state
         self._subscription = app.store.subscribe(self._my_job, self._render_job, init=False)
 
-    def on_unmount(self) -> None:
+    @override
+    def _release_on_prune(self) -> None:
+        # The app store outlives this screen.
         if self._subscription is not None:
             self._subscription.unsubscribe()
+
+    def on_unmount(self) -> None:
+        # Covers an unmount without a prune; a no-op after one.
+        self._release_on_prune()
 
     def _my_job(self, model: AppModel) -> Job | FinishedJob | None:
         """This screen's job, live (``AppModel.jobs``) or finished

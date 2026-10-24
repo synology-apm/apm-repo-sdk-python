@@ -42,11 +42,13 @@ from .api import (
     Symptom,
     TraceEvent,
     VerifyLevel,
+    VerifyTuning,
     Version,
     VersionLocation,
     Workload,
     WorkloadFrame,
     find_path_with_children,
+    validate_key_string,
 )
 from .catalog.version import (
     VersionMeta,
@@ -61,6 +63,7 @@ from .errors import (
     ContentUnavailableError,
     DataCorruptError,
     FormatError,
+    InvalidArgumentError,
     KeyMaterialError,
     KeyMismatchError,
     KeyRequiredError,
@@ -140,6 +143,7 @@ __all__ = [
     "Finding",
     "FormatError",
     "Frame",
+    "InvalidArgumentError",
     "ItemColumns",
     "KeyMaterialError",
     "KeyMismatchError",
@@ -181,6 +185,7 @@ __all__ = [
     "UnsupportedDataFormatError",
     "UnsupportedVersionError",
     "VerifyLevel",
+    "VerifyTuning",
     "Version",
     "VersionId",
     "VersionLocation",
@@ -199,4 +204,5 @@ __all__ = [
     "find_path_with_children",
     "node_kind_label",
     "read_site_list_items",
+    "validate_key_string",
 ]

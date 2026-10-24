@@ -31,7 +31,13 @@ from textual.widgets import Button, Checkbox, DirectoryTree, Input, OptionList, 
 from textual.worker import Worker
 
 from synology_apm_repo.browser.runtime.connect import local_store, remote_store, scan_repositories
-from synology_apm_repo.browser.screens._shared import AppStateMixin, modal_box_css, move_cursor_to_parent, show_error
+from synology_apm_repo.browser.screens._shared import (
+    AppStateMixin,
+    ReleasesOnPrune,
+    modal_box_css,
+    move_cursor_to_parent,
+    show_error,
+)
 from synology_apm_repo.browser.screens.profile_manager import SavedProfileManager, profile_backend_of
 from synology_apm_repo.browser.screens.remote_browser import RemoteOptionsBrowser
 from synology_apm_repo.browser.strings import (
@@ -108,7 +114,7 @@ _DISABLE_WHILE_SCANNING_IDS = (
 ConnectResult = tuple[list[Repository], str]
 
 
-class ConnectDialog(AppStateMixin, ModalScreen[ConnectResult | None]):
+class ConnectDialog(ReleasesOnPrune, AppStateMixin, ModalScreen[ConnectResult | None]):
     """Keeps no ``COMMON_BINDINGS``: the App's ``q``/``d``/``?`` don't reach
     past a modal."""
 

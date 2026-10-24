@@ -5,7 +5,11 @@ from __future__ import annotations
 from collections.abc import Callable
 from typing import TYPE_CHECKING
 
-from synology_apm_repo.browser.strings import GOTO_REF_NOT_CANONICAL_WARNING, GOTO_REF_PARSE_ERROR_WARNING
+from synology_apm_repo.browser.strings import (
+    GOTO_REF_MISSING_SIGIL_WARNING,
+    GOTO_REF_NOT_CANONICAL_WARNING,
+    GOTO_REF_PARSE_ERROR_WARNING,
+)
 from synology_apm_repo.browser.widgets.progress_hint import DebouncedProgress
 from synology_apm_repo.sdk import ApmRepoError, NodeRef, RefKind
 
@@ -22,6 +26,9 @@ def parse_canonical_ref(text: str, *, notify: Callable[..., None]) -> NodeRef | 
         node_ref = NodeRef.parse(text.strip())
     except ValueError:
         notify(GOTO_REF_PARSE_ERROR_WARNING, severity="warning")
+        return None
+    if node_ref.kind is RefKind.HUMAN and node_ref.segments and node_ref.segments[0].startswith("cat:"):
+        notify(GOTO_REF_MISSING_SIGIL_WARNING, severity="warning")
         return None
     if node_ref.kind is not RefKind.CANONICAL or node_ref.canonical_ids is None:
         notify(GOTO_REF_NOT_CANONICAL_WARNING, severity="warning")

@@ -4,8 +4,9 @@ pager named is a binary that doesn't exist."""
 
 from __future__ import annotations
 
+import json
 import subprocess
-from io import StringIO
+from io import BytesIO, StringIO, TextIOWrapper
 
 import pytest
 from rich.console import Console
@@ -86,6 +87,23 @@ class TestRender:
         render(console, CliState(json=False), json=None, human=lambda: console.print("paged output"), page=True)
         assert shown and "paged output" in shown[0]
 
+    def test_json_mode_is_ascii_escaped_on_a_non_utf8_console_and_parses_back(self) -> None:
+        raw = BytesIO()
+        stream = TextIOWrapper(raw, encoding="cp950", errors="backslashreplace", write_through=True)
+        render(Console(file=stream), CliState(json=True), json={"name": "名稱 😋"}, human=lambda: None)
+        assert json.loads(raw.getvalue().decode("ascii")) == {"name": "名稱 😋"}
+
+    def test_json_mode_treats_the_cp65001_alias_as_utf8(self) -> None:
+        raw = BytesIO()
+        stream = TextIOWrapper(raw, encoding="cp65001", write_through=True)
+        render(Console(file=stream), CliState(json=True), json={"name": "名稱"}, human=lambda: None)
+        assert '"名稱"' in raw.getvalue().decode("utf-8")
+
+    def test_json_mode_keeps_non_ascii_text_on_a_utf8_console(self) -> None:
+        buffer = StringIO()  # Rich treats an encoding-less file as UTF-8
+        render(Console(file=buffer), CliState(json=True), json={"name": "名稱"}, human=lambda: None)
+        assert '"名稱"' in buffer.getvalue()
+
     def test_page_true_is_ignored_under_json(self) -> None:
         buffer = StringIO()
         console = Console(file=buffer, force_terminal=True)
@@ -97,15 +115,15 @@ class TestRender:
 
 class TestSubprocessPager:
     def test_shows_content_via_the_configured_pager(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        calls: list[tuple[list[str], str]] = []
+        calls: list[tuple[list[str], str, str]] = []
 
-        def _fake_run(argv: list[str], *, input: str, text: bool, check: bool) -> object:  # noqa: A002 - subprocess.run's own keyword
-            calls.append((argv, input))
+        def _fake_run(argv: list[str], *, input: str, text: bool, errors: str, check: bool) -> object:  # noqa: A002 - subprocess.run's own keyword
+            calls.append((argv, input, errors))
             return None
 
         monkeypatch.setattr(subprocess, "run", _fake_run)
         _SubprocessPager(["less", "-FIRX"]).show("some content")
-        assert calls == [(["less", "-FIRX"], "some content")]
+        assert calls == [(["less", "-FIRX"], "some content", "backslashreplace")]
 
     def test_falls_back_to_printing_directly_when_the_pager_binary_is_missing(
         self, capsys: pytest.CaptureFixture[str]

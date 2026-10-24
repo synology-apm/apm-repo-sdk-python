@@ -26,6 +26,7 @@ import base64
 import binascii
 import hashlib
 import re
+import struct
 
 from cryptography.exceptions import InvalidTag
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
@@ -56,17 +57,21 @@ _USER_KEY_ID_PATH_SEPARATORS = re.compile(r"[/\\]")
 _OFF_AHLT_IV = 8
 _AHLT_IV_LEN = 16
 
+_IV_PACK = struct.Struct(">QQ").pack
+"""``_IV_PACK(a, a)`` is the chunk IV for raw ``uint64`` chunk address ``a``."""
+
 
 def chunk_iv(addr: ChunkAddress) -> bytes:
     """16-byte AES-CTR IV for one chunk: its own 64-bit ``ChunkAddress``,
     big-endian, repeated twice (FORMAT-SPEC.md: Chunk pool encryption)."""
-    half = addr.to_int().to_bytes(8, "big")
-    return half + half
+    address = addr.to_int()
+    return _IV_PACK(address, address)
 
 
 def build_aes_algorithm(vault_key: bytes) -> algorithms.AES:
     """Build one AES-256 key-schedule object from ``vault_key``, for a caller
-    decrypting many chunks with one key (``decrypt_chunk``'s ``algorithm=``).
+    decrypting many chunks with one key (the ``algorithm=`` of
+    ``decrypt_chunk`` and ``ChunkDecryptor``).
 
     Nothing here caches it; the caller does, for the lifetime of whatever
     owns ``vault_key`` (``Pool``).
@@ -82,10 +87,8 @@ def build_aes_algorithm(vault_key: bytes) -> algorithms.AES:
 def _aes_ctr_decrypt(
     vault_key: bytes, iv: bytes, ciphertext: bytes | bytearray | memoryview, *, algorithm: algorithms.AES | None = None
 ) -> bytes:
-    """AES-256-CTR-decrypt ``ciphertext`` with ``iv``; shared by the ``aHlT``,
-    ``version_spec`` and per-chunk paths, which differ only in their IV.
-    ``algorithm``, when given, replaces building a key schedule from
-    ``vault_key`` (see ``build_aes_algorithm``)."""
+    """AES-256-CTR-decrypt ``ciphertext`` with ``iv``. ``algorithm``, when
+    given, replaces building a key schedule from ``vault_key``."""
     if algorithm is None:
         algorithm = algorithms.AES(vault_key)
     decryptor = Cipher(algorithm, modes.CTR(iv)).decryptor()
@@ -96,18 +99,14 @@ def decrypt_chunk(
     vault_key: bytes, addr: ChunkAddress, ciphertext: bytes | memoryview, *, algorithm: algorithms.AES | None = None
 ) -> bytes:
     """AES-256-CTR-decrypt one chunk's ciphertext (no decompression; see
-    ``compression``).
-
-    A prebuilt ``algorithm`` (from ``build_aes_algorithm``) skips building the
-    key schedule; it must come from the same ``vault_key`` (not checked).
-    Each call uses its own ``Cipher``: every chunk's counter starts at its own
-    ``chunk_iv``, so one decryptor streamed across chunks would be wrong
-    (``ChunkDecryptor`` re-nonces one instead, for many chunks).
+    ``compression``). Many chunks decrypt cheaper through ``ChunkDecryptor``.
 
     Args:
         vault_key: The DEK; unused when ``algorithm`` is given.
         addr: The chunk's address, which derives the IV.
         ciphertext: ``bytes`` or a ``memoryview`` (not copied).
+        algorithm: The DEK's prebuilt key schedule (``build_aes_algorithm``),
+            not checked against ``vault_key``.
 
     Returns:
         The plaintext (still compressed, if the chunk was).
@@ -124,9 +123,8 @@ def decrypt_chunk(
 
 class ChunkDecryptor:
     """``decrypt_chunk`` for many chunks: one AES-256-CTR context, re-nonced
-    with each chunk's own ``chunk_iv`` (building a context per chunk costs
-    several times the decryption itself). A context is not thread-safe: use
-    one instance per thread.
+    with each chunk's own IV. ``vault_key`` and ``algorithm`` are as
+    ``decrypt_chunk``'s. Not thread-safe: use one instance per thread.
 
     Raises:
         KeyMaterialError: ``vault_key`` is not 32 bytes and no ``algorithm``
@@ -138,9 +136,10 @@ class ChunkDecryptor:
             algorithm = build_aes_algorithm(vault_key)
         self._context = Cipher(algorithm, modes.CTR(bytes(16))).decryptor()
 
-    def decrypt(self, addr: ChunkAddress, ciphertext: bytes | memoryview) -> bytes:
-        """One chunk's ciphertext decrypted, as ``decrypt_chunk`` would."""
-        self._context.reset_nonce(chunk_iv(addr))
+    def decrypt(self, address: int, ciphertext: bytes | memoryview) -> bytes:
+        """One chunk's ciphertext decrypted, as ``decrypt_chunk`` would.
+        ``address`` is the chunk's raw ``uint64`` form (``ChunkAddress.to_int()``)."""
+        self._context.reset_nonce(_IV_PACK(address, address))
         return self._context.update(ciphertext)
 
 

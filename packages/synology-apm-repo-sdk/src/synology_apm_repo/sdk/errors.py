@@ -7,8 +7,9 @@ Every ``ApmRepoError`` carries two optional pieces of context:
 - ``spec``: the ``FORMAT-SPEC.md`` subsection explaining why this is an
   error.
 
-The hierarchy covers repository data, backend and worker failures;
-argument and programmer errors raise stdlib ``ValueError``/``IndexError``.
+The hierarchy covers repository data, backend and worker failures, and
+``InvalidArgumentError``; other argument and programmer errors raise stdlib
+``ValueError``/``IndexError``.
 Names avoid shadowing builtins such as ``KeyError``.
 """
 
@@ -53,6 +54,14 @@ class DataCorruptError(FormatError):
     """An integrity check failed: a magic, CRC32 or other self-consistency
     check did not match, so the bytes did not survive intact."""
 
+    @classmethod
+    def from_missing(cls, exc: NotFoundError) -> DataCorruptError:
+        """``exc``'s message, ``ref`` and ``spec`` as corruption: for a file
+        the repository's own records name (a listing, a probe that just
+        found it), absent is damage, not a lookup miss. Raise it ``from
+        exc``."""
+        return cls(exc.safe_message, ref=exc.ref, spec=exc.spec)
+
 
 class UnsupportedVersionError(FormatError):
     """The on-disk format version is one this SDK does not read: a newer
@@ -78,6 +87,12 @@ class KeyRequiredError(KeyMaterialError):
 class KeyMismatchError(KeyMaterialError):
     """The supplied key does not unwrap this repository's VaultKey, or was
     already rejected by ``Repository.set_key()`` (FORMAT-SPEC.md: Key hierarchy)."""
+
+
+class InvalidArgumentError(ApmRepoError, ValueError):
+    """The caller's ref or path cannot be acted on as given — malformed
+    past parsing, too short, or matching several candidates — as opposed
+    to naming something that does not exist. Also a ``ValueError``."""
 
 
 class NotFoundError(ApmRepoError):

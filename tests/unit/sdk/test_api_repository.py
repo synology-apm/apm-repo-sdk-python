@@ -33,8 +33,8 @@ from synology_apm_repo.sdk.catalog.version import Version
 from synology_apm_repo.sdk.catalog.workload import Workload
 from synology_apm_repo.sdk.dedup.keys import KeyMaterial, KeyVerification
 from synology_apm_repo.sdk.dedup.repository import DedupRepo
-from synology_apm_repo.sdk.errors import KeyMismatchError, KeyRequiredError, NotFoundError
-from synology_apm_repo.sdk.findings import Finding, Stage, Symptom
+from synology_apm_repo.sdk.errors import InvalidArgumentError, KeyMismatchError, KeyRequiredError, NotFoundError
+from synology_apm_repo.sdk.findings import Finding, Stage, Symptom, VerifyTuning
 from synology_apm_repo.sdk.identifiers import (
     CatalogId,
 )
@@ -230,6 +230,44 @@ async def test_set_key_reports_a_failed_reopen_in_the_result(monkeypatch: pytest
     assert "1 open catalog" in result.warning
     # The key was accepted, so key_status still reflects the verification.
     assert repo.key_status is api.KeyStatus.VERIFIED
+
+
+async def test_set_key_reopens_catalogs_concurrently_and_reports_failures_in_catalog_order(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    layout = RepositoryLayout(
+        kind=RepoKind.OBJECT_STORE, repo_root="", key_root="@ActiveProtectKey", catalog_ids=["a", "b", "c"]
+    )
+    repo = repo_with_fake_dedup(
+        monkeypatch, FakeDedupRepo(vault_layout()), keys=None, key_verification=None, layout=layout, connections=[]
+    )
+    patch_dedup_open(monkeypatch)  # a FakeDedupRepo of its own per catalog
+    for index in range(3):
+        await repo._open_catalogs.resolve(index)
+
+    monkeypatch.setattr(KeyMaterial, "verify", async_returning(KeyVerification(gcm_ok=True, vault_key=b"x" * 32)))
+    in_flight: list[str] = []
+    most_in_flight = 0
+
+    async def reopen(store: object, catalog_layout: RepoLayout, keys: object, **k: object) -> DedupRepo:
+        nonlocal most_in_flight
+        in_flight.append(str(catalog_layout.repo_id))
+        most_in_flight = max(most_in_flight, len(in_flight))
+        await asyncio.sleep(0)  # each reopen yields once: concurrent ones all start before any ends
+        # "c" fails first, so the result's order is the catalogs' own, not completion order.
+        if catalog_layout.repo_id == "b":
+            await asyncio.sleep(0)
+        in_flight.remove(str(catalog_layout.repo_id))
+        if catalog_layout.repo_id == "a":
+            return as_dedup_repo(FakeDedupRepo(catalog_layout))
+        raise KeyMismatchError(f"reopen of {catalog_layout.repo_id} failed")
+
+    patch_dedup_open(monkeypatch, reopen)
+
+    result = await repo.set_key("good-id-0000@" + VALID_B64_KEY)
+
+    assert most_in_flight == 3
+    assert [str(exc) for exc in result.reopen_errors] == ["reopen of b failed", "reopen of c failed"]
 
 
 async def test_set_key_still_attempts_every_close_when_an_earlier_reopen_succeeded(
@@ -508,24 +546,25 @@ async def test_repository_verify_raises_key_mismatch_when_key_invalid() -> None:
 
 async def test_repository_verify_succeeds_when_not_encrypted(monkeypatch: pytest.MonkeyPatch) -> None:
     """An unencrypted repository passes the gate and reaches the reachability
-    walk once per opened ``DedupRepo``."""
+    walk once per opened ``DedupRepo``, with the given tuning."""
     fake_repo = FakeDedupRepo(vault_layout())
     repo = repo_with_fake_dedup(monkeypatch, fake_repo, encrypted=False, connections=[])
     sentinel = [Finding(stage=Stage.REPO_INFO, symptom=Symptom.MISMATCH, path="p", detail="d")]
-    calls: list[object] = []
+    calls: list[tuple[object, object]] = []
+    tuning = VerifyTuning(max_concurrent_reads=3)
 
     async def fake_verify_reachable(
-        dedup_repo: object, level: object, *, progress: object = None, executor: object = None
+        dedup_repo: object, level: object, *, progress: object = None, executor: object = None, tuning: object = None
     ) -> list[Finding]:
-        calls.append(dedup_repo)
+        calls.append((dedup_repo, tuning))
         return sentinel
 
     monkeypatch.setattr(api_repository, "verify_reachable", fake_verify_reachable)
 
-    result = await repo.verify()
+    result = await repo.verify(tuning=tuning)
 
     assert result == sentinel
-    assert calls == [fake_repo]
+    assert calls == [(fake_repo, tuning)]
 
 
 # -- file_map_tree -------------------------------------------------
@@ -612,6 +651,7 @@ async def test_invalidate_caches_rereads_the_connection_list_after_the_db_source
     assert refreshed.connections == fresh
     assert refreshed.dedup_repo is first.dedup_repo  # in place: the catalog's DedupRepo is kept
     assert refreshed.saas_streams is first.saas_streams
+    assert not refreshed.saas_streams._closed  # invalidated, still serving lookups
 
 
 async def test_invalidate_caches_keeps_the_connection_list_when_db_sources_is_not_named(
@@ -1023,6 +1063,16 @@ async def test_locate_human_ref_one_segment_returns_catalog_frame(monkeypatch: p
     assert frame.catalog.connection is connection
 
 
+@pytest.mark.parametrize("first", ["cat:1", "raw"])
+async def test_a_ref_written_without_the_at_sigil_hints_at_it(monkeypatch: pytest.MonkeyPatch, first: str) -> None:
+    repo = _repo_with_catalog_stubs(monkeypatch, connections=[make_connection()])
+    with pytest.raises(NotFoundError, match="canonical and raw refs start with '@'") as caught:
+        await repo.locate(NodeRef.parse(f"#{first}/wl:2/ver:x"))
+    assert caught.value.safe_message == (
+        f"no backup source named {first!r} — canonical and raw refs start with '@' (#@{first}/…)"
+    )
+
+
 async def test_locate_human_ref_unknown_catalog_raises_not_found(monkeypatch: pytest.MonkeyPatch) -> None:
     repo = _repo_with_catalog_stubs(monkeypatch, connections=[make_connection()])
     with pytest.raises(NotFoundError, match="no backup source named"):
@@ -1047,7 +1097,7 @@ async def test_locate_human_ref_unknown_workload_raises_not_found(monkeypatch: p
         await repo.locate(NodeRef.human("", connection.display_name, "NoSuchWorkload"))
 
 
-async def test_locate_human_ref_ambiguous_workload_raises_not_found_with_candidates(
+async def test_locate_human_ref_ambiguous_workload_raises_invalid_argument_with_candidates(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     # Same display_name and sub_type: a collision, not a miss, so the message
@@ -1060,7 +1110,7 @@ async def test_locate_human_ref_ambiguous_workload_raises_not_found_with_candida
         workload_id=2, workload_uid="wl-b", workload_type="M365", sub_type="MAIL", display_name="Alice"
     )
     repo = _repo_with_catalog_stubs(monkeypatch, connections=[connection], workloads=[dup_a, dup_b])
-    with pytest.raises(NotFoundError, match="workload named 'Alice' is ambiguous \\(2 matches\\) — use one of:"):
+    with pytest.raises(InvalidArgumentError, match="workload named 'Alice' is ambiguous \\(2 matches\\) — use one of:"):
         await repo.locate(NodeRef.human("", connection.display_name, dup_a.display_name))
 
 
@@ -1145,7 +1195,7 @@ async def test_locate_human_ref_releases_the_provider_when_an_item_segment_fails
 
 
 async def test_locate_raw_ref_releases_the_provider_when_no_node_matches(monkeypatch: pytest.MonkeyPatch) -> None:
-    root_node = Node(ref=NodeRef("", ("raw",)), name="root", is_leaf=False)
+    root_node = Node(ref=NodeRef.raw("", ""), name="root", is_leaf=False)
     provider = _FakeWalkProvider(root_node, {})
     repo = _repo_with_catalog_stubs(monkeypatch)
     monkeypatch.setattr(api_repository, "FileMapTreeProvider", lambda r: provider)
@@ -1164,7 +1214,7 @@ async def test_locate_reports_not_found_even_when_releasing_the_provider_fails(
         async def close(self) -> None:
             raise OSError("close failed")
 
-    provider = _FailingClose(Node(ref=NodeRef("", ("raw",)), name="root", is_leaf=False), {})
+    provider = _FailingClose(Node(ref=NodeRef.raw("", ""), name="root", is_leaf=False), {})
     repo = _repo_with_catalog_stubs(monkeypatch)
     monkeypatch.setattr(api_repository, "FileMapTreeProvider", lambda r: provider)
 

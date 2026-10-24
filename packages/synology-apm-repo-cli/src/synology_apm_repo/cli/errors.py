@@ -89,8 +89,9 @@ async def unwrap[T](awaitable: Awaitable[T], *, verbose: bool = False) -> T:
         fail(friendly_message(exc, verbose=verbose), cause=exc)
 
 
-def require_one_of(repo: str | None, profile: str | None) -> None:
+def require_one_of(ctx: typer.Context, repo: str | None, profile: str | None) -> None:
     """Refuse to continue unless exactly one of REPO/``--profile`` is
-    given — the guard shared by ``doctor``/``key``/``verify``."""
+    given — the guard shared by ``doctor``/``key``/``verify``. A mismatch
+    is a usage error: Click's own exit 2, with the command's usage line."""
     if (repo is None) == (profile is None):
-        fail("give exactly one of REPO or --profile")
+        ctx.fail("give exactly one of REPO or --profile")

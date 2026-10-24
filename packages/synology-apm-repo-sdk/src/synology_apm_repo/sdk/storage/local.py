@@ -6,6 +6,7 @@ from __future__ import annotations
 import asyncio
 import dataclasses
 import os
+import stat
 import struct
 import sys
 from pathlib import Path, PurePosixPath
@@ -168,9 +169,12 @@ class LocalFsStore:
     def _size_sync(self, path: str) -> int:
         p = self.local_path(path)
         try:
-            return p.stat().st_size
+            st = p.stat()
         except OSError as exc:
             raise _mapped_os_error(exc, path) from exc
+        if stat.S_ISDIR(st.st_mode):
+            raise NotFoundError("is a directory, not a file", ref=path)
+        return st.st_size
 
     def _exists_sync(self, path: str) -> bool:
         try:

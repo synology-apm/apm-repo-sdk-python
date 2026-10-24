@@ -34,7 +34,7 @@ def run(ctx: SmokeContext) -> None:
     )
 
     # --quiet gates confirmation lines, never error output.
-    bad_ref = f"{repo_path}#cat:not-a-real-id"
+    bad_ref = f"{repo_path}#@cat:not-a-real-id"
     quiet_error = ctx.run(
         "global_flags", "global_flags.quiet.errors_still_show", "--quiet", "ls", bad_ref, expect_exit=1
     )

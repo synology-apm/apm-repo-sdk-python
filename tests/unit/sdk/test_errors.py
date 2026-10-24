@@ -34,6 +34,13 @@ def test_none_of_the_hierarchy_shadows_builtin_keyerror() -> None:
             assert not issubclass(obj, KeyError)
 
 
+def test_a_missing_file_the_records_name_becomes_corruption() -> None:
+    missing = errors.NotFoundError("no such file", ref="db/x", spec="FORMAT-SPEC.md: X")
+    corrupt = errors.DataCorruptError.from_missing(missing)
+    assert type(corrupt) is errors.DataCorruptError
+    assert (corrupt.safe_message, corrupt.ref, corrupt.spec) == ("no such file", "db/x", "FORMAT-SPEC.md: X")
+
+
 def test_message_includes_ref_and_spec() -> None:
     exc = errors.NotFoundError("no such file", ref="db/file_map", spec="FORMAT-SPEC.md: repo_info")
     text = str(exc)

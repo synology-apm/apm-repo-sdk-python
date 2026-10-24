@@ -36,7 +36,7 @@ from collections import OrderedDict
 from collections.abc import AsyncIterator
 from typing import override
 
-from ..._util.closing import AsyncClosing, close_all
+from ..._util.closing import AsyncClosing, close_all, run_to_completion
 from ...asynccache import AsyncKeyedCache, CacheStats
 from ...cachemanager import DEFAULT_LIMITS
 from ...catalog.version import Version
@@ -102,9 +102,7 @@ class SaasStream(AsyncClosing):
         # connection. Bounded by construction: a bare file and one
         # generation for each of the two logical names.
         self._sources: AsyncKeyedCache[str, SqliteSource] = AsyncKeyedCache(self._fetch_source)
-        # Whether each bare db file exists, asked once per file: version_info and
-        # stream_info both look at saas_version. Keys are the two bare paths.
-        self._bare_exists: AsyncKeyedCache[str, bool] = AsyncKeyedCache(self._fetch_bare_exists)
+        self._closed = False
         # Single-value caches (key None): fixed for this instance's lifetime.
         self._candidate_middles_cache: AsyncKeyedCache[None, list[str]] = AsyncKeyedCache(self._fetch_candidate_middles)
         self._generations_cache: AsyncKeyedCache[None, list[tuple[int, str]]] = AsyncKeyedCache(self._fetch_generations)
@@ -121,21 +119,24 @@ class SaasStream(AsyncClosing):
     @override
     async def close(self) -> None:
         """Close every SQLite connection this instance opened, including
-        one still being opened when this is called."""
-        self._table_cache.invalidate()
+        one still being opened when this is called; open none afterwards."""
+        self._closed = True
         sources, _errors = await self._sources.settle_all()
-        try:
-            await close_all([source.close for source in sources.values()], "closing a SaaS stream's sources failed")
-        finally:
-            self._sources.invalidate()
-            self._bare_exists.invalidate()
+        # No await before the clears (settle_all's contract).
+        self._table_cache.invalidate()
+        self._sources.invalidate()
+        # Already cleared: a cancelled sweep must still close them all.
+        await run_to_completion(
+            close_all([source.close for source in sources.values()], "closing a SaaS stream's sources failed")
+        )
 
     # -- db connections -------------------------------------------------
 
     async def _candidate_paths(self, logical_name: str) -> AsyncIterator[str]:
         """The physical files ``logical_name`` (``"saas_snapshot"``/
-        ``"saas_version"``) might live in, best first, produced lazily so a
-        healthy bare file costs no directory listing.
+        ``"saas_version"``) might live in, best first, both answered from one
+        listing of the stream's ``db/`` (the listing opening a file needs
+        anyway for its sidecars).
 
         The bare, un-suffixed name comes first when present — the connector
         writes live updates to it directly, only rotating to a numbered
@@ -149,20 +150,27 @@ class SaasStream(AsyncClosing):
         """
         db_dir = f"{self._stream_root}/db"
         bare = f"{db_dir}/{logical_name}"
-        if await self._bare_exists.resolve(bare):
-            yield bare
         index = await self._dir_cache.grouped(db_dir)
+        if logical_name in index.get(logical_name, ()):
+            yield bare
         generation = f"{db_dir}/{resolve_seq_file(index, logical_name, ref=bare)}"
         if generation != bare:
             yield generation
 
-    async def _fetch_bare_exists(self, bare: str) -> bool:
-        return await self._repo.store.exists(bare)
-
     async def _fetch_source(self, path: str) -> SqliteSource:
         """``_sources``' fetch. Both db files are never ``aHlT``-enveloped,
-        so no ``vault_key`` is needed."""
-        return await SqliteSource.from_raw_store(self._repo.store, path)
+        so no ``vault_key`` is needed. Refuses once closed: a source opened
+        after ``close()`` would never be closed."""
+        if self._closed:
+            raise RuntimeError("SaasStream is closed")
+        # One listing of the stream's db/ answers for every file's sidecars.
+        listing = await self._dir_cache.entry_sizes(path.rsplit("/", 1)[0])
+        try:
+            return await SqliteSource.from_raw_store(self._repo.store, path, listing=listing)
+        except NotFoundError as exc:
+            # Candidates come from a listing: gone now is damage, which
+            # _open_table falls back from like an unreadable file.
+            raise DataCorruptError.from_missing(exc) from exc
 
     async def _open_table(self, logical_name: str, table_name: str, columns: list[Column]) -> Table:
         """``table_name`` from ``logical_name``'s first candidate file that
@@ -277,7 +285,7 @@ class SaasStream(AsyncClosing):
         snap_row = await snap_table.select_one("snapshot_uuid = ?", (version.saas_snapshot_uuid,))
         if snap_row is None:
             raise NotFoundError(
-                f"no snapshot_info row for snapshot_uuid={version.saas_snapshot_uuid!r}",
+                "this version's snapshot is missing from its backup stream",
                 ref=self._stream_root,
             )
         snapshot_id = as_int(snap_row["snapshot_id"])
@@ -288,7 +296,7 @@ class SaasStream(AsyncClosing):
         )
         if ver_row is None:
             raise NotFoundError(
-                f"no version_info row for snapshot_id={snapshot_id!r} version_id={version.saas_version_id!r}",
+                "this version is missing from its backup stream",
                 ref=self._stream_root,
             )
         return as_int(ver_row["stream_version"])
@@ -343,7 +351,9 @@ class SaasStreamCache(AsyncClosing):
     off. SaaS providers borrow streams from it and never close them.
 
     Holds at most ``maxsize`` streams, evicting the least recently used
-    one not in use (see ``_stream_for``). Closing it closes every stream.
+    one not in use (see ``_stream_for``). ``invalidate()`` (the
+    ``saas_streams`` cache-invalidation hook) closes every stream and keeps
+    serving; ``close()`` also refuses every later lookup.
 
     Raises:
         ValueError: ``maxsize`` is less than 1.
@@ -358,6 +368,7 @@ class SaasStreamCache(AsyncClosing):
         # Per-key count of in-flight resolve_saas_obj calls; _stream_for
         # never evicts a key in use.
         self._in_use: dict[tuple[int, str], int] = {}
+        self._closed = False
         self._hits = 0
         self._misses = 0
         self._evictions = 0
@@ -380,7 +391,10 @@ class SaasStreamCache(AsyncClosing):
         ``maxsize`` rather than closing one in use.
 
         The caller marks ``key`` in ``_in_use`` first, so a concurrent
-        eviction can't pick it."""
+        eviction can't pick it. Refuses once closed: a stream created after
+        ``close()`` would never be closed."""
+        if self._closed:
+            raise RuntimeError("SaasStreamCache is closed")
         stream = self._streams.get(key)
         if stream is not None:
             self._hits += 1
@@ -425,9 +439,18 @@ class SaasStreamCache(AsyncClosing):
             else:
                 self._in_use[key] = remaining
 
-    @override
-    async def close(self) -> None:
+    async def invalidate(self) -> None:
+        """Close and drop every stream; the next lookup builds a fresh one."""
         streams = list(self._streams.values())
         self._streams.clear()
         self._in_use.clear()
-        await close_all([s.close for s in streams], "SaasStreamCache.close() failed to close every tracked stream")
+        # Already dropped: a cancelled sweep must still close them all.
+        await run_to_completion(
+            close_all([s.close for s in streams], "SaasStreamCache failed to close every tracked stream")
+        )
+
+    @override
+    async def close(self) -> None:
+        """``invalidate()``, then refuse every later lookup."""
+        self._closed = True
+        await self.invalidate()

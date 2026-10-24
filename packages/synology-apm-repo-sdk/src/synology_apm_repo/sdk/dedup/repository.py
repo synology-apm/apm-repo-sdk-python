@@ -17,7 +17,7 @@ from typing import Self, override
 
 import aiosqlite
 
-from .._util.closing import RESOURCE_CLOSE_TIMEOUT, AsyncClosing, close_each, leaf_exceptions
+from .._util.closing import RESOURCE_CLOSE_TIMEOUT, AsyncClosing, close_each, leaf_exceptions, run_to_completion
 from ..asynccache import AsyncKeyedCache
 from ..cachemanager import DEFAULT_LIMITS, CacheLimits, CacheManager
 from ..errors import DataCorruptError, KeyRequiredError, NotFoundError
@@ -173,6 +173,7 @@ class DedupRepo(AsyncClosing):
         self._file_meta_table_cache: AsyncKeyedCache[None, Table | None] = self.caches.keyed(
             "file_meta_table", self._build_file_meta_table, maxsize=1
         )
+        self._closed = False
         self._composition_records: AsyncKeyedCache[tuple[StreamId, SessionId, int], CompositionRecord] = (
             self.caches.keyed("composition_records", maxsize=limits.composition_records)
         )
@@ -300,10 +301,12 @@ class DedupRepo(AsyncClosing):
 
         Raises:
             NotFoundError: No such db file.
-            DataCorruptError: The file is not a readable sqlite database.
+            DataCorruptError: The file is not a readable sqlite database, or
+                is gone although db/ lists it.
             ResourceLimitExceededError: The slow path's private copy doesn't
                 fit in the temp directory with its free-space reserve left.
             ValueError: ``name`` is not in ``DB_SOURCE_NAMES``.
+            RuntimeError: The repository is closed.
         """
         name = PHYSICAL_NAME_ALIASES.get(name, name)
         if name not in DB_SOURCE_NAMES:
@@ -313,9 +316,19 @@ class DedupRepo(AsyncClosing):
 
     async def _build_db_source(self, name: str) -> SqliteSource:
         """``self._db_sources``'s fetch — ``name`` is already alias-resolved
-        by ``db`` before this runs."""
+        by ``db`` before this runs. Refuses once closed: a source opened
+        after ``close()`` would never be closed."""
+        if self._closed:
+            raise RuntimeError("DedupRepo is closed")
         path = await _resolve_versioned(self._store, self._fixed_dir_cache, self.layout, self._db_root, name)
-        return await SqliteSource.from_raw_store(self._store, path)
+        # Resolving the generation listed db/ already: it answers for the sidecars.
+        listing = await self._fixed_dir_cache.entry_sizes(self._db_root)
+        try:
+            return await SqliteSource.from_raw_store(self._store, path, listing=listing)
+        except NotFoundError as exc:
+            # Listed, so it must open: gone now is damage (an absent db is
+            # the NotFoundError _resolve_versioned raised above).
+            raise DataCorruptError.from_missing(exc) from exc
 
     async def locate_file(self, path: str) -> FileLocation:
         """Look up ``path`` in ``db/file_map`` and supplement it with
@@ -449,19 +462,26 @@ class DedupRepo(AsyncClosing):
         )
 
     async def _close_db_sources(self, cache: AsyncKeyedCache[str, SqliteSource]) -> None:
-        """``db_sources``' invalidate hook: settle in-flight fetches, then give
-        every source a close attempt (each bounded by a timeout) before the
-        cache is cleared.
+        """``db_sources``' invalidate hook: settle in-flight fetches, clear the
+        cache, then give every source a close attempt (each bounded by a
+        timeout). A ``db()`` call during the closes opens a fresh source,
+        unless ``close()`` is what's running.
 
         Raises:
             ExceptionGroup: One or more sources failed to settle or close.
         """
-        # A Table is bound to a connection about to be closed, so it goes first
-        # even when only db_sources was named (not just under invalidate_all()).
-        self._file_meta_table_cache.invalidate()
         sources, errors = await cache.settle_all()
-        errors.extend(await close_each((s.close for s in sources.values()), per_close_timeout=RESOURCE_CLOSE_TIMEOUT))
+        # No await before the clears (settle_all's contract). A Table is bound
+        # to a connection about to be closed, so it goes too, even when only
+        # db_sources was named.
+        self._file_meta_table_cache.invalidate()
         cache.invalidate()
+        # Already cleared: a cancelled sweep must still close them all.
+        errors.extend(
+            await run_to_completion(
+                close_each((s.close for s in sources.values()), per_close_timeout=RESOURCE_CLOSE_TIMEOUT)
+            )
+        )
         if errors:
             raise ExceptionGroup("db source close failed", errors)
 
@@ -477,6 +497,7 @@ class DedupRepo(AsyncClosing):
         Raises:
             ExceptionGroup: One or more resources failed to close.
         """
+        self._closed = True
         try:
             await self.caches.invalidate_all()
         except ExceptionGroup as group:

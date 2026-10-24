@@ -13,6 +13,7 @@ from typing import BinaryIO, Self
 from ....errors import ContentUnavailableError
 from ....units.provider_kit import dir_first_sort_key
 from ...base import ContentSource
+from ..readahead import SequentialReadahead
 from ._apfs import _APFS_FORMAT
 from ._base import _DirEntry, _Format
 from ._base import _try_import as _try_import
@@ -83,16 +84,18 @@ def _build_bridge(content: ContentSource, loop: asyncio.AbstractEventLoop) -> Bi
     """A blocking ``dissect.util.stream.AlignedStream`` over the async
     ``content``. Must be read from a worker thread, never from ``loop``
     itself: each read runs on ``loop`` and blocks the calling thread until
-    it completes."""
+    it completes. Reads go through one ``SequentialReadahead``, which holds
+    up to its ``MAX_BYTES`` while Dissect reads and nothing once it stops."""
     stream_mod = _try_import("dissect.util.stream")
     assert stream_mod is not None  # caller (open()) already confirmed a dissect package is installed
+    readahead = SequentialReadahead(content.read, content.size or 0)
 
     class _Bridge(stream_mod.AlignedStream):  # type: ignore[name-defined,misc]
         def __init__(self) -> None:
             super().__init__(size=content.size or 0)
 
         def _read(self, offset: int, length: int) -> bytes:
-            future = asyncio.run_coroutine_threadsafe(content.read(offset, length), loop)
+            future = asyncio.run_coroutine_threadsafe(readahead.read(offset, length), loop)
             # Dissect is typed for, and may cache or hash, bytes.
             return bytes(future.result())
 
@@ -120,7 +123,7 @@ class _DissectEntry:
         if reason is not None:
             raise ContentUnavailableError(reason)
         size = self._fmt.size(entry)
-        return DissectFileContentSource(entry, size)
+        return DissectFileContentSource(entry, size, self._fmt.open_stream)
 
 
 class DiskFilesystem:
@@ -241,10 +244,10 @@ class DiskFilesystem:
 
     async def list_dir(self, partition_addr: int, path: str) -> list[_DirEntry]:
         """The entries of directory ``path`` (``"/"`` is the volume root),
-        containers first then by name, without ``.``/``..`` or format
-        bookkeeping entries. ``file_state`` is ``FileState.NORMAL`` for a
-        directory or a format without that concept; ``mtime`` is ``None``
-        when there's no reliable value."""
+        containers first then by name, without ``.``/``..`` (filesystem
+        metadata such as NTFS's ``$MFT`` is kept). ``file_state`` is
+        ``FileState.NORMAL`` for a directory or a format without that
+        concept; ``mtime`` is ``None`` when there's no reliable value."""
         entry = self._filesystems[partition_addr]
         return await asyncio.to_thread(entry.list_dir, path)
 
@@ -253,8 +256,8 @@ class DiskFilesystem:
 
         Raises:
             ContentUnavailableError: The file is a cloud-sync placeholder
-                with no local data, or (NTFS only) is EFS-encrypted with no
-                key material available.
+                without its complete data, or (NTFS only) is EFS-encrypted
+                with no key material available.
         """
         entry = self._filesystems[partition_addr]
         return await asyncio.to_thread(entry.open_file, path)

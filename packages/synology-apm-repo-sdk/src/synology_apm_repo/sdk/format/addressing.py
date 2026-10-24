@@ -31,7 +31,7 @@ class ChunkAddress(NamedTuple):
     chunkIdx(16b)`` (FORMAT-SPEC.md: ChunkAddress).
 
     Fields are not range-checked on construction or by ``from_int``; an
-    out-of-range field surfaces downstream (``IndexError`` for an
+    out-of-range field surfaces downstream (``DataCorruptError`` for an
     over-capacity ``chunk_idx``, ``NotFoundError`` for a bogus ``bucket_id``)
     or as a ``verify()`` finding.
 

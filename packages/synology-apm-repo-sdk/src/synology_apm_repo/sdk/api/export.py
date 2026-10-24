@@ -7,11 +7,10 @@ import dataclasses
 import time
 from collections.abc import Awaitable, Callable
 
-from ..dedup.export_scheduler import ExportTuning
+from ..dedup.export_scheduler import ExportTuning, SharedExportTuning
 from ..dedup.export_sink import ExportSink, WrittenBytesCallback, run_sink_export
 from ..dedup.export_workers import ExportExecutor
 from ..dedup.extent import ExportResult
-from ..dedup.pool import BucketReaderCache
 from ..dedup.pool_descriptor import SupportsWorkerPool
 from ..units.base import ContentSource
 
@@ -48,8 +47,9 @@ async def run_export(
             ``total`` is ``content.planned_bytes`` over the whole content,
             which can be less than its size (dedup-backed content counts
             only ``DATA`` bytes).
-        tuning: Concurrency knobs for dedup-backed content; ignored by other
-            content.
+        tuning: How dedup-backed content decodes (default
+            ``ExportTuning()``: in this process, several reads at once);
+            ignored by other content.
 
     Returns:
         What was written, and how much of the content was holes or zeros.
@@ -97,10 +97,10 @@ async def _export_segments(
     a worker, one pool of worker processes, built for the export and closed
     after it: a pool per slice would spend its start-up on every one."""
     ranges = [(start, min(start + segment_size, size)) for start in range(0, size, segment_size)]
-    shared = dataclasses.replace(tuning or ExportTuning(), export_cache=_cache_of(tuning))
+    shared = SharedExportTuning.of(tuning)
     pool_descriptor = (
         content.pool_descriptor()
-        if isinstance(content, SupportsWorkerPool) and len(ranges) > 1 and shared.executor is None
+        if isinstance(content, SupportsWorkerPool) and len(ranges) > 1 and shared.builds_workers
         else None
     )
 
@@ -113,7 +113,7 @@ async def _export_segments(
             writer = await sink.begin_segment(index, start, end - start)
             waited += time.perf_counter() - waiting_since
             if index == 0 and pool_descriptor is not None and (target := writer.worker_target()) is not None:
-                executor = ExportExecutor(pool_descriptor, target.descriptor)
+                executor = ExportExecutor(pool_descriptor, target.descriptor, max_workers=shared.workers)
                 shared = dataclasses.replace(shared, executor=executor)
             result = await content.export_range(
                 writer,
@@ -133,12 +133,6 @@ async def _export_segments(
     return ExportResult(
         bytes_written=bytes_written, logical_size=size, holes=holes, zeros=zeros, sink_wait_seconds=waited
     )
-
-
-def _cache_of(tuning: ExportTuning | None) -> BucketReaderCache:
-    """The caller's reader cache, else a new one: every segment of one export
-    reuses the buckets the previous one opened."""
-    return tuning.export_cache if tuning is not None and tuning.export_cache is not None else BucketReaderCache()
 
 
 async def _counting_progress(

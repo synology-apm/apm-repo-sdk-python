@@ -9,10 +9,18 @@ the loop's default executor a stalled server would starve every other
 ``connection_cache`` instead of ``smbclient``'s process-wide session table,
 so closing one ``SmbStore`` never tears down a sibling's connection.
 
-Requests are routed through a small pool of independent sessions
+Requests are routed through a pool of independent sessions
 (``_DEFAULT_CONNECTION_POOL_SIZE``) because an SMB2 connection's credit
 window starts at 1, and two in-flight requests on one connection would race
 for it.
+
+Each session keeps the files it read open for reuse (``_SLOT_OPEN_HANDLES``,
+closed after ``_HANDLE_IDLE`` seconds unused), so a repeated read of a
+bucket or composition file costs one round trip instead of open, read and
+close. A cached handle reads the file as it was opened: an open repository
+is read as a snapshot, so a file written to or replaced meanwhile need not
+show the change. One whose read fails (the server closed it) gives way to a
+fresh open.
 
 Unlike ``S3Store``/``AzureStore``, a share has real directories, so
 ``listdir`` on a missing path raises ``NotFoundError`` (as ``LocalFsStore``
@@ -24,9 +32,13 @@ its connect timeout is capped to ``NETWORK_CONNECT_TIMEOUT``.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import dataclasses
 import errno
 import functools
+import stat
+import time
+from collections import OrderedDict
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from typing import TYPE_CHECKING, Any, override
@@ -46,14 +58,26 @@ DEFAULT_SMB_PORT = 445
 # slot's session (see _drop_slot_session) so the retry reconnects.
 _DEFAULT_MAX_ATTEMPTS = 2
 
-# Each slot is a separately authenticated, costly SMB session. Worker
-# processes each rebuild a pool of this size, so the worst case is
-# `concurrency.default_worker_count() * this` sessions against one server.
-_DEFAULT_CONNECTION_POOL_SIZE = 2
+# Each slot is a separately authenticated SMB session, connected on first use,
+# so callers' own concurrency decides how many open, up to this: above the
+# bounded callers' (an export's concurrent reads, a verify's bucket checks),
+# and the cap on unbounded fan-outs. Worker processes each rebuild a pool of
+# this size, so the worst case is the worker count times this, in sessions
+# against one server; an export or verify worker reads one bucket at a time,
+# so in practice it holds one.
+_DEFAULT_CONNECTION_POOL_SIZE = 16
 
 # Room for every slot's call plus each of its retries while timed-out
 # threads are still stuck in a stalled server.
 _THREAD_POOL_SIZE = _DEFAULT_CONNECTION_POOL_SIZE * _DEFAULT_MAX_ATTEMPTS
+
+# Files each session keeps open for reuse (64 across the pool), and how long
+# one stays open unused.
+_SLOT_OPEN_HANDLES = 4
+_HANDLE_IDLE = 30.0
+
+#: The clock idle handles are measured on (a test's seam).
+_monotonic = time.monotonic
 
 # Pause before retrying a credit-exhaustion race (see _is_credit_exhaustion).
 _CREDIT_RETRY_DELAY = 0.1
@@ -123,17 +147,54 @@ def _mapped_transport_error(exc: Exception, server: str) -> ApmRepoError:
     return StorageBackendError(f"SMB request failed: {exc!r}", ref=server)
 
 
+class _OpenHandles(OrderedDict[str, tuple[Any, float]]):
+    """The files one session keeps open: path -> ``(file, last used)``,
+    least recently used first."""
+
+    def take(self, path: str) -> Any | None:
+        """``path``'s open file, if kept and not idle too long; closes every
+        handle idle past ``_HANDLE_IDLE``."""
+        now = _monotonic()
+        for stale in [p for p, (_, used) in self.items() if now - used > _HANDLE_IDLE]:
+            _close_quietly(self.pop(stale)[0])
+        kept = self.pop(path, None)
+        return None if kept is None else kept[0]
+
+    def keep(self, path: str, file: Any) -> None:
+        """Keep ``file`` open for ``path``, closing the least recently used
+        handle past ``_SLOT_OPEN_HANDLES``."""
+        self[path] = (file, _monotonic())
+        while len(self) > _SLOT_OPEN_HANDLES:
+            _close_quietly(self.popitem(last=False)[1][0])
+
+    def close_all(self) -> None:
+        while self:
+            _close_quietly(self.popitem()[1][0])
+
+
 class _ConnectionSlot:
     """One pooled SMB session: ``connection_cache`` (passed to every
-    ``smbclient`` call) and ``ready`` (``register_session`` has succeeded).
-    Lock-free: the pool's semaphore and free-stack check a slot out to one
-    caller at a time."""
+    ``smbclient`` call), ``ready`` (``register_session`` has succeeded) and
+    ``handles``, the files it keeps open. Lock-free: the pool's semaphore
+    and free-stack check a slot out to one caller at a time."""
 
-    __slots__ = ("connection_cache", "ready")
+    __slots__ = ("connection_cache", "handles", "ready")
 
     def __init__(self) -> None:
         self.connection_cache: dict[Any, Any] = {}
+        self.handles = _OpenHandles()
         self.ready = False
+
+
+def _read_at(file: Any, offset: int, length: int | None) -> bytes:
+    file.seek(offset)
+    return file.read() if length is None else file.read(length)  # type: ignore[no-any-return]
+
+
+def _close_quietly(file: Any) -> None:
+    """Close a kept handle; a failure only leaks a handle the logoff reclaims."""
+    with contextlib.suppress(Exception):
+        file.close()
 
 
 @dataclasses.dataclass(frozen=True, slots=True)
@@ -145,6 +206,14 @@ class SmbStoreDescriptor:
     port: int
     username: str | None
     password: str | None
+
+    @override
+    def __repr__(self) -> str:
+        password_repr = "<redacted>" if self.password is not None else None
+        return (
+            f"SmbStoreDescriptor(share={self.share!r}, server={self.server!r}, port={self.port!r}, "
+            f"username={self.username!r}, password={password_repr})"
+        )
 
     def build(self) -> SmbStore:
         return SmbStore(self.share, server=self.server, port=self.port, username=self.username, password=self.password)
@@ -248,8 +317,10 @@ class SmbStore(AsyncClosing):
         graceful close; the next attempt reconnects."""
         slot.ready = False
         slot.connection_cache = {}
+        # The session is gone, and with it every handle opened on it.
+        slot.handles = _OpenHandles()
 
-    async def _call_with_retry[T](self, fn: Callable[[dict[Any, Any]], T]) -> T:
+    async def _call_with_retry[T](self, fn: Callable[[_ConnectionSlot], T]) -> T:
         """Check out a slot and run ``fn`` on this store's thread pool, bounded by
         ``NETWORK_READ_TIMEOUT``. Attempted up to ``_DEFAULT_MAX_ATTEMPTS``
         times, retrying on a timeout (session dropped first) or a credit-exhaustion race
@@ -262,9 +333,8 @@ class SmbStore(AsyncClosing):
             last_exc: Exception | None = None
             for _attempt in range(_DEFAULT_MAX_ATTEMPTS):
                 await self._ensure_slot_session(slot)
-                cache = slot.connection_cache
                 try:
-                    return await asyncio.wait_for(self._in_thread(fn, cache), timeout=NETWORK_READ_TIMEOUT)
+                    return await asyncio.wait_for(self._in_thread(fn, slot), timeout=NETWORK_READ_TIMEOUT)
                 except TimeoutError as exc:
                     last_exc = exc
                     self._drop_slot_session(slot)
@@ -293,6 +363,7 @@ class SmbStore(AsyncClosing):
                 if smbclient is None:
                     smbclient = _import_smbclient()
                 slot.ready = False
+                await self._in_thread(slot.handles.close_all)
                 await self._in_thread(
                     smbclient.delete_session,
                     self._server,
@@ -309,17 +380,23 @@ class SmbStore(AsyncClosing):
 
     async def read(self, path: str, offset: int = 0, length: int | None = None) -> bytes:
         return await self._call_with_retry(
-            lambda cache: self._read_sync(_import_smbclient(), path, offset, length, cache)
+            lambda slot: self._read_sync(_import_smbclient(), path, offset, length, slot)
         )
 
     async def size(self, path: str) -> int:
-        return await self._call_with_retry(lambda cache: self._size_sync(_import_smbclient(), path, cache))
+        return await self._call_with_retry(
+            lambda slot: self._size_sync(_import_smbclient(), path, slot.connection_cache)
+        )
 
     async def exists(self, path: str) -> bool:
-        return await self._call_with_retry(lambda cache: self._exists_sync(_import_smbclient(), path, cache))
+        return await self._call_with_retry(
+            lambda slot: self._exists_sync(_import_smbclient(), path, slot.connection_cache)
+        )
 
     async def listdir(self, path: str) -> list[Entry]:
-        return await self._call_with_retry(lambda cache: self._listdir_sync(_import_smbclient(), path, cache))
+        return await self._call_with_retry(
+            lambda slot: self._listdir_sync(_import_smbclient(), path, slot.connection_cache)
+        )
 
     def _read_sync(
         self,
@@ -327,25 +404,50 @@ class SmbStore(AsyncClosing):
         path: str,
         offset: int,
         length: int | None,
-        connection_cache: dict[Any, Any],
+        slot: _ConnectionSlot,
     ) -> bytes:
-        unc = self._unc(path)
+        from smbprotocol.exceptions import SMBException
+
+        # Taken once: if this call times out, it runs on while the retry
+        # reconnects the slot, and must not touch the new session.
+        handles, connection_cache = slot.handles, slot.connection_cache
+        kept = handles.take(path)
+        if kept is not None:
+            try:
+                data = _read_at(kept, offset, length)
+            except (OSError, SMBException) as exc:
+                if _is_credit_exhaustion(exc):
+                    handles.keep(path, kept)  # the handle is fine; _call_with_retry retries
+                    raise
+                # The server may have closed it since (a lease break, its own
+                # idle timeout: a raw FileClosed, not an OSError); a fresh
+                # open settles whether it was stale.
+                _close_quietly(kept)
+            else:
+                handles.keep(path, kept)
+                return data
+        f = None
         try:
-            # share_access="rwd": the "rb" default implies FILE_SHARE_READ only, which
-            # would raise a spurious STATUS_SHARING_VIOLATION on a file open for writing elsewhere.
-            with smbclient.open_file(unc, mode="rb", share_access="rwd", connection_cache=connection_cache) as f:
-                if offset:
-                    f.seek(offset)
-                return f.read() if length is None else f.read(length)  # type: ignore[no-any-return]
+            # share_access="rwd": the "rb" default implies FILE_SHARE_READ only, which would
+            # raise a spurious STATUS_SHARING_VIOLATION on a file open for writing elsewhere.
+            f = smbclient.open_file(self._unc(path), mode="rb", share_access="rwd", connection_cache=connection_cache)
+            data = _read_at(f, offset, length)
         except OSError as exc:
+            if f is not None:
+                _close_quietly(f)
             raise _mapped_os_error(exc, path) from exc
+        handles.keep(path, f)
+        return data
 
     def _size_sync(self, smbclient: _smbclient_module, path: str, connection_cache: dict[Any, Any]) -> int:
         unc = self._unc(path)
         try:
-            return int(smbclient.stat(unc, connection_cache=connection_cache).st_size)
+            st = smbclient.stat(unc, connection_cache=connection_cache)
         except OSError as exc:
             raise _mapped_os_error(exc, path) from exc
+        if stat.S_ISDIR(st.st_mode):
+            raise NotFoundError("is a directory, not a file", ref=path)
+        return int(st.st_size)
 
     def _exists_sync(self, smbclient: _smbclient_module, path: str, connection_cache: dict[Any, Any]) -> bool:
         try:

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable
+from typing import override
 
 from textual.worker import Worker
 
@@ -14,10 +15,10 @@ from .navigable_screen import NavigableScreen
 
 class StoreScreen[ModelT, MsgT, CmdT](NavigableScreen):
     """Owns its store's lifecycle. ``_open_store`` (from ``on_mount``)
-    builds it. On unmount the store closes first, so a result still in
-    flight finds it closed, then this screen's own workers are cancelled and
-    drained, so none outlives the screen, then ``_after_store_closed``
-    runs."""
+    builds it; it closes as the screen's removal starts
+    (``_release_on_prune``), so a result still in flight finds it closed.
+    On unmount this screen's own workers are drained, so none outlives the
+    screen, then ``_after_store_closed`` runs."""
 
     store: Store[ModelT, MsgT, CmdT]
 
@@ -31,12 +32,21 @@ class StoreScreen[ModelT, MsgT, CmdT](NavigableScreen):
         returns, from the first dispatch on."""
         self.store = Store(model, update, perform)
 
-    async def on_unmount(self) -> None:
-        # Unset when on_mount failed before _open_store: the workers are
-        # still drained, and there is no store state to tear down.
+    def _close_store(self) -> Store[ModelT, MsgT, CmdT] | None:
+        """Closes the store, if ``_open_store`` ran (``on_mount`` can fail
+        before it); returns it. Idempotent."""
         store: Store[ModelT, MsgT, CmdT] | None = self.__dict__.get("store")
         if store is not None:
             store.close()
+        return store
+
+    @override
+    def _release_on_prune(self) -> None:
+        self._close_store()
+
+    async def on_unmount(self) -> None:
+        # Covers an unmount without a prune; a no-op after one.
+        store = self._close_store()
         await drain(self._own_workers(cancel=True))
         if store is not None:
             await self._after_store_closed()

@@ -5,7 +5,7 @@ from __future__ import annotations
 
 import pytest
 
-from synology_apm_repo.sdk.findings import Finding, Stage, Symptom, VerifyLevel
+from synology_apm_repo.sdk.findings import Finding, Stage, Symptom, VerifyLevel, VerifyTuning
 
 
 class TestFindingType:
@@ -35,3 +35,10 @@ class TestEnumValues:
     def test_verify_level_values(self) -> None:
         assert VerifyLevel.QUICK.value == "quick"
         assert VerifyLevel.FULL.value == "full"
+
+
+@pytest.mark.parametrize("field", ["max_concurrent_reads", "max_concurrent_decodes"])
+@pytest.mark.parametrize("value", [0, -1])
+def test_verify_tuning_rejects_a_bound_below_one(field: str, value: int) -> None:
+    with pytest.raises(ValueError, match=field):
+        VerifyTuning(**{field: value})

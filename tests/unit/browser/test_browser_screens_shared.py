@@ -18,7 +18,11 @@ from synology_apm_repo.browser.screens._shared import (
     move_cursor_to_parent,
     parse_canonical_ref,
 )
-from synology_apm_repo.browser.strings import GOTO_REF_NOT_CANONICAL_WARNING, GOTO_REF_PARSE_ERROR_WARNING
+from synology_apm_repo.browser.strings import (
+    GOTO_REF_MISSING_SIGIL_WARNING,
+    GOTO_REF_NOT_CANONICAL_WARNING,
+    GOTO_REF_PARSE_ERROR_WARNING,
+)
 
 
 def test_move_cursor_to_parent_with_nothing_selected_is_a_no_op() -> None:
@@ -47,6 +51,17 @@ def test_parse_canonical_ref_a_human_ref_is_rejected_as_not_canonical() -> None:
     result = parse_canonical_ref("/some/path#not-canonical", notify=notify)
     assert result is None
     assert warnings == [(GOTO_REF_NOT_CANONICAL_WARNING, "warning")]
+
+
+def test_parse_canonical_ref_a_canonical_ref_missing_its_at_says_so() -> None:
+    warnings: list[tuple[str, str]] = []
+
+    def notify(message: str, *, severity: str = "information") -> None:
+        warnings.append((message, severity))
+
+    result = parse_canonical_ref("/some/path#cat:1/wl:2/ver:x", notify=notify)
+    assert result is None
+    assert warnings == [(GOTO_REF_MISSING_SIGIL_WARNING, "warning")]
 
 
 class _NavScreen(NavigableScreen):

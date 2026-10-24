@@ -37,13 +37,14 @@ async def _vault_db_row(
     """Run ``query`` against the vault's ``db/vault_encryption_key`` and return
     its first row (``None`` if none). A truncated or garbage ``db_path``
     raises ``DataCorruptError`` instead of a raw sqlite error, so callers
-    (``Session.discover()``) can skip that repository.
+    (``Session.discover()``) can skip that repository; so does one gone
+    since the caller found it.
     """
     try:
         async with await SqliteSource.from_raw_store(store, db_path) as source:
             cursor = await source.connection.execute(query, params)
             return await cursor.fetchone()
-    except aiosqlite.Error as exc:
+    except (aiosqlite.Error, NotFoundError) as exc:
         raise DataCorruptError(f"{db_path} is not a readable vault_encryption_key database", ref=db_path) from exc
 
 

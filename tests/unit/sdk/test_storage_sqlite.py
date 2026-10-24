@@ -13,11 +13,12 @@ import aiosqlite
 import pytest
 
 from support.fakes import faithful_to
+from support.store_fakes import WrappingStore
 from synology_apm_repo.sdk.errors import NotFoundError, ResourceLimitExceededError
 from synology_apm_repo.sdk.storage import sqlite_source as sqlite_source_mod
 from synology_apm_repo.sdk.storage.base import Entry, ObjectStore
 from synology_apm_repo.sdk.storage.local import LocalFsStore
-from synology_apm_repo.sdk.storage.sqlite import apply_index_hint, open_sqlite
+from synology_apm_repo.sdk.storage.sqlite import apply_index_hint, open_sqlite, table_columns
 from unit.sdk.storage_fakes import fake_disk_usage
 
 
@@ -53,6 +54,15 @@ async def test_fast_path_refuses_a_path_that_escapes_the_store_root(tmp_path: Pa
     _make_plain_db(tmp_path, "outside.db")
     with pytest.raises(NotFoundError, match="escapes store root"):
         await open_sqlite(LocalFsStore(root), "../outside.db")
+
+
+@pytest.mark.parametrize("wrapped", [False, True], ids=["fast_path", "slow_path"])
+async def test_a_missing_file_is_not_found_on_either_path(tmp_path: Path, wrapped: bool) -> None:
+    local = LocalFsStore(tmp_path)
+    store: ObjectStore = WrappingStore(local) if wrapped else local
+    with pytest.raises(NotFoundError, match="no such file") as raised:
+        await open_sqlite(store, "gone.db")
+    assert (raised.value.safe_message, raised.value.ref) == ("no such file", "gone.db")
 
 
 async def test_zero_length_wal_sidecar_still_takes_fast_path(tmp_path: Path) -> None:
@@ -257,6 +267,37 @@ async def test_a_fast_failing_main_read_does_not_race_a_slower_sidecars_write(
     assert events == ["sidecar done", "cleanup"]
 
 
+async def test_an_open_cancelled_mid_write_cleans_up_only_once_the_writer_thread_ends(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Cleanup racing the writer fails on Windows while it holds the file open.
+    _make_plain_db(tmp_path, "wrapped.db")
+    events: list[str] = []
+    writing, release = threading.Event(), threading.Event()
+
+    class _RecordingTemporaryDirectory(tempfile.TemporaryDirectory[str]):
+        def cleanup(self) -> None:
+            events.append("cleanup")
+            super().cleanup()
+
+    monkeypatch.setattr(tempfile, "TemporaryDirectory", _RecordingTemporaryDirectory)
+
+    def _blocking_transform(raw: bytes, dest: BinaryIO) -> None:
+        writing.set()
+        release.wait(5)
+        dest.write(raw)
+        events.append("write done")
+
+    task = asyncio.create_task(open_sqlite(LocalFsStore(tmp_path), "wrapped.db", transform=_blocking_transform))
+    await asyncio.to_thread(writing.wait, 5)
+    task.cancel()
+    await asyncio.sleep(0.05)  # an unwaited cleanup would run now
+    release.set()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert events == ["write done", "cleanup"]
+
+
 async def test_a_cancelled_slow_path_open_removes_its_temp_directory(tmp_path: Path) -> None:
     (tmp_path / "wrapped.db-wal").write_bytes(b"fake-wal-bytes")
     tmp_root = tmp_path / "tmp"
@@ -345,6 +386,35 @@ async def test_non_local_store_always_materializes_even_without_wal(tmp_path: Pa
             materialized.cleanup()
 
 
+class _ExistsCountingStub(_NonLocalStub):
+    """``_NonLocalStub`` noting every path ``exists`` is asked about."""
+
+    def __init__(self, root: Path) -> None:
+        super().__init__(root)
+        self.probed: list[str] = []
+
+    async def exists(self, path: str) -> bool:
+        self.probed.append(path)
+        return await super().exists(path)
+
+
+async def test_a_listing_answers_for_the_sidecars(tmp_path: Path) -> None:
+    _make_plain_db(tmp_path)
+    (tmp_path / "test.db-shm").write_bytes(b"")
+
+    async def opened_with(listing: dict[str, int | None] | None) -> list[str]:
+        store = _ExistsCountingStub(tmp_path)
+        conn, materialized = await open_sqlite(store, "test.db", listing=listing)
+        await conn.close()
+        assert materialized is not None
+        assert sorted(p.name for p in Path(materialized.name).iterdir()) == ["test.db", "test.db-shm"]
+        materialized.cleanup()
+        return store.probed
+
+    assert await opened_with(None) == ["test.db-wal", "test.db-shm"]
+    assert await opened_with({"test.db": None, "test.db-shm": 0}) == []
+
+
 # -- apply_index_hint() --------------------------------------------------
 
 
@@ -380,6 +450,18 @@ class TestApplyIndexHint:
             await apply_index_hint(conn, "t", ["a"])
             after = await _index_names(conn, "t")
             assert after == before  # no new index — "existing_idx" already covers it
+        finally:
+            await conn.close()
+
+    async def test_an_index_name_that_needs_quoting_is_read(self, tmp_path: Path) -> None:
+        conn = await aiosqlite.connect(tmp_path / "t.db")
+        await conn.execute("CREATE TABLE t (a INTEGER)")
+        await conn.execute('CREATE INDEX "existing-idx" ON t (a)')
+        await conn.commit()
+        try:
+            before = await _index_names(conn, "t")
+            await apply_index_hint(conn, "t", ["a"])
+            assert await _index_names(conn, "t") == before
         finally:
             await conn.close()
 
@@ -436,6 +518,54 @@ class TestApplyIndexHint:
         try:
             with pytest.raises(aiosqlite.OperationalError, match="no such column"):
                 await apply_index_hint(conn, "t", ["no_such_column"])
+        finally:
+            await conn.close()
+
+
+class TestAskedOncePerConnection:
+    """``table_columns`` and ``apply_index_hint`` ask a connection once per
+    table (per hint)."""
+
+    @staticmethod
+    async def _traced(conn: aiosqlite.Connection) -> list[str]:
+        statements: list[str] = []
+        await conn.set_trace_callback(statements.append)
+        return statements
+
+    async def test_table_columns_reads_the_schema_once(self, tmp_path: Path) -> None:
+        conn = await aiosqlite.connect(tmp_path / "t.db")
+        await conn.execute("CREATE TABLE t (a INTEGER, b TEXT)")
+        try:
+            statements = await self._traced(conn)
+            assert await table_columns(conn, "t") == {"a", "b"}
+            assert await table_columns(conn, "t") == {"a", "b"}
+            assert await table_columns(conn, "missing") == frozenset()
+            assert sum("table_info" in sql for sql in statements) == 2
+        finally:
+            await conn.close()
+
+    async def test_a_repeated_hint_asks_nothing(self, tmp_path: Path) -> None:
+        conn = await aiosqlite.connect(tmp_path / "t.db")
+        await conn.execute("CREATE TABLE t (a INTEGER)")
+        await conn.commit()
+        try:
+            await apply_index_hint(conn, "t", ["a"])
+            statements = await self._traced(conn)
+            await apply_index_hint(conn, "t", ["a"])
+            assert statements == []
+        finally:
+            await conn.close()
+
+    async def test_a_failed_hint_is_tried_again(self, tmp_path: Path) -> None:
+        conn = await aiosqlite.connect(tmp_path / "t.db")
+        await conn.execute("CREATE TABLE t (a INTEGER)")
+        await conn.commit()
+        try:
+            with pytest.raises(aiosqlite.OperationalError, match="no such column"):
+                await apply_index_hint(conn, "t", ["b"])
+            await conn.execute("ALTER TABLE t ADD COLUMN b INTEGER")
+            await apply_index_hint(conn, "t", ["b"])
+            assert "_synology_apm_repo_idx_t_b" in await _index_names(conn, "t")
         finally:
             await conn.close()
 

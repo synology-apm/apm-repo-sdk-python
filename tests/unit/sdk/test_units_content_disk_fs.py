@@ -51,16 +51,22 @@ from synology_apm_repo.sdk.units.content.disk_fs import (
 from synology_apm_repo.sdk.units.content.disk_fs._base import (
     _CLOUD_ONLY_REASON,
     _ENCRYPTED_REASON,
+    _default_open_stream,
     _default_size,
     _DirEntry,
     _Format,
     _try_import,
 )
-from synology_apm_repo.sdk.units.content.disk_fs._disk_filesystem import _DissectEntry, _partition_table_label
+from synology_apm_repo.sdk.units.content.disk_fs._disk_filesystem import (
+    _build_bridge,
+    _DissectEntry,
+    _partition_table_label,
+)
 from synology_apm_repo.sdk.units.content.disk_fs._ntfs import (
     _is_cloud_file,
     _ntfs_content_unavailable,
     _ntfs_entry_mtime,
+    _ntfs_is_cloud_only,
     _ntfs_is_encrypted,
     _ntfs_is_encrypted_attr,
     _ntfs_iterdir,
@@ -553,6 +559,7 @@ def test_dissect_entry_list_dir_sorts_directories_before_files() -> None:
         size=_default_size,
         volume_label=lambda volume: None,
         content_unavailable=lambda entry: None,
+        open_stream=_default_open_stream,
     )
     entry = _DissectEntry(fmt, object())
     assert entry.list_dir("/") == [
@@ -632,6 +639,29 @@ async def test_ntfs_list_dir_lists_real_entries() -> None:
     subdir = next(e for e in entries if e.name == "subdir")
     assert subdir.is_dir is True
     assert isinstance(subdir.mtime, datetime)
+
+
+class _CountingMemoryContent(MemoryContent):
+    def __init__(self, data: bytes) -> None:
+        super().__init__(data)
+        self.reads = 0
+
+    async def read(self, offset: int = 0, length: int | None = None) -> bytes:
+        self.reads += 1
+        return await super().read(offset, length)
+
+
+async def test_the_bridge_reads_sequential_blocks_through_a_readahead() -> None:
+    data = bytes(range(256)) * 4096  # 1 MiB
+    content = _CountingMemoryContent(data)
+    bridge = _build_bridge(content, asyncio.get_running_loop())
+
+    def read_sequentially() -> bytes:
+        # As Dissect does: one 8 KiB block at a time, from a worker thread.
+        return b"".join(bridge.read(8192) for _ in range(len(data) // 8192))
+
+    assert await asyncio.to_thread(read_sequentially) == data
+    assert content.reads < len(data) // 8192 // 4
 
 
 async def test_ntfs_open_file_reads_the_real_file_content() -> None:
@@ -758,21 +788,154 @@ def test_is_cloud_file_returns_false_when_the_method_is_absent_or_raises() -> No
     assert _is_cloud_file(_True()) is True
 
 
-def test_ntfs_content_unavailable_returns_a_reason_only_for_a_cloud_file_entry() -> None:
-    class _CloudEntry:
+#: ``FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS``/``_RECALL_ON_OPEN``/``_OFFLINE``
+#: (winnt.h), as in dissect.ntfs's ``c_ntfs.FILE_ATTRIBUTE``.
+_RECALL_ON_DATA_ACCESS = 0x400000
+_RECALL_ON_OPEN = 0x40000
+_OFFLINE = 0x1000
+
+
+class _FakeVolumeInfo:
+    cluster_size = 4096
+
+
+#: ``ATTRIBUTE_FLAG_COMPRESSION_MASK``'s LZNT1 value, as in dissect.ntfs's
+#: ``c_ntfs``.
+_ATTRIBUTE_FLAG_COMPRESSED = 0x0001
+
+
+class _FakeAttributeHeader:
+    def __init__(self, *, resident: bool, flags: int) -> None:
+        self.resident = resident
+        self.flags = flags
+
+
+@unchecked_fake("a dissect filesystem object")
+class _FakeDataStream:
+    """Fakes an ``AttributeCollection`` of one ``$DATA`` stream: its
+    header's residency and flags, size and runs (``None`` as a run's
+    cluster marks a sparse run)."""
+
+    def __init__(self, *, size: int, runs: list[tuple[int | None, int]], resident: bool, flags: int) -> None:
+        self.header = _FakeAttributeHeader(resident=resident, flags=flags)
+        self._size = size
+        self._runs = runs
+
+    def size(self) -> int:
+        return self._size
+
+    def dataruns(self) -> list[tuple[int | None, int]]:
+        return self._runs
+
+
+@unchecked_fake("a dissect filesystem object")
+class _FakeCloudAttributes:
+    """Fakes ``AttributeMap`` for a cloud-tagged record:
+    ``.STANDARD_INFORMATION``, the unnamed ``$DATA`` via ``.find("", ...)``
+    (none when ``data`` is ``None``, as for a record missing it) and the
+    ``$EFS`` lookup ``_ntfs_is_encrypted`` makes (never present)."""
+
+    def __init__(self, *, file_attributes: int, data: _FakeDataStream | None) -> None:
+        self.STANDARD_INFORMATION = _FakeStandardInformation(file_attributes)
+        self._data = data
+
+    def find(self, name: str, attr_type: object) -> object:
+        return self._data if name == "" and self._data is not None else []
+
+
+@unchecked_fake("a dissect filesystem object")
+class _FakeCloudRecord:
+    """Fakes just enough of a cloud-tagged ``MftRecord`` for
+    ``_ntfs_is_cloud_only``: the reparse-tag check and its attributes.
+    ``resident`` is dissect's own ``MftRecord.resident`` — true when *any*
+    ``$DATA`` stream, a named one included, is resident."""
+
+    ntfs = _FakeVolumeInfo()
+
+    def __init__(
+        self,
+        *,
+        file_attributes: int = 0,
+        size: int = 3 * 4096,
+        runs: list[tuple[int | None, int]] | None = None,
+        resident: bool = False,
+        compressed: bool = False,
+        has_data: bool = True,
+        any_stream_resident: bool = False,
+        cloud: bool = True,
+    ) -> None:
+        data = _FakeDataStream(
+            size=size,
+            runs=[(100, 3)] if runs is None else runs,
+            resident=resident,
+            flags=_ATTRIBUTE_FLAG_COMPRESSED if compressed else 0,
+        )
+        self.attributes = _FakeCloudAttributes(file_attributes=file_attributes, data=data if has_data else None)
+        self.resident = resident or any_stream_resident
+        self._cloud = cloud
+
+    def is_cloud_file(self) -> bool:
+        return self._cloud
+
+
+def test_ntfs_is_cloud_only_reads_recall_flags_and_data_runs_not_just_the_reparse_tag() -> None:
+    """Cloud Files placeholders keep their reparse tag after download, so the
+    tag alone doesn't make a file cloud-only."""
+    for flag in (_RECALL_ON_DATA_ACCESS, _RECALL_ON_OPEN, _OFFLINE):
+        assert _ntfs_is_cloud_only(_FakeCloudRecord(file_attributes=flag)) is True
+    # A cluster within the size not on disk: none, a sparse run, or runs
+    # ending short of the size.
+    assert _ntfs_is_cloud_only(_FakeCloudRecord(runs=[(None, 3)])) is True
+    assert _ntfs_is_cloud_only(_FakeCloudRecord(runs=[(100, 1), (None, 1), (200, 1)])) is True
+    assert _ntfs_is_cloud_only(_FakeCloudRecord(runs=[(100, 2)])) is True
+    # Fully downloaded: every cluster within the size allocated (a sparse
+    # tail past the size doesn't count), resident data, or an empty file.
+    assert _ntfs_is_cloud_only(_FakeCloudRecord(runs=[(100, 3)])) is False
+    assert _ntfs_is_cloud_only(_FakeCloudRecord(runs=[(100, 3), (None, 5)])) is False
+    assert _ntfs_is_cloud_only(_FakeCloudRecord(resident=True, runs=[])) is False
+    assert _ntfs_is_cloud_only(_FakeCloudRecord(size=0, runs=[])) is False
+    assert _ntfs_is_cloud_only(_FakeCloudRecord(cloud=False)) is False
+
+
+def test_ntfs_is_cloud_only_checks_the_unnamed_stream_not_a_resident_named_one() -> None:
+    """dissect's ``MftRecord.resident`` is true for any resident ``$DATA``
+    stream, e.g. a small ``Zone.Identifier``; the unnamed stream's runs
+    still decide."""
+    assert _ntfs_is_cloud_only(_FakeCloudRecord(runs=[(None, 3)], any_stream_resident=True)) is True
+
+
+def test_ntfs_is_cloud_only_trusts_only_the_recall_flags_for_a_compressed_stream() -> None:
+    """A compressed stream's compression units hold sparse runs by design."""
+    assert _ntfs_is_cloud_only(_FakeCloudRecord(runs=[(100, 1), (None, 2)], compressed=True)) is False
+    assert _ntfs_is_cloud_only(_FakeCloudRecord(file_attributes=_RECALL_ON_DATA_ACCESS, compressed=True)) is True
+
+
+def test_ntfs_is_cloud_only_counts_a_cloud_file_whose_state_cant_be_read_as_cloud_only() -> None:
+    assert _ntfs_is_cloud_only(_FakeCloudRecord(has_data=False)) is True
+
+    @unchecked_fake("a dissect filesystem object")
+    class _NoStandardInformation:
         def is_cloud_file(self) -> bool:
             return True
 
+    assert _ntfs_is_cloud_only(_NoStandardInformation()) is True
+
+
+def test_ntfs_content_unavailable_refuses_cloud_files_without_their_complete_data_only() -> None:
     class _NormalEntry:
         def is_cloud_file(self) -> bool:
             return False
 
-    assert _ntfs_content_unavailable(_CloudEntry()) == _CLOUD_ONLY_REASON
+    assert _ntfs_content_unavailable(_FakeCloudRecord(file_attributes=_RECALL_ON_DATA_ACCESS)) == _CLOUD_ONLY_REASON
+    assert _ntfs_content_unavailable(_FakeCloudRecord(runs=[(100, 2), (None, 1)])) == _CLOUD_ONLY_REASON
+    assert _ntfs_content_unavailable(_FakeCloudRecord()) is None
     assert _ntfs_content_unavailable(_NormalEntry()) is None
 
 
-def test_ntfs_iterdir_flags_a_cloud_file_child_as_cloud_only() -> None:
-    """The cloud check reads the ``$FILE_NAME`` attribute ``_ntfs_iterdir`` already reads."""
+def test_ntfs_iterdir_flags_a_cloud_file_child_as_cloud_only_without_resolving_it() -> None:
+    """The cloud check reads only the ``$FILE_NAME`` attribute
+    ``_ntfs_iterdir`` already reads; whether the file was downloaded is
+    left to ``_ntfs_content_unavailable`` at open."""
 
     class _CloudAttr:
         file_name = "cloud.txt"
@@ -786,6 +949,9 @@ def test_ntfs_iterdir_flags_a_cloud_file_child_as_cloud_only() -> None:
 
     class _CloudChild:
         attribute = _CloudAttr()
+
+        def dereference(self) -> object:
+            raise AssertionError("a listing resolved a child's MftRecord")
 
     @unchecked_fake("a dissect filesystem object")
     class _FakeEntry:
@@ -863,15 +1029,12 @@ def test_ntfs_content_unavailable_returns_the_efs_reason_for_an_encrypted_entry(
 
 
 def test_ntfs_content_unavailable_prioritizes_cloud_only_over_encrypted() -> None:
-    """A file that is both a cloud placeholder and EFS-encrypted is reported as the placeholder."""
-
-    class _CloudAndEncryptedEntry:
-        def is_cloud_file(self) -> bool:
-            return True
-
-        attributes = _FakeNtfsAttributes(file_attributes=_FILE_ATTRIBUTE_ENCRYPTED)
-
-    assert _ntfs_content_unavailable(_CloudAndEncryptedEntry()) == _CLOUD_ONLY_REASON
+    """A cloud file that is also EFS-encrypted is refused as a placeholder
+    when it lacks its complete data, else for its encryption."""
+    both = _FakeCloudRecord(file_attributes=_FILE_ATTRIBUTE_ENCRYPTED | _RECALL_ON_DATA_ACCESS)
+    assert _ntfs_content_unavailable(both) == _CLOUD_ONLY_REASON
+    hydrated = _FakeCloudRecord(file_attributes=_FILE_ATTRIBUTE_ENCRYPTED)
+    assert _ntfs_content_unavailable(hydrated) == _ENCRYPTED_REASON
 
 
 def test_ntfs_iterdir_flags_an_encrypted_child_as_encrypted() -> None:
@@ -956,6 +1119,7 @@ def test_open_file_raises_content_unavailable_without_opening_or_sizing_the_entr
         size=_size,
         volume_label=lambda volume: None,
         content_unavailable=lambda entry: "synthetic placeholder reason",
+        open_stream=_default_open_stream,
     )
     dissect_entry = _DissectEntry(fmt, volume=object())
     with pytest.raises(ContentUnavailableError, match="synthetic placeholder reason"):
@@ -1095,7 +1259,9 @@ class _CountingFakeEntry:
 class TestDissectFileContentSourceExportRange:
     async def test_a_sub_range_is_written_at_offsets_relative_to_its_start(self) -> None:
         content = bytes(range(100))
-        source = DissectFileContentSource(_CountingFakeEntry(content), size=len(content))
+        source = DissectFileContentSource(
+            _CountingFakeEntry(content), size=len(content), open_stream=_default_open_stream
+        )
         writes: list[tuple[int, bytes]] = []
 
         @faithful_to(ExportWriter)
@@ -1109,14 +1275,14 @@ class TestDissectFileContentSourceExportRange:
         assert (result.bytes_written, result.logical_size) == (20, 20)
 
     async def test_a_range_outside_the_file_is_rejected(self) -> None:
-        source = DissectFileContentSource(_CountingFakeEntry(b"abc"), size=3)
+        source = DissectFileContentSource(_CountingFakeEntry(b"abc"), size=3, open_stream=_default_open_stream)
         with pytest.raises(ValueError, match="is not inside"):
             await source.export_range(None, 0, 4)  # type: ignore[arg-type]
         with pytest.raises(ValueError, match="is not inside"):
             await source.planned_bytes(0, 4)
 
     async def test_planned_bytes_is_the_range_length(self) -> None:
-        source = DissectFileContentSource(_CountingFakeEntry(b"abcdef"), size=6)
+        source = DissectFileContentSource(_CountingFakeEntry(b"abcdef"), size=6, open_stream=_default_open_stream)
         assert await source.planned_bytes(2, 5) == 3
 
 
@@ -1128,7 +1294,7 @@ class TestDissectFileContentSourceHandleReuse:
     async def test_two_separate_reads_share_one_open_call(self) -> None:
         content = b"hello world"
         entry = _CountingFakeEntry(content)
-        source = DissectFileContentSource(entry, size=len(content))
+        source = DissectFileContentSource(entry, size=len(content), open_stream=_default_open_stream)
         assert await source.read(0, 5) == b"hello"
         assert await source.read(6, 5) == b"world"
         assert entry.open_calls == 1
@@ -1136,7 +1302,7 @@ class TestDissectFileContentSourceHandleReuse:
     async def test_streamed_export_across_many_blocks_shares_one_open_call(self, tmp_path: Path) -> None:
         content = b"0123456789" * 100  # 1000 bytes, well past one block at block=64
         entry = _CountingFakeEntry(content)
-        source = DissectFileContentSource(entry, size=len(content))
+        source = DissectFileContentSource(entry, size=len(content), open_stream=_default_open_stream)
         blocks = [chunk async for _pos, chunk in source.stream(block=64)]
         assert b"".join(blocks) == content
         assert entry.open_calls == 1
@@ -1169,7 +1335,7 @@ class TestDissectFileContentSourceHandleReuse:
                 return stream
 
         entry = _FailFirstOpenEntry()
-        source = DissectFileContentSource(entry, size=len(content))
+        source = DissectFileContentSource(entry, size=len(content), open_stream=_default_open_stream)
         with pytest.raises(DataCorruptError, match="synthetic read failure") as exc_info:
             await source.read(0, 5)
         assert isinstance(exc_info.value.__cause__, OSError)
@@ -1180,14 +1346,14 @@ class TestDissectFileContentSourceHandleReuse:
         # A short read for a request reaching the declared end means the
         # guest file is truncated relative to its metadata.
         entry = _CountingFakeEntry(b"ab")
-        source = DissectFileContentSource(entry, size=100)
+        source = DissectFileContentSource(entry, size=100, open_stream=_default_open_stream)
         with pytest.raises(DataCorruptError, match="declared size=100"):
             await source.read(0, 100)
 
     async def test_short_read_not_reaching_declared_end_does_not_raise(self) -> None:
         # Same short stream, but the window doesn't reach the declared end.
         entry = _CountingFakeEntry(b"ab")
-        source = DissectFileContentSource(entry, size=100)
+        source = DissectFileContentSource(entry, size=100, open_stream=_default_open_stream)
         assert await source.read(0, 50) == b"ab"
 
     async def test_export_to_short_read_reaching_declared_end_raises_data_corrupt(self, tmp_path: Path) -> None:
@@ -1195,7 +1361,7 @@ class TestDissectFileContentSourceHandleReuse:
         # independently (it bypasses read()), so it needs its own proof.
         dst = tmp_path / "out.bin"
         entry = _CountingFakeEntry(b"ab")
-        source = DissectFileContentSource(entry, size=100)
+        source = DissectFileContentSource(entry, size=100, open_stream=_default_open_stream)
         with pytest.raises(DataCorruptError, match="declared size=100"):
             await run_export(source, LocalFileSink(dst, staged=False))
         # The only block failed, so no bytes were written and the sink's
@@ -1210,7 +1376,7 @@ class TestDissectFileContentSourceHandleReuse:
                 raise EOFError("not enough bytes to read struct")
 
         dst = tmp_path / "nested" / "out.bin"
-        source = DissectFileContentSource(_AlwaysFailsToOpenEntry(), size=1000)
+        source = DissectFileContentSource(_AlwaysFailsToOpenEntry(), size=1000, open_stream=_default_open_stream)
         with pytest.raises(DataCorruptError, match="dissect filesystem parser failed reading offset"):
             await run_export(source, LocalFileSink(dst, staged=False))
         assert not dst.exists()
@@ -1220,7 +1386,7 @@ class TestDissectFileContentSourceHandleReuse:
     ) -> None:
         dst = tmp_path / "out.bin"
         entry = _CountingFakeEntry(b"")
-        source = DissectFileContentSource(entry, size=0)
+        source = DissectFileContentSource(entry, size=0, open_stream=_default_open_stream)
         result = await run_export(source, LocalFileSink(dst, staged=False))
         assert dst.exists()
         assert dst.read_bytes() == b""
@@ -1249,7 +1415,9 @@ class TestDissectFileContentSourceHandleReuse:
                 return _FailsOnSecondBlockStream()
 
         dst = tmp_path / "out.bin"
-        source = DissectFileContentSource(_FailsOnSecondBlockEntry(), size=DEFAULT_STREAM_BLOCK * 2)
+        source = DissectFileContentSource(
+            _FailsOnSecondBlockEntry(), size=DEFAULT_STREAM_BLOCK * 2, open_stream=_default_open_stream
+        )
         with pytest.raises(DataCorruptError, match="synthetic failure on the second block"):
             await run_export(source, LocalFileSink(dst, staged=False))
         assert dst.exists()
@@ -1271,7 +1439,9 @@ class TestDissectFileContentSourceHandleReuse:
             def open(self) -> _AlwaysShortStream:
                 return _AlwaysShortStream()
 
-        source = DissectFileContentSource(_AlwaysShortEntry(), size=DEFAULT_STREAM_BLOCK * 2)
+        source = DissectFileContentSource(
+            _AlwaysShortEntry(), size=DEFAULT_STREAM_BLOCK * 2, open_stream=_default_open_stream
+        )
         with pytest.raises(DataCorruptError, match=r"read \d+ bytes at offset \d+, expected"):
             await asyncio.wait_for(run_export(source, LocalFileSink(tmp_path / "out.bin", staged=False)), timeout=5.0)
 
@@ -1323,7 +1493,7 @@ class TestDissectFileContentSourceHandleReuse:
             def __exit__(self, *exc_info: object) -> None:
                 self._lock.release()
 
-        source = DissectFileContentSource(_FakeEntry(), size=len(content))
+        source = DissectFileContentSource(_FakeEntry(), size=len(content), open_stream=_default_open_stream)
         monkeypatch.setattr(source, "_fh_lock", _ArrivalLock())
         a, b = await asyncio.gather(source.read(0, 5), source.read(5, 5))
         assert a == b"AAAAA"

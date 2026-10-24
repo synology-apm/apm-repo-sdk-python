@@ -62,17 +62,30 @@ async def _settle[T](task: asyncio.Future[T]) -> None:
             await asyncio.wait([task])
 
 
-async def shield_or_undo[T](work: Awaitable[T], undo: Callable[[T | None], Awaitable[object]]) -> T:
-    """Awaits ``work`` (typically a thread, which can't be stopped) and
-    lets it finish even if the caller is cancelled. If the await fails or
-    is cancelled, then once ``work`` ends, runs ``undo(result)`` (``None``
-    if ``work`` failed); neither wait yields to a further cancellation,
-    and an ``undo`` failure is noted on the exception being raised."""
+async def run_to_completion[T](work: Awaitable[T]) -> T:
+    """Awaits ``work`` and lets it finish even if the caller is cancelled,
+    then re-raises the cancellation, with any failure of ``work`` noted on
+    it. For cleanup run via ``asyncio.to_thread``: cancelling a job still
+    queued in the executor drops it, so the cleanup would never run."""
     task = asyncio.ensure_future(work)
     try:
         return await asyncio.shield(task)
     except BaseException as exc:
         await _settle(task)
+        if not task.cancelled() and (failure := task.exception()) is not None and failure is not exc:
+            exc.add_note(f"cleanup also failed: {failure!r}")
+        raise
+
+
+async def shield_or_undo[T](work: Awaitable[T], undo: Callable[[T | None], Awaitable[object]]) -> T:
+    """``run_to_completion(work)``; if that fails or is cancelled, runs
+    ``undo(result)`` (``None`` if ``work`` failed) without yielding to a
+    further cancellation, and notes an ``undo`` failure on the exception
+    being raised."""
+    task = asyncio.ensure_future(work)
+    try:
+        return await run_to_completion(task)
+    except BaseException as exc:
         result = None if task.cancelled() or task.exception() is not None else task.result()
         undo_task = asyncio.ensure_future(undo(result))
         await _settle(undo_task)

@@ -25,6 +25,9 @@ from synology_apm_repo.sdk.storage.dircache import DirCache, split_seq_suffix
             {"0.inf": ("0.inf", None), "0_0.fgp": ("0_0.fgp", None)},
             id="does_not_false_positive_on_non_numeric_extension",
         ),
+        pytest.param(
+            {"file_map.\u0661\u0662": ("file_map.\u0661\u0662", None)}, id="non_ascii_digits_are_not_a_suffix"
+        ),
     ],
 )
 def test_split_seq_suffix(expected: dict[str, tuple[str, int | None]]) -> None:

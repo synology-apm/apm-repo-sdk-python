@@ -21,8 +21,8 @@ from support.fakes import unchecked_fake
 from support.format_builders import encode_size_store, sizestore_region_pad
 from support.repo_builders import write_bucket
 from support.store_fakes import WrappingStore
-from synology_apm_repo.sdk.dedup.pool import BucketReader, Pool
-from synology_apm_repo.sdk.dedup.pool._bucket_reader import _GAP_TOLERANCE, _IndexRun
+from synology_apm_repo.sdk.dedup.pool import DECODE_BLOCK_CHUNKS, BucketReader, Pool
+from synology_apm_repo.sdk.dedup.pool._bucket_reader import _GAP_TOLERANCE, _IndexRun, _split_into_blocks
 from synology_apm_repo.sdk.errors import (
     ChunkCompactedError,
     DataCorruptError,
@@ -218,6 +218,27 @@ class TestCompacted:
         with pytest.raises(ChunkCompactedError, match="is COMPACTED — reclaimed, cannot be recovered"):
             await reader.read_chunk(ChunkIdx(0), pool_chunk_addr(0))
         assert read_calls == []
+
+
+class TestChunkIndexPastTheBucket:
+    """A chunk index past the bucket's chunks (a corrupt chunk-map record)
+    is repository corruption on every read path."""
+
+    async def test_read_chunk(self, plaintext_pool: Pool) -> None:
+        reader = await plaintext_pool.bucket(StreamId(5), BucketId(0))
+        idx = ChunkIdx(len(PLAINTEXTS))
+        with pytest.raises(DataCorruptError, match="is outside"):
+            await reader.read_chunk(idx, pool_chunk_addr(idx))
+
+    async def test_read_raw_chunks(self, plaintext_pool: Pool) -> None:
+        reader = await plaintext_pool.bucket(StreamId(5), BucketId(0))
+        with pytest.raises(DataCorruptError, match="is outside"):
+            await reader.read_raw_chunks([len(PLAINTEXTS)])
+
+    async def test_read_chunks(self, plaintext_pool: Pool) -> None:
+        reader = await plaintext_pool.bucket(StreamId(5), BucketId(0))
+        with pytest.raises(DataCorruptError, match="are outside"):
+            await reader.read_chunks(StreamId(5), BucketId(0), [(0, len(PLAINTEXTS) + 1)])
 
 
 def _reference_runs(located: list[tuple[int, int, int]]) -> list[list[tuple[int, int, int]]]:
@@ -459,6 +480,69 @@ class TestReadChunksBatch:
         with pytest.raises(ChunkCompactedError, match="is COMPACTED — reclaimed, cannot be recovered"):
             await reader.read_chunks(StreamId(5), BucketId(0), [(0, 2)])
         assert read_calls == []
+
+
+class TestReadChunkBlocks:
+    """``BucketReader.read_chunk_blocks``: ``read_chunks``' merged reads,
+    handed over one aligned decode block at a time."""
+
+    @staticmethod
+    async def _blocks(
+        reader: BucketReader, ranges: list[tuple[int, int]]
+    ) -> list[tuple[list[tuple[int, int]], dict[int, bytes | memoryview]]]:
+        blocks: list[tuple[list[tuple[int, int]], dict[int, bytes | memoryview]]] = []
+
+        async def _on_block(block_ranges: list[tuple[int, int]], chunks: dict[int, bytes | memoryview]) -> None:
+            blocks.append((block_ranges, {idx: bytes(data) for idx, data in chunks.items()}))
+
+        await reader.read_chunk_blocks(StreamId(5), BucketId(0), ranges, _on_block)
+        return blocks
+
+    async def test_a_large_request_arrives_in_aligned_blocks_from_one_read(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        plaintexts = [i.to_bytes(4, "big") * 1024 for i in range(2 * DECODE_BLOCK_CHUNKS + 100)]
+        write_bucket(tmp_path / "Pool" / "5" / "0.buk", plaintexts, stream_id=5, bucket_id=0)
+        store = LocalFsStore(tmp_path)
+        reader = await Pool(store, "Pool", DirCache(store)).bucket(StreamId(5), BucketId(0))
+        reads: list[tuple[int, int | None]] = []
+        original_read_sync = store.read_sync
+
+        def counting_read_sync(path: str, offset: int = 0, length: int | None = None) -> bytes:
+            reads.append((offset, length))
+            return original_read_sync(path, offset, length)
+
+        monkeypatch.setattr(store, "read_sync", counting_read_sync)
+
+        blocks = await self._blocks(reader, [(10, len(plaintexts) - 10)])
+
+        assert len(reads) == 1
+        assert [block_ranges for block_ranges, _ in blocks] == [
+            [(10, DECODE_BLOCK_CHUNKS)],
+            [(DECODE_BLOCK_CHUNKS, 2 * DECODE_BLOCK_CHUNKS)],
+            [(2 * DECODE_BLOCK_CHUNKS, len(plaintexts))],
+        ]
+        for block_ranges, chunks in blocks:
+            assert sorted(chunks) == [idx for start, end in block_ranges for idx in range(start, end)]
+            assert all(data == plaintexts[idx] for idx, data in chunks.items())
+
+    async def test_encrypted_blocks_hold_the_same_chunks_read_chunks_returns(
+        self, encrypted_pool: tuple[Pool, bytes]
+    ) -> None:
+        pool, _vault_key = encrypted_pool
+        reader = await pool.bucket(StreamId(5), BucketId(0))
+        requests = [(0, 1), (2, 1)]
+        blocks = await self._blocks(reader, requests)
+        merged = {idx: data for _, chunks in blocks for idx, data in chunks.items()}
+        assert merged == await reader.read_chunks(StreamId(5), BucketId(0), requests)
+
+    def test_ranges_are_split_at_block_boundaries(self) -> None:
+        block = DECODE_BLOCK_CHUNKS
+        assert _split_into_blocks([(block - 24, block + 6), (block + 16, 2 * block + 52)]) == [
+            [(block - 24, block)],
+            [(block, block + 6), (block + 16, 2 * block)],
+            [(2 * block, 2 * block + 52)],
+        ]
 
 
 class TestReadChunksThreadHops:
@@ -779,12 +863,25 @@ class _ParkFirstDataReadStore(WrappingStore):
         return await self._backing.read(path, offset, length)
 
 
-class TestReadChunksConcurrentReads:
-    """``read_chunks``'s ``semaphore``: concurrency across one bucket's merged
-    runs. With ``_GAP_TOLERANCE`` patched to 0, skipping chunk 1 splits the
-    request into two runs. The fresh semaphores here always have spare
-    permits; ``test_dedup_chunk_walk.py`` covers the pre-acquired permit
-    hand-off from ``exec_chunks``."""
+async def _read_blocks_merged(
+    reader: BucketReader, ranges: list[tuple[int, int]], semaphore: asyncio.Semaphore
+) -> dict[int, bytes | memoryview]:
+    """``read_chunk_blocks``' chunks gathered into one dict."""
+    merged: dict[int, bytes | memoryview] = {}
+
+    async def _on_block(_ranges: list[tuple[int, int]], chunks: dict[int, bytes | memoryview]) -> None:
+        merged.update(chunks)
+
+    await reader.read_chunk_blocks(StreamId(5), BucketId(0), ranges, _on_block, semaphore=semaphore)
+    return merged
+
+
+class TestReadChunkBlocksConcurrentReads:
+    """``read_chunk_blocks``' ``semaphore``: concurrency across one bucket's
+    merged runs, and ``read_chunks``' strictly serial runs. With
+    ``_GAP_TOLERANCE`` patched to 0, skipping chunk 1 splits the request into
+    two runs. The fresh semaphores here always have spare permits;
+    ``test_dedup_chunk_walk.py`` covers a call whose permits are all taken."""
 
     async def test_output_is_unchanged_across_two_runs(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         write_bucket(tmp_path / "Pool" / "5" / "0.buk", PLAINTEXTS, stream_id=5, bucket_id=0, chunk_crc_store=False)
@@ -794,7 +891,7 @@ class TestReadChunksConcurrentReads:
         monkeypatch.setattr("synology_apm_repo.sdk.dedup.pool._bucket_reader._GAP_TOLERANCE", 0)
 
         requests = [(0, 1), (2, 1)]  # skip chunk 1 -> forced 2-run split at tolerance=0
-        result = await reader.read_chunks(StreamId(5), BucketId(0), requests, semaphore=asyncio.Semaphore(4))
+        result = await _read_blocks_merged(reader, requests, asyncio.Semaphore(4))
 
         assert result == {0: PLAINTEXTS[0], 2: PLAINTEXTS[2]}
 
@@ -815,9 +912,7 @@ class TestReadChunksConcurrentReads:
         reader._store = parking_store
 
         requests = [(0, 1), (2, 1)]
-        task = asyncio.create_task(
-            reader.read_chunks(StreamId(5), BucketId(0), requests, semaphore=asyncio.Semaphore(4))
-        )
+        task = asyncio.create_task(_read_blocks_merged(reader, requests, asyncio.Semaphore(4)))
         await parking_store.parked.wait()
         with contextlib.suppress(TimeoutError):
             await asyncio.wait_for(parking_store.second_read_started.wait(), timeout=5.0)
@@ -830,9 +925,8 @@ class TestReadChunksConcurrentReads:
 
         assert result == {0: PLAINTEXTS[0], 2: PLAINTEXTS[2]}
 
-    async def test_no_semaphore_is_still_strictly_serial(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-        """With ``semaphore=None`` (the default), the second run's read waits
-        for the first."""
+    async def test_read_chunks_is_strictly_serial(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        """``read_chunks``' second run's read waits for the first."""
         write_bucket(tmp_path / "Pool" / "5" / "0.buk", PLAINTEXTS, stream_id=5, bucket_id=0, chunk_crc_store=False)
         backing = LocalFsStore(tmp_path)
         pool = Pool(backing, "Pool", DirCache(backing))
@@ -843,7 +937,7 @@ class TestReadChunksConcurrentReads:
         reader._store = parking_store
 
         requests = [(0, 1), (2, 1)]
-        task = asyncio.create_task(reader.read_chunks(StreamId(5), BucketId(0), requests, semaphore=None))
+        task = asyncio.create_task(reader.read_chunks(StreamId(5), BucketId(0), requests))
         await parking_store.parked.wait()
         parking_store._unblock()
         result = await task

@@ -56,9 +56,11 @@ or `make smoke-test`; needs `../smoke_samples.toml` configured (see
   never suppressing errors, `--progress`'s NDJSON stream (only with
   `--json`), `--trace` never polluting `--json` stdout.
 - **`export_lifecycle`** -- a real file export end to end (no leftover
-  `.part`, a non-empty final file), plus a real, timed `SIGINT` mid-export:
-  a first Ctrl-C is a handled cancellation (`.part` deleted, no final file,
-  exit 130, `ExitCode.CANCELLED`).
+  `.part`, a non-empty final file), plus a real `SIGINT` to the CLI's
+  process group once its progress line shows data being read: a first
+  Ctrl-C is a handled cancellation (`.part` deleted, no final file, exit
+  130, `ExitCode.CANCELLED`). POSIX only: skipped on Windows, which has no
+  Ctrl-C for another process group.
 - **`profile`** -- `profile add/list/show/remove` round trip against a
   sandboxed config dir, driven through `--no-input`'s stdin-secrets flow.
   Uses the `null` keyring backend (`_cli_runner.py`'s `sandboxed_env()`),

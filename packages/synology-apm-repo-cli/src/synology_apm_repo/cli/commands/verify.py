@@ -14,8 +14,12 @@ from synology_apm_repo.cli.paging import render
 from synology_apm_repo.cli.progress_render import build_progress_meter
 from synology_apm_repo.cli.repo_session import opened_repo_or_profile
 from synology_apm_repo.cli.state import CliState
-from synology_apm_repo.cli.strings import VERIFY_LEVEL_HELP
-from synology_apm_repo.sdk import Finding, VerifyLevel
+from synology_apm_repo.cli.strings import (
+    VERIFY_CONCURRENT_DECODES_HELP,
+    VERIFY_CONCURRENT_READS_HELP,
+    VERIFY_LEVEL_HELP,
+)
+from synology_apm_repo.sdk import Finding, VerifyLevel, VerifyTuning
 from synology_apm_repo.sdk.presentation import VerifySummary, group_count_label, safe, summarize_findings
 
 
@@ -60,21 +64,38 @@ def _render_human(summary: VerifySummary, level: VerifyLevel, *, verbose: bool) 
             console.print(line + _finding_ref_suffix(aug.finding, verbose=verbose))
 
 
+def _tuning(*, concurrent_reads: int | None, concurrent_decodes: int | None) -> VerifyTuning | None:
+    """The ``VerifyTuning`` the given flags ask for, the SDK's defaults for the rest; ``None`` when neither is given."""
+    given = {
+        name: value
+        for name, value in (("max_concurrent_reads", concurrent_reads), ("max_concurrent_decodes", concurrent_decodes))
+        if value is not None
+    }
+    return VerifyTuning(**given) if given else None
+
+
 @typer_async
 async def verify(
     ctx: typer.Context,
     repo: RepoArgument = None,
     key: KeyOption = None,
     level: Annotated[VerifyLevel, typer.Option("--level", help=VERIFY_LEVEL_HELP)] = VerifyLevel.QUICK,
+    concurrent_reads: Annotated[
+        int | None, typer.Option("--concurrent-reads", min=1, help=VERIFY_CONCURRENT_READS_HELP)
+    ] = None,
+    concurrent_decodes: Annotated[
+        int | None, typer.Option("--concurrent-decodes", min=1, help=VERIFY_CONCURRENT_DECODES_HELP)
+    ] = None,
     profile: ProfileOption = None,
 ) -> None:
     """Run an integrity check against REPO and report every Finding; exits 3 when any is still unresolved."""
     state: CliState = ctx.obj
     verify_meter = build_progress_meter(state)
-    async with opened_repo_or_profile(repo, key, profile=profile, state=state) as repository:
+    tuning = _tuning(concurrent_reads=concurrent_reads, concurrent_decodes=concurrent_decodes)
+    async with opened_repo_or_profile(ctx, repo, key, profile=profile) as repository:
         # Two stages: one "items" tick per discovered workload/version, then
         # one per bucket checked ("bytes" at FULL, "buckets" at QUICK).
-        summary = summarize_findings(await repository.verify(level, progress=verify_meter.update))
+        summary = summarize_findings(await repository.verify(level, progress=verify_meter.update, tuning=tuning))
 
     report = _build_report(summary, level, verbose=state.verbose)
     render(console, state, json=report, human=lambda: _render_human(summary, level, verbose=state.verbose), page=True)

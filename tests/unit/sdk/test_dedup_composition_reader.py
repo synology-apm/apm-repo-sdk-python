@@ -114,6 +114,11 @@ class TestRecord:
         with pytest.raises(UnsupportedVersionError, match="RecordHead lacks the Redundancy mode bit"):
             await reader.record(64)
 
+    async def test_a_given_head_is_used_without_reading_it(self, reader: CompositionReader) -> None:
+        head = RecordHead(status=CompositionStatus.COMPLETE, map_num=3, map_crc=0, mode=0, attr_leng=0, attr_crc=0)
+        record = await reader.record(64, record_head=head)  # no sub-file exists: any read would raise
+        assert record.record_head is head
+
 
 class TestCompositionCache:
     """``record()``'s optional shared ``composition_cache`` (in production,
@@ -194,7 +199,7 @@ class TestCompositionCache:
             store, DirCache(store), "Composition", StreamId(7), SessionId(3), composition_cache=cache
         )
 
-        async def fake_build_record(head_off: int) -> CompositionRecord:
+        async def fake_build_record(head_off: int, record_head: RecordHead | None) -> CompositionRecord:
             return CompositionRecord(
                 head_off=head_off,
                 record_head=RecordHead(
@@ -224,7 +229,7 @@ class TestCompositionCache:
         )
         built: list[int] = []
 
-        async def fake_build_record(head_off: int) -> CompositionRecord:
+        async def fake_build_record(head_off: int, record_head: RecordHead | None) -> CompositionRecord:
             built.append(head_off)
             return CompositionRecord(
                 head_off=head_off,
@@ -417,6 +422,86 @@ class TestRepairedPagesSurviveEviction:
         await record._get_page(1)  # evicts page 0
         assert 0 not in record._pages
         assert await record._get_page(0) == repaired[: 2048 * 20]
+
+
+class TestPrimePages:
+    """``prime_pages`` caches a window's pages from an array the caller
+    already read, within the page cache's free room only."""
+
+    _MAP_NUM = 2 * 2048 + 5  # three pages
+
+    def _record_with_fetch_tracking(
+        self, monkeypatch: pytest.MonkeyPatch, *, maxsize: int
+    ) -> tuple[CompositionRecord, dict[int, int]]:
+        fetch_calls: dict[int, int] = {}
+        record = CompositionRecord(
+            head_off=0,
+            record_head=RecordHead(
+                status=CompositionStatus.COMPLETE, map_num=self._MAP_NUM, map_crc=0, mode=0, attr_leng=0, attr_crc=0
+            ),
+            reader=cast(CompositionReader, object()),
+            _pages=AsyncKeyedCache(maxsize=maxsize),
+        )
+
+        async def fake_fetch_page(page_idx: int) -> bytes:
+            fetch_calls[page_idx] = fetch_calls.get(page_idx, 0) + 1
+            start_entry, count = record._page_bounds(page_idx)
+            return _fake_page(start_entry, count)
+
+        monkeypatch.setattr(record, "_fetch_page", fake_fetch_page)
+        return record, fetch_calls
+
+    async def test_a_primed_record_walks_with_no_fetch(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        record, fetch_calls = self._record_with_fetch_tracking(monkeypatch, maxsize=8)
+        await record.prime_pages(_fake_page(0, self._MAP_NUM), 0, self._MAP_NUM * 4096)
+
+        entries = [e async for e in record.entries(start=4097 * 4096)]
+
+        assert len(entries) == self._MAP_NUM - 4097
+        assert fetch_calls == {}
+
+    async def test_only_free_room_is_filled_and_nothing_is_evicted(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        record, fetch_calls = self._record_with_fetch_tracking(monkeypatch, maxsize=2)
+        await record._get_page(2)  # already cached: one slot left
+
+        await record.prime_pages(_fake_page(0, self._MAP_NUM), 0, self._MAP_NUM * 4096)
+
+        assert set(record._pages) == {0, 2}
+        assert record._page_end_offsets.keys() == {0, 1, 2}  # page 1 is located with no I/O
+        assert [e.file_offset async for e in record.entries()] == [i * 4096 for i in range(self._MAP_NUM)]
+        assert 0 not in fetch_calls
+        assert fetch_calls[1] == 1  # page 1 comes from storage, not from the primed array
+
+    async def test_only_pages_overlapping_the_window_are_cached(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        record, fetch_calls = self._record_with_fetch_tracking(monkeypatch, maxsize=8)
+        window_start = 2048 * 4096  # page 1's first entry
+
+        await record.prime_pages(_fake_page(0, self._MAP_NUM), window_start, window_start + 4096)
+
+        assert set(record._pages) == {1}
+        assert record._page_end_offsets.keys() == {0, 1}  # nothing past the window
+        assert [e.file_offset async for e in record.entries(window_start, window_start + 4096)] == [window_start]
+        assert fetch_calls == {}
+
+    async def test_a_repaired_record_keeps_its_repaired_pages(self) -> None:
+        repaired = _fake_page(0, self._MAP_NUM)
+        record = CompositionRecord(
+            head_off=0,
+            record_head=RecordHead(
+                status=CompositionStatus.COMPLETE, map_num=self._MAP_NUM, map_crc=0, mode=0, attr_leng=0, attr_crc=0
+            ),
+            reader=cast(CompositionReader, object()),
+        )
+        await record.seed_pages_from_array(repaired)
+
+        await record.prime_pages(_fake_page(1, self._MAP_NUM), 0, self._MAP_NUM * 4096)
+
+        assert record._pages.get(0) == repaired[: 2048 * 20]
+
+    async def test_an_array_of_the_wrong_length_raises(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        record, _ = self._record_with_fetch_tracking(monkeypatch, maxsize=8)
+        with pytest.raises(ValueError, match="prime_pages"):
+            await record.prime_pages(_fake_page(0, self._MAP_NUM - 1), 0, self._MAP_NUM * 4096)
 
 
 class TestEntries:

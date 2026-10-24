@@ -117,7 +117,10 @@ async def ls(
     any further ones go into that version's own item tree. A name
     containing a literal '/' (rare, but real — e.g. a workload named
     '../A') must be percent-encoded within its own segment ('..%2FA') or
-    it reads as an extra navigation level instead of part of the name."""
+    it reads as an extra navigation level instead of part of the name. A
+    canonical ref (what --ref prints) starts with '@' instead
+    (#@cat:<id>/wl:<id>/ver:<uid>/...), so a first name that itself starts
+    with '@' is written '%40...'."""
     state: CliState = ctx.obj
     async with walked_ref(state, ref, key, profile=profile, object_db_id=object_db_id, show_ref=show_ref) as walked:
         frame, show = walked.frame, walked.show_ref

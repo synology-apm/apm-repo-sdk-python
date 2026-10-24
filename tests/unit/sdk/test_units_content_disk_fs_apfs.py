@@ -5,6 +5,22 @@ which covers the other formats.
 Fixture: ``tests/fixtures/tiny_apfs_gpt.raw.gz``, a 16MiB GPT disk with one
 ``Apple_APFS`` partition at byte offset 20480, built with macOS ``hdiutil`` and
 holding a ``hello.txt``/``subdir/nested.txt`` payload.
+
+Fixture: ``tests/fixtures/tiny_apfs_cloud_gpt.raw.gz``, a 16MiB GPT disk
+erased as APFS by macOS ``diskutil`` (partition at the same offset, volume
+``CloudFixture``), holding iCloud Drive's two on-disk file states as
+macOS 26 leaves them, with ``com.apple.decmpfs`` headers copied from real
+iCloud files (only the size and the item identifier replaced):
+``downloaded.txt`` (10000 bytes on disk, ``UF_TRACKED``, and the 36-byte
+header with dataless algorithm ``0x80000001`` a download leaves behind,
+recording 9000 bytes as after a local edit iCloud hasn't synced yet) and
+``cloud_only.txt`` (no data, the 40-byte header an eviction writes,
+``SF_DATALESS | UF_COMPRESSED | UF_TRACKED``). The kernel won't set
+``SF_DATALESS``, so it was written into the inode records offline with each
+block's Fletcher-64 checksum recomputed; ``fsck_apfs -n`` passes. Also
+``sparse.bin`` (8 KiB data, 16 KiB zeros whose first 8 KiB is a sparse
+extent, 8 KiB data) and ``fragmented.bin`` (two non-adjacent 8 KiB
+extents). Every file's content is ``_pattern``'s.
 """
 
 from __future__ import annotations
@@ -14,8 +30,10 @@ import struct
 from datetime import UTC, datetime
 from io import BytesIO
 from pathlib import Path
+from typing import ClassVar
 
 import pytest
+from dissect.apfs.c_apfs import c_apfs
 
 import synology_apm_repo.sdk.units.content.disk_fs._disk_filesystem as disk_fs_module
 from support.fakes import unchecked_fake
@@ -33,9 +51,10 @@ from synology_apm_repo.sdk.units.content.disk_fs._apfs import (
     _apfs_entry_mtime,
     _apfs_is_dataless,
     _apfs_iterdir,
+    _apfs_open_stream,
     _apfs_size,
 )
-from synology_apm_repo.sdk.units.content.disk_fs._base import _CLOUD_ONLY_REASON, _DirEntry
+from synology_apm_repo.sdk.units.content.disk_fs._base import _CLOUD_ONLY_REASON, _default_open_stream, _DirEntry
 from synology_apm_repo.sdk.units.content.disk_fs._disk_filesystem import _DissectEntry
 from unit.sdk.disk_fs_fakes import MemoryContent, raw_image
 
@@ -45,6 +64,9 @@ _IS_PURGEABLE_FLAG = 0x00080000
 
 #: SF_DATALESS, per dissect.apfs's own c_apfs.py.
 _SF_DATALESS_FLAG = 0x40000000
+
+#: UF_COMPRESSED, per dissect.apfs's own c_apfs.py.
+_UF_COMPRESSED_FLAG = 0x00000020
 
 #: A real compression algorithm (LZFSE), disjoint from the dataless
 #: sentinels -- for proving a compressed, locally-resident file isn't flagged.
@@ -70,10 +92,16 @@ class _FakeXAttr:
         return BytesIO(self._raw)
 
 
+class _FakeDataStream:
+    def __init__(self, size: int) -> None:
+        self.size = size
+
+
 @unchecked_fake("a dissect.apfs object")
 class _FakeApfsInode:
     """A fake APFS ``INode``, exposing exactly what ``_apfs_is_dataless``/
     ``_apfs_size`` need: ``bsd_flags``, ``is_compressed()``, ``xattr``,
+    ``xfields`` (a data stream of ``data_size`` bytes, none when ``None``)
     and ``size``."""
 
     def __init__(
@@ -85,8 +113,12 @@ class _FakeApfsInode:
         size: int | None = 0,
         size_raises: BaseException | None = None,
         mtime: datetime | None = None,
+        data_size: int | None = None,
     ) -> None:
         self.bsd_flags = bsd_flags
+        self.xfields: dict[object, tuple[object, _FakeDataStream]] = (
+            {} if data_size is None else {c_apfs.INO_EXT_TYPE.DSTREAM: (None, _FakeDataStream(data_size))}
+        )
         self._size = size
         self._size_raises = size_raises
         self.mtime = mtime
@@ -99,7 +131,7 @@ class _FakeApfsInode:
         return self._xattr
 
     def is_compressed(self) -> bool:
-        return bool(self.bsd_flags & 0x00000020)  # UF_COMPRESSED
+        return bool(self.bsd_flags & _UF_COMPRESSED_FLAG)
 
     @property
     def size(self) -> int | None:
@@ -186,13 +218,10 @@ def test_apfs_iterdir_skips_a_self_reference_and_a_partial_object() -> None:
     """``_apfs_iterdir`` skips a ``"."`` self-reference and a child lacking
     ``is_dir()``/``inode``."""
 
-    class _FakeInode:
-        size = 3
-
     @unchecked_fake("a dissect.apfs object")
     class _FakeChild:
         name = "real_file.txt"
-        inode = _FakeInode()
+        inode = _FakeApfsInode(size=3)
 
         def is_dir(self) -> bool:
             return False
@@ -272,7 +301,7 @@ def test_apfs_iterdir_lists_a_dataless_files_pre_eviction_size() -> None:
     class _FakeChild:
         name = "alice-notes.zip"
         inode = _FakeApfsInode(
-            bsd_flags=_SF_DATALESS_FLAG | 0x00000020,  # SF_DATALESS | UF_COMPRESSED
+            bsd_flags=_SF_DATALESS_FLAG | _UF_COMPRESSED_FLAG,
             decmpfs_algorithm=_DATALESS_ALGORITHM,
             decmpfs_uncompressed_size=13016,
             size=0,
@@ -330,18 +359,40 @@ def test_apfs_entry_mtime_degrades_to_none_when_the_underlying_read_raises() -> 
     assert _apfs_entry_mtime(_RaisingInode()) is None
 
 
-def test_apfs_is_dataless_matches_sf_dataless_or_a_dataless_decmpfs_algorithm() -> None:
+def test_apfs_is_dataless_matches_sf_dataless_or_a_dataless_header_without_local_data() -> None:
     # SF_DATALESS alone is enough, without is_compressed() or a decmpfs xattr.
     assert _apfs_is_dataless(_FakeApfsInode(bsd_flags=_SF_DATALESS_FLAG)) is True
+    # A dataless header on a compressed file, or on one with no data stream.
+    assert (
+        _apfs_is_dataless(_FakeApfsInode(bsd_flags=_UF_COMPRESSED_FLAG, decmpfs_algorithm=_DATALESS_ALGORITHM)) is True
+    )
     assert _apfs_is_dataless(_FakeApfsInode(decmpfs_algorithm=_DATALESS_ALGORITHM)) is True
-    # The decmpfs check isn't gated on is_compressed(), which a real
-    # dataless file commonly leaves unset.
-    assert _apfs_is_dataless(_FakeApfsInode(bsd_flags=0, decmpfs_algorithm=_DATALESS_ALGORITHM)) is True
+    # A downloaded cloud file keeps the header, uncompressed, with a data stream.
+    assert _apfs_is_dataless(_FakeApfsInode(decmpfs_algorithm=_DATALESS_ALGORITHM, data_size=100)) is False
     # IS_PURGEABLE is unrelated.
     assert _apfs_is_dataless(_FakeApfsInode(bsd_flags=_IS_PURGEABLE_FLAG)) is False
     # A real compression algorithm (LZFSE) must never be flagged.
-    assert _apfs_is_dataless(_FakeApfsInode(bsd_flags=0x00000020, decmpfs_algorithm=_REAL_LZFSE_ALGORITHM)) is False
+    assert (
+        _apfs_is_dataless(_FakeApfsInode(bsd_flags=_UF_COMPRESSED_FLAG, decmpfs_algorithm=_REAL_LZFSE_ALGORITHM))
+        is False
+    )
     assert _apfs_is_dataless(_FakeApfsInode()) is False
+
+
+def test_apfs_is_dataless_reads_a_dataless_header_whose_data_stream_cant_be_read_as_dataless() -> None:
+    @unchecked_fake("a dissect.apfs object")
+    class _BrokenXfields:
+        bsd_flags = 0
+        xattr: ClassVar[dict[str, object]] = {"com.apple.decmpfs": _FakeXAttr(_DATALESS_ALGORITHM, 100)}
+
+        def is_compressed(self) -> bool:
+            return False
+
+        @property
+        def xfields(self) -> dict[object, object]:
+            raise EOFError("truncated xfields")
+
+    assert _apfs_is_dataless(_BrokenXfields()) is True
 
 
 def test_apfs_content_unavailable_is_a_thin_wrapper_around_is_dataless() -> None:
@@ -382,7 +433,9 @@ async def test_read_converts_a_dataless_apfs_open_failure_to_content_unavailable
         def open(self) -> object:
             raise EOFError("not enough bytes to read struct")
 
-    source = DissectFileContentSource(_DatalessEntry(bsd_flags=_SF_DATALESS_FLAG), size=10)
+    source = DissectFileContentSource(
+        _DatalessEntry(bsd_flags=_SF_DATALESS_FLAG), size=10, open_stream=_default_open_stream
+    )
     with pytest.raises(ContentUnavailableError, match="cloud-sync placeholder") as exc_info:
         await source.read(0, 5)
     assert str(exc_info.value) == _CLOUD_ONLY_REASON
@@ -393,12 +446,19 @@ def test_apfs_size_prefers_the_decmpfs_headers_uncompressed_size_when_zeroed_on_
     """A compressed entry reporting ``.size == 0`` (zeroed on eviction)
     gets its size from the decmpfs xattr header instead."""
     entry = _FakeApfsInode(
-        bsd_flags=0x00000020,  # UF_COMPRESSED
+        bsd_flags=_UF_COMPRESSED_FLAG,
         decmpfs_algorithm=_DATALESS_ALGORITHM,
         decmpfs_uncompressed_size=13016,
         size=0,
     )
     assert _apfs_size(entry) == 13016
+
+
+def test_apfs_size_of_an_uncompressed_file_is_its_data_streams_not_a_stale_decmpfs_header() -> None:
+    entry = _FakeApfsInode(
+        decmpfs_algorithm=_DATALESS_ALGORITHM, decmpfs_uncompressed_size=850, size=850, data_size=867
+    )
+    assert _apfs_size(entry) == 867
 
 
 def test_apfs_size_never_overrides_a_genuinely_empty_non_compressed_files_zero() -> None:
@@ -408,7 +468,7 @@ def test_apfs_size_never_overrides_a_genuinely_empty_non_compressed_files_zero()
 
 def test_apfs_size_returns_zero_when_compressed_but_no_decmpfs_xattr_at_all() -> None:
     """With no decmpfs xattr to fall back to, the size stays ``0``."""
-    entry = _FakeApfsInode(bsd_flags=0x00000020, size=0)  # UF_COMPRESSED, no decmpfs xattr
+    entry = _FakeApfsInode(bsd_flags=_UF_COMPRESSED_FLAG, size=0)  # no decmpfs xattr
     assert _apfs_size(entry) == 0
 
 
@@ -494,3 +554,58 @@ def test_disk_fs_available_true_with_only_dissect_apfs(monkeypatch: pytest.Monke
 
     monkeypatch.setattr(importlib.util, "find_spec", _fake_find_spec)
     assert disk_fs_available() is True
+
+
+def _pattern(tag: bytes, size: int) -> bytes:
+    """The cloud fixture's file content: numbered lines, cut to ``size``."""
+    return b"".join(b"%s %06d\n" % (tag, i) for i in range(size // 8 + 1))[:size]
+
+
+async def _open_cloud_fixture() -> tuple[DiskFilesystem, int]:
+    disk_fs = await DiskFilesystem.open(MemoryContent(raw_image("tiny_apfs_cloud_gpt.raw.gz")))
+    assert disk_fs is not None
+    ((addr, _label),) = disk_fs.partitions()
+    return disk_fs, addr
+
+
+async def test_list_dir_flags_an_evicted_icloud_file_but_not_a_downloaded_one() -> None:
+    disk_fs, addr = await _open_cloud_fixture()
+    entries = {e.name: e for e in await disk_fs.list_dir(addr, "/")}
+    assert (entries["cloud_only.txt"].file_state, entries["cloud_only.txt"].size) == (FileState.CLOUD_ONLY, 10000)
+    # Its data stream's size, not the 9000 its stale header records.
+    assert (entries["downloaded.txt"].file_state, entries["downloaded.txt"].size) == (FileState.NORMAL, 10000)
+
+
+async def test_open_file_reads_a_downloaded_icloud_file_and_refuses_an_evicted_one() -> None:
+    disk_fs, addr = await _open_cloud_fixture()
+    content = await disk_fs.open_file(addr, "/downloaded.txt")
+    assert await content.read() == _pattern(b"downloaded", 10000)
+    with pytest.raises(ContentUnavailableError, match="cloud-sync placeholder"):
+        await disk_fs.open_file(addr, "/cloud_only.txt")
+
+
+async def test_open_file_reads_a_sparse_extent_as_zeros() -> None:
+    disk_fs, addr = await _open_cloud_fixture()
+    content = await disk_fs.open_file(addr, "/sparse.bin")
+    assert await content.read() == _pattern(b"sparse-a", 8192) + bytes(16384) + _pattern(b"sparse-b", 8192)
+
+
+async def test_open_file_reads_across_extents_starting_inside_one() -> None:
+    disk_fs, addr = await _open_cloud_fixture()
+    content = await disk_fs.open_file(addr, "/fragmented.bin")
+    expected = _pattern(b"frag", 16384)
+    assert await content.read(4096, 8192) == expected[4096:12288]
+    assert await content.read() == expected
+
+
+def test_apfs_open_stream_keeps_the_entrys_own_stream_unless_a_plain_file_stream() -> None:
+    """A decmpfs or in-memory stream (a compressed or empty file) is
+    returned as ``entry.open()`` gave it."""
+    sentinel = BytesIO(b"own stream")
+
+    @unchecked_fake("a dissect.apfs object")
+    class _Inode:
+        def open(self) -> BytesIO:
+            return sentinel
+
+    assert _apfs_open_stream(_Inode()) is sentinel

@@ -5,6 +5,7 @@ covers the real-sample envelope combinations."""
 from __future__ import annotations
 
 import asyncio
+import concurrent.futures
 import contextlib
 import os
 import sqlite3
@@ -58,6 +59,12 @@ def _real_sqlite_bytes() -> bytes:
         return conn.serialize()
     finally:
         conn.close()
+
+
+def _join_scratch_cleanup() -> None:
+    for thread in threading.enumerate():
+        if thread.name == "sqlite-scratch-cleanup":
+            thread.join(timeout=5)
 
 
 async def _fetchone(conn: aiosqlite.Connection, sql: str) -> Any:
@@ -263,6 +270,122 @@ class TestSqliteSource:
         monkeypatch.setattr(os, "unlink", unlinked.append)
         await src.close()  # must not raise FileNotFoundError
         assert unlinked == []  # the second close does no cleanup work at all
+
+    async def test_a_hung_close_lets_an_owners_timeout_fire_and_still_removes_the_temp_file(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """An owner's ``wait_for`` (``RESOURCE_CLOSE_TIMEOUT``) must not wait
+        on a hung connection close, and the temp file still goes: at once,
+        or on Windows once the connection really closes."""
+        src = await SqliteSource.from_bytes(_real_sqlite_bytes())
+        path = src._path
+        assert path is not None
+        worker = src.connection._thread
+        real_close = src.connection.close
+        monkeypatch.setattr(src.connection, "close", asyncio.Event().wait)  # never returns
+        try:
+            with pytest.raises(TimeoutError) as info:
+                await asyncio.wait_for(src.close(), timeout=0.1)
+            assert not getattr(info.value.__cause__, "__notes__", [])
+        finally:
+            await real_close()
+        await asyncio.to_thread(worker.join)
+        await asyncio.to_thread(_join_scratch_cleanup)
+        assert not os.path.exists(path)
+
+    async def test_a_removal_refused_while_the_connection_thread_runs_is_retried_once_it_exits(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        src = await SqliteSource.from_bytes(_real_sqlite_bytes())
+        path = src._path
+        assert path is not None
+        worker = src.connection._thread
+        real_close = src.connection.close
+        real_removal = src._remove_scratch_files
+        removals: list[str] = []
+
+        def refused_then_real_removal() -> None:
+            removals.append("attempt")
+            if len(removals) == 1:
+                raise PermissionError("file in use")  # what Windows says while sqlite holds it
+            real_removal()
+
+        monkeypatch.setattr(src.connection, "close", asyncio.Event().wait)  # never returns
+        monkeypatch.setattr(src, "_remove_scratch_files", refused_then_real_removal)
+        with pytest.raises(TimeoutError):
+            await asyncio.wait_for(src.close(), timeout=0.1)
+        assert removals == ["attempt"] and os.path.exists(path)
+        await real_close()
+        await asyncio.to_thread(worker.join)
+        await asyncio.to_thread(_join_scratch_cleanup)
+        assert removals == ["attempt", "attempt"]
+        assert not os.path.exists(path)
+
+    async def test_a_close_cancelled_while_its_removal_is_queued_still_removes_the_temp_file(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        src = await SqliteSource.from_bytes(_real_sqlite_bytes())
+        path = src._path
+        assert path is not None
+        connection_closed = asyncio.Event()
+        real_close = src.connection.close
+
+        async def signalling_close() -> None:
+            await real_close()
+            connection_closed.set()
+
+        monkeypatch.setattr(src.connection, "close", signalling_close)
+        asyncio.get_running_loop().set_default_executor(concurrent.futures.ThreadPoolExecutor(max_workers=1))
+        busy_gate = threading.Event()
+        busy = asyncio.ensure_future(asyncio.to_thread(busy_gate.wait, 5))  # the removal queues behind it
+        close = asyncio.ensure_future(src.close())
+        await connection_closed.wait()
+        await asyncio.sleep(0)  # close() has now queued its removal
+        close.cancel()
+        busy_gate.set()
+        with pytest.raises(asyncio.CancelledError):
+            await close
+        await busy
+        assert not os.path.exists(path)
+
+    async def test_a_failing_close_still_removes_the_temp_file(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        src = await SqliteSource.from_bytes(_real_sqlite_bytes())
+        path = src._path
+        assert path is not None
+        real_close = src.connection.close
+
+        async def failing_close() -> None:
+            await real_close()
+            raise sqlite3.OperationalError("simulated close failure")
+
+        monkeypatch.setattr(src.connection, "close", failing_close)
+        with pytest.raises(sqlite3.OperationalError, match="simulated close failure"):
+            await src.close()
+        assert not os.path.exists(path)
+
+    async def test_a_removal_failure_after_a_failed_close_is_a_note_not_the_raised_error(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        src = await SqliteSource.from_bytes(_real_sqlite_bytes())
+        real_close = src.connection.close
+
+        async def failing_close() -> None:
+            await real_close()
+            await asyncio.to_thread(src.connection._thread.join)  # a live thread would defer the removal
+            raise sqlite3.OperationalError("simulated close failure")
+
+        def failing_removal() -> None:
+            raise PermissionError("file in use")
+
+        real_removal = src._remove_scratch_files
+        monkeypatch.setattr(src.connection, "close", failing_close)
+        monkeypatch.setattr(src, "_remove_scratch_files", failing_removal)
+        try:
+            with pytest.raises(sqlite3.OperationalError, match="simulated close failure") as info:
+                await src.close()
+        finally:
+            real_removal()
+        assert info.value.__notes__ == ["cleanup also failed: PermissionError('file in use')"]
 
     async def test_failure_during_open_still_cleans_up_the_temp_file(self, monkeypatch: pytest.MonkeyPatch) -> None:
         data = _real_sqlite_bytes()

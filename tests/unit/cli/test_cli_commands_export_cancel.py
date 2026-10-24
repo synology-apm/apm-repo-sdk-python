@@ -1,13 +1,16 @@
 """Unit tests for ``synology_apm_repo.cli.commands.export``'s
 Ctrl-C/``--keep-partial`` handling: the SIGINT handler's first-press branch
-and the CLI's behavior when the export raises ``asyncio.CancelledError``. The
-second-press ``os._exit()`` branch is not exercised.
+(including one landing mid-write to stderr) and the CLI's behavior when the
+export raises ``asyncio.CancelledError``. The second-press ``os._exit()``
+branch is not exercised.
 """
 
 from __future__ import annotations
 
 import asyncio
+import io
 import signal
+import sys
 from collections.abc import AsyncIterator
 from pathlib import Path
 
@@ -44,6 +47,42 @@ def test_first_sigint_cancels_the_task_and_can_be_restored() -> None:
             with pytest.raises(asyncio.CancelledError):
                 await task
             assert task.cancelled()
+        finally:
+            restore()
+
+    asyncio.run(scenario())
+
+
+class _MidWriteStderr(io.StringIO):
+    """Stderr that, like a real ``BufferedWriter``, rejects a write made
+    while another write is in progress (``busy``)."""
+
+    busy = False
+
+    def write(self, s: str) -> int:
+        if self.busy:
+            raise RuntimeError("reentrant call inside <_io.BufferedWriter name='<stderr>'>")
+        return super().write(s)
+
+
+def test_first_sigint_during_a_stderr_write_announces_the_cancel_on_the_raw_descriptor(
+    monkeypatch: pytest.MonkeyPatch, capfd: pytest.CaptureFixture[str]
+) -> None:
+    stderr = _MidWriteStderr()
+    monkeypatch.setattr(sys, "stderr", stderr)  # err_console resolves sys.stderr on each write
+
+    async def scenario() -> None:
+        task = asyncio.ensure_future(asyncio.Event().wait())
+        restore = _install_sigint_cancel(task)
+        try:
+            handler = signal.getsignal(signal.SIGINT)
+            assert callable(handler)
+            stderr.busy = True  # the signal lands mid-write, e.g. on the progress line
+            handler(signal.SIGINT, None)
+            stderr.busy = False
+            assert "cancelling..." in capfd.readouterr().err  # shown at once, not when the loop next runs
+            with pytest.raises(asyncio.CancelledError):
+                await task
         finally:
             restore()
 

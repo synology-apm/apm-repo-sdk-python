@@ -77,7 +77,7 @@ def _needle_for(model: UnitModel, ref: NodeRef) -> str:
 def error_leaf_ref(ref: NodeRef) -> NodeRef:
     """Key of the error leaf under ``ref`` after its first children fetch
     failed; no real child carries that segment."""
-    return NodeRef(repo_path=ref.repo_path, segments=(*ref.segments, "__error__"))
+    return ref.child("__error__")
 
 
 def _folder_node_spec(model: UnitModel, node: Node) -> NodeSpec[NodeRef]:

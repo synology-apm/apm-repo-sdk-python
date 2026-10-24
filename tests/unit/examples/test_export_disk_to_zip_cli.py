@@ -38,7 +38,7 @@ def _disk(ex: ModuleType, label: str) -> Any:
 def test_parse_args_defaults(ex: ModuleType, tmp_path: Path) -> None:
     args = ex.parse_args(["repo#a/b/c", str(tmp_path / "out.zip")])
 
-    assert (args.segment_size_mib, args.buffered_segments, args.level) == (256, 2, 6)
+    assert (args.segment_size_mib, args.buffered_segments, args.level) == (32, 2, 6)
     assert args.profile is None and args.key is None
     assert args.force is False and args.dry_run is False
 

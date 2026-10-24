@@ -7,6 +7,7 @@ from typing import Any, cast
 
 import pytest
 
+from support.cli import invoke
 from support.fakes import faithful_to
 from support.model_factories import make_catalog, make_connection
 from synology_apm_repo.cli.browse import ParsedRef, parse_ref_argument
@@ -32,6 +33,20 @@ def test_parse_ref_argument_splits_on_first_hash() -> None:
     parsed = parse_ref_argument("/some/path#Test-Workload-02/my-vm")
     assert parsed.fs_path == "/some/path"
     assert parsed.node_ref.segments == ("Test-Workload-02", "my-vm")
+
+
+@pytest.mark.parametrize(
+    ("ref", "message"),
+    [
+        ("/repo#%FF", "error: invalid percent-encoding in segment '%FF'"),
+        ("/repo#@ver:1", "error: not a NodeRef ('@' must start '@cat:' or '@raw'): '/repo#@ver:1'"),
+    ],
+)
+@pytest.mark.parametrize("command", ["ls", "tree", "cat"])
+def test_a_ref_that_does_not_parse_is_a_cli_error(command: str, ref: str, message: str) -> None:
+    result = invoke([command, ref], exit_code=1)
+    assert result.stdout == ""
+    assert result.stderr == f"{message}\n"
 
 
 # -- Repository.locate() as the listing commands call it -------------------

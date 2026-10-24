@@ -971,6 +971,28 @@ class TestSpoolStorage:
         await asyncio.wait_for(sink.abort(), _TIMEOUT)
         assert _spool_files(tmp_path) == []
 
+    async def test_a_spool_close_cancelled_while_a_write_is_pending_still_closes_the_fd_after_it(
+        self, tmp_path: Path
+    ) -> None:
+        spool = segment_buffers_mod.Spool(tmp_path, _SEG)
+        await spool.create(1)
+        path = spool.path
+        assert path is not None
+        gate = threading.Event()
+        pending = asyncio.ensure_future(spool.run(gate.wait, 5))
+        await asyncio.sleep(0)
+        close = asyncio.ensure_future(spool.close())
+        await asyncio.sleep(0.05)
+        close.cancel()
+        await asyncio.sleep(0.05)
+        assert spool._fd is not None  # the write still holds it
+        gate.set()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(close, _TIMEOUT)
+        await pending
+        assert spool._fd is None
+        assert not path.exists()
+
     async def test_cancelling_abort_neither_discards_early_nor_stops_the_flush(self) -> None:
         sink = _Sink()
         gate = sink.block_flushes()

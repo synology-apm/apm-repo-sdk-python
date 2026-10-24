@@ -1,6 +1,6 @@
 """Schema-tolerant SQLite table access: declare the columns a query needs and
 whether each is required, and ``Table.create`` introspects the real table
-(``PRAGMA table_info``) once. A missing *optional* column reads back as
+(``PRAGMA table_info``, once per connection). A missing *optional* column reads back as
 ``None`` for every row instead of raising ``no such column``, which differs
 across connector versions.
 """
@@ -14,7 +14,7 @@ from typing import Self
 import aiosqlite
 
 from ..errors import DataCorruptError
-from .sqlite import apply_index_hint
+from .sqlite import apply_index_hint, table_columns
 
 
 @dataclasses.dataclass(frozen=True, slots=True)
@@ -29,7 +29,8 @@ class Column:
 class Table:
     """A schema-tolerant view of one real SQLite table.
 
-    Introspects ``PRAGMA table_info(name)`` once, in ``create``. A missing
+    Introspects ``PRAGMA table_info(name)`` in ``create`` (once per
+    connection, see ``sqlite.table_columns``). A missing
     *required* column raises ``DataCorruptError``; a missing optional one is
     left out of the ``SELECT`` and backfilled as ``None`` in every row.
 
@@ -74,15 +75,14 @@ class Table:
             DataCorruptError: The table is missing or lacks a required column.
         """
         self = cls(name, columns)
-        cursor = await conn.execute(f"PRAGMA table_info({name})")
-        present = {row[1] for row in await cursor.fetchall()}
+        present = await table_columns(conn, name)
         if not present:
             raise DataCorruptError(f"table {name!r} does not exist (or has no columns)", ref=name)
         missing_required = [c.name for c in self.columns if c.required and c.name not in present]
         if missing_required:
             raise DataCorruptError(f"table {name!r} is missing required column(s) {missing_required}", ref=name)
         self._present_columns = [c.name for c in self.columns if c.name in present]
-        self._all_columns = frozenset(present)
+        self._all_columns = present
         self._conn = conn
         for hint in index_hints:
             await apply_index_hint(conn, name, hint)
@@ -93,8 +93,7 @@ class Table:
         """Whether ``name`` exists with at least one column. Call before
         ``create`` for a table some repository shapes lack entirely (e.g.
         ``file_meta``); ``create`` raises for a missing table."""
-        cursor = await conn.execute(f"PRAGMA table_info({name})")
-        return bool({row[1] for row in await cursor.fetchall()})
+        return bool(await table_columns(conn, name))
 
     @property
     def columns_present(self) -> frozenset[str]:
@@ -146,7 +145,7 @@ class Table:
 
     async def select_one(self, where: str = "", params: Sequence[object] = ()) -> dict[str, object | None] | None:
         """The first row ``select(where, params)`` yields, or ``None``."""
-        async for row in self.select(where, params):
+        async for row in self.select(where, params, limit=1):
             return row
         return None
 

@@ -190,6 +190,7 @@ class Session(AsyncClosing):
         Raises:
             NotFoundError: No open repository owns the ref, or no node
                 matches it.
+            InvalidArgumentError: See ``Repository.resolve``.
             KeyRequiredError: See ``Repository.resolve``.
             KeyMismatchError: See ``Repository.resolve``.
             ValueError: The string is not a parseable ref.

@@ -30,13 +30,21 @@ from support.repo_builders import (
     write_composition_entries,
 )
 from support.store_fakes import BlockingStore, WrappingStore
+from synology_apm_repo.sdk import concurrency
 from synology_apm_repo.sdk.api import export as api_export_mod
+from synology_apm_repo.sdk.dedup import chunk_walk as chunk_walk_mod
 from synology_apm_repo.sdk.dedup import export_scheduler as export_scheduler_mod
 from synology_apm_repo.sdk.dedup import export_sink as export_sink_mod
 from synology_apm_repo.sdk.dedup import local_file_sink as local_file_sink_mod
 from synology_apm_repo.sdk.dedup.composition_reader import CompositionReader
 from synology_apm_repo.sdk.dedup.dedup_file import ByteRangeView, DedupFile
-from synology_apm_repo.sdk.dedup.export_scheduler import ExportTuning, _ExportAccounting, export_to_writer
+from synology_apm_repo.sdk.dedup.export_scheduler import (
+    MAX_EXPORT_WORKERS,
+    ExportTuning,
+    SharedExportTuning,
+    _ExportAccounting,
+    export_to_writer,
+)
 from synology_apm_repo.sdk.dedup.export_sink import AbortOutcome, OffsetWriter, RandomAccessExportSink, run_sink_export
 from synology_apm_repo.sdk.dedup.export_workers import ExportExecutor
 from synology_apm_repo.sdk.dedup.extent import ExportResult, ExtentKind
@@ -278,8 +286,9 @@ class TestBehavior:
             dedup_file,
             tmp_path / "out.bin",
             progress=_recording_progress(calls),
+            tuning=ExportTuning(workers=2),
         )
-        assert calls == [3 * 4096 + 4 * 4096]  # one bucket group, reported once
+        assert calls == [3 * 4096 + 4 * 4096]  # one bucket group, reported once by its worker
 
     async def test_is_cancellable_via_its_surrounding_task_and_closes_its_output_fd(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -311,7 +320,9 @@ class TestBehavior:
             store.armed = True
 
         async def do_export() -> object:
-            return await export_to(file, dst, progress=_arm_on_first_progress, tuning=ExportTuning(window_entries=1))
+            return await export_to(
+                file, dst, progress=_arm_on_first_progress, tuning=SharedExportTuning(window_entries=1)
+            )
 
         task = asyncio.create_task(do_export())
         await store.blocked.wait()
@@ -358,7 +369,7 @@ class TestWindowing:
         production_dst = tmp_path / "production.bin"
         r_naive = await _naive_export_to(dedup_file, naive_dst, sparse=True)
         r_production = await export_to(
-            dedup_file, production_dst, sparse=True, tuning=ExportTuning(window_entries=window_entries)
+            dedup_file, production_dst, sparse=True, tuning=SharedExportTuning(window_entries=window_entries)
         )
         assert naive_dst.read_bytes() == production_dst.read_bytes()
         assert r_naive == r_production
@@ -378,7 +389,7 @@ class TestWindowing:
         naive_dst = tmp_path / "naive.bin"
         production_dst = tmp_path / "production.bin"
         await _naive_export_to(file, naive_dst)
-        await export_to(file, production_dst, tuning=ExportTuning(window_entries=1))
+        await export_to(file, production_dst, tuning=SharedExportTuning(window_entries=1))
         assert naive_dst.read_bytes() == production_dst.read_bytes()
 
     async def test_holes_and_zeros_are_summed_across_windows_not_just_the_last_ones(
@@ -386,7 +397,7 @@ class TestWindowing:
     ) -> None:
         default_result = await export_to(dedup_file, tmp_path / "default.bin", sparse=False)
         windowed_result = await export_to(
-            dedup_file, tmp_path / "windowed.bin", sparse=False, tuning=ExportTuning(window_entries=1)
+            dedup_file, tmp_path / "windowed.bin", sparse=False, tuning=SharedExportTuning(window_entries=1)
         )
         assert windowed_result.holes == default_result.holes
         assert windowed_result.zeros == default_result.zeros
@@ -394,7 +405,10 @@ class TestWindowing:
     async def test_progress_reports_each_windows_data_bytes_once(self, dedup_file: DedupFile, tmp_path: Path) -> None:
         calls: list[int] = []
         await export_to(
-            dedup_file, tmp_path / "out.bin", progress=_recording_progress(calls), tuning=ExportTuning(window_entries=1)
+            dedup_file,
+            tmp_path / "out.bin",
+            progress=_recording_progress(calls),
+            tuning=SharedExportTuning(window_entries=1),
         )
         assert len(calls) > 1  # one report per window
         assert all(written > 0 for written in calls)
@@ -463,7 +477,9 @@ class TestPipelinedWriter:
             store.armed = True
 
         async def do_export() -> object:
-            return await export_to(file, dst, progress=_arm_on_first_progress, tuning=ExportTuning(window_entries=1))
+            return await export_to(
+                file, dst, progress=_arm_on_first_progress, tuning=SharedExportTuning(window_entries=1)
+            )
 
         task = asyncio.create_task(do_export())
         await store.blocked.wait()
@@ -586,7 +602,7 @@ class TestParallel:
         naive_dst = tmp_path / "naive.bin"
         production_dst = tmp_path / "production.bin"
         await _naive_export_to(file, naive_dst)
-        await export_to(file, production_dst, tuning=ExportTuning(window_entries=1))
+        await export_to(file, production_dst, tuning=SharedExportTuning(window_entries=1))
         assert naive_dst.read_bytes() == production_dst.read_bytes()
 
     @pytest.mark.parametrize("max_concurrent_reads", [2, 8])
@@ -617,17 +633,17 @@ class TestParallel:
     async def test_max_concurrent_reads_bounds_and_allows_overlapping_reads(self, tmp_path: Path) -> None:
         """Peak overlapping reads is 1 serially and capped at the setting otherwise."""
         serial = await _peak_reads(
-            tmp_path / "serial", ExportTuning(max_concurrent_reads=1, max_concurrent_opens=1), overlap=1
+            tmp_path / "serial", SharedExportTuning(max_concurrent_reads=1, max_concurrent_opens=1), overlap=1
         )
         capped = await _peak_reads(
-            tmp_path / "capped", ExportTuning(max_concurrent_reads=3, max_concurrent_opens=1), overlap=3
+            tmp_path / "capped", SharedExportTuning(max_concurrent_reads=3, max_concurrent_opens=1), overlap=3
         )
         assert serial == 1
         assert capped == 3
 
-    async def test_max_concurrent_reads_surfaces_a_bucket_failure_as_an_exception_group(self, tmp_path: Path) -> None:
-        """Unlike ``max_concurrent_reads=1``, a concurrent bucket-group failure
-        surfaces as an ``ExceptionGroup``."""
+    async def test_max_concurrent_reads_surfaces_a_bucket_failure_as_itself(self, tmp_path: Path) -> None:
+        """As with ``max_concurrent_reads=1``, a concurrent bucket-group failure
+        surfaces as itself, not wrapped in its ``TaskGroup``'s ``ExceptionGroup``."""
         entries = mapping_record(0, 0, 0, map_num=2) + mapping_record(8192, 1, 0, map_num=2)
         write_composition_entries(tmp_path / "Composition", entries, session_id=SESSION_ID, stream_id=STREAM_ID)
         write_bucket(tmp_path / "Pool" / "0" / "0.buk", CHUNK_PLAINTEXTS[:2])
@@ -638,9 +654,9 @@ class TestParallel:
         pool = Pool(store, "Pool", dir_cache)
         file = DedupFile(comp_reader, pool, HEAD_OFF, size=16384)
 
-        with pytest.raises(ExceptionGroup, match="unhandled errors in a TaskGroup") as excinfo:
+        with pytest.raises(DataCorruptError, match=r"synthetic failure for '.*1\.buk'") as excinfo:
             await export_to(file, tmp_path / "out.bin", tuning=ExportTuning(max_concurrent_reads=8))
-        assert any(isinstance(exc, DataCorruptError) for exc in excinfo.value.exceptions)
+        assert not isinstance(excinfo.value, BaseExceptionGroup)
 
 
 class TestWorkersNeedManyBucketGroups:
@@ -654,8 +670,10 @@ class TestWorkersNeedManyBucketGroups:
         dispatched: list[int] = []
 
         class _Counting(ExportExecutor):
-            def __init__(self, pool_descriptor: PoolDescriptor, sink_descriptor: Any) -> None:
-                super().__init__(pool_descriptor, sink_descriptor)
+            def __init__(
+                self, pool_descriptor: PoolDescriptor, sink_descriptor: Any, *, max_workers: int | None = None
+            ) -> None:
+                super().__init__(pool_descriptor, sink_descriptor, max_workers=max_workers)
                 built.append(self)
 
         real_dispatch = export_scheduler_mod._dispatch_window_multiprocess
@@ -675,7 +693,7 @@ class TestWorkersNeedManyBucketGroups:
         naive_dst, dst = tmp_path / "naive.bin", tmp_path / "out.bin"
         await _naive_export_to(dedup_file, naive_dst)
 
-        await export_to(dedup_file, dst)
+        await export_to(dedup_file, dst, tuning=ExportTuning(workers=2))
 
         assert (built, dispatched) == ([], [])
         assert dst.read_bytes() == naive_dst.read_bytes()
@@ -688,7 +706,7 @@ class TestWorkersNeedManyBucketGroups:
         naive_dst, dst = tmp_path / "naive.bin", tmp_path / "out.bin"
         await _naive_export_to(file, naive_dst)
 
-        await export_to(file, dst)
+        await export_to(file, dst, tuning=ExportTuning(workers=2))
 
         assert (len(built), dispatched) == (1, [2])
         assert dst.read_bytes() == naive_dst.read_bytes()
@@ -697,7 +715,7 @@ class TestWorkersNeedManyBucketGroups:
         file = _two_bucket_file(tmp_path)
         built, dispatched = self._spy(monkeypatch, 3)
 
-        await export_to(file, tmp_path / "out.bin")
+        await export_to(file, tmp_path / "out.bin", tuning=ExportTuning(workers=2))
 
         assert (built, dispatched) == ([], [])
 
@@ -710,7 +728,7 @@ class TestWorkersNeedManyBucketGroups:
         await _naive_export_to(file, naive_dst)
 
         # Three chunk entries per window: the first window touches both buckets, the second only one.
-        await export_to(file, dst, tuning=ExportTuning(window_entries=3))
+        await export_to(file, dst, tuning=SharedExportTuning(window_entries=3, workers=2))
 
         assert (len(built), dispatched) == (1, [2, 1])
         assert dst.read_bytes() == naive_dst.read_bytes()
@@ -721,7 +739,7 @@ class TestWorkersNeedManyBucketGroups:
         file = _two_bucket_file(tmp_path)
         built, dispatched = self._spy(monkeypatch, 2)
 
-        await export_to(file, tmp_path / "out.bin", tuning=ExportTuning(window_entries=1))
+        await export_to(file, tmp_path / "out.bin", tuning=SharedExportTuning(window_entries=1, workers=2))
 
         assert (built, dispatched) == ([], [])
 
@@ -740,9 +758,95 @@ class TestWorkersNeedManyBucketGroups:
             with pytest.raises(
                 WorkerProcessError, match="export worker process died unexpectedly"
             ):  # the dead pool is what fails: the executor was used, not skipped
-                await export_to(dedup_file, dst, tuning=ExportTuning(executor=executor))
+                await export_to(dedup_file, dst, tuning=SharedExportTuning(executor=executor))
         finally:
             await executor.close()
+
+
+class TestWorkerCount:
+    """``ExportTuning.workers`` sizes the pool an export builds and how many tasks it keeps in flight;
+    ``0`` builds none."""
+
+    @staticmethod
+    def _spy(monkeypatch: pytest.MonkeyPatch) -> tuple[list[ExportExecutor], list[int]]:
+        _CountingExecutor.built = []
+        in_flight: list[int] = []
+        real_dispatch = concurrency.dispatch_to_pool
+
+        async def _dispatch(*args: Any, max_concurrent: int, **kwargs: Any) -> Any:
+            in_flight.append(max_concurrent)
+            return await real_dispatch(*args, max_concurrent=max_concurrent, **kwargs)
+
+        monkeypatch.setattr(export_scheduler_mod, "ExportExecutor", _CountingExecutor)
+        monkeypatch.setattr(export_scheduler_mod, "dispatch_to_pool", _dispatch)
+        return _CountingExecutor.built, in_flight
+
+    @pytest.mark.parametrize("count", [-1, MAX_EXPORT_WORKERS + 1])
+    def test_a_count_outside_the_supported_range_is_refused(self, count: int) -> None:
+        with pytest.raises(ValueError, match=f"workers must be 0 to {MAX_EXPORT_WORKERS}, got {count}"):
+            ExportTuning(workers=count)
+
+    def test_fewer_than_one_read_in_flight_is_refused(self) -> None:
+        with pytest.raises(ValueError, match="max_concurrent_reads must be 1 or more, got 0"):
+            ExportTuning(max_concurrent_reads=0)
+
+    @pytest.mark.parametrize(
+        ("given", "expected"),
+        [
+            pytest.param(None, (0, 4), id="none_takes_the_defaults"),
+            pytest.param(ExportTuning(workers=3, max_concurrent_reads=2), (3, 2), id="public_settings_carry_over"),
+        ],
+    )
+    def test_shared_tuning_of_a_public_one_keeps_its_settings_with_a_new_cache(
+        self, given: ExportTuning | None, expected: tuple[int, int]
+    ) -> None:
+        shared = SharedExportTuning.of(given)
+        assert (shared.workers, shared.max_concurrent_reads) == expected
+        assert isinstance(shared.export_cache, BucketReaderCache)
+        assert shared.executor is None
+        assert SharedExportTuning.of(given).export_cache is not shared.export_cache  # one per resolution
+
+    def test_shared_tuning_without_a_cache_gets_one_and_keeps_the_rest(self) -> None:
+        given = SharedExportTuning(window_entries=7)
+        shared = SharedExportTuning.of(given)
+        assert isinstance(shared.export_cache, BucketReaderCache)
+        assert shared.window_entries == 7
+
+    def test_shared_tuning_of_a_shared_one_is_that_one(self) -> None:
+        given = SharedExportTuning(window_entries=7, export_cache=BucketReaderCache())
+        assert SharedExportTuning.of(given) is given
+
+    async def test_zero_workers_decode_in_process(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        file = _two_bucket_file(tmp_path)
+        built, in_flight = self._spy(monkeypatch)
+        naive_dst, dst = tmp_path / "naive.bin", tmp_path / "out.bin"
+        await _naive_export_to(file, naive_dst)
+
+        await export_to(file, dst, tuning=ExportTuning(workers=0))
+
+        assert (built, in_flight) == ([], [])
+        assert dst.read_bytes() == naive_dst.read_bytes()
+
+    async def test_a_count_sizes_the_pool_and_the_tasks_in_flight(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        file = _two_bucket_file(tmp_path)
+        built, in_flight = self._spy(monkeypatch)
+        naive_dst, dst = tmp_path / "naive.bin", tmp_path / "out.bin"
+        await _naive_export_to(file, naive_dst)
+
+        await export_to(file, dst, tuning=ExportTuning(workers=2))
+
+        assert ([executor.max_workers for executor in built], in_flight) == ([2], [2])
+        assert dst.read_bytes() == naive_dst.read_bytes()
+
+    async def test_the_default_decodes_in_process(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        file = _two_bucket_file(tmp_path)
+        built, in_flight = self._spy(monkeypatch)
+
+        await export_to(file, tmp_path / "out.bin")
+
+        assert (built, in_flight) == ([], [])
 
 
 class TestMultiprocessFailure:
@@ -750,11 +854,11 @@ class TestMultiprocessFailure:
     ``ExceptionGroup`` its ``TaskGroup`` raises."""
 
     async def test_a_corrupt_bucket_surfaces_as_its_own_error(self, tmp_path: Path) -> None:
-        file = _two_bucket_file(tmp_path)  # a describable store, so the multiprocess path
+        file = _two_bucket_file(tmp_path)  # a describable store, so workers can run
         (tmp_path / "Pool" / "0" / "1.buk").write_bytes(b"not a bucket" * 8)
 
         with pytest.raises(ApmRepoError, match="bad magic") as excinfo:
-            await export_to(file, tmp_path / "out.bin")
+            await export_to(file, tmp_path / "out.bin", tuning=ExportTuning(workers=2))
 
         assert not isinstance(excinfo.value, BaseExceptionGroup)
 
@@ -764,7 +868,7 @@ class TestMultiprocessFailure:
         dst = tmp_path / "out.bin"
 
         with pytest.raises(ApmRepoError, match="bad magic"):
-            await export_to(file, dst)
+            await export_to(file, dst, tuning=ExportTuning(workers=2))
 
         assert dst.exists()  # unstaged, and the sink was told workers may write, so abort keeps the file
 
@@ -785,21 +889,21 @@ class TestWorkerProcessFailure:
                 executor.process_pool.submit(os._exit, 1).result()  # kills the one worker the pool spawned
 
             with pytest.raises(WorkerProcessError, match="worker process died") as excinfo:
-                await export_to(dedup_file, dst, tuning=ExportTuning(executor=executor))
+                await export_to(dedup_file, dst, tuning=SharedExportTuning(executor=executor))
 
             assert isinstance(excinfo.value.__cause__, BrokenProcessPool)
         finally:
             await executor.close()
 
     async def test_cancelling_while_workers_run_aborts_the_sink_and_reaps_the_workers(self, tmp_path: Path) -> None:
-        file = _two_bucket_file(tmp_path)  # a describable store, so the multiprocess path
+        file = _two_bucket_file(tmp_path)  # a describable store, so workers can run
         dst = tmp_path / "out.bin"
 
         async def cancel_the_export(written: int) -> None:
             task.cancel()
 
         task = asyncio.create_task(
-            export_to(file, dst, tuning=ExportTuning(window_entries=1), progress=cancel_the_export)
+            export_to(file, dst, tuning=SharedExportTuning(window_entries=1, workers=2), progress=cancel_the_export)
         )
         with pytest.raises(asyncio.CancelledError):
             await task
@@ -810,6 +914,32 @@ class TestWorkerProcessFailure:
 class TestPrefetchOpens:
     """``max_concurrent_opens`` through ``export_to``, in-process."""
 
+    @pytest.mark.parametrize(
+        ("tuning", "prefetched"),
+        [
+            pytest.param(ExportTuning(), [], id="concurrent_reads_by_default"),
+            pytest.param(ExportTuning(max_concurrent_reads=1), [2], id="serial_reads"),
+        ],
+    )
+    async def test_the_default_prefetches_only_for_serial_reads(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, tuning: ExportTuning, prefetched: list[int]
+    ) -> None:
+        """Concurrent reads already overlap their opens, and a prefetch running through a whole window
+        evicts what it opened from the export cache, so the default leaves it off for them."""
+        file = _two_bucket_file(tmp_path, in_process=True)
+        widths: list[int] = []
+        real_prefetch = chunk_walk_mod._prefetch_bucket_opens
+
+        async def _spy(groups: Any, *, max_concurrent_opens: int, **kwargs: Any) -> None:
+            widths.append(max_concurrent_opens)
+            await real_prefetch(groups, max_concurrent_opens=max_concurrent_opens, **kwargs)
+
+        monkeypatch.setattr(chunk_walk_mod, "_prefetch_bucket_opens", _spy)
+
+        await export_to(file, tmp_path / "out.bin", tuning=tuning)
+
+        assert widths == prefetched
+
     @pytest.mark.parametrize("max_concurrent_opens", [2, 8])
     async def test_matches_the_naive_oracle(self, tmp_path: Path, max_concurrent_opens: int) -> None:
         file = _two_bucket_file(tmp_path, in_process=True)
@@ -817,7 +947,7 @@ class TestPrefetchOpens:
         production_dst = tmp_path / "production.bin"
         r_naive = await _naive_export_to(file, naive_dst)
         r_production = await export_to(
-            file, production_dst, tuning=ExportTuning(max_concurrent_opens=max_concurrent_opens)
+            file, production_dst, tuning=SharedExportTuning(max_concurrent_opens=max_concurrent_opens)
         )
         assert naive_dst.read_bytes() == production_dst.read_bytes()
         assert r_naive == r_production
@@ -829,7 +959,7 @@ class TestPrefetchOpens:
         production_dst = tmp_path / "production.bin"
         r_naive = await _naive_export_to(file, naive_dst)
         r_production = await export_to(
-            file, production_dst, tuning=ExportTuning(max_concurrent_reads=8, max_concurrent_opens=8)
+            file, production_dst, tuning=SharedExportTuning(max_concurrent_reads=8, max_concurrent_opens=8)
         )
         assert naive_dst.read_bytes() == production_dst.read_bytes()
         assert r_naive == r_production
@@ -838,10 +968,10 @@ class TestPrefetchOpens:
         """With serial reads, peak overlapping reads is 1 without prefetch and
         capped at the setting with it."""
         off = await _peak_reads(
-            tmp_path / "off", ExportTuning(max_concurrent_reads=1, max_concurrent_opens=1), overlap=1
+            tmp_path / "off", SharedExportTuning(max_concurrent_reads=1, max_concurrent_opens=1), overlap=1
         )
         capped = await _peak_reads(
-            tmp_path / "capped", ExportTuning(max_concurrent_reads=1, max_concurrent_opens=3), overlap=3
+            tmp_path / "capped", SharedExportTuning(max_concurrent_reads=1, max_concurrent_opens=3), overlap=3
         )
         assert off == 1
         assert 3 <= capped <= 3 + 1  # the prefetch opens, plus the serial main loop's own read
@@ -862,7 +992,7 @@ class TestPrefetchOpens:
         file = DedupFile(comp_reader, pool, HEAD_OFF, size=16384)
 
         with pytest.raises(DataCorruptError, match="synthetic failure for"):
-            await export_to(file, tmp_path / "out.bin", tuning=ExportTuning(max_concurrent_opens=8))
+            await export_to(file, tmp_path / "out.bin", tuning=SharedExportTuning(max_concurrent_opens=8))
 
 
 def _build_many_bucket_dedup_file(tmp_path: Path, num_buckets: int) -> tuple[DedupFile, Pool]:
@@ -911,12 +1041,12 @@ class TestBucketReaderCache:
         file, _pool = _build_many_bucket_dedup_file(tmp_path, 3)
         cache = BucketReaderCache()
 
-        await export_to(file, tmp_path / "out1.bin", tuning=ExportTuning(export_cache=cache))
+        await export_to(file, tmp_path / "out1.bin", tuning=SharedExportTuning(export_cache=cache))
         assert len(cache) == 3
         opened_once = dict(cache)
 
         # Identity, not just equal keys: a close-and-reopen would also fail.
-        await export_to(file, tmp_path / "out2.bin", tuning=ExportTuning(export_cache=cache))
+        await export_to(file, tmp_path / "out2.bin", tuning=SharedExportTuning(export_cache=cache))
         assert dict(cache).keys() == opened_once.keys()
         for key, reader in opened_once.items():
             assert cache[key] is reader
@@ -956,7 +1086,7 @@ class TestOffsetWriter:
 
         sink = _NotingSink(tmp_path / "out.bin", staged=False)
         await sink.open(SIZE, sparse=True)
-        result = await export_to_writer(dedup_file, sink, sparse=True)
+        result = await export_to_writer(dedup_file, sink, sparse=True, tuning=ExportTuning(workers=2))
         await sink.commit()
         assert result.bytes_written > 0  # data really went to worker processes
         assert events == ["note"], "the multiprocess path never called note_worker_write"
@@ -1049,8 +1179,10 @@ class _MemorySink:
 class _CountingExecutor(ExportExecutor):
     built: ClassVar[list[ExportExecutor]] = []
 
-    def __init__(self, pool_descriptor: PoolDescriptor, sink_descriptor: Any) -> None:
-        super().__init__(pool_descriptor, sink_descriptor)
+    def __init__(
+        self, pool_descriptor: PoolDescriptor, sink_descriptor: Any, *, max_workers: int | None = None
+    ) -> None:
+        super().__init__(pool_descriptor, sink_descriptor, max_workers=max_workers)
         _CountingExecutor.built.append(self)
 
 
@@ -1085,7 +1217,9 @@ class TestExportFragmentsToWriter:
         file = _two_bucket_file(tmp_path)
         dst = tmp_path / "out.bin"
 
-        result = await self._run([(file, 0, 8192), (file, 8192, 16384)], LocalFileSink(dst, staged=False))
+        result = await self._run(
+            [(file, 0, 8192), (file, 8192, 16384)], LocalFileSink(dst, staged=False), tuning=ExportTuning(workers=2)
+        )
 
         assert len(_CountingExecutor.built) == 1
         assert dst.read_bytes() == await file.read(0, 16384)
@@ -1097,7 +1231,9 @@ class TestExportFragmentsToWriter:
         file_a, file_b = _two_bucket_file(tmp_path / "a"), _two_bucket_file(tmp_path / "b")
         dst = tmp_path / "out.bin"
 
-        await self._run([(file_a, 0, 8192), (file_b, 8192, 16384)], LocalFileSink(dst, staged=False))
+        await self._run(
+            [(file_a, 0, 8192), (file_b, 8192, 16384)], LocalFileSink(dst, staged=False), tuning=ExportTuning(workers=2)
+        )
 
         assert len(_CountingExecutor.built) == 2  # one per segment, built and closed by its own export
         assert dst.read_bytes() == await file_a.read(0, 8192) + await file_b.read(8192, 8192)
@@ -1107,7 +1243,9 @@ class TestExportFragmentsToWriter:
         sink = _MemorySink(supports_sparse=True)
         await sink.open(16384, sparse=True)
 
-        await export_scheduler_mod.export_fragments_to_writer([(file, 0, 8192), (file, 8192, 16384)], sink, sparse=True)
+        await export_scheduler_mod.export_fragments_to_writer(
+            [(file, 0, 8192), (file, 8192, 16384)], sink, sparse=True, tuning=ExportTuning(workers=2)
+        )
 
         assert _CountingExecutor.built == []
         assert bytes(sink.buffer) == await file.read(0, 16384)
@@ -1123,7 +1261,7 @@ class TestExportFragmentsToWriter:
             await self._run(
                 [(file, 0, 8192), (file, 8192, 16384)],
                 LocalFileSink(dst, staged=False),
-                tuning=ExportTuning(executor=supplied),
+                tuning=SharedExportTuning(executor=supplied),
             )
 
             assert _CountingExecutor.built == []  # none built on top of the supplied one
@@ -1131,6 +1269,28 @@ class TestExportFragmentsToWriter:
             supplied.process_pool.submit(int).result()  # still usable: the export did not close it
         finally:
             await supplied.close()
+
+    async def test_zero_workers_build_no_executor(self, tmp_path: Path) -> None:
+        file = _two_bucket_file(tmp_path)
+        dst = tmp_path / "out.bin"
+
+        await self._run(
+            [(file, 0, 8192), (file, 8192, 16384)], LocalFileSink(dst, staged=False), tuning=ExportTuning(workers=0)
+        )
+
+        assert _CountingExecutor.built == []
+        assert dst.read_bytes() == await file.read(0, 16384)
+
+    async def test_a_worker_count_sizes_the_shared_executor(self, tmp_path: Path) -> None:
+        file = _two_bucket_file(tmp_path)
+        dst = tmp_path / "out.bin"
+
+        await self._run(
+            [(file, 0, 8192), (file, 8192, 16384)], LocalFileSink(dst, staged=False), tuning=ExportTuning(workers=2)
+        )
+
+        assert [executor.max_workers for executor in _CountingExecutor.built] == [2]
+        assert dst.read_bytes() == await file.read(0, 16384)
 
     async def test_every_segment_shares_one_reader_cache(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         file = _two_bucket_file(tmp_path)
@@ -1301,7 +1461,7 @@ class TestSegmentedExport:
     ) -> None:
         sink = SegmentCollector(8192, storage="spool", spool_dir=tmp_path)
 
-        await run_export(dedup_file, sink, sparse=False)
+        await run_export(dedup_file, sink, sparse=False, tuning=ExportTuning(workers=2))
 
         assert len(count_executors) == 1  # six segments, one pool
         assert bytes(sink.output) == await dedup_file.read(0, SIZE)
@@ -1311,7 +1471,7 @@ class TestSegmentedExport:
     ) -> None:
         sink = SegmentCollector(8192)
 
-        await run_export(dedup_file, sink, sparse=False)
+        await run_export(dedup_file, sink, sparse=False, tuning=ExportTuning(workers=2))
 
         assert len(count_executors) == 1
         assert bytes(sink.output) == await dedup_file.read(0, SIZE)
@@ -1321,10 +1481,31 @@ class TestSegmentedExport:
     ) -> None:
         sink = SegmentCollector(SIZE, storage="spool", spool_dir=tmp_path)
 
-        await run_export(dedup_file, sink, sparse=False)
+        await run_export(dedup_file, sink, sparse=False, tuning=ExportTuning(workers=2))
 
         assert bytes(sink.output) == await dedup_file.read(0, SIZE)
         assert len(count_executors) <= 1  # built by the segment's own export if at all, never up front
+
+    async def test_zero_workers_build_no_pool_up_front_or_per_segment(
+        self, dedup_file: DedupFile, count_executors: list[ExportExecutor], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(export_scheduler_mod, "ExportExecutor", _CountingExecutor)
+        sink = SegmentCollector(8192)
+
+        await run_export(dedup_file, sink, sparse=False, tuning=ExportTuning(workers=0))
+
+        assert count_executors == []
+        assert bytes(sink.output) == await dedup_file.read(0, SIZE)
+
+    async def test_tuning_s_worker_count_sizes_the_shared_pool(
+        self, dedup_file: DedupFile, count_executors: list[ExportExecutor]
+    ) -> None:
+        sink = SegmentCollector(8192)
+
+        await run_export(dedup_file, sink, sparse=False, tuning=ExportTuning(workers=2))
+
+        assert [executor.max_workers for executor in count_executors] == [2]
+        assert bytes(sink.output) == await dedup_file.read(0, SIZE)
 
     async def test_progress_counts_the_real_data_across_segments(self, dedup_file: DedupFile) -> None:
         calls: list[tuple[int, int]] = []
@@ -1341,8 +1522,8 @@ class TestSegmentedExport:
 
 class TestNonFileSink:
     """A sink without a ``worker_target`` must take the in-process path even
-    though ``dedup_file``'s real ``LocalFsStore`` would otherwise be
-    exported through worker processes."""
+    when workers are asked for and ``dedup_file``'s real ``LocalFsStore``
+    could be rebuilt in them."""
 
     async def test_never_builds_an_executor_and_reproduces_the_naive_export(
         self, dedup_file: DedupFile, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -1354,7 +1535,7 @@ class TestNonFileSink:
         sink = _MemorySink(supports_sparse=False)
         await sink.open(SIZE, sparse=True)
 
-        result = await export_to_writer(dedup_file, sink, sparse=True)
+        result = await export_to_writer(dedup_file, sink, sparse=True, tuning=ExportTuning(workers=2))
 
         naive_dst = tmp_path / "naive.bin"
         await _naive_export_to(dedup_file, naive_dst, sparse=False)
@@ -1432,7 +1613,7 @@ class TestNonFileSink:
             sink = _MemorySink(supports_sparse=True)
             await sink.open(SIZE, sparse=True)
             with pytest.raises(ValueError, match="was not built for"):
-                await export_to_writer(dedup_file, sink, tuning=ExportTuning(executor=executor))
+                await export_to_writer(dedup_file, sink, tuning=SharedExportTuning(executor=executor))
         finally:
             await executor.close()
 
@@ -1456,7 +1637,7 @@ class TestMultiprocessExecutorTeardown:
 
         monkeypatch.setattr(asyncio, "to_thread", _recording_to_thread)
 
-        await export_to(dedup_file, tmp_path / "out.bin")
+        await export_to(dedup_file, tmp_path / "out.bin", tuning=ExportTuning(workers=2))
 
         shutdown_calls = [
             f for f in recorded if getattr(f, "__name__", None) == "shutdown" and getattr(f, "__self__", None)

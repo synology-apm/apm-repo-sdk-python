@@ -205,4 +205,3 @@ def test_default_limits_match_the_documented_bounds() -> None:
     assert DEFAULT_LIMITS.composition_records == 64
     assert DEFAULT_LIMITS.composition_pages == 128
     assert DEFAULT_LIMITS.saas_streams == 8
-    assert DEFAULT_LIMITS.verify_bucket_readers == 16

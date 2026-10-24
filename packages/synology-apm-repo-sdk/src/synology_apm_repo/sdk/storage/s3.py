@@ -101,6 +101,11 @@ class S3StoreDescriptor:
     bucket: str
     client_kwargs: dict[str, object]
 
+    @override
+    def __repr__(self) -> str:
+        # client_kwargs carries the access keys.
+        return f"S3StoreDescriptor(bucket={self.bucket!r}, client_kwargs=<redacted>)"
+
     def build(self) -> S3Store:
         return S3Store(self.bucket, **self.client_kwargs)
 

@@ -175,6 +175,36 @@ async def test_bounded_gather_propagates_a_worker_exception() -> None:
     assert isinstance(exc_info.value.exceptions[0], ValueError)
 
 
+async def test_bounded_gather_first_error_raises_the_earliest_items_error_bare() -> None:
+    # Item 1 fails first; item 0 fails later and wins, as in a serial loop.
+    # Item 2 starts only after item 1 failed, so it is skipped.
+    release_0 = asyncio.Event()
+    ran: list[int] = []
+
+    async def worker(item: int) -> None:
+        ran.append(item)
+        if item == 0:
+            await release_0.wait()
+            raise ValueError("item 0")
+        if item == 1:
+            release_0.set()
+            raise KeyError("item 1")
+
+    with pytest.raises(ValueError, match="item 0"):
+        await concurrency.bounded_gather_first_error(range(3), worker, max_concurrent=2)
+    assert ran == [0, 1]
+
+
+async def test_bounded_gather_first_error_runs_every_item_without_a_failure() -> None:
+    ran: list[int] = []
+
+    async def worker(item: int) -> None:
+        ran.append(item)
+
+    await concurrency.bounded_gather_first_error(range(4), worker, max_concurrent=2)
+    assert sorted(ran) == [0, 1, 2, 3]
+
+
 @pytest.mark.parametrize(("cpus", "expected"), [(None, 1), (1, 1), (2, 1), (3, 1), (8, 4), (16, 8), (64, 8)])
 def test_default_worker_count_is_half_the_cpus_clamped_to_one_through_eight(
     monkeypatch: pytest.MonkeyPatch, cpus: int | None, expected: int
@@ -240,7 +270,7 @@ def test_first_failure_raises_the_first_real_failure_and_notes_the_others() -> N
     raised = concurrency.first_failure(group, operation="export")
 
     assert raised is first
-    assert raised.__notes__ == ["1 other export worker failure: ValueError"]
+    assert raised.__notes__ == ["1 other export failure: ValueError"]
 
 
 def test_first_failure_leaves_a_group_of_only_cancellations_alone() -> None:

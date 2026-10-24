@@ -3,6 +3,7 @@ fake repository whose ``verify()`` returns canned ``Finding``\\ s."""
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import Callable
 from typing import Any, cast
 
@@ -11,7 +12,7 @@ from textual.widgets import DataTable, Static
 
 import synology_apm_repo.sdk.api as _sdk_api
 from support.fakes import faithful_to
-from support.pilot import SDK_TIMEOUT, wait_for_screen, wait_until
+from support.pilot import SDK_TIMEOUT, step_until_pruned, wait_for_screen, wait_for_workers, wait_until
 from synology_apm_repo.browser.core.app.cmd import AppCmd
 from synology_apm_repo.browser.core.app.model import AppModel, Job
 from synology_apm_repo.browser.core.app.msg import AppMsg
@@ -40,7 +41,9 @@ class _FakeRepo:
     def __init__(self, verify: Callable[[VerifyLevel], list[Finding] | ApmRepoError]) -> None:
         self._verify = verify
 
-    async def verify(self, level: VerifyLevel = VerifyLevel.QUICK, *, progress: Any = None) -> list[Finding]:
+    async def verify(
+        self, level: VerifyLevel = VerifyLevel.QUICK, *, progress: Any = None, tuning: Any = None
+    ) -> list[Finding]:
         result = self._verify(level)
         if isinstance(result, Exception):
             raise result
@@ -80,7 +83,7 @@ async def test_quick_check_with_findings_populates_the_table() -> None:
 async def test_findings_are_grouped_and_ref_only_shown_when_verbose() -> None:
     """``ref`` follows the verbose toggle live (``refresh_for_verbose_mode``), not only on the next check."""
     ref_finding = Finding(
-        Stage.VERSION, Symptom.FILE_MISSING, "wl/2024-01-01 00:00:00", "boom", ref="local:/repo#cat:1/wl:2/ver:abc"
+        Stage.VERSION, Symptom.FILE_MISSING, "wl/2024-01-01 00:00:00", "boom", ref="local:/repo#@cat:1/wl:2/ver:abc"
     )
     app = _FakeApp(_FakeRepo(lambda level: [_QUICK_FINDING, _QUICK_FINDING, ref_finding]))
     async with app.run_test() as pilot:
@@ -260,3 +263,40 @@ async def test_action_run_full_refuses_while_quick_is_still_running() -> None:
         await wait_until(pilot, lambda: "error:" in str(status.render()), timeout=SDK_TIMEOUT, interval=0.02)
         assert DIAGNOSTICS_QUICK_STILL_RUNNING_WARNING in str(status.render())
         assert VerifyLevel.FULL not in calls
+
+
+@faithful_to(_sdk_api.Repository)
+class _GatedRepo:
+    """``verify()`` blocks on ``gate``, then returns no findings."""
+
+    def __init__(self) -> None:
+        self.gate = asyncio.Event()
+        self.verify_started = False
+
+    async def verify(
+        self, level: VerifyLevel = VerifyLevel.QUICK, *, progress: Any = None, tuning: Any = None
+    ) -> list[Finding]:
+        self.verify_started = True
+        await self.gate.wait()
+        return []
+
+
+class _PoppableApp(_FakeApp):
+    """A base ``Screen`` under ``DiagnosticsScreen``, so a test can pop it."""
+
+    def screens(self) -> list[Screen[Any]]:
+        return [Screen(), *super().screens()]
+
+
+async def test_a_verify_finishing_while_the_screen_is_being_removed_is_cancelled_not_rendered() -> None:
+    repo = _GatedRepo()
+    app = _PoppableApp(cast(_FakeRepo, repo))
+    async with app.run_test() as pilot:
+        screen = await wait_for_screen(pilot, DiagnosticsScreen)
+        await wait_until(pilot, lambda: repo.verify_started, timeout=SDK_TIMEOUT)
+
+        app.pop_screen()
+        await step_until_pruned(screen, "#diag-table")
+        repo.gate.set()
+        await wait_for_workers(pilot, node=screen)
+        assert screen._last_summary is None  # cancelled before showing a result

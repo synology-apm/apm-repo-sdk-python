@@ -61,7 +61,7 @@ def test_copy_ref_puts_the_cursor_nodes_canonical_ref_on_the_clipboard_replayed(
 
     clipboard_text, expected_ref = asyncio.run(scenario())
     assert clipboard_text == expected_ref
-    assert "#cat:" in clipboard_text
+    assert "#@cat:" in clipboard_text
 
 
 def test_copy_ref_with_nothing_selected_warns_not_crashes_replayed(

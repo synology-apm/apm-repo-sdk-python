@@ -30,10 +30,14 @@ class ParsedRef:
 
 def parse_ref_argument(value: str) -> ParsedRef:
     """A bare path (no ``#``) is a human ref with zero segments — "browse
-    from the top of whatever's discovered there"."""
+    from the top of whatever's discovered there". A fragment that does not
+    parse is the CLI error exit."""
     if "#" not in value:
         return ParsedRef(fs_path=value, node_ref=NodeRef.human(value))
-    node_ref = NodeRef.parse(value)
+    try:
+        node_ref = NodeRef.parse(value)
+    except ValueError as exc:
+        fail(str(exc), cause=exc)
     return ParsedRef(fs_path=node_ref.repo_path, node_ref=node_ref)
 
 

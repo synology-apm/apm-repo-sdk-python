@@ -68,9 +68,8 @@ still runs and produces a clean, all-skipped report (`_samples.py`'s
   ref selection (`pick_workload_with_retry`/`find_leaf` for `sdk/`;
   `list_representative_refs`/`pick_session_refs` for `cli/`'s and
   `browser/`'s bootstrap).
-- **`_trace_step.py`** -- the `<domain>.<step>` label a store call belongs
-  to (a `ContextVar` that `sdk/`'s `SmokeContext.call` sets), so its
-  `store_trace.jsonl` attributes each call to the step that issued it.
+- **`_trace_step.py`** -- the `<domain>.<step>` label (a `ContextVar`)
+  that `sdk/`'s `store_trace.jsonl` attributes each store call to.
 - **`_file_keyring.py`** -- a file-backed `keyring` backend, so `cli/`'s
   throwaway profiles keep their secrets in a temp file instead of the OS
   keychain.
@@ -79,9 +78,9 @@ still runs and produces a clean, all-skipped report (`_samples.py`'s
 
 Each tool writes to its own `reports/<tool>/<UTC timestamp>/`:
 `index.md` (run metadata, per-domain stats table, resource usage -- CPU and max
-RSS from `_report.resource_usage` -- and the full checklist linking into each
-domain's detail file), one `<domain>.md` per domain, plus
-whatever trace artifact that tool's own README documents.
+RSS from `_report.resource_usage`, not available on Windows -- and the full
+checklist linking into each domain's detail file), one `<domain>.md` per
+domain, plus whatever trace artifact that tool's own README documents.
 
 **`reports/` is gitignored and stays that way**: real workload/
 connection/item names and any real content a run reads (mail subjects,

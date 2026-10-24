@@ -16,13 +16,14 @@ from .app_state import AppStateMixin
 from .breadcrumb import breadcrumb_with_tasks_hint
 from .goto_ref import parse_canonical_ref, resolve_and_open_goto_target
 from .key_delegation import forward_to_focused
+from .prune_release import ReleasesOnPrune
 from .tree_nav import move_cursor_to_parent
 
 if TYPE_CHECKING:
     from synology_apm_repo.sdk import NodeRef
 
 
-class NavigableScreen(AppStateMixin, Screen[None]):
+class NavigableScreen(ReleasesOnPrune, AppStateMixin, Screen[None]):
     """Forwards ``j``/``k``/``l``/Enter to the focused ``DataTable``/
     ``Tree``, and provides Esc (``_go_back``), ``g`` goto, ``v``
     diagnostics and the breadcrumb with its job-count suffix.

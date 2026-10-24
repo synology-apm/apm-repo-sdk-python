@@ -16,7 +16,7 @@ from synology_apm_repo.cli.commands import ls as ls_cmd
 from synology_apm_repo.cli.commands import profile as profile_cmd
 from synology_apm_repo.cli.commands import tree as tree_cmd
 from synology_apm_repo.cli.commands import verify as verify_cmd
-from synology_apm_repo.cli.consoles import console
+from synology_apm_repo.cli.consoles import console, escape_unencodable_output
 from synology_apm_repo.cli.state import CliState, ProgressMode
 from synology_apm_repo.cli.strings import (
     APP_HELP,
@@ -90,6 +90,7 @@ app.add_typer(profile_cmd.app, name="profile")
 
 
 def main() -> None:  # pragma: no cover - real sys.argv/sys.exit; every test drives ``app`` via CliRunner instead
+    escape_unencodable_output()
     # Silences dependency logging by default, or redirects it to a file via
     # SYNOLOGY_APM_REPO_LOG — shared with the TUI's own call site
     # (browser/app.py::main()).

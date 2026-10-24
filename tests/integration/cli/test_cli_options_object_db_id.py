@@ -27,7 +27,7 @@ def test_object_db_id_asks_for_the_raw_view_even_where_dispatch_succeeds_replaye
 ) -> None:
     patch_profile_store("object_db_id_cli_teams_chat_vault_plain.json.gz", allow_content=True)
 
-    ref = f"#cat:{_CCID}/wl:{_WORKLOAD_ID}/ver:{_VERSION_UID}"
+    ref = f"#@cat:{_CCID}/wl:{_WORKLOAD_ID}/ver:{_VERSION_UID}"
     bogus_object_db_id = f"{_STREAM_UUID}_999999999_1234"
 
     invoke(["--json", "ls", ref, "--profile", "anything"])

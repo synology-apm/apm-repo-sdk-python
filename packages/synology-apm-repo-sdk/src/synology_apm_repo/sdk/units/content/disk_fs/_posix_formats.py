@@ -10,6 +10,7 @@ from datetime import UTC, datetime
 from ...base import FileState
 from ._base import (
     _default_content_unavailable,
+    _default_open_stream,
     _default_resolve,
     _default_size,
     _DirEntry,
@@ -60,6 +61,7 @@ _EXTFS_FORMAT = _Format(
     size=_default_size,
     volume_label=_extfs_volume_label,
     content_unavailable=_default_content_unavailable,
+    open_stream=_default_open_stream,
 )
 
 
@@ -75,6 +77,7 @@ _XFS_FORMAT = _Format(
     size=_default_size,
     volume_label=_xfs_volume_label,
     content_unavailable=_default_content_unavailable,
+    open_stream=_default_open_stream,
 )
 
 
@@ -113,6 +116,7 @@ _BTRFS_FORMAT = _Format(
     size=_default_size,
     volume_label=_btrfs_volume_label,
     content_unavailable=_default_content_unavailable,
+    open_stream=_default_open_stream,
 )
 
 
@@ -159,4 +163,5 @@ _FAT_FORMAT = _Format(
     size=_default_size,
     volume_label=_fat_volume_label,
     content_unavailable=_default_content_unavailable,
+    open_stream=_default_open_stream,
 )

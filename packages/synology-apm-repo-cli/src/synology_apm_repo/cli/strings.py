@@ -5,6 +5,12 @@ Command help stays in each command's docstring, which Typer shows as
 
 from __future__ import annotations
 
+from synology_apm_repo.sdk import VerifyTuning
+from synology_apm_repo.sdk.export import ExportTuning
+
+_EXPORT_DEFAULTS = ExportTuning()
+_VERIFY_DEFAULTS = VerifyTuning()
+
 # -- root app / global flags (main.py) -----------------------------------
 
 APP_HELP = "Offline browser/exporter for Synology APV/Object-Storage dedup repositories."
@@ -57,12 +63,35 @@ EXPORT_OUTPUT_HELP = "Destination file path; a directory when REF is a folder."
 EXPORT_SPARSE_HELP = "Skip writing zero/hole regions (default: on)."
 EXPORT_KEEP_PARTIAL_HELP = "Keep the .part file after a cancelled or failed export instead of deleting it."
 EXPORT_FORCE_HELP = "Overwrite the destination file if it already exists (default: refuse)."
+EXPORT_WORKERS_HELP = (
+    f"Worker processes decoding the backup data (default {_EXPORT_DEFAULTS.workers}; 0 decodes in this "
+    "process, --concurrent-reads at a time). Workers speed up a fast destination on a local repository; each one "
+    "adds memory, and a folder export starts them again for every file."
+)
+
+EXPORT_CONCURRENT_READS_HELP = (
+    f"Backup data reads in flight at once in this process (default {_EXPORT_DEFAULTS.max_concurrent_reads}). "
+    "More hide a remote repository's latency; each one holds up to about 40 MiB while it is decoded and "
+    "written. Worker processes read one at a time each."
+)
 
 VERIFY_LEVEL_HELP = (
     "quick (default): every reachable composition record and bucket is checked structurally; "
     "no chunk content is read or checked. full: every live chunk in every touched bucket also "
     "gets decoded and checked — as thorough, and as slow, as a full export of the whole "
     "repository."
+)
+
+VERIFY_CONCURRENT_READS_HELP = (
+    f"Buckets checked at once (default {_VERIFY_DEFAULTS.max_concurrent_reads}). More hide a remote "
+    "repository's latency; past what the storage itself serves, more only add latency and load on it. "
+    "At --level full, worker processes check the buckets instead, one each, unless --trace keeps the "
+    "check in this process, where --concurrent-decodes also caps it."
+)
+
+VERIFY_CONCURRENT_DECODES_HELP = (
+    "At --level full with --trace, which keeps the check in this process: buckets decoded at once "
+    f"(default {_VERIFY_DEFAULTS.max_concurrent_decodes}), each holding about 4 MiB plus one read."
 )
 
 TREE_DEPTH_HELP = "Maximum levels to descend."

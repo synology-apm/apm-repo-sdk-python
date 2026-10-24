@@ -17,24 +17,23 @@ from collections.abc import Awaitable, Callable
 
 from ..concurrency import (
     bounded_gather,
-    default_worker_count,
     dispatch_to_pool,
     first_failure,
     raise_worker_failure,
 )
 from ..errors import FormatError, NotFoundError, StorageBackendError
-from ..findings import Finding, Stage, Symptom, VerifyLevel
+from ..findings import Finding, Stage, Symptom, VerifyLevel, VerifyTuning
 from ..format.addressing import group_start_bucket_id
+from ..format.composition import RecordHead
 from ..identifiers import BucketId, SessionId, StreamId
 from ..presentation.progress import Progress, ProgressCallback, ProgressUnit
 from .chunk_walk import iter_bucket_keys
 from .composition_reader import CompositionReader
 from .dedup_file import DedupFile
-from .pool import FULL_VERIFY, BucketReaderCache
+from .pool import FULL_VERIFY
 from .pool_descriptor import PoolDescriptor
 from .repository import DedupRepo
 from .verify_bucket_check import (
-    MAX_CONCURRENT_BUCKET_CHECKS,
     VerifyExecutor,
     check_one_bucket,
     verify_bucket_worker,
@@ -46,13 +45,14 @@ async def _gather_or_raise_first(
     keys: list[tuple[StreamId, BucketId]],
     worker: Callable[[tuple[StreamId, BucketId]], Awaitable[None]],
     *,
+    max_concurrent: int,
     on_done: Callable[[tuple[StreamId, BucketId]], Awaitable[None]] | None = None,
 ) -> None:
-    """``bounded_gather`` over ``keys`` at ``MAX_CONCURRENT_BUCKET_CHECKS``,
-    raising the first failure itself (a ``StorageBackendError``, the only
-    one a bucket check lets escape) rather than its exception group."""
+    """``bounded_gather`` over ``keys``, raising the first failure itself (a
+    ``StorageBackendError``, the only one a bucket check lets escape) rather
+    than its exception group."""
     try:
-        await bounded_gather(keys, worker, max_concurrent=MAX_CONCURRENT_BUCKET_CHECKS, on_done=on_done)
+        await bounded_gather(keys, worker, max_concurrent=max_concurrent, on_done=on_done)
     except BaseExceptionGroup as group:
         raise first_failure(group, operation="verify") from None
 
@@ -85,13 +85,17 @@ class _RecordCheckState:
     """Non-``None`` when this record's ``map_crc`` mismatch was repaired
     via parity; reseeded into the shared ``CompositionRecord`` on every
     visit."""
+    record_head: RecordHead | None = None
+    """The parsed ``RecordHead``, so a later visit's ``CompositionRecord``
+    (a fresh one once the shared cache evicted it) needn't read it again."""
 
 
 class ReachabilitySweep:
     """Per-run state for one repository's sweep. Owns a private ``Pool``
-    (fingerprint and ciphertext-CRC verification forced on) and
-    ``BucketReaderCache``, so the sweep doesn't thrash the repository's
-    shared ones.
+    (fingerprint and ciphertext-CRC verification forced on) and opens each
+    bucket uncached, so the sweep doesn't thrash the repository's shared
+    bucket caches; the composition records it walks do go through the
+    shared composition-record cache.
 
     ``claim_extent`` claims buckets; ``check_all_buckets`` checks them as a
     separate pass once every extent is claimed (``finalize_pending_buckets``
@@ -105,12 +109,13 @@ class ReachabilitySweep:
         *,
         progress: ProgressCallback | None = None,
         executor: VerifyExecutor | None = None,
+        tuning: VerifyTuning | None = None,
     ) -> None:
         self._repo = repo
         self._level = level
         self._progress = progress
+        self._tuning = tuning or VerifyTuning()
         self._pool = repo.new_pool(verify=FULL_VERIFY)
-        self._bucket_cache = BucketReaderCache.for_verify()
         self._pool_descriptor = PoolDescriptor.from_pool(self._pool)
         if executor is not None and not executor.accepts_pool(self._pool_descriptor):
             raise ValueError(
@@ -149,23 +154,30 @@ class ReachabilitySweep:
 
     async def _ensure_record_checked(
         self, reader: CompositionReader, record_key: tuple[StreamId, SessionId, int], comp_offset: int, path: str
-    ) -> list[Finding]:
+    ) -> tuple[list[Finding], RecordHead | None, bytes | None]:
         """Check this composition record's ``RecordHead``/``map_crc`` once
-        per run; a repeat call for the same key returns ``[]``."""
-        if record_key in self._record_checks:
-            return []
+        per run. Returns ``(findings, record_head, verified_array)``: what
+        this check read, for the caller to hand to the shared
+        ``CompositionRecord`` instead of re-reading it (a parity-repaired
+        array goes to ``_record_checks`` instead). A repeat call for the
+        same key returns ``([], <the remembered head>, None)``."""
+        if (known := self._record_checks.get(record_key)) is not None:
+            return [], known.record_head, None
         findings: list[Finding] = []
         head_finding, record_head = await check_record_head(reader, comp_offset, path=path)
         if head_finding is not None:
             findings.append(head_finding)
             self._record_checks[record_key] = _RecordCheckState(broken=True)
-            return findings
+            return findings, None, None
+        verified_array: bytes | None = None
         repaired_array: bytes | None = None
         if record_head is not None and record_head.map_num > 0:
-            crc_findings, repaired_array = await check_map_and_attr_crc(reader, comp_offset, record_head, path=path)
+            crc_findings, verified_array, repaired_array = await check_map_and_attr_crc(
+                reader, comp_offset, record_head, path=path
+            )
             findings.extend(crc_findings)
-        self._record_checks[record_key] = _RecordCheckState(repaired_map_array=repaired_array)
-        return findings
+        self._record_checks[record_key] = _RecordCheckState(repaired_map_array=repaired_array, record_head=record_head)
+        return findings, record_head, verified_array
 
     async def claim_extent(self, extent: CompositionExtent, ref: str, label: str) -> list[Finding]:
         """Check ``extent``'s composition header and record once per run,
@@ -176,7 +188,7 @@ class ReachabilitySweep:
         stream_id = extent.dedup_file.stream_id
         session_id = extent.dedup_file.session_id
         comp_offset = extent.dedup_file.comp_offset
-        # Only read_at() is used below, so no composition cache is needed.
+        # The header and record checks use only read_at(), so their reader needs no composition cache.
         reader = self._repo.composition_reader(stream_id, session_id)
 
         session_key = (stream_id, session_id)
@@ -187,7 +199,10 @@ class ReachabilitySweep:
                 findings.append(header_finding)
 
         record_key = (stream_id, session_id, comp_offset)
-        findings.extend(await self._ensure_record_checked(reader, record_key, comp_offset, extent.unit_label))
+        record_findings, record_head, verified_array = await self._ensure_record_checked(
+            reader, record_key, comp_offset, extent.unit_label
+        )
+        findings.extend(record_findings)
         check_state = self._record_checks[record_key]
         if check_state.broken:
             # Already reported via _ensure_record_checked; iter_bucket_keys
@@ -195,7 +210,12 @@ class ReachabilitySweep:
             return findings
 
         try:
-            cached_record = await extent.dedup_file.cached_record()
+            cached_record = await extent.dedup_file.cached_record(record_head=record_head)
+            if verified_array is not None and cached_record.record_head == record_head:
+                # A record the shared cache already held from a different
+                # head keeps reading its own pages from storage.
+                await cached_record.prime_pages(verified_array, extent.start, extent.end)
+            verified_array = None  # the walk below must not keep the whole array alive
 
             if check_state.repaired_map_array is not None:
                 # Reseed so the shared CompositionRecord doesn't carry
@@ -253,7 +273,7 @@ class ReachabilitySweep:
             self._total_bytes_to_verify += size
             self._buckets_to_check.append(key)
 
-        await _gather_or_raise_first(batch, _size_and_record)
+        await _gather_or_raise_first(batch, _size_and_record, max_concurrent=self._tuning.max_concurrent_reads)
 
     async def _size_one_bucket(self, key: tuple[StreamId, BucketId]) -> int:
         """A bucket's on-disk size, ``0`` on any failure but a
@@ -277,8 +297,9 @@ class ReachabilitySweep:
 
         At FULL with a store a worker process can reopen (a
         ``PoolDescriptor``), buckets are checked in a process pool for
-        multi-core decoding; otherwise in-process, bounded by
-        ``MAX_CONCURRENT_BUCKET_CHECKS``. Progress ticks once per bucket.
+        multi-core decoding; otherwise in-process,
+        ``VerifyTuning.max_concurrent_reads`` at a time (at FULL, no more than
+        ``max_concurrent_decodes``). Progress ticks once per bucket.
         """
         findings: list[Finding] = []
         full = self._level is VerifyLevel.FULL
@@ -312,9 +333,13 @@ class ReachabilitySweep:
         async def _check(key: tuple[StreamId, BucketId]) -> None:
             findings.extend(await self._check_one_bucket(key))
 
+        max_concurrent = self._tuning.max_concurrent_reads
+        if full:
+            max_concurrent = min(max_concurrent, self._tuning.max_concurrent_decodes)
+
         # on_done runs after the semaphore is released, so a slow progress
         # callback doesn't narrow concurrency.
-        await _gather_or_raise_first(self._buckets_to_check, _check, on_done=_tick)
+        await _gather_or_raise_first(self._buckets_to_check, _check, max_concurrent=max_concurrent, on_done=_tick)
         return findings
 
     async def _check_all_buckets_multiprocess(
@@ -342,7 +367,7 @@ class ReachabilitySweep:
                 executor.process_pool,
                 verify_bucket_worker,
                 ordered,
-                max_concurrent=default_worker_count(),
+                max_concurrent=executor.max_workers,
                 on_result=_on_result,
             )
         except BaseExceptionGroup as group:
@@ -360,7 +385,7 @@ class ReachabilitySweep:
     async def _check_one_bucket(self, key: tuple[StreamId, BucketId]) -> list[Finding]:
         """In-process counterpart of ``verify_bucket_worker``; both run
         ``check_one_bucket``."""
-        findings, key_missing = await check_one_bucket(self._pool, self._bucket_cache, key, self._level)
+        findings, key_missing = await check_one_bucket(self._pool, key, self._level)
         return self._tag_with_claim(key, self._dedup_key_missing(findings, key_missing))
 
     def _dedup_key_missing(self, findings: list[Finding], key_missing: bool) -> list[Finding]:

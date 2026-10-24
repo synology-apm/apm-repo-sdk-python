@@ -11,7 +11,7 @@ import pytest
 
 from support.cli import invoke
 from support.fakes import faithful_to
-from synology_apm_repo.sdk.api import Finding, Repository, VerifyLevel
+from synology_apm_repo.sdk.api import Finding, Repository, VerifyLevel, VerifyTuning
 from synology_apm_repo.sdk.presentation import Progress, ProgressCallback
 from unit.cli.session_fakes import install_fake_session
 
@@ -19,7 +19,11 @@ from unit.cli.session_fakes import install_fake_session
 @faithful_to(Repository)
 class _ProgressReportingRepo:
     async def verify(
-        self, level: VerifyLevel = VerifyLevel.QUICK, *, progress: ProgressCallback | None = None
+        self,
+        level: VerifyLevel = VerifyLevel.QUICK,
+        *,
+        progress: ProgressCallback | None = None,
+        tuning: VerifyTuning | None = None,
     ) -> list[Finding]:
         assert progress is not None  # commands/verify.py must always pass one
         await progress(Progress(phase="verifying", determinate=True, done=0, total=1, unit="items"))

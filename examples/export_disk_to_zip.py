@@ -2,9 +2,11 @@
 
 A zip entry can only be written front to back, but the exporter produces a disk's bytes in the order they sit in
 the repository, not the order they sit on the disk. ``BufferedExportSink`` bridges the two: it takes the disk
-in segments, in shared memory the export's worker processes write into, and hands each finished segment to
-``ZipSink.flush_segment`` in disk order while the exporter is already filling the next one. So decoding (spread
-over several cores) overlaps compressing (one thread), and the memory held is bounded however large the disk.
+in segments held in shared memory and hands each finished segment to ``ZipSink.flush_segment`` in disk order
+while the exporter is already filling the next one. So decoding overlaps compressing (one thread), and the
+memory held is bounded however large the disk. The export decodes in this process, as ``run_export`` does by
+default: one process decodes far faster than one thread deflates, so worker processes would add memory, not
+speed.
 
 Flow:
 
@@ -17,12 +19,11 @@ Flow:
 
 Caveats:
     * Throughput is bounded by one deflate thread, which segment size and buffering cannot raise; ``--level 1``
-      trades size for speed. Holes in a sparse disk are shipped as zeros (they compress to almost nothing), so
-      the zip holds the whole logical disk.
+      trades size for speed. Holes in a sparse disk are shipped as zeros, so the zip holds the whole logical
+      disk: they compress to almost nothing but still take deflate time.
     * The "waited for the zip" time each disk prints is how long the exporter was held back because the zip could
-      not take the next segment: when it is most of the run, compression is the bottleneck. Larger segments
-      (default 256 MiB) keep more worker processes busy; about ``--buffered-segments x --segment-size-mib`` of
-      memory is held.
+      not take the next segment: when it is most of the run, compression is the bottleneck.
+    * ``--buffered-segments x --segment-size-mib`` (default 2 x 32 MiB) of shared memory is held.
 
 Requirements (the standard library plus this SDK)::
 
@@ -348,7 +349,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument(
         "ref",
-        help="<path>#<source>/<workload>/<version> (display names) or a canonical <path>#cat:N/wl:N/ver:UID ref, "
+        help="<path>#<source>/<workload>/<version> (display names) or a canonical <path>#@cat:N/wl:N/ver:UID ref, "
         "exactly as the CLI takes it (with --profile, <path> is store-relative); every disk at or below it is "
         "exported. VM, PC and PS versions all work.",
     )
@@ -364,9 +365,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--segment-size-mib",
         type=int,
-        default=256,
-        help="MiB of a disk taken at once; larger keeps more worker processes busy, smaller uses less memory "
-        "(default: 256)",
+        default=32,
+        help="MiB of a disk taken at once; smaller uses less memory, larger keeps more reads in flight when "
+        "compression is not the bottleneck (default: 32)",
     )
     parser.add_argument(
         "--buffered-segments",

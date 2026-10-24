@@ -107,6 +107,25 @@ class TestResolveGenerationSupplementalTables:
         )
         assert path == "db/connection_config.10"
 
+    async def test_a_name_with_non_ascii_digits_is_not_a_generation_or_marker(self, tmp_path: Path) -> None:
+        db = tmp_path / "db"
+        db.mkdir()
+        for name in ("connection_config.1", "connection_config.\u00b2", "connection_config.\u0669"):
+            (db / name).write_bytes(b"")
+        suppl = tmp_path / "suppl_transaction_ids"
+        suppl.mkdir()
+        for name in ("1", "\u00b2", "\u0669"):
+            (suppl / name).write_bytes(b"")
+        store = LocalFsStore(tmp_path)
+        path = await resolve_generation(
+            store,
+            "db",
+            "connection_config",
+            transactions_dir="repo_transactions",
+            suppl_dir="suppl_transaction_ids",
+        )
+        assert path == "db/connection_config.1"
+
     async def test_unrelated_numbering_from_repo_transactions_is_ignored(self, tmp_path: Path) -> None:
         # A supplemental table's generations are a sequence independent of
         # repo_transactions/, which a supplemental lookup never consults.

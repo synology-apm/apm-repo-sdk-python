@@ -143,6 +143,7 @@ repository formats.
    api/synology_apm_repo.sdk.units.content.disk_fs
    api/synology_apm_repo.sdk.units.content.local_file
    api/synology_apm_repo.sdk.units.content.pcps_disk
+   api/synology_apm_repo.sdk.units.content.readahead
    api/synology_apm_repo.sdk.units.content.saas_artifact
    api/synology_apm_repo.sdk.units.content.saas_mail
    api/synology_apm_repo.sdk.units.content.saas_calendar

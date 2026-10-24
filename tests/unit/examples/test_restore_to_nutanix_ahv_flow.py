@@ -17,7 +17,7 @@ import pytest
 from support.fakes import faithful_to, unchecked_fake
 from synology_apm_repo.sdk import Frame, Node, NodeFrame, NodeRef, RestorableUnit, RootFrame, UnitKind
 from synology_apm_repo.sdk.api import Repository, Session
-from synology_apm_repo.sdk.export import ExportResult
+from synology_apm_repo.sdk.export import ExportResult, ExportTuning
 from synology_apm_repo.sdk.units.base import ContentSource, UnitProvider
 
 _MIB = 1 << 20
@@ -589,7 +589,7 @@ async def test_resolve_start_needs_the_ref_to_reach_a_version(ex: ModuleType, le
 
 async def test_resolve_start_resolves_a_canonical_ref_through_its_version(ex: ModuleType) -> None:
     provider, root = _vm_tree()
-    ref = NodeRef.parse("repo#cat:1/wl:2/ver:abc")
+    ref = NodeRef.parse("repo#@cat:1/wl:2/ver:abc")
 
     got_provider, got_node = await ex.resolve_start(_FakeRepo(provider, root), ref)
 
@@ -598,7 +598,7 @@ async def test_resolve_start_resolves_a_canonical_ref_through_its_version(ex: Mo
 
 async def test_resolve_start_rejects_a_raw_ref(ex: ModuleType) -> None:
     with pytest.raises(SystemExit, match="raw refs are not supported"):
-        await ex.resolve_start(_FakeRepo(), NodeRef.parse("repo#raw/x"))
+        await ex.resolve_start(_FakeRepo(), NodeRef.parse("repo#@raw/x"))
 
 
 def test_parse_ref_treats_a_bare_path_as_a_human_ref_with_no_segments(ex: ModuleType) -> None:
@@ -850,6 +850,9 @@ class _LunWriter:
 class _ExportingContent:
     size = 2 * _MIB
 
+    def __init__(self) -> None:
+        self.tuning: object = None
+
     async def read(self, offset: int = 0, length: int | None = None) -> bytes:
         return b""
 
@@ -859,6 +862,7 @@ class _ExportingContent:
     async def export_range(
         self, sink: Any, start: int, end: int, *, sparse: bool = True, progress: Any = None, tuning: object = None
     ) -> ExportResult:
+        self.tuning = tuning
         await sink.write_at(0, b"A" * 8192)
         if progress is not None:
             await progress(8192)
@@ -870,10 +874,12 @@ async def test_export_to_lun_exports_through_a_block_sink_and_reports(
 ) -> None:
     _LunWriter.instances.clear()
     monkeypatch.setattr(ex, "LibiscsiWriter", _LunWriter)
-    unit = SimpleNamespace(content=_ExportingContent())
-    disk = ex.SourceDisk("disk", unit, 2 * _MIB)
+    content = _ExportingContent()
+    disk = ex.SourceDisk("disk", SimpleNamespace(content=content), 2 * _MIB)
 
     await ex.export_to_lun(disk, "iscsi://h/iqn/1", 0, 2, 4 * _MIB, initiator_iqn="iqn.me")
+
+    assert content.tuning == ExportTuning(workers=4)  # one iSCSI session per worker
 
     writers = [w for w in _LunWriter.instances if w.writes]
     assert [(w.url, w.initiator_iqn) for w in writers] == [("iscsi://h/iqn/1", "iqn.me")]

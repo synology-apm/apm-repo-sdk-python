@@ -9,8 +9,8 @@ unknown size is checked the same way piece by piece as it writes:
   process may still write.
 - ``in_flight``: bytes reserved by this process's other writes to the same
   filesystem that haven't finished yet.
-- ``reserve``: ``total / 20``, at least the smaller of 1 GiB and
-  ``total / 10``, at most 10 GiB -- left free for the rest of the machine.
+- ``reserve``: the smaller of 1 GiB and ``total / 10`` -- left free for
+  the rest of the machine.
 
 Other processes' writes are not seen until they land, so the check stays
 best-effort.
@@ -28,17 +28,11 @@ from pathlib import Path
 from ..errors import ResourceLimitExceededError
 from ..presentation.format import format_bytes
 
-#: The reserve's floor on a filesystem of 10 GiB or more: room for swap
-#: growth, logs and a package update, where 5% would be a few hundred MiB.
-_MIN_RESERVE = 1 << 30  # 1 GiB
-#: Below 10 GiB the floor is this fraction of the filesystem instead, so a
+#: What a write keeps free: room for swap growth, logs and a package update.
+_RESERVE = 1 << 30  # 1 GiB
+#: Below 10 GiB the reserve is this fraction of the filesystem instead, so a
 #: small tmpfs still takes a small copy.
-_SMALL_FS_FLOOR_DIVISOR = 10  # 10%
-#: The reserve's ceiling, reached at 200 GiB, so a large filesystem with
-#: plenty free still takes a small copy.
-_MAX_RESERVE = 10 << 30  # 10 GiB
-#: The reserve as a fraction of the filesystem's total size, between the two bounds.
-_RESERVE_DIVISOR = 20  # 5%
+_SMALL_FS_DIVISOR = 10  # 10%
 
 _lock = threading.Lock()
 #: Bytes reserved by unfinished writes, per filesystem (``st_dev``).
@@ -47,8 +41,7 @@ _in_flight: dict[int, int] = {}
 
 def _free_space_reserve(total_bytes: int) -> int:
     """The bytes kept free on a filesystem of ``total_bytes``."""
-    floor = min(_MIN_RESERVE, total_bytes // _SMALL_FS_FLOOR_DIVISOR)
-    return max(floor, min(total_bytes // _RESERVE_DIVISOR, _MAX_RESERVE))
+    return min(_RESERVE, total_bytes // _SMALL_FS_DIVISOR)
 
 
 class DiskReservation:

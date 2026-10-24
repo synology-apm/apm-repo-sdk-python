@@ -129,6 +129,11 @@ class AzureStoreDescriptor:
     container: str
     client_kwargs: dict[str, Any]
 
+    @override
+    def __repr__(self) -> str:
+        # client_kwargs carries the account key or connection string.
+        return f"AzureStoreDescriptor(container={self.container!r}, client_kwargs=<redacted>)"
+
     def build(self) -> AzureStore:
         return AzureStore(self.container, **self.client_kwargs)
 

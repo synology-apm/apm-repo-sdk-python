@@ -406,7 +406,7 @@ async def _first_working_ref(
             # recognize a --key-narrowed single-repository rescan.
             key = ri.key if ri.sole_repo_for_entry else ""
             real_path = ri.broad_repo_ref if key else ri.narrow_repo_ref
-            ref_str = str(NodeRef(real_path, leaf.ref.segments))
+            ref_str = str(NodeRef(real_path, leaf.ref.segments, leaf.ref.kind))
             return RepresentativeRef(
                 sample_name,
                 type_key,

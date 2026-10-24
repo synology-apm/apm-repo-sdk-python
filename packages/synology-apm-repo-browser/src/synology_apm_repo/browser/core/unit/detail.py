@@ -61,8 +61,7 @@ def header_text(node: Node, *, verbose: bool) -> str:
     if node.size is not None:
         size_line = f"size: {format_bytes(node.size)}"
         if node.file_state is FileState.CLOUD_ONLY:
-            # A cloud-sync placeholder's size is declared, not on disk.
-            size_line += " (0 Byte on disk)"
+            size_line += " (cloud-sync file — data may not be on disk)"
         lines.append(size_line)
     modified = node.mtime
     if modified is not None:

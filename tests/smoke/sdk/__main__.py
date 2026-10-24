@@ -115,9 +115,8 @@ async def _process_entry(
 
     for ri in found:
         print(f"[smoke] processing sample: {ri.sample_name}")
-        # Phase-level fallback labels: a store call a phase makes between its
-        # ctx.call steps is attributed to the phase, and an inner ctx.call
-        # still overrides this with its own step.
+        # Phase-level fallback labels, for a phase's store calls outside any
+        # inner label (a ctx.call step or the phase's own trace_step).
         with trace_step("catalog", f"enumerate[{ri.sample_name}]"):
             await _enumerate_catalog(ctx, ri)
         for domain in domains:

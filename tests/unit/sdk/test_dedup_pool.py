@@ -671,9 +671,8 @@ class TestCacheStatsAndLimits:
         assert stats["pool.buckets"].maxsize == DEFAULT_LIMITS.bucket_readers
         assert stats["pool.chunks"].maxsize == DEFAULT_LIMITS.chunks
 
-    def test_a_scan_bucket_cache_is_bounded_by_default_and_verify_has_its_own_size(self) -> None:
+    def test_a_scan_bucket_cache_is_bounded_by_default(self) -> None:
         assert BucketReaderCache().maxsize == DEFAULT_LIMITS.bucket_readers
-        assert BucketReaderCache.for_verify().maxsize == DEFAULT_LIMITS.verify_bucket_readers
 
 
 class TestBucketSize:

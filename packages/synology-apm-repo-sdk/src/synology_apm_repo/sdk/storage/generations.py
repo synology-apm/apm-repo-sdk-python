@@ -64,14 +64,14 @@ SUPPL_TRANSACTION_IDS_DIR = "suppl_transaction_ids"
 
 
 def _numeric_suffixes(names: list[str], base: str) -> list[int]:
-    """The ``<N>`` of every ``<base>.<N>`` entry in ``names`` with a numeric
-    ``<N>``; bare ``<base>`` never matches."""
+    """The ``<N>`` of every ``<base>.<N>`` entry in ``names`` with an ASCII
+    decimal ``<N>``; bare ``<base>`` never matches."""
     prefix = base + "."
     result = []
     for name in names:
         if name.startswith(prefix):
             suffix = name[len(prefix) :]
-            if suffix.isdigit():
+            if suffix.isascii() and suffix.isdigit():
                 result.append(int(suffix))
     return result
 
@@ -144,7 +144,7 @@ async def resolve_generation(
         return join_path(db_dir, name)
 
     if name in SUPPLEMENTAL_TABLES:
-        suppl_ids = {int(n) for n in await list_dir(suppl_dir) if n.isdigit()}
+        suppl_ids = {int(n) for n in await list_dir(suppl_dir) if n.isascii() and n.isdigit()}
         valid = [s for s in suffixes if s in suppl_ids]
         if not valid:
             raise NotFoundError(

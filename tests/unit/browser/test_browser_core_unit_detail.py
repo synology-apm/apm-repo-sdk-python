@@ -34,7 +34,7 @@ def test_header_text_shows_the_fallback_label_for_a_kindless_node() -> None:
 def test_header_text_flags_a_cloud_only_files_size() -> None:
     node = _leaf("placeholder.docx", size=2048, file_state=FileState.CLOUD_ONLY)
 
-    assert "size: 2.0 KiB (0 Byte on disk)" in header_text(node, verbose=False)
+    assert "size: 2.0 KiB (cloud-sync file — data may not be on disk)" in header_text(node, verbose=False)
 
 
 def test_header_text_escapes_markup_in_a_backed_up_name() -> None:

@@ -25,7 +25,7 @@ def test_invalid_progress_value_is_rejected() -> None:
 def test_valid_progress_values_reach_the_subcommand(value: str) -> None:
     # ``doctor`` failing for its own reason (no REPO/--profile) proves the
     # root callback accepted the value.
-    result = invoke(["--progress", value, "doctor"], exit_code=1)
+    result = invoke(["--progress", value, "doctor"], exit_code=2)
     assert "exactly one of REPO or --profile" in result.output
 
 

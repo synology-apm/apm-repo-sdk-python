@@ -64,16 +64,16 @@ class SmokeContext(ReportContext):
         domain: str,
         step: str,
         *args: str,
-        cancel_after: float,
+        cancel_on: str,
         env_overrides: dict[str, str] | None = None,
         expect_exit: int = 130,
         note: str = "",
         **kwargs: Any,
     ) -> CliResult:
         """``run``, but through ``CliRunner.run_cancellable``: a real ``SIGINT``
-        ``cancel_after`` seconds in. ``expect_exit`` defaults to 130
+        once ``cancel_on`` appears on stderr. ``expect_exit`` defaults to 130
         (``ExitCode.CANCELLED``)."""
-        result = self.runner.run_cancellable(*args, cancel_after=cancel_after, env_overrides=env_overrides, **kwargs)
+        result = self.runner.run_cancellable(*args, cancel_on=cancel_on, env_overrides=env_overrides, **kwargs)
         return self._record(domain, step, result, expect_exit=expect_exit, note=note)
 
     def _record(

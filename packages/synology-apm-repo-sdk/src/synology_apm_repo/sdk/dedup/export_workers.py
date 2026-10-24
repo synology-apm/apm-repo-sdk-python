@@ -70,17 +70,25 @@ class ExportExecutor(BoundProcessPool):
     """Worker processes for ``export_to_writer``, bound for their lifetime to
     one repository (``pool_descriptor``) and one destination
     (``sink_descriptor``). Share one across the calls of a single logical
-    export to that destination.
+    export to that destination. ``max_workers`` is the process count
+    (``concurrency.default_worker_count()`` when ``None``).
 
     Raises:
         ValueError: A descriptor cannot be pickled for the workers.
     """
 
-    def __init__(self, pool_descriptor: PoolDescriptor, sink_descriptor: SinkDescriptor) -> None:
+    def __init__(
+        self, pool_descriptor: PoolDescriptor, sink_descriptor: SinkDescriptor, *, max_workers: int | None = None
+    ) -> None:
         _require_picklable("pool descriptor", pool_descriptor)
         _require_picklable("sink descriptor", sink_descriptor)
         self.sink_descriptor = sink_descriptor
-        super().__init__(pool_descriptor, initializer=_export_worker_init, initargs=(pool_descriptor, sink_descriptor))
+        super().__init__(
+            pool_descriptor,
+            initializer=_export_worker_init,
+            initargs=(pool_descriptor, sink_descriptor),
+            max_workers=max_workers,
+        )
 
     def accepts(self, pool_descriptor: PoolDescriptor | None, target: WorkerTarget | None) -> bool:
         """Whether an export of ``pool_descriptor``'s repository into

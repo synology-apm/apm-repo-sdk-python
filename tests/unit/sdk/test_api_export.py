@@ -12,7 +12,7 @@ import pytest
 from support.fakes import faithful_to
 from synology_apm_repo.sdk.api import export as api_export_mod
 from synology_apm_repo.sdk.dedup.buffered_export_sink import BufferedExportSink, FlushableSegment
-from synology_apm_repo.sdk.dedup.export_scheduler import ExportTuning
+from synology_apm_repo.sdk.dedup.export_scheduler import ExportTuning, SharedExportTuning
 from synology_apm_repo.sdk.dedup.export_sink import (
     AbortOutcome,
     ExportWriter,
@@ -303,18 +303,18 @@ class TestRunExportSegmented:
 
         await run_export(content, _CollectingSink(), tuning=ExportTuning(max_concurrent_reads=4))
 
-        caches = [tuning.export_cache for tuning in content.tunings if tuning is not None]
-        assert len(caches) == 3 and caches[0] is not None
-        assert all(cache is caches[0] for cache in caches)
-        assert {tuning.max_concurrent_reads for tuning in content.tunings if tuning is not None} == {4}
+        shared = [tuning for tuning in content.tunings if isinstance(tuning, SharedExportTuning)]
+        assert len(shared) == 3 and shared[0].export_cache is not None
+        assert all(tuning.export_cache is shared[0].export_cache for tuning in shared)
+        assert {tuning.max_concurrent_reads for tuning in shared} == {4}
 
     async def test_a_cache_the_caller_supplied_is_the_one_shared(self) -> None:
         content = _RangeContent(b"x" * 8192)
         mine = BucketReaderCache()
 
-        await run_export(content, _CollectingSink(), tuning=ExportTuning(export_cache=mine))
+        await run_export(content, _CollectingSink(), tuning=SharedExportTuning(export_cache=mine))
 
-        assert all(tuning is not None and tuning.export_cache is mine for tuning in content.tunings)
+        assert all(isinstance(tuning, SharedExportTuning) and tuning.export_cache is mine for tuning in content.tunings)
 
     async def test_time_spent_waiting_for_the_sink_is_reported(self, monkeypatch: pytest.MonkeyPatch) -> None:
         content = _RangeContent(b"x" * 12288)

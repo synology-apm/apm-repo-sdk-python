@@ -24,14 +24,15 @@ import contextlib
 import enum
 import os
 import tempfile
-from collections.abc import AsyncIterator, Callable, Iterable, Iterator
+import threading
+from collections.abc import AsyncIterator, Callable, Iterable, Iterator, Mapping
 from pathlib import Path
 from typing import BinaryIO, Self, override
 
 import aiosqlite
 import zstandard
 
-from .._util.closing import AsyncClosing, shield_or_undo
+from .._util.closing import AsyncClosing, close_preserving, run_to_completion, shield_or_undo
 from ..errors import DataCorruptError, KeyRequiredError
 from ..format.compression import (
     decompress_zstd_stream,
@@ -275,19 +276,23 @@ class SqliteSource(AsyncClosing):
         return cls(await _connect_temp_file(path), path=path), envelopes
 
     @classmethod
-    async def from_raw_store(cls, store: ObjectStore, path: str) -> Self:
+    async def from_raw_store(
+        cls, store: ObjectStore, path: str, *, listing: Mapping[str, int | None] | None = None
+    ) -> Self:
         """Open ``path`` from ``store`` for a caller that knows it is never
         enveloped (``db/<name>``, ``saas/*/db/saas_{version,snapshot}``).
         Delegates to ``open_sqlite``: a plain ``LocalFsStore`` file without a
         non-empty ``-wal`` opens read-only in place, anything else via a
-        private materialized copy.
+        private materialized copy. ``listing``, ``path``'s directory as
+        already listed, answers for the ``-wal``/``-shm`` sidecars with no
+        request (``open_sqlite``).
 
         Raises:
             ResourceLimitExceededError: The materialized copy doesn't fit in
                 the system temp directory with ``disk_space``'s reserve left
                 free.
         """
-        return await cls._from_open_sqlite(store, path)
+        return await cls._from_open_sqlite(store, path, listing=listing)
 
     @classmethod
     async def from_enveloped_store(
@@ -338,19 +343,48 @@ class SqliteSource(AsyncClosing):
         *,
         transform: Callable[[bytes, BinaryIO], None] | None = None,
         tmp_dir: Path | None = None,
+        listing: Mapping[str, int | None] | None = None,
     ) -> Self:
-        conn, tmp = await open_sqlite(store, path, tmp_dir=tmp_dir, transform=transform)
+        conn, tmp = await open_sqlite(store, path, tmp_dir=tmp_dir, transform=transform, listing=listing)
         return cls(conn, tmp_dir=tmp)
 
     @override
     async def close(self) -> None:
-        """Closes the connection and removes its temp file or directory. Safe
-        to call more than once."""
+        """Closes the connection and removes its temp file or directory, the
+        latter even if the close fails or is cancelled. There, a removal
+        Windows refuses while the connection's thread still holds the file
+        is retried once that thread exits; any other removal failure becomes
+        a note on the close's error. Safe to call more than once."""
         if self._closed:
             return
         self._closed = True
-        await self.connection.close()
-        await asyncio.to_thread(self._remove_scratch_files)
+        try:
+            await self.connection.close()
+        except BaseException as exc:
+            await close_preserving(exc, [self._remove_scratch_files_once_released])
+            raise
+        await run_to_completion(asyncio.to_thread(self._remove_scratch_files))
+
+    async def _remove_scratch_files_once_released(self) -> None:
+        await run_to_completion(asyncio.to_thread(self._remove_now_or_once_released))
+
+    def _remove_now_or_once_released(self) -> None:
+        try:
+            self._remove_scratch_files()
+        except OSError:
+            # aiosqlite's private worker thread; it exits once the queued close
+            # has released the file, even if the awaiting caller was cancelled.
+            worker = getattr(self.connection, "_thread", None)
+            if not (isinstance(worker, threading.Thread) and worker.is_alive()):
+                raise
+            threading.Thread(
+                target=self._remove_scratch_files_after, args=(worker,), name="sqlite-scratch-cleanup", daemon=True
+            ).start()
+
+    def _remove_scratch_files_after(self, worker: threading.Thread) -> None:
+        worker.join()
+        with contextlib.suppress(OSError):
+            self._remove_scratch_files()
 
     def _remove_scratch_files(self) -> None:
         if self._path is not None:
