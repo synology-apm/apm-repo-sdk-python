@@ -13,6 +13,7 @@ Each fragment is its own composition over a shared ``Pool``, and its
 
 from __future__ import annotations
 
+import asyncio
 import dataclasses
 import random
 from collections.abc import Awaitable, Callable
@@ -32,10 +33,11 @@ from synology_apm_repo.sdk.dedup import export_scheduler as export_scheduler_mod
 from synology_apm_repo.sdk.dedup import local_file_sink as local_file_sink_mod
 from synology_apm_repo.sdk.dedup.composition_reader import CompositionReader
 from synology_apm_repo.sdk.dedup.dedup_file import DedupFile
-from synology_apm_repo.sdk.dedup.export_scheduler import ExportTuning
+from synology_apm_repo.sdk.dedup.export_scheduler import ExportTuning, SharedExportTuning
 from synology_apm_repo.sdk.dedup.export_sink import run_sink_export
 from synology_apm_repo.sdk.dedup.extent import ExportResult
 from synology_apm_repo.sdk.dedup.pool import Pool
+from synology_apm_repo.sdk.errors import NotFoundError
 from synology_apm_repo.sdk.export import LocalFileSink, run_export
 from synology_apm_repo.sdk.identifiers import SessionId, StreamId
 from synology_apm_repo.sdk.storage.dircache import DirCache
@@ -358,6 +360,54 @@ class TestRead:
     async def test_zero_length_read_returns_empty_bytes(self, two_fragment_disk: VirtualDiskContentSource) -> None:
         assert await two_fragment_disk.read(4096, 0) == b""
 
+    async def test_fragments_a_read_spans_are_read_side_by_side(
+        self, two_fragment_disk: VirtualDiskContentSource, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # Each fragment's read waits until the other has started: a serial
+        # loop would never get past the first.
+        real_read = DedupFile.read
+        started: list[int] = []
+        both_started = asyncio.Event()
+
+        async def gated_read(self: DedupFile, offset: int = 0, length: int | None = None) -> bytes | bytearray:
+            started.append(offset)
+            if len(started) == 2:
+                both_started.set()
+            await both_started.wait()
+            return await real_read(self, offset, length)
+
+        monkeypatch.setattr(DedupFile, "read", gated_read)
+        expected = _PLAINTEXT_A[0] + _PLAINTEXT_A[1] + bytes(8192) + _PLAINTEXT_B[0] + _PLAINTEXT_B[1] + bytes(8192)
+        assert await two_fragment_disk.read(0, _DISK_SIZE) == expected
+        assert sorted(started) == [_FRAG_A_START, _FRAG_B_START]
+
+    async def test_a_short_fragment_read_leaves_a_zero_tail_and_moves_nothing_else(
+        self, two_fragment_disk: VirtualDiskContentSource, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        real_read = DedupFile.read
+
+        async def short_a(self: DedupFile, offset: int = 0, length: int | None = None) -> bytes | bytearray:
+            data = await real_read(self, offset, length)
+            return data[:4096] if offset < _FRAG_B_START else data
+
+        monkeypatch.setattr(DedupFile, "read", short_a)
+        expected = _PLAINTEXT_A[0] + bytes(3 * 4096) + _PLAINTEXT_B[0] + _PLAINTEXT_B[1] + bytes(8192)
+        assert await two_fragment_disk.read(0, _DISK_SIZE) == expected
+
+    async def test_a_failing_fragment_raises_its_own_error_not_a_group(
+        self, two_fragment_disk: VirtualDiskContentSource, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        real_read = DedupFile.read
+
+        async def failing_b(self: DedupFile, offset: int = 0, length: int | None = None) -> bytes | bytearray:
+            if offset >= _FRAG_B_START:
+                raise NotFoundError("fragment B's bucket is gone")
+            return await real_read(self, offset, length)
+
+        monkeypatch.setattr(DedupFile, "read", failing_b)
+        with pytest.raises(NotFoundError, match="fragment B"):
+            await two_fragment_disk.read(0, _DISK_SIZE)
+
 
 class TestStream:
     async def test_stream_reassembles_the_whole_disk_in_order(
@@ -486,7 +536,7 @@ class TestExportTo:
         real_export_to = export_scheduler_mod.export_to_writer
 
         async def _spy_export_to(*args: Any, **kwargs: Any) -> object:
-            received.append(cast(ExportTuning, kwargs["tuning"]).max_concurrent_opens)
+            received.append(cast(SharedExportTuning, kwargs["tuning"]).max_concurrent_opens)
             return await real_export_to(*args, **kwargs)
 
         monkeypatch.setattr(export_scheduler_mod, "export_to_writer", _spy_export_to)
@@ -496,23 +546,30 @@ class TestExportTo:
             two_fragment_disk.size,
             sparse=True,
             body=lambda sink: two_fragment_disk.export_range(
-                sink, 0, two_fragment_disk.size, tuning=ExportTuning(max_concurrent_opens=8)
+                sink, 0, two_fragment_disk.size, tuning=SharedExportTuning(max_concurrent_opens=8)
             ),
         )
 
         assert received == [8, 8]  # once per fragment
 
+    @pytest.mark.parametrize("workers", [0, 2])
     @pytest.mark.parametrize("sparse", [True, False])
     @pytest.mark.parametrize("segment_size", [4096, 8192, 12288])
     async def test_a_segmented_sink_gets_the_same_bytes_and_totals_as_a_local_file(
-        self, two_fragment_disk: VirtualDiskContentSource, tmp_path: Path, sparse: bool, segment_size: int
+        self,
+        two_fragment_disk: VirtualDiskContentSource,
+        tmp_path: Path,
+        sparse: bool,
+        segment_size: int,
+        workers: int,
     ) -> None:
-        """Segments cut across the fragments and the gaps between and around them."""
+        """Segments cut across the fragments and the gaps between and around them, decoded in this
+        process or by one pool of workers both fragments share."""
         local = tmp_path / "local.img"
         expected = await run_export(two_fragment_disk, LocalFileSink(local, staged=False), sparse=sparse)
 
         sink = SegmentCollector(segment_size)
-        result = await run_export(two_fragment_disk, sink, sparse=sparse)
+        result = await run_export(two_fragment_disk, sink, sparse=sparse, tuning=ExportTuning(workers=workers))
 
         assert bytes(sink.output) == local.read_bytes()
         assert (result.bytes_written, result.logical_size, result.holes, result.zeros) == (

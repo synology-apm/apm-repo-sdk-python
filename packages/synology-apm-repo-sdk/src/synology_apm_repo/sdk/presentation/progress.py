@@ -10,7 +10,11 @@ builds on, so rate/ETA math is computed once.
    often ``ProgressMeter.update`` is called, which bounds the sample deque.
 4. ``ProgressMeter.update`` is cheap to call per chunk; it forwards to the
    wrapped callback only every ``min_interval`` seconds or ``min_delta``
-   units, whichever comes first.
+   units, whichever comes first -- except that the snapshot completing a
+   known total and the first snapshot of a new phase always notify, so a
+   display never stops short of 100% or misses a phase.
+5. A new phase (or unit) restarts the rate window; a count that goes back
+   within one never makes the rate negative.
 """
 
 from __future__ import annotations
@@ -132,6 +136,21 @@ class ProgressMeter:
             self._last_notify_time = None
             self._last_notify_done = progress.done
 
+        latest = self._latest
+        new_phase = latest is not None and (latest.phase, latest.unit) != (progress.phase, progress.unit)
+        if new_phase:
+            # The old phase's counts say nothing about this one's rate (rule 5).
+            self._samples.clear()
+            self._rate = 0.0
+            self._last_notify_done = progress.done
+        completes = (
+            progress.determinate
+            and progress.total is not None
+            and progress.total > 0
+            and progress.done >= progress.total
+            and (latest is None or new_phase or latest.total is None or latest.done < latest.total)
+        )
+
         if not self._samples or (t - self._samples[-1][0]) >= self._rate_sample_interval:
             self._samples.append((t, progress.done))
             cutoff = t - self._rate_window_seconds
@@ -140,13 +159,15 @@ class ProgressMeter:
             oldest_t, oldest_done = self._samples[0]
             dt = t - oldest_t
             if dt > 0:
-                self._rate = (progress.done - oldest_done) / dt
+                self._rate = max(0.0, (progress.done - oldest_done) / dt)
             # dt == 0 leaves the previous rate unchanged.
 
         self._latest = progress
 
         should_notify = (
             self._last_notify_time is None
+            or new_phase
+            or completes
             or (t - self._last_notify_time) >= self._min_interval
             or (self._min_delta > 0 and (progress.done - self._last_notify_done) >= self._min_delta)
         )

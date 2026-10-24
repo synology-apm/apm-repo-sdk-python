@@ -17,16 +17,18 @@ planning needs the chunk-native ``addr``/``map_num``/``repeat`` fields
 from __future__ import annotations
 
 import asyncio
+import bisect
 import contextlib
 from collections.abc import AsyncIterator, Awaitable, Callable, Iterable, Iterator
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
+from ..concurrency import first_failure
 from ..format.addressing import ChunkAddress
 from ..format.const import BUCKET_MAX_CHUNK_NUM, FIXED_CHUNK_LENGTH
 from ..identifiers import BucketId, ChunkIdx, StreamId
 from .extent import DataExtent, ExtentKind, GapExtent
-from .pool import BucketReader, BucketReaderCache, Pool
+from .pool import DECODE_BLOCK_CHUNKS, BucketReader, BucketReaderCache, ChunkBlockCallback, Pool
 
 if TYPE_CHECKING:
     from .dedup_file import DedupFile
@@ -302,9 +304,8 @@ def merge_overlapping_ranges(ranges: Iterable[tuple[int, int]]) -> list[tuple[in
     into their union, sorted ascending by start.
 
     Two ``ChunkRun``\\ s of one bucket can reference overlapping physical
-    ranges (dedup). The result also gives ``decode_bucket_chunks`` the
-    sorted, duplicate-free ``chunk_idx`` requests ``BucketReader.read_chunks``
-    requires.
+    ranges (dedup). The result is the sorted, duplicate-free request
+    ``BucketReader.read_chunks``/``read_chunk_blocks`` require.
     """
     merged: list[tuple[int, int]] = []
     for start, length in sorted(ranges):
@@ -399,22 +400,91 @@ async def decode_bucket_chunks(
     ranges: Iterable[tuple[int, int]],
     *,
     pool: Pool,
-    semaphore: asyncio.Semaphore | None = None,
 ) -> dict[int, bytes | memoryview]:
     """Every chunk in ``ranges`` (``(chunk_idx_start, length)``, overlap
     allowed) of ``reader``'s bucket, decoded once each with merged reads and
-    ``pool``'s fingerprint policy applied, keyed by chunk index.
-
-    The caller opens ``reader`` from whichever cache it reads through — a
-    sweep's private one, or ``Pool``'s own for an interactive read — so this
-    never decides what gets cached. ``semaphore`` goes to
-    ``BucketReader.read_chunks`` as-is (a permit already acquired for this
-    call is spent by its first run).
+    ``pool``'s fingerprint policy applied, keyed by chunk index: for a
+    caller-bounded read (``DedupFile.read``) that keeps the chunks; a sweep
+    uses ``read_verified_blocks``.
     """
-    decoded = await reader.read_chunks(stream_id, bucket_id, merge_overlapping_ranges(ranges), semaphore=semaphore)
+    decoded = await reader.read_chunks(stream_id, bucket_id, merge_overlapping_ranges(ranges))
     # read_chunks() bypasses Pool.read_chunk(), so apply its fingerprint policy here.
     await pool.verify_fingerprints(stream_id, bucket_id, decoded)
     return decoded
+
+
+async def read_verified_blocks(
+    reader: BucketReader,
+    stream_id: StreamId,
+    bucket_id: BucketId,
+    ranges: list[tuple[int, int]],
+    on_block: ChunkBlockCallback,
+    *,
+    pool: Pool,
+    semaphore: asyncio.Semaphore | None = None,
+) -> None:
+    """``BucketReader.read_chunk_blocks`` over ``ranges`` (sorted,
+    duplicate-free, as ``merge_overlapping_ranges`` returns), each block
+    checked against ``pool``'s fingerprint policy before ``on_block`` gets
+    it. The stored digests are read once for the whole request, once the
+    first block is decoded: per-block checks add no ``.fgp`` reads, and a
+    range or decode failure surfaces before any fingerprint read.
+    """
+    loaded: list[dict[int, bytes] | None] = []
+    loading = asyncio.Lock()
+
+    async def _expected() -> dict[int, bytes] | None:
+        async with loading:  # concurrent reads' first blocks share one load
+            if not loaded:
+                indices = (idx for start, length in ranges for idx in range(start, start + length))
+                loaded.append(await pool.expected_fingerprints(stream_id, bucket_id, indices))
+        return loaded[0]
+
+    async def _checked(block_ranges: list[tuple[int, int]], chunks: dict[int, bytes | memoryview]) -> None:
+        expected = await _expected()
+        if expected is not None:
+            pool.check_fingerprints(stream_id, bucket_id, chunks, expected)
+        await on_block(block_ranges, chunks)
+
+    await reader.read_chunk_blocks(stream_id, bucket_id, ranges, _checked, semaphore=semaphore)
+
+
+class _BlockPlacements:
+    """Where each chunk of one bucket group goes, indexed by decode block
+    (``DECODE_BLOCK_CHUNKS``), so one block's decoded chunks can be written
+    out as soon as they arrive: every ``ChunkRun`` is split at block
+    boundaries into ``(chunk_start, chunk_end, dest_offset)`` pieces."""
+
+    def __init__(self, runs: list[ChunkRun]) -> None:
+        pieces: dict[int, list[tuple[int, int, int]]] = {}
+        for run in runs:
+            index, dest, remaining = run.chunk_idx_start, run.dest_offset_start, run.length
+            while remaining > 0:
+                block = index // DECODE_BLOCK_CHUNKS
+                take = min(remaining, (block + 1) * DECODE_BLOCK_CHUNKS - index)
+                pieces.setdefault(block, []).append((index, index + take, dest))
+                index += take
+                dest += take * FIXED_CHUNK_LENGTH
+                remaining -= take
+        for block_pieces in pieces.values():
+            block_pieces.sort()
+        self._pieces = pieces
+
+    def runs_for(self, ranges: list[tuple[int, int]]) -> list[ChunkRun]:
+        """The placements of the chunks in ``ranges`` (ascending, disjoint
+        ``[a, b)`` ranges within one block) as ``ChunkRun``\\ s, one per
+        destination occurrence."""
+        starts = [start for start, _ in ranges]
+        placed: list[ChunkRun] = []
+        for piece_start, piece_end, dest in self._pieces.get(ranges[0][0] // DECODE_BLOCK_CHUNKS, ()):
+            # The last range starting at or before the piece may still overlap it.
+            i = max(bisect.bisect_right(starts, piece_start) - 1, 0)
+            while i < len(ranges) and ranges[i][0] < piece_end:
+                low, high = max(ranges[i][0], piece_start), min(ranges[i][1], piece_end)
+                if low < high:
+                    placed.append(ChunkRun(low, high - low, dest + (low - piece_start) * FIXED_CHUNK_LENGTH))
+                i += 1
+        return placed
 
 
 async def exec_one_bucket_group(
@@ -428,25 +498,32 @@ async def exec_one_bucket_group(
     export_cache: BucketReaderCache,
     semaphore: asyncio.Semaphore | None = None,
 ) -> None:
-    """One ``(stream_id, bucket_id)`` group's Pass-2 job:
-    ``decode_bucket_chunks``, then merged runs flushed via ``on_run``.
+    """One ``(stream_id, bucket_id)`` group's Pass-2 job: its chunks read via
+    ``read_verified_blocks``, each block flushed via ``on_run``
+    before the next is decoded, so the group never holds all its plaintext
+    at once.
 
     ``runs`` is visited twice: in ``chunk_idx`` order for reads, in
-    ``dest_offset`` order for writes (see ``_merge_and_flush_writes``).
-    ``export_cache`` holds the ``BucketReader`` so the sweep never evicts
-    ``Pool``'s own interactive entries.
+    ``dest_offset`` order within each block for writes. ``export_cache``
+    holds the ``BucketReader`` so the sweep never evicts ``Pool``'s own
+    interactive entries.
     """
     reader = await pool.bucket(stream_id, bucket_id, cache=export_cache)
-    cache = await decode_bucket_chunks(
+    placements = _BlockPlacements(runs)
+
+    async def _write_block(ranges: list[tuple[int, int]], chunks: dict[int, bytes | memoryview]) -> None:
+        # From the placements, not the read ranges: a repeated range is written once per destination occurrence.
+        await _merge_and_flush_writes(placements.runs_for(ranges), chunks, on_run=on_run, size=size)
+
+    await read_verified_blocks(
         reader,
         stream_id,
         bucket_id,
-        ((run.chunk_idx_start, run.length) for run in runs),
+        merge_overlapping_ranges((run.chunk_idx_start, run.length) for run in runs),
+        _write_block,
         pool=pool,
         semaphore=semaphore,
     )
-    # From runs, not the merged read ranges: a repeated range is written once per destination occurrence.
-    await _merge_and_flush_writes(runs, cache, on_run=on_run, size=size)
 
 
 async def _prefetch_bucket_opens(
@@ -506,9 +583,10 @@ async def exec_chunks(
         export_cache: ``None`` creates one for this call (sized
             ``DEFAULT_LIMITS.bucket_readers``); pass one to share it across calls.
 
-    Note:
-        With ``max_concurrent_reads > 1`` and more than one bucket group,
-        an exception arrives wrapped in an ``ExceptionGroup``.
+    Raises:
+        Exception: A bucket group's own failure, never wrapped in an
+            ``ExceptionGroup``; with ``max_concurrent_reads > 1`` the first
+            one, noting how many others failed.
     """
     if export_cache is None:
         export_cache = BucketReaderCache()
@@ -543,18 +621,22 @@ async def exec_chunks(
 
             async def _run_bucket_and_release(stream_id: StreamId, bucket_id: BucketId) -> None:
                 # Releases the permit the dispatch loop acquired for this call;
-                # read_chunks() spends it on its first run, so in-flight reads
-                # never exceed max_concurrent_reads.
+                # read_chunk_blocks() reads on it, and on only the permits free
+                # when it starts, so in-flight reads never exceed max_concurrent_reads.
                 try:
                     await exec_group(stream_id, bucket_id, semaphore)
                 finally:
                     semaphore.release()
 
-            async with asyncio.TaskGroup() as tg:
-                for stream_id, bucket_id in groups:
-                    # Acquire before create_task: bounds live tasks to max_concurrent_reads.
-                    await semaphore.acquire()
-                    tg.create_task(_run_bucket_and_release(stream_id, bucket_id))
+            try:
+                async with asyncio.TaskGroup() as tg:
+                    for stream_id, bucket_id in groups:
+                        # Acquire before create_task: bounds live tasks to max_concurrent_reads.
+                        await semaphore.acquire()
+                        tg.create_task(_run_bucket_and_release(stream_id, bucket_id))
+            except BaseExceptionGroup as group:
+                # The caller sees the failure itself, as on the serial path.
+                raise first_failure(group, operation="export") from None
     finally:
         if prefetch_task is not None:
             prefetch_task.cancel()

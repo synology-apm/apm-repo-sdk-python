@@ -30,6 +30,7 @@ from synology_apm_repo.sdk.dedup.keys import KeyMaterial, KeyVerification
 from synology_apm_repo.sdk.dedup.repository import DedupRepo
 from synology_apm_repo.sdk.errors import (
     ApmRepoError,
+    InvalidArgumentError,
     KeyMaterialError,
     NotFoundError,
     NotRestorableError,
@@ -51,7 +52,7 @@ from synology_apm_repo.sdk.units.base import (
     UnitProvider,
 )
 from synology_apm_repo.sdk.units.content.saas_artifact import LazyArtifact
-from synology_apm_repo.sdk.units.node_ref import NodeRef
+from synology_apm_repo.sdk.units.node_ref import NodeRef, RefKind
 from unit.sdk.api_fakes import (
     VALID_B64_KEY,
     FakeDedupRepo,
@@ -435,6 +436,16 @@ async def test_session_close_closes_the_store_it_opened(monkeypatch: pytest.Monk
     assert store.closed is True
 
 
+async def test_a_malformed_key_still_leaves_the_store_to_session_close() -> None:
+    store = _FakeStoreWithClose()
+    session = api.Session()
+    with pytest.raises(KeyMaterialError, match="key string is not"):
+        await session.open(as_object_store(store), "not-a-key")
+    await session.close()
+
+    assert store.closed is True
+
+
 async def test_session_close_still_closes_every_remaining_store_when_an_earlier_one_raises(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -800,9 +811,9 @@ def _make_tree() -> _FakeUnitProvider:
         "", catalog_id=CatalogId(str(_RESOLVE_CCID)), workload_id=_RESOLVE_WORKLOAD_ID, version_uid=_RESOLVE_VERSION_UID
     )
     root = Node(ref=root_ref, name="root", is_leaf=False)
-    folder_ref = NodeRef(root_ref.repo_path, (*root_ref.segments, "folder"))
+    folder_ref = root_ref.child("folder")
     folder = Node(ref=folder_ref, name="Folder", is_leaf=False)
-    leaf_ref = NodeRef(root_ref.repo_path, (*folder_ref.segments, "leaf1"))
+    leaf_ref = folder_ref.child("leaf1")
     leaf = RestorableUnit(ref=leaf_ref, name="leaf1.txt", is_leaf=True, content=LazyArtifact(_unread_content))
     return _FakeUnitProvider(
         root=root,
@@ -923,7 +934,7 @@ async def test_resolve_canonical_ref_flat_id_leaf_via_direct_lookup(monkeypatch:
         "", catalog_id=CatalogId(str(_RESOLVE_CCID)), workload_id=_RESOLVE_WORKLOAD_ID, version_uid=_RESOLVE_VERSION_UID
     )
     root = Node(ref=root_ref, name="root", is_leaf=False)
-    flat_leaf_ref = NodeRef(root_ref.repo_path, (*root_ref.segments, "flatid"))
+    flat_leaf_ref = root_ref.child("flatid")
     flat_leaf = RestorableUnit(ref=flat_leaf_ref, name="flat.txt", is_leaf=True, content=LazyArtifact(_unread_content))
     provider = _FlatIdFakeProvider(root=root, leaf_by_id={"flatid": flat_leaf})
     repo = _repo_with_tree(monkeypatch, provider)
@@ -992,12 +1003,12 @@ async def test_resolve_canonical_ref_no_match_in_tree_raises_not_found(monkeypat
         await session.resolve(str(missing_ref))
 
 
-async def test_resolve_malformed_canonical_ref_raises_not_found(monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_resolve_malformed_canonical_ref_raises_invalid_argument(monkeypatch: pytest.MonkeyPatch) -> None:
     repo = _repo_with_tree(monkeypatch, _make_tree())
     session = _session_with_repo(repo)
     # kind is CANONICAL (starts with "cat:") but missing the wl:/ver: parts.
-    malformed = NodeRef("", ("cat:1",))
-    with pytest.raises(NotFoundError, match="malformed canonical ref"):
+    malformed = NodeRef("", ("cat:1",), RefKind.CANONICAL)
+    with pytest.raises(InvalidArgumentError, match="malformed canonical ref"):
         await session.resolve(str(malformed))
 
 
@@ -1087,11 +1098,21 @@ async def test_repo_for_ref_matches_object_store_catalog_level_repo_root() -> No
     assert session._repo_for_ref(NodeRef(catalog_repo_root, ("x",))) is repo
 
 
-async def test_resolve_human_ref_too_few_segments_raises_not_found(monkeypatch: pytest.MonkeyPatch) -> None:
+@pytest.mark.parametrize("ref", ["#raw/VM-uid", "#cat:1/wl:2"])
+async def test_a_short_ref_spelled_like_a_canonical_or_raw_one_hints_at_the_at(
+    monkeypatch: pytest.MonkeyPatch, ref: str
+) -> None:
+    repo = _repo_with_tree(monkeypatch, _make_tree())
+    session = _session_with_repo(repo)
+    with pytest.raises(InvalidArgumentError, match="canonical and raw refs start with '@'"):
+        await session.resolve(ref)
+
+
+async def test_resolve_human_ref_too_few_segments_raises_invalid_argument(monkeypatch: pytest.MonkeyPatch) -> None:
     repo = _repo_with_tree(monkeypatch, _make_tree())
     session = _session_with_repo(repo)
     ref = NodeRef.human("", "OnlyOneSegment")
-    with pytest.raises(NotFoundError, match="human ref must name at least a catalog, workload, and version"):
+    with pytest.raises(InvalidArgumentError, match="human ref must name at least a catalog, workload, and version"):
         await session.resolve(str(ref))
 
 

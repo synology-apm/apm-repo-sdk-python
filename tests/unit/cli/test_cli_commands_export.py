@@ -1,11 +1,12 @@
 """Unit tests for ``synology-apm-repo-cli export`` of a single item: destination
 handling, ``--sparse``/``--force``/``--quiet``/``--key``/``--profile``/
-``--object-db-id``, the success summary, and failure reporting (unavailable
-content, out of space)."""
+``--object-db-id``/``--workers``/``--concurrent-reads``, the success summary,
+and failure reporting (unavailable content, out of space)."""
 
 from __future__ import annotations
 
 import errno
+import json
 from collections.abc import AsyncIterator
 from pathlib import Path
 from typing import Any
@@ -15,6 +16,7 @@ import pytest
 from support.cli import invoke
 from support.fakes import faithful_to
 from synology_apm_repo.sdk.api import NodeFrame, RawView, Repository
+from synology_apm_repo.sdk.dedup.export_scheduler import ExportTuning
 from synology_apm_repo.sdk.errors import ContentUnavailableError
 from synology_apm_repo.sdk.export import ExportResult, ExportWriter
 from synology_apm_repo.sdk.units.base import ContentSource, RestorableUnit
@@ -26,12 +28,13 @@ from unit.cli.session_fakes import FakeSession, install_fake_session
 @faithful_to(ContentSource)
 class _RecordingBucketBackedSource:
     """A ``ContentSource`` whose ``export_range()`` writes one byte and
-    records the ``sparse`` it received."""
+    records the ``sparse`` and ``tuning`` it received."""
 
     size = 1
 
     def __init__(self) -> None:
         self.received_sparse: bool | None = None
+        self.received_tuning: object = None
 
     async def read(self, offset: int = 0, length: int | None = None) -> bytes:
         raise AssertionError("not used in this test")
@@ -53,6 +56,7 @@ class _RecordingBucketBackedSource:
         tuning: object = None,
     ) -> ExportResult:
         self.received_sparse = sparse
+        self.received_tuning = tuning
         await sink.write_at(0, b"x")
         return ExportResult(bytes_written=1, logical_size=1, holes=0, zeros=0)
 
@@ -170,6 +174,58 @@ def test_no_sparse_flag_forwards_sparse_false(tmp_path: Path, monkeypatch: pytes
     assert content.received_sparse is False
 
 
+def test_workers_flag_forwards_the_worker_count(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    content = _RecordingBucketBackedSource()
+    _fake_session_returning(monkeypatch, content)
+    invoke(["export", "somewhere", "-o", str(tmp_path / "out.bin"), "--workers", "2"])
+    assert isinstance(content.received_tuning, ExportTuning)
+    assert content.received_tuning.workers == 2
+
+
+def test_without_workers_flag_the_sdk_default_applies(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    content = _RecordingBucketBackedSource()
+    _fake_session_returning(monkeypatch, content)
+    invoke(["export", "somewhere", "-o", str(tmp_path / "out.bin")])
+    assert content.received_tuning is None
+
+
+def test_concurrent_reads_flag_forwards_the_read_count_with_the_default_workers(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    content = _RecordingBucketBackedSource()
+    _fake_session_returning(monkeypatch, content)
+    invoke(["export", "somewhere", "-o", str(tmp_path / "out.bin"), "--concurrent-reads", "2"])
+    assert content.received_tuning == ExportTuning(workers=ExportTuning().workers, max_concurrent_reads=2)
+
+
+def test_workers_flag_alone_keeps_the_default_concurrent_reads(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    content = _RecordingBucketBackedSource()
+    _fake_session_returning(monkeypatch, content)
+    invoke(["export", "somewhere", "-o", str(tmp_path / "out.bin"), "--workers", "2"])
+    assert content.received_tuning == ExportTuning(workers=2, max_concurrent_reads=ExportTuning().max_concurrent_reads)
+
+
+def test_a_concurrent_read_count_below_one_is_a_usage_error(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    content = _RecordingBucketBackedSource()
+    _fake_session_returning(monkeypatch, content)
+    dst = tmp_path / "out.bin"
+    result = invoke(["export", "somewhere", "-o", str(dst), "--concurrent-reads", "0"], exit_code=2)
+    assert "--concurrent-reads" in result.output
+    assert content.received_sparse is None and not dst.exists()
+
+
+@pytest.mark.parametrize("count", ["-1", "62"])
+def test_a_worker_count_out_of_range_is_a_usage_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, count: str
+) -> None:
+    content = _RecordingBucketBackedSource()
+    _fake_session_returning(monkeypatch, content)
+    dst = tmp_path / "out.bin"
+    result = invoke(["export", "somewhere", "-o", str(dst), "--workers", count], exit_code=2)
+    assert "--workers" in result.output
+    assert content.received_sparse is None and not dst.exists()
+
+
 def test_success_summary_reports_real_bytes_written_holes_and_zeros(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -185,6 +241,21 @@ def test_success_summary_reports_real_bytes_written_holes_and_zeros(
     assert "400 B logical" in collapsed
     assert "250 B holes" in collapsed
     assert "50 B zero-fill" in collapsed
+
+
+def test_json_reports_the_byte_counts(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    _fake_session_returning(monkeypatch, _FixedResultSource())
+    dst = tmp_path / "out.bin"
+    result = invoke(["--json", "export", "somewhere", "-o", str(dst)])
+    assert json.loads(result.stdout) == {
+        "kind": "item",
+        "output": str(dst),
+        "bytes_written": 100,
+        "logical_size": 400,
+        "holes": 250,
+        "zeros": 50,
+        "incomplete": [],
+    }
 
 
 @pytest.mark.parametrize("flag", ["-q", "--quiet"])
@@ -223,6 +294,15 @@ def test_a_degraded_item_is_exported_and_reported_incomplete_on_stderr(
     assert dst.read_bytes() == b"x"
 
 
+def test_json_lists_a_degraded_item_as_incomplete_by_its_file_name(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _fake_session_returning(monkeypatch, _RecordingBucketBackedSource(), degraded="2 of 3 parts are missing")
+    dst = tmp_path / "out.bin"
+    result = invoke(["--json", "export", "somewhere", "-o", str(dst)])
+    assert json.loads(result.stdout)["incomplete"] == [{"path": "out.bin", "reason": "2 of 3 parts are missing"}]
+
+
 def test_object_db_id_asks_resolve_for_that_raw_view(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     repo = _ItemRepo(_item_unit(_RecordingBucketBackedSource()))
     install_fake_session(monkeypatch, [repo])
@@ -243,8 +323,9 @@ def test_missing_output_parent_directory_is_created(tmp_path: Path, monkeypatch:
 def test_key_reaches_session_open(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     session = _fake_session_returning(monkeypatch, _RecordingBucketBackedSource())
 
-    invoke(["export", "somewhere", "-o", str(tmp_path / "out.bin"), "--key", "id@secret"])
-    assert [call["key"] for call in session.open_calls] == ["id@secret"]
+    key = "AliceKey0001@AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8="
+    invoke(["export", "somewhere", "-o", str(tmp_path / "out.bin"), "--key", key])
+    assert [call["key"] for call in session.open_calls] == [key]
 
 
 def test_profile_flag_opens_the_profile_store_not_a_local_path(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

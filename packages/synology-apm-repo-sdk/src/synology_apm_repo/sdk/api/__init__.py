@@ -14,10 +14,11 @@ from ..catalog.connection import Connection
 from ..catalog.version import Version
 from ..catalog.workload import Workload
 from ..dedup.keys import KeyVerification
-from ..findings import Finding, Stage, Symptom, VerifyLevel
+from ..findings import Finding, Stage, Symptom, VerifyLevel, VerifyTuning
 from ..storage.layout import RepositoryLayout
 from ..units.resolve import find_path_with_children
 from .catalog import Catalog, CatalogFrame, Frame, NodeFrame, RawView, RootFrame, VersionLocation, WorkloadFrame
+from .key_manager import validate_key_string
 from .repository import KeyStatus, Repository, SetKeyResult
 from .session import Session, TraceEvent
 
@@ -40,9 +41,11 @@ __all__ = [
     "Symptom",
     "TraceEvent",
     "VerifyLevel",
+    "VerifyTuning",
     "Version",
     "VersionLocation",
     "Workload",
     "WorkloadFrame",
     "find_path_with_children",
+    "validate_key_string",
 ]

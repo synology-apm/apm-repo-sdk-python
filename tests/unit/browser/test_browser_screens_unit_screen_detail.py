@@ -195,7 +195,7 @@ async def test_teams_chat_message_preview_reads_the_tail_when_content_exceeds_th
         assert "message number 0" not in detail
 
 
-async def test_detail_pane_size_line_notes_zero_bytes_on_disk_for_a_cloud_file() -> None:
+async def test_detail_pane_size_line_notes_a_cloud_files_data_may_not_be_on_disk() -> None:
     root_ref = NodeRef("repo", ("root",))
     root = Node(ref=root_ref, name="root", is_leaf=False)
     normal_leaf = leaf_node("normal.bin", "normal", size=1572864)
@@ -213,11 +213,11 @@ async def test_detail_pane_size_line_notes_zero_bytes_on_disk_for_a_cloud_file()
         cloud_detail = str(screen.query_one("#detail", Static).render())
 
         assert "size: 1.5 MiB" in normal_detail
-        assert "on disk" not in normal_detail
-        assert "size: 1.5 MiB (0 Byte on disk)" in cloud_detail
+        assert "cloud-sync file" not in normal_detail
+        assert "size: 1.5 MiB (cloud-sync file — data may not be on disk)" in cloud_detail
 
 
-async def test_detail_pane_size_line_has_no_on_disk_caveat_for_an_encrypted_file() -> None:
+async def test_detail_pane_size_line_has_no_cloud_caveat_for_an_encrypted_file() -> None:
     root_ref = NodeRef("repo", ("root",))
     root = Node(ref=root_ref, name="root", is_leaf=False)
     encrypted_leaf = leaf_node("secret.docx", "secret", size=1572864, file_state=FileState.ENCRYPTED)
@@ -232,7 +232,7 @@ async def test_detail_pane_size_line_has_no_on_disk_caveat_for_an_encrypted_file
         encrypted_detail = str(screen.query_one("#detail", Static).render())
 
         assert "size: 1.5 MiB" in encrypted_detail
-        assert "on disk" not in encrypted_detail
+        assert "cloud-sync file" not in encrypted_detail
 
 
 async def test_file_table_label_shows_the_cloud_file_icon() -> None:

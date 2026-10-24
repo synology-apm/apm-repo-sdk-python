@@ -181,9 +181,9 @@ class BufferedExportSink(ExportSink):
     ``discard_destination`` called.
 
     ``storage`` picks where a segment's bytes are held. ``"memory"`` keeps
-    them in a block of shared memory that the export's worker processes write
-    into directly, so decoding stays spread over several cores. ``"spool"``
-    keeps them in a temporary file, likewise written by the workers directly;
+    them in a block of shared memory, which worker processes (an export with
+    ``ExportTuning.workers``) write into directly as this process does.
+    ``"spool"`` keeps them in a temporary file, likewise writable by workers;
     it holds the same number of bytes on disk instead of in memory (the
     default temporary directory may itself be memory-backed: pass
     ``spool_dir`` to choose one).

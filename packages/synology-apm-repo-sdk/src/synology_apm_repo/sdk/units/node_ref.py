@@ -2,17 +2,19 @@
 node, shared by CLI arguments, TUI breadcrumbs/bookmarks and error
 messages.
 
-Three segment shapes share the same ``<repo-path>#<seg>/<seg>/...``
-structure — which shape a ref is is entirely a property of its
-segments' content, not a separate stored field:
+Three shapes share the same ``<repo-path>#<seg>/<seg>/...`` structure.
+The machine-made ones start their fragment with ``@``, so which shape a
+ref is never depends on what a display name looks like:
 
 ======================================================  =====================================================
 shape                                                   example
 ======================================================  =====================================================
-canonical (``cat:``/``wl:``/``ver:`` prefixed)          ``repository#cat:1/wl:2/ver:abc-uid/Inbox/Subject``
-raw (``file_map`` fallback axis, diagnostic-mode only)  ``repository#raw/VM-uid/.../disk.img``
+canonical (``@cat:``/``wl:``/``ver:`` prefixed)         ``repository#@cat:1/wl:2/ver:abc-uid/Inbox/Subject``
+raw (``file_map`` fallback axis, diagnostic-mode only)  ``repository#@raw/VM-uid/.../disk.img``
 human (display names, everything else)                  ``repository#Test-Workload-01/CORP-PC-001/2026-08-07 09:00``
 ======================================================  =====================================================
+
+A human ref whose first name starts with ``@`` writes it as ``%40``.
 
 Canonical refs are stable across display-name changes — the right form
 for scripts and bookmarks. Human refs are what breadcrumbs and ``ls``
@@ -49,7 +51,7 @@ _RESERVED = frozenset("#/%")
 
 
 class RefKind(enum.Enum):
-    """Which of the module docstring's three segment shapes a ``NodeRef`` is."""
+    """Which of the module docstring's three shapes a ``NodeRef`` is."""
 
     CANONICAL = "canonical"
     RAW = "raw"
@@ -68,22 +70,36 @@ def _encode_segment(segment: str) -> str:
 
 
 def _decode_segment(segment: str) -> str:
-    return unquote(segment, errors="strict")
+    try:
+        return unquote(segment, errors="strict")
+    except UnicodeDecodeError:
+        raise ValueError(f"invalid percent-encoding in segment {segment!r}") from None
+
+
+#: Starts the fragment of a canonical or raw ref.
+_MACHINE_SIGIL = "@"
 
 
 @dataclasses.dataclass(frozen=True, slots=True)
 class NodeRef:
     """``repo_path`` is a store-relative or filesystem path to the
     repository root (unencoded — it is a path, not ref content);
-    ``segments`` are the decoded logical path components after the ``#``.
+    ``segments`` are the decoded logical path components after the ``#``
+    (a canonical ref's first three keep their ``cat:``/``wl:``/``ver:``,
+    a raw ref's first is ``raw``); ``kind`` is which shape it is.
     """
 
     repo_path: str
     segments: tuple[str, ...] = ()
+    kind: RefKind = RefKind.HUMAN
 
     @override
     def __str__(self) -> str:
         encoded = "/".join(_encode_segment(s) for s in self.segments)
+        if self.kind is not RefKind.HUMAN:
+            encoded = _MACHINE_SIGIL + encoded
+        elif encoded.startswith(_MACHINE_SIGIL):
+            encoded = "%40" + encoded[1:]
         return f"{self.repo_path}#{encoded}"
 
     @classmethod
@@ -91,14 +107,25 @@ class NodeRef:
         """Inverse of ``__str__``.
 
         Raises:
-            ValueError: ``text`` has no ``#`` at all (not a ref), or a
-                segment's percent-encoding is not valid UTF-8.
+            ValueError: ``text`` has no ``#`` at all (not a ref), its ``@``
+                form is neither ``@cat:`` nor ``@raw``, or a segment's
+                percent-encoding is not valid UTF-8.
         """
         if "#" not in text:
             raise ValueError(f"not a NodeRef (missing '#'): {text!r}")
         repo_path, fragment = text.split("#", 1)
+        kind = RefKind.HUMAN
+        if fragment.startswith(_MACHINE_SIGIL):
+            fragment = fragment.removeprefix(_MACHINE_SIGIL)
+            head = fragment.split("/", 1)[0]
+            if head == "raw":
+                kind = RefKind.RAW
+            elif head.startswith("cat:"):
+                kind = RefKind.CANONICAL
+            else:
+                raise ValueError(f"not a NodeRef ('@' must start '@cat:' or '@raw'): {text!r}")
         segments = tuple(_decode_segment(part) for part in fragment.split("/")) if fragment else ()
-        return cls(repo_path, segments)
+        return cls(repo_path, segments, kind)
 
     @classmethod
     def coerce(cls, ref: str | NodeRef) -> NodeRef:
@@ -108,18 +135,6 @@ class NodeRef:
             ValueError: ``ref`` is a string that is not a ref.
         """
         return ref if isinstance(ref, NodeRef) else cls.parse(ref)
-
-    @property
-    def kind(self) -> RefKind:
-        """Which addressing form this ref uses, from its first segment."""
-        if not self.segments:
-            return RefKind.HUMAN
-        first = self.segments[0]
-        if first == "raw":
-            return RefKind.RAW
-        if first.startswith("cat:"):
-            return RefKind.CANONICAL
-        return RefKind.HUMAN
 
     @property
     def canonical_ids(self) -> tuple[CatalogId, WorkloadId, VersionUid] | None:
@@ -167,13 +182,14 @@ class NodeRef:
         return cls(
             repo_path,
             (f"cat:{catalog_id}", f"wl:{workload_id}", f"ver:{version_uid}", *extra),
+            RefKind.CANONICAL,
         )
 
     @classmethod
     def raw(cls, repo_path: str, file_map_path: str) -> NodeRef:
         # One segment per path component, so the ref renders as a readable
         # path ("raw/VM-uid/dir/disk.img").
-        return cls(repo_path, ("raw", *file_map_path.split("/")))
+        return cls(repo_path, ("raw", *file_map_path.split("/")), RefKind.RAW)
 
     @classmethod
     def human(cls, repo_path: str, *names: str) -> NodeRef:
@@ -184,7 +200,7 @@ class NodeRef:
         appending segments to an already-resolved node's ref (a
         diagnostic leaf, synthetic entry, ...), not the version root
         (``canonical_ref_for`` covers that)."""
-        return NodeRef(self.repo_path, (*self.segments, *extra))
+        return NodeRef(self.repo_path, (*self.segments, *extra), self.kind)
 
 
 def canonical_ref_for(repo: DedupRepo, version: Version, extra: Sequence[str] = ()) -> NodeRef:

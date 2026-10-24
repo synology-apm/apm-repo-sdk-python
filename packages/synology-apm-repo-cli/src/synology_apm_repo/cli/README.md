@@ -36,7 +36,9 @@ outside any discovered repository, which the catalog-based facade can't do.
   out.bin` produces clean stdout. `--progress auto|always|never`, the
   `--json` NDJSON progress events and `--trace` are all stderr-only. Rich
   output goes through `consoles.py`'s shared `console` (stdout) and
-  `err_console` (stderr).
+  `err_console` (stderr), which never raise on a character their encoding
+  can't represent (`escape_unencodable_output`); text piped to another
+  process needs its own `errors="backslashreplace"`, as the pager's does.
 - **Exports write `<dst>.part` and rename on success**, so a cancelled or
   failed export never leaves something that looks like a complete file.
   `LocalFileSink(staged=True)` owns that, through the SDK's `run_export`,
@@ -50,8 +52,8 @@ outside any discovered repository, which the catalog-based facade can't do.
   run and files already finished stay.
 - **An item the backup holds only partly** (its `RestorableUnit.degraded`
   is set, e.g. a PC/PS disk with missing fragments, read back as zeros) is
-  still exported, with an `incomplete` line on stderr that `--quiet` does
-  not hide.
+  still exported and reported as `incomplete`: a stderr line `--quiet` does
+  not hide, or under `--json` an entry in the report.
 - **`--keep-partial`** governs whether a cancelled or failed export's `.part`
   file is kept; decide this explicitly for any new export-adjacent command.
 

@@ -1,5 +1,5 @@
 """``export_lifecycle`` domain: a real file export to a temp dir (no
-leftover ``.part``, a non-empty final file), plus a real, timed ``SIGINT``
+leftover ``.part``, a non-empty final file), plus a real ``SIGINT``
 mid-export.
 
 A first Ctrl-C during ``export`` is a handled cancellation: it reports the
@@ -9,6 +9,7 @@ destination, and exits ``ExitCode.CANCELLED`` (130).
 
 from __future__ import annotations
 
+import sys
 import tempfile
 from pathlib import Path
 
@@ -16,10 +17,13 @@ from ..._shared_refs import RepresentativeRef
 from .._context import SmokeContext
 from ._shared import key_args
 
-#: Below this size an export can finish before a SIGINT sent after
-#: _CANCEL_AFTER seconds lands, so the cancellation check is skipped.
+#: Below this size an export can finish before a SIGINT sent on its first
+#: progress line lands, so the cancellation check is skipped.
 _CANCEL_MIN_SIZE = 20 * 1024 * 1024
-_CANCEL_AFTER = 0.2
+#: The start of the export's "reading" progress line on stderr (``label │
+#: bar``): data is being read, so the CLI's own SIGINT handler is installed and
+#: the destination isn't final yet.
+_CANCEL_ON = "reading │"
 
 
 def run(ctx: SmokeContext) -> None:
@@ -53,6 +57,9 @@ def run(ctx: SmokeContext) -> None:
             dst.exists() and dst.stat().st_size > 0,
         )
 
+    if sys.platform == "win32":
+        ctx.skip("export_lifecycle", "export_lifecycle.cancel", "a mid-export SIGINT needs POSIX process groups")
+        return
     candidate = max(refs, key=lambda r: r.node.size or 0)
     if (candidate.node.size or 0) < _CANCEL_MIN_SIZE:
         ctx.skip(
@@ -72,7 +79,7 @@ def run(ctx: SmokeContext) -> None:
             "-o",
             str(dst),
             *key_args(candidate),
-            cancel_after=_CANCEL_AFTER,
+            cancel_on=_CANCEL_ON,
         )
         ctx.check(
             "export_lifecycle",

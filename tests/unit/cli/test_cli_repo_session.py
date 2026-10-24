@@ -11,7 +11,7 @@ from support.cli import invoke
 from support.fakes import faithful_to
 from synology_apm_repo.cli.repo_session import open_single_repo
 from synology_apm_repo.sdk.api import Session, TraceEvent
-from synology_apm_repo.sdk.errors import NotFoundError
+from synology_apm_repo.sdk.errors import InvalidArgumentError, NotFoundError
 from synology_apm_repo.sdk.storage.layout import RepoKind, RepoLayout
 from unit.cli.session_fakes import install_fake_session
 
@@ -59,13 +59,13 @@ async def test_open_single_repo_without_store_uses_open() -> None:
     assert fake_session.store_open_calls == []
 
 
-async def test_open_single_repo_raises_not_found_on_multiple_repos() -> None:
+async def test_open_single_repo_rejects_a_path_with_several_repos() -> None:
     class _FakeRepo:
         def __init__(self, root: str) -> None:
             self.layout = RepoLayout(kind=RepoKind.OBJECT_STORE, repo_root=root)
 
     session = cast(Any, _FakeSession([_FakeRepo("a"), _FakeRepo("b")]))
-    with pytest.raises(NotFoundError, match="2 repositories found"):
+    with pytest.raises(InvalidArgumentError, match="2 repositories found"):
         await open_single_repo(session, "/some/path", None)
 
 
@@ -150,6 +150,23 @@ def test_key_reaches_session_open(recording: type[_RecordingSession], command: l
     assert result.stdout == ""
     assert result.stderr == "error: no repository found at '/repo'\n"
     assert recording.calls == [("open", {"fs_path": "/repo", "key": _KEY, "trace": False})]
+
+
+@pytest.mark.parametrize("command", [*_REPO_COMMANDS, ["key", "/repo"]], ids=lambda command: command[0])
+def test_a_malformed_key_is_a_usage_error_that_does_not_echo_it(
+    recording: type[_RecordingSession], command: list[str]
+) -> None:
+    result = invoke([*command, "--key", "short@c2VjcmV0c2VjcmV0"], exit_code=2)
+    assert "Invalid value for '--key': userKeyID must be 12 characters" in " ".join(result.output.split())
+    assert "c2VjcmV0c2VjcmV0" not in result.output
+    assert recording.calls == []
+
+
+@pytest.mark.parametrize("command", _REPO_COMMANDS, ids=lambda command: command[0])
+def test_an_empty_key_is_no_key(recording: type[_RecordingSession], command: list[str]) -> None:
+    invoke([*command, "--key", ""], exit_code=1)
+
+    assert recording.calls == [("open", {"fs_path": "/repo", "key": None, "trace": False})]
 
 
 @pytest.mark.parametrize("command", _REPO_COMMANDS, ids=lambda command: command[0])

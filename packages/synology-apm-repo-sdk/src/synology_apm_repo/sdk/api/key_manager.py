@@ -141,3 +141,14 @@ class KeyManager:
         ``INVALID`` rather than ``NO_KEY_PROVIDED``."""
         self._key_verification = verification
         self._status = _resolve_key_status(keys, verification, self._encrypted)
+
+
+def validate_key_string(key_string: str) -> None:
+    """Check ``key_string`` is a well-formed ``"<userKeyID>@<base64 userKey>"``
+    without opening anything, e.g. while a command line is read.
+
+    Raises:
+        KeyMaterialError: It is malformed. The message never repeats the
+            secret ``userKey``.
+    """
+    KeyMaterial.from_key_string(key_string)

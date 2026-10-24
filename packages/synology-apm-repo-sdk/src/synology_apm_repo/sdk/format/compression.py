@@ -111,16 +111,22 @@ _ZSTD_BATCH_THREADS_MIN_ENTRIES = 500
 ``_ZSTD_BATCH_THREADS`` threads cost more than they save, so ``threads=1``
 is used."""
 
+_ZSTD_BATCH_MAX_ENTRIES = 1024
+"""Most ZSTD frames per ``multi_decompress_to_buffer`` call, each of which
+allocates its own output. A process decoding bucket after bucket keeps less
+freed memory resident with smaller calls: an export worker's peak footprint
+was a third to a half lower than with one call per 8192-chunk bucket."""
+
 
 def decompress_many(items: Sequence[tuple[CompressType, bytes | memoryview]]) -> list[bytes | memoryview]:
     """Batch form of ``decompress``: decompresses ``(compress_type, data)``
-    pairs in one pass, preserving order. ``data`` may be a ``memoryview``.
+    pairs, preserving order. ``data`` may be a ``memoryview``.
 
-    **A ZSTD entry's result is a ``memoryview`` into the call's shared decode
-    buffer, not a copy** (copying every frame is the most expensive decode
-    step). Keeping one alive keeps the whole batch buffer alive, so copy via
-    ``bytes(x)`` if a chunk must outlive the batch. ``NONE`` entries return
-    the input as given.
+    **A ZSTD entry's result is a ``memoryview`` into a decode buffer it
+    shares with the other ZSTD entries of its batch, not a copy** (copying
+    every frame is the most expensive decode step). Keeping one alive keeps
+    that whole buffer alive; copy with ``bytes()`` to keep one chunk alone.
+    ``NONE`` entries return the input as given.
 
     Raises:
         ChunkCompactedError: An entry is ``COMPACTED``.
@@ -156,18 +162,23 @@ def decompress_many(items: Sequence[tuple[CompressType, bytes | memoryview]]) ->
             )
         result[i] = plain
 
-    if zstd_data:
-        threads = _ZSTD_BATCH_THREADS if len(zstd_data) >= _ZSTD_BATCH_THREADS_MIN_ENTRIES else 1
+    # Even batches, not full ones plus a remainder: past one batch, each holds over half of
+    # _ZSTD_BATCH_MAX_ENTRIES, which keeps it above _ZSTD_BATCH_THREADS_MIN_ENTRIES.
+    batch_count = -(-len(zstd_data) // _ZSTD_BATCH_MAX_ENTRIES)
+    batch_size = -(-len(zstd_data) // batch_count) if batch_count else 1
+    for start in range(0, len(zstd_data), batch_size):
+        batch = zstd_data[start : start + batch_size]
+        threads = _ZSTD_BATCH_THREADS if len(batch) >= _ZSTD_BATCH_THREADS_MIN_ENTRIES else 1
         try:
             decoded = _zstd_decompressor().multi_decompress_to_buffer(
-                zstd_data, decompressed_sizes=_ZSTD_SIZE_ENTRY * len(zstd_data), threads=threads
+                batch, decompressed_sizes=_ZSTD_SIZE_ENTRY * len(batch), threads=threads
             )
         except (zstandard.ZstdError, ValueError) as exc:
             # decompressed_sizes is an exact expectation, so a mismatch raises
             # here; translated so both paths give callers DataCorruptError.
-            # ValueError: every ZSTD entry is empty.
+            # ValueError: every ZSTD entry of the batch is empty.
             raise DataCorruptError(f"batch zstd decompress failed: {exc}", spec=_SPEC) from exc
-        for pos, i in enumerate(zstd_positions):
+        for pos, i in enumerate(zstd_positions[start : start + len(batch)]):
             # memoryview, not a bare BufferSegment: BufferSegment.__eq__ is identity-based.
             result[i] = memoryview(decoded[pos])  # type: ignore[arg-type]
     return result

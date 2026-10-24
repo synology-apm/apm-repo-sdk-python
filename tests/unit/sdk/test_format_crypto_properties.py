@@ -62,7 +62,7 @@ def test_chunk_decryption_is_its_own_inverse(addr: int, data: bytes) -> None:
     reused-context decryptor agrees with the one-shot form."""
     address = ChunkAddress.from_int(addr)
     once = decrypt_chunk(_VAULT_KEY, address, data)
-    assert ChunkDecryptor(_VAULT_KEY).decrypt(address, data) == once
+    assert ChunkDecryptor(_VAULT_KEY).decrypt(addr, data) == once
     assert decrypt_chunk(_VAULT_KEY, address, once) == data
 
 

@@ -214,7 +214,10 @@ class AsyncKeyedCache[K, V](Mapping[K, V]):
         return errors
 
     async def settle_all(self) -> tuple[dict[K, V], list[Exception]]:
-        """Wait out every fetch in flight, e.g. before closing the values.
+        """Wait until no fetch is in flight, including one that starts while
+        this waits, e.g. before closing the values. A caller that calls
+        ``invalidate()`` before its next ``await`` thus drops exactly the
+        values returned.
 
         Returns every settled value plus every in-flight fetch's value —
         including one an ``invalidate()`` keeps out of the cache, which still
@@ -223,18 +226,23 @@ class AsyncKeyedCache[K, V](Mapping[K, V]):
         skipped (its owner already got the error). Never starts a fetch; only
         this task's own cancellation propagates.
         """
-        settled: dict[K, V] = dict(self._store)
+        # A value evicted during the wait is still returned, unless its key is refetched.
+        held_at_entry = dict(self._store)
+        landed: dict[K, V] = {}
         errors: list[Exception] = []
-        for key, future in list(self._inflight.items()):
-            if future.done() and (future.cancelled() or future.exception() is not None):
-                continue
-            try:
-                settled[key] = await asyncio.shield(future)
-            except asyncio.CancelledError:
-                _reraise_if_this_task_is_cancelled()
-            except Exception as exc:  # noqa: BLE001
-                errors.append(exc)
-        return settled, errors
+        awaited: set[asyncio.Future[V]] = set()
+        while pending := [(key, future) for key, future in self._inflight.items() if future not in awaited]:
+            for key, future in pending:
+                awaited.add(future)
+                if future.done() and (future.cancelled() or future.exception() is not None):
+                    continue
+                try:
+                    landed[key] = await asyncio.shield(future)
+                except asyncio.CancelledError:
+                    _reraise_if_this_task_is_cancelled()
+                except Exception as exc:  # noqa: BLE001
+                    errors.append(exc)
+        return {**held_at_entry, **self._store, **landed}, errors
 
 
 def _reraise_if_this_task_is_cancelled() -> None:

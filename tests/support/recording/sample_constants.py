@@ -30,7 +30,7 @@ OBJSTORE_M365_ENCRYPTED_KEY_STRING = "wLeLZp9tnAYw@s9m9JIplgBRHN4IPJ+75W8ttZ5okH
 #: ``vault-plain``'s VM backup version (workload 2 of catalog 1).
 VAULT_PLAIN_VM_VERSION_UID = "06b4b5e3-5490-4b6a-bee8-ce4287f7a9a7"
 #: Canonical ref to ``VAULT_PLAIN_VM_VERSION_UID``.
-VAULT_PLAIN_VM_REF = f"#cat:1/wl:2/ver:{VAULT_PLAIN_VM_VERSION_UID}"
+VAULT_PLAIN_VM_REF = f"#@cat:1/wl:2/ver:{VAULT_PLAIN_VM_VERSION_UID}"
 
 #: ``vault-plain``'s FS backup version (FS workload 1).
 VAULT_PLAIN_FS_VERSION_UID = "f72e8124-7e8f-43f7-afe5-52726835b3f3"

@@ -7,6 +7,7 @@ import dataclasses
 import importlib
 import os
 import sys
+import threading
 from collections.abc import AsyncIterator
 from pathlib import Path
 from typing import Literal
@@ -367,6 +368,34 @@ async def test_export_tree_writes_each_item_at_its_path(tmp_path: Path) -> None:
     assert skipped == []
     assert (tmp_path / "d" / "f").read_bytes() == b"F"
     assert (tmp_path / "g").read_bytes() == b"G"
+
+
+async def test_each_destination_is_checked_off_the_event_loop(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    provider = _provider(
+        {_ref(): [_folder("d"), _file("g")], _ref("d"): [_file("d", "f")]},
+        {"d/f": _Content(b"F"), "g": _Content(b"G")},
+    )
+    plan = await plan_tree_export(provider, provider.root(), tmp_path)
+    preflight = preflight_tree(plan, tmp_path, force=False)
+    module = importlib.import_module("synology_apm_repo.sdk.api.export_tree")
+    real_state, real_identity = module.destination_state, module._file_identity
+    checked_on: set[int] = set()
+
+    def recording_state(path: Path) -> object:
+        checked_on.add(threading.get_ident())
+        return real_state(path)
+
+    def recording_identity(path: Path) -> object:
+        checked_on.add(threading.get_ident())
+        return real_identity(path)
+
+    monkeypatch.setattr(module, "destination_state", recording_state)
+    monkeypatch.setattr(module, "_file_identity", recording_identity)
+
+    await run_tree_export(provider, plan, tmp_path, preflight=preflight)
+
+    assert checked_on
+    assert threading.get_ident() not in checked_on
 
 
 async def test_an_item_without_content_is_skipped_and_the_rest_continue(tmp_path: Path) -> None:

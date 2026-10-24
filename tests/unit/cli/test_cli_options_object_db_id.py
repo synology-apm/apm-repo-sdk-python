@@ -117,7 +117,7 @@ def test_object_db_id_cli_end_to_end_ls_and_export_against_a_synthetic_degraded_
 
     ccid, workload_id, version_uid = asyncio.run(_resolve())
 
-    ref = f"{repo_root}#cat:{ccid}/wl:{workload_id}/ver:{version_uid}"
+    ref = f"{repo_root}#@cat:{ccid}/wl:{workload_id}/ver:{version_uid}"
 
     ls_result = invoke(["--json", "ls", ref, "--object-db-id", object_db_id])
     rows = json.loads(ls_result.stdout)

@@ -36,33 +36,31 @@ class TestReserve:
     @pytest.mark.parametrize(
         ("total", "reserve"),
         [
-            pytest.param(512 << 20, (512 << 20) // 10, id="512MiB_tmpfs_10pct_floor"),
-            pytest.param(8 * GiB, 8 * GiB // 10, id="8GiB_10pct_floor"),
-            pytest.param(10 * GiB, GiB, id="10GiB_10pct_floor_meets_1GiB"),
-            pytest.param(16 * GiB, GiB, id="16GiB_1GiB_floor"),
-            pytest.param(20 * GiB, GiB, id="20GiB_5pct_meets_floor"),
-            pytest.param(64 * GiB, 64 * GiB // 20, id="64GiB_5pct"),
-            pytest.param(200 * GiB, 10 * GiB, id="200GiB_5pct_meets_ceiling"),
-            pytest.param(4 << 40, 10 * GiB, id="4TiB_ceiling"),
+            pytest.param(512 << 20, (512 << 20) // 10, id="512MiB_tmpfs_10pct"),
+            pytest.param(8 * GiB, 8 * GiB // 10, id="8GiB_10pct"),
+            pytest.param(10 * GiB, GiB, id="10GiB_10pct_meets_1GiB"),
+            pytest.param(16 * GiB, GiB, id="16GiB_1GiB"),
+            pytest.param(200 * GiB, GiB, id="200GiB_1GiB"),
+            pytest.param(4 << 40, GiB, id="4TiB_1GiB"),
         ],
     )
-    def test_five_percent_between_a_size_scaled_floor_and_ten_gib(self, total: int, reserve: int) -> None:
+    def test_a_tenth_of_the_filesystem_up_to_one_gib(self, total: int, reserve: int) -> None:
         assert disk_space_module._free_space_reserve(total) == reserve
 
 
 class TestBoundary:
     def test_free_exactly_needed_plus_reserve_passes(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         needed = 3 * GiB
-        fake_disk_usage(monkeypatch, total=100 * GiB, free=needed + 5 * GiB)
+        fake_disk_usage(monkeypatch, total=100 * GiB, free=needed + GiB)
         with reserve_disk_space(tmp_path, needed) as reservation:
             assert reservation.needed == needed
-            assert reservation.reserve == 5 * GiB
+            assert reservation.reserve == GiB
 
     def test_one_byte_less_fails_naming_needed_free_reserve_and_directory(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         needed = 3 * GiB
-        fake_disk_usage(monkeypatch, total=100 * GiB, free=needed + 5 * GiB - 1)
+        fake_disk_usage(monkeypatch, total=100 * GiB, free=needed + GiB - 1)
         with (
             pytest.raises(ResourceLimitExceededError, match="not enough free space under") as excinfo,
             reserve_disk_space(tmp_path, needed),
@@ -70,12 +68,11 @@ class TestBoundary:
             pass  # pragma: no cover - the check raises first
         message = excinfo.value.safe_message
         assert str(tmp_path) in message
-        assert "needs 3.0 GiB plus 5.0 GiB kept free" in message
-        assert "only 8.0 GiB is free (1 B short)" in message
+        assert "needs 3.0 GiB plus 1.0 GiB kept free" in message
+        assert "only 4.0 GiB is free (1 B short)" in message
         assert _in_flight() == 0
 
-    def test_a_small_disk_keeps_the_floor_free(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-        # 16 GiB total: 5% is 819 MiB, so the 1 GiB floor applies.
+    def test_a_disk_of_10_gib_or_more_keeps_1_gib_free(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         fake_disk_usage(monkeypatch, total=16 * GiB, free=GiB + 100)
         with reserve_disk_space(tmp_path, 100):
             pass
@@ -99,13 +96,12 @@ class TestBoundary:
         ):
             pass  # pragma: no cover - the check raises first
 
-    def test_a_large_disk_keeps_only_the_ceiling_free(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-        # 4 TiB total: 5% would be 205 GiB, so the 10 GiB ceiling applies.
-        fake_disk_usage(monkeypatch, total=4 << 40, free=10 * GiB + 100)
+    def test_a_large_disk_keeps_only_1_gib_free(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        fake_disk_usage(monkeypatch, total=4 << 40, free=GiB + 100)
         with reserve_disk_space(tmp_path, 100):
             pass
         with (
-            pytest.raises(ResourceLimitExceededError, match=r"plus 10\.0 GiB kept free"),
+            pytest.raises(ResourceLimitExceededError, match=r"plus 1\.0 GiB kept free"),
             reserve_disk_space(tmp_path, 101),
         ):
             pass  # pragma: no cover - the check raises first
@@ -116,7 +112,7 @@ class TestConcurrentReservations:
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         # free never drops here: the first write hasn't landed yet.
-        fake_disk_usage(monkeypatch, total=100 * GiB, free=50 * GiB)
+        fake_disk_usage(monkeypatch, total=100 * GiB, free=46 * GiB)
         needed = 27 * GiB  # 60% of the 45 GiB above the reserve
         with reserve_disk_space(tmp_path, needed):
             assert _in_flight() == needed
@@ -132,7 +128,7 @@ class TestConcurrentReservations:
     def test_directories_on_one_filesystem_share_the_holds(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        fake_disk_usage(monkeypatch, total=100 * GiB, free=50 * GiB)
+        fake_disk_usage(monkeypatch, total=100 * GiB, free=46 * GiB)
         (tmp_path / "a").mkdir()
         (tmp_path / "b").mkdir()
         with (
@@ -193,8 +189,8 @@ class TestUnknownSize:
     def test_holds_what_it_has_written_up_to_the_space_above_the_reserve_and_other_holds(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        fake_disk_usage(monkeypatch, total=100 * GiB, free=50 * GiB)
-        room = 50 * GiB - 20 * GiB - 5 * GiB
+        fake_disk_usage(monkeypatch, total=100 * GiB, free=46 * GiB)
+        room = 46 * GiB - 20 * GiB - GiB
         with reserve_disk_space(tmp_path, 20 * GiB), reserve_disk_space(tmp_path, None) as reservation:
             assert _in_flight() == 20 * GiB
             reservation.account(room - 1)
@@ -207,7 +203,7 @@ class TestUnknownSize:
     def test_concurrent_unknown_size_writes_share_the_room_instead_of_each_getting_all_of_it(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        fake_disk_usage(monkeypatch, total=100 * GiB, free=15 * GiB)  # 10 GiB above the 5 GiB reserve
+        fake_disk_usage(monkeypatch, total=100 * GiB, free=11 * GiB)  # 10 GiB above the 1 GiB reserve
         with reserve_disk_space(tmp_path, None) as first, reserve_disk_space(tmp_path, None) as second:
             first.account(6 * GiB)
             with pytest.raises(ResourceLimitExceededError, match=r"needs more than 4\.0 GiB"):
@@ -219,7 +215,7 @@ class TestUnknownSize:
     def test_a_sized_write_sees_an_unknown_size_writes_bytes_so_far(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        fake_disk_usage(monkeypatch, total=100 * GiB, free=15 * GiB)
+        fake_disk_usage(monkeypatch, total=100 * GiB, free=11 * GiB)
         with reserve_disk_space(tmp_path, None) as unknown:
             unknown.account(8 * GiB)
             with pytest.raises(ResourceLimitExceededError, match="held by other temporary copies"):
@@ -237,7 +233,7 @@ class TestUnknownSize:
     def test_fails_when_nothing_is_free_above_the_reserve(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        fake_disk_usage(monkeypatch, total=100 * GiB, free=5 * GiB)
+        fake_disk_usage(monkeypatch, total=100 * GiB, free=GiB)
         with (
             pytest.raises(ResourceLimitExceededError, match="needs an undeclared size"),
             reserve_disk_space(tmp_path, None),

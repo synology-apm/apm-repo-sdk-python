@@ -171,7 +171,7 @@ async def doctor(
     a literal ``/`` needs percent-encoding (``/`` → ``%2F``) before it's
     usable in another command's REF — see `synology-apm-repo-cli ls --help`."""
     state: CliState = ctx.obj
-    async with opened_repo_or_profile(repo, key, profile=profile, state=state) as repository:
+    async with opened_repo_or_profile(ctx, repo, key, profile=profile) as repository:
         report = await _build_report(repository, state)
 
     render(console, state, json=report, human=lambda: _render_human(report, state.verbose))

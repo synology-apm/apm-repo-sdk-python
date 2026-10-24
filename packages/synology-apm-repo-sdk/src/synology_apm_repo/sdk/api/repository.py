@@ -12,11 +12,12 @@ from ..asynccache import AsyncKeyedCache, CacheStats
 from ..cachemanager import DEFAULT_LIMITS
 from ..catalog.connection import Connection, connections
 from ..catalog.workload import Workload
+from ..concurrency import bounded_gather
 from ..dedup.keys import KeyMaterial, KeyVerification
 from ..dedup.repository import DedupRepo
 from ..dedup.verify_bucket_check import shared_verify_executor
-from ..errors import NotFoundError
-from ..findings import Finding, VerifyLevel
+from ..errors import InvalidArgumentError, NotFoundError
+from ..findings import Finding, VerifyLevel, VerifyTuning
 from ..identifiers import CatalogId
 from ..presentation.format import pluralize
 from ..presentation.progress import ProgressCallback
@@ -37,6 +38,9 @@ from .provider_registry import ProviderRegistry
 _INTERACTIVE_LIMITS = dataclasses.replace(DEFAULT_LIMITS, bucket_readers=DEFAULT_LIMITS.bucket_readers_interactive)
 """The limits of the ``DedupRepo`` a ``Repository`` shares among interactive
 consumers: a larger bucket-reader cache (see ``CacheLimits.bucket_readers_interactive``)."""
+
+_REOPEN_CONCURRENCY = 4
+"""The most catalogs ``set_key`` reopens at once under a newly verified key."""
 
 
 @dataclasses.dataclass(frozen=True, slots=True)
@@ -126,7 +130,7 @@ class Repository:
         # Registered last, so ``caches.invalidate_all()`` closes the streams
         # before the db sources they read through.
         dedup_repo.caches.register(
-            "saas_streams", saas_streams.close, saas_streams.cache_stats, bounded_by="maxsize (LRU)"
+            "saas_streams", saas_streams.invalidate, saas_streams.cache_stats, bounded_by="maxsize (LRU)"
         )
         return _OpenCatalog(dedup_repo=dedup_repo, saas_streams=saas_streams, connections=conns)
 
@@ -166,7 +170,8 @@ class Repository:
         becomes ``INVALID``.
 
         Args:
-            key_string: ``"<userKeyID>@<base64 userKey>"``.
+            key_string: ``"<userKeyID>@<base64 userKey>"``; an empty string
+                is malformed (``Session.open`` reads it as no key).
 
         Returns:
             The verification outcome plus any catalog reopen failures.
@@ -183,8 +188,9 @@ class Repository:
         return SetKeyResult(verification, tuple(errors))
 
     async def _reopen_catalogs_under_new_key(self, keys: KeyMaterial) -> list[Exception]:
-        """Rebuild every already-opened catalog under the verified ``keys``
-        and close the old ones, returning failures instead of raising."""
+        """Rebuild every already-opened catalog under the verified ``keys``,
+        ``_REOPEN_CONCURRENCY`` at a time, and close the old ones, returning
+        failures (in catalog order) instead of raising."""
         errors: list[Exception] = []
         # Settle fetches started under the old key before the snapshot.
         await self._open_catalogs.settle_all()
@@ -194,12 +200,17 @@ class Repository:
         for index in already_opened:
             self._open_catalogs.invalidate(index)
         # Eager, so a catalog that fails to reopen lands in reopen_errors.
-        for index in already_opened:
+        failures: dict[int, Exception] = {}
+
+        async def reopen(index: int) -> None:
             try:
                 await self._open_catalogs.resolve(index)
             except Exception as exc:  # noqa: BLE001
-                # Broad: the close loop below must still run.
-                errors.append(exc)
+                # Broad: the other reopens and the close loop below must still run.
+                failures[index] = exc
+
+        await bounded_gather(already_opened, reopen, max_concurrent=_REOPEN_CONCURRENCY)
+        errors.extend(failures[index] for index in already_opened if index in failures)
         errors.extend(await _close_opened_catalogs(already_opened.values()))
         return errors
 
@@ -292,8 +303,9 @@ class Repository:
 
         Call this after the store changed; nothing else revalidates. Catalogs
         stay valid: only their caches are rebuilt, and the connection list is
-        re-read when ``db_sources`` is dropped. Providers handed out earlier keep their own connections and
-        are not closed; fetch fresh ones to see new data.
+        re-read when ``db_sources`` is dropped. Providers handed out earlier
+        keep their own connections and are not closed; fetch fresh ones to
+        see new data.
 
         No catalog or provider call may be in flight: db connections and
         SaaS streams are closed and replaced. Does nothing while no catalog
@@ -358,8 +370,10 @@ class Repository:
             The frame the ref reached.
 
         Raises:
-            NotFoundError: A segment matches nothing or matches ambiguously,
-                or no node matches a canonical/raw ref.
+            NotFoundError: A segment matches nothing, or no node matches a
+                canonical/raw ref.
+            InvalidArgumentError: A segment matches ambiguously, or a
+                canonical ref is malformed.
             KeyRequiredError: The ref goes below a catalog of an encrypted
                 repository and no key was supplied.
             KeyMismatchError: As above, but the last key supplied was rejected.
@@ -383,7 +397,12 @@ class Repository:
         if not segments:
             return RootFrame()
         catalogs_list = await self.catalogs()
-        catalog = match_or_raise(segments[0], catalog_pairs(catalogs_list), catalogs_list, kind="backup source")
+        try:
+            catalog = match_or_raise(segments[0], catalog_pairs(catalogs_list), catalogs_list, kind="backup source")
+        except NotFoundError as exc:
+            if hint := _sigil_hint(segments[0]):
+                raise NotFoundError(f"{exc.safe_message}{hint}", ref=exc.ref, spec=exc.spec) from exc
+            raise
         if len(segments) == 1:
             return CatalogFrame(catalog)
         return await catalog.locate(segments[1:], raw=raw)
@@ -410,8 +429,9 @@ class Repository:
             The ``NodeFrame`` the ref reached.
 
         Raises:
-            NotFoundError: No node matches the ref, or a human ref stops
-                above a version.
+            NotFoundError: No node matches the ref.
+            InvalidArgumentError: A human ref stops above a version, a
+                canonical ref is malformed, or a segment matches ambiguously.
             KeyRequiredError: The ref goes below a catalog of an encrypted
                 repository and no key was supplied.
             KeyMismatchError: As above, but the last key supplied was rejected.
@@ -419,9 +439,10 @@ class Repository:
         """
         node_ref = NodeRef.coerce(ref)
         if node_ref.kind is RefKind.HUMAN and len(node_ref.segments) < 3:
-            raise NotFoundError(
+            hint = _sigil_hint(node_ref.segments[0]) if node_ref.segments else ""
+            raise InvalidArgumentError(
                 "human ref must name at least a catalog, workload, and version "
-                f"(got {len(node_ref.segments)} {pluralize(len(node_ref.segments), 'segment')}): {node_ref}",
+                f"(got {len(node_ref.segments)} {pluralize(len(node_ref.segments), 'segment')}): {node_ref}{hint}",
                 ref=str(node_ref),
             )
         frame = await self.locate(node_ref, raw=raw)
@@ -439,8 +460,8 @@ class Repository:
             Where the version is; its ``catalog``'s ``provider()`` opens it.
 
         Raises:
-            NotFoundError: The ref is malformed or names no such catalog or
-                version.
+            NotFoundError: The ref names no such catalog or version.
+            InvalidArgumentError: The ref is malformed.
             ValueError: The string is not a parseable ref.
             KeyRequiredError: The ref goes below a catalog of an encrypted
                 repository and no key was supplied.
@@ -453,6 +474,7 @@ class Repository:
         level: VerifyLevel = VerifyLevel.QUICK,
         *,
         progress: ProgressCallback | None = None,
+        tuning: VerifyTuning | None = None,
     ) -> list[Finding]:
         """Integrity check over every catalog, each distinct ``DedupRepo``
         once (a vault's catalogs share one). Opens every catalog first; at
@@ -461,6 +483,7 @@ class Repository:
         Args:
             level: How deep to check.
             progress: Receives a ``Progress`` snapshot as checking advances.
+            tuning: How the check spreads its reads (default ``VerifyTuning()``).
 
         Returns:
             Every ``Finding`` from every catalog.
@@ -478,7 +501,9 @@ class Repository:
         executor = shared_verify_executor(dedup_repos) if level is VerifyLevel.FULL and len(dedup_repos) > 1 else None
         try:
             for dedup_repo in dedup_repos:
-                findings.extend(await verify_reachable(dedup_repo, level, progress=progress, executor=executor))
+                findings.extend(
+                    await verify_reachable(dedup_repo, level, progress=progress, executor=executor, tuning=tuning)
+                )
         finally:
             if executor is not None:
                 await executor.close()
@@ -517,13 +542,21 @@ async def _find_or_raise(provider: UnitProvider, node_ref: NodeRef) -> Node:
     return node
 
 
+def _sigil_hint(first: str) -> str:
+    """The note a human ref's error carries when its first name is spelled
+    like a canonical or raw ref without the ``@`` those start with."""
+    if first == "raw" or first.startswith("cat:"):
+        return f" — canonical and raw refs start with '@' (#@{first}/…)"
+    return ""
+
+
 async def _locate_canonical_ref(repo: Repository, node_ref: NodeRef) -> VersionLocation:
     """Picks the ``Catalog`` by the ref's ``CatalogId`` first, then the
     version within it: ``connection_config_id`` alone collides across
     object-storage siblings."""
     ids = node_ref.canonical_ids
     if ids is None:
-        raise NotFoundError(f"malformed canonical ref: {node_ref}", ref=str(node_ref))
+        raise InvalidArgumentError(f"malformed canonical ref: {node_ref}", ref=str(node_ref))
     catalog_id, workload_id, version_uid = ids
     catalog = await repo.catalog_by_id(catalog_id)
     if catalog is None:

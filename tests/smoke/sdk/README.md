@@ -28,7 +28,8 @@ run, since they are cheap, metadata-only I/O.
 `../reports/sdk/<UTC timestamp>/` (see `../README.md` for the shared shape) --
 this tool additionally writes `store_trace.jsonl`: one line per
 underlying `ObjectStore` call, tagged with the sample it came from and the
-`<domain>.<step>` that issued it (`step`, empty outside any step), via
+`<domain>.<step>` that issued it (`step`; a call between steps carries its
+phase's `run_for_repo[...]`/`enumerate[...]` fallback label), via
 `Session.discover()`'s `trace=` callback. `started` is the call's epoch start time.
 Summarize one with `uv run python scripts/analyze_store_trace.py <path>`:
 per-sample calls and store time, repeated calls by path kind, and which

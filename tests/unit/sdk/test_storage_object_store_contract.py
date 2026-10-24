@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import asyncio
 import errno
+import stat
 from collections.abc import AsyncIterator
 from pathlib import Path
 from typing import Any
@@ -163,8 +164,9 @@ class _FakeSmbFile:
 
 
 class _FakeSmbStat:
-    def __init__(self, size: int) -> None:
+    def __init__(self, size: int, mode: int = stat.S_IFREG) -> None:
         self.st_size = size
+        self.st_mode = mode
 
 
 @unchecked_fake("the smbclient module")
@@ -199,6 +201,8 @@ class _FakeSmbClientModule:
     def stat(self, unc: str, **kwargs: Any) -> _FakeSmbStat:
         content = self._files.get(self._rel(unc))
         if content is None:
+            if self.exists(unc):
+                return _FakeSmbStat(0, stat.S_IFDIR)
             raise OSError(errno.ENOENT, "no such file", unc)
         return _FakeSmbStat(len(content))
 
@@ -303,6 +307,11 @@ async def test_size(store: ObjectStore) -> None:
 async def test_size_missing_raises(store: ObjectStore) -> None:
     with pytest.raises(NotFoundError, match=r"no such (blob|object|path)"):
         await store.size("nope")
+
+
+async def test_size_of_a_directory_raises_not_found(store: ObjectStore) -> None:
+    with pytest.raises(NotFoundError, match=r"no such (blob|object)|is a directory"):
+        await store.size("sub")
 
 
 async def test_exists(store: ObjectStore) -> None:

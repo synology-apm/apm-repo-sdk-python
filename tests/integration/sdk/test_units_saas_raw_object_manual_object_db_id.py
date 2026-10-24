@@ -57,15 +57,14 @@ async def test_replayed_manual_object_db_id_matches_the_object_name_indexs_own_l
             finally:
                 await auto.close()
 
-        object_db_id = f"{version.saas_stream_uuid}_{object_name_index.offset}_{object_name_index.length}"
-        assert object_db_id == "uvWRSFkGxCcZAMwt_66564096_12288"
-        manual = await RawObjectProvider.create(repo, version, saas_streams, object_db_id=object_db_id)
-        try:
-            assert isinstance(manual, RawObjectProvider)
-            manual_nodes = await manual.children(manual.root())
-        finally:
-            await manual.close()
-            await saas_streams.close()
+            object_db_id = f"{version.saas_stream_uuid}_{object_name_index.offset}_{object_name_index.length}"
+            assert object_db_id == "uvWRSFkGxCcZAMwt_66564096_12288"
+            manual = await RawObjectProvider.create(repo, version, saas_streams, object_db_id=object_db_id)
+            try:
+                assert isinstance(manual, RawObjectProvider)
+                manual_nodes = await manual.children(manual.root())
+            finally:
+                await manual.close()
 
         auto_locations = {(h.offset, h.length) for n in auto_nodes if isinstance(h := n.handle, _ObjectRange)}
         manual_locations = {(h.offset, h.length) for n in manual_nodes if isinstance(h := n.handle, _ObjectRange)}

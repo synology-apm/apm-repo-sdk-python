@@ -37,11 +37,16 @@ their own — run `synology-apm-repo-cli <command> --help` for that command's
 own options. Commands: `doctor`, `ls`, `tree`, `cat`, `export`, `key`,
 `verify`, `dump`, `profile`.
 
+Output piped or redirected on Windows uses the system code page; a
+character it can't represent, such as an emoji in a name, prints as a
+`\U...` escape (`--json` stays valid JSON). Set `PYTHONUTF8=1` for UTF-8
+output instead.
+
 ## Exit status
 
 | Status | Meaning |
 |---|---|
-| 0 | Success. `verify` found nothing unresolved (findings repaired via parity alone still exit 0); `export` wrote everything it could, even an item the backup holds only partly (reported on stderr as `incomplete`). |
+| 0 | Success. `verify` found nothing unresolved (findings repaired via parity alone still exit 0); `export` wrote everything it could, even an item the backup holds only partly (reported as `incomplete`). |
 | 1 | Error, including a folder export that skipped an item. |
 | 2 | Usage error (a bad option or argument). |
 | 3 | `verify` ran to completion and found at least one unresolved problem. |

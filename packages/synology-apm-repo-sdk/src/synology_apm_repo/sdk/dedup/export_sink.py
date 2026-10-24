@@ -87,13 +87,17 @@ class ExportWriter(Protocol):
     (``SegmentWriter``).
 
     Offsets are relative to the range being exported. Writes may arrive at
-    any offset and in any order; a write on a writer that is not open raises
-    rather than being dropped. Offsets and lengths are multiples of 4096,
-    except a write that ends at the end of its exported range, which may be
-    shorter; a sector-addressed sink only needs to check in ``open`` that
-    ``logical_size`` is a multiple of its sector size. ``write_at`` and
-    ``write_zero`` may return before the bytes are durable; ``commit``
-    returning without raising means every handed-off write completed.
+    any offset and in any order, and several may be in flight at once (an
+    export reads ``ExportTuning.max_concurrent_reads`` bucket groups
+    concurrently), so a writer whose ``write_at``/``write_zero`` awaits
+    between steps on shared state serializes them itself. A write on a
+    writer that is not open raises rather than being dropped. Offsets and
+    lengths are multiples of 4096, except a write that ends at the end of
+    its exported range, which may be shorter; a sector-addressed sink only
+    needs to check in ``open`` that ``logical_size`` is a multiple of its
+    sector size. ``write_at`` and ``write_zero`` may return before the bytes
+    are durable; ``commit`` returning without raising means every handed-off
+    write completed.
     ``write_zero``'s ``length`` is unbounded (a hole can be gigabytes), so
     write it in blocks rather than allocating it at once, and zero whatever
     range it is given.

@@ -1,8 +1,9 @@
 """Multi-core parallelism for CPU-bound work (decompress/decrypt/hash)
-through a ``ProcessPoolExecutor`` (``asyncio.to_thread()`` stays on one
-core under the GIL): pool sizing and construction, load-balanced dispatch,
-worker-failure reporting and the worker-side event loop, plus
-``bounded_gather`` for I/O-bound fan-out."""
+through a ``ProcessPoolExecutor`` (``asyncio.to_thread()`` keeps decrypt
+and the decode loop on one core under the GIL): pool sizing and
+construction, load-balanced dispatch, worker-failure reporting and the
+worker-side event loop, plus ``bounded_gather``/
+``bounded_gather_first_error`` for I/O-bound fan-out."""
 
 from __future__ import annotations
 
@@ -33,17 +34,19 @@ def default_worker_count() -> int:
 
 def new_process_pool(
     *,
+    max_workers: int | None = None,
     initializer: Callable[..., None] | None = None,
     initargs: Sequence[object] = (),
 ) -> ProcessPoolExecutor:
-    """A ``ProcessPoolExecutor`` sized by ``default_worker_count()``, always
-    with the ``spawn`` start method: ``fork`` (Linux's default) would copy
-    a live event loop and ``aiosqlite`` threads, which don't survive it.
+    """A ``ProcessPoolExecutor`` of ``max_workers`` processes
+    (``default_worker_count()`` when ``None``), always with the ``spawn``
+    start method: ``fork`` (Linux's default) would copy a live event loop
+    and ``aiosqlite`` threads, which don't survive it.
     """
     # typeshed pairs the initializer's signature with initargs' tuple type,
     # which a wrapper generic over the initializer can't satisfy.
     return ProcessPoolExecutor(
-        max_workers=default_worker_count(),
+        max_workers=max_workers if max_workers is not None else default_worker_count(),
         mp_context=multiprocessing.get_context("spawn"),
         initializer=initializer,
         initargs=tuple(initargs),  # type: ignore[arg-type]
@@ -68,9 +71,10 @@ def common_descriptor[T](descriptors: Sequence[T | None]) -> T | None:
 
 
 def first_failure(group: BaseExceptionGroup[BaseException], *, operation: str) -> BaseException:
-    """The failure a worker-dispatch exception group stands for: its first
-    exception that is not a cancellation, with a note counting the others.
-    A group of only cancellations is returned unchanged."""
+    """The failure an exception group of concurrent tasks (worker dispatches,
+    or in-process reads) stands for: its first exception that is not a
+    cancellation, with a note counting the others. A group of only
+    cancellations is returned unchanged."""
     failures = [exc for exc in leaf_exceptions(group) if not isinstance(exc, asyncio.CancelledError)]
     if not failures:
         return group
@@ -78,7 +82,7 @@ def first_failure(group: BaseExceptionGroup[BaseException], *, operation: str) -
     if others:
         kinds = ", ".join(sorted({type(exc).__name__ for exc in others}))
         noun = "failure" if len(others) == 1 else "failures"
-        first.add_note(f"{len(others)} other {operation} worker {noun}: {kinds}")
+        first.add_note(f"{len(others)} other {operation} {noun}: {kinds}")
     return first
 
 
@@ -165,6 +169,33 @@ async def bounded_gather[T](
     async with asyncio.TaskGroup() as tg:
         for item in items:
             tg.create_task(_bounded(item))
+
+
+async def bounded_gather_first_error[T](
+    items: Iterable[T], worker: Callable[[T], Awaitable[None]], *, max_concurrent: int
+) -> None:
+    """``bounded_gather``, but failing as a serial loop over ``items`` would:
+    with the error of the earliest item that failed, raised bare. A failure
+    cancels no running item; an item after it that has not started yet is
+    skipped.
+
+    Raises:
+        Exception: The earliest failed item's error.
+    """
+    failures: dict[int, Exception] = {}
+
+    async def run(indexed: tuple[int, T]) -> None:
+        index, item = indexed
+        if failures and min(failures) < index:
+            return
+        try:
+            await worker(item)
+        except Exception as exc:  # noqa: BLE001 - raised below, in item order
+            failures[index] = exc
+
+    await bounded_gather(enumerate(items), run, max_concurrent=max_concurrent)
+    if failures:
+        raise failures[min(failures)]
 
 
 async def dispatch_to_pool[T, R](

@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import asyncio
+import concurrent.futures
+import threading
 
 import pytest
 
@@ -12,6 +14,7 @@ from synology_apm_repo.sdk._util.closing import (
     close_each,
     close_preserving,
     leaf_exceptions,
+    run_to_completion,
     shield_or_undo,
 )
 from synology_apm_repo.sdk.storage.azure import AzureStore
@@ -117,6 +120,50 @@ class TestAsyncClosing:
     @pytest.mark.parametrize("store_class", [S3Store, AzureStore, SmbStore])
     def test_every_network_store_supports_async_with(self, store_class: type) -> None:
         assert issubclass(store_class, AsyncClosing)
+
+
+class TestRunToCompletion:
+    async def test_a_cancelled_caller_still_runs_a_thread_job_queued_behind_busy_workers(self) -> None:
+        # Plain to_thread drops a queued job on cancellation.
+        loop = asyncio.get_running_loop()
+        executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+        loop.set_default_executor(executor)
+        busy_gate = threading.Event()
+        ran: list[str] = []
+        busy = asyncio.ensure_future(asyncio.to_thread(busy_gate.wait, 5))
+        cleanup = asyncio.ensure_future(run_to_completion(asyncio.to_thread(ran.append, "cleanup")))
+        await asyncio.sleep(0.05)  # the cleanup job is queued behind the busy one
+        cleanup.cancel()
+        await asyncio.sleep(0.05)
+        busy_gate.set()
+        with pytest.raises(asyncio.CancelledError):
+            await cleanup
+        await busy
+        assert ran == ["cleanup"]
+
+    async def test_a_cancelled_caller_gets_the_cleanups_failure_as_a_note(self) -> None:
+        started, gate = asyncio.Event(), asyncio.Event()
+
+        async def work() -> None:
+            started.set()
+            await gate.wait()
+            raise OSError("cleanup failed")
+
+        task = asyncio.ensure_future(run_to_completion(work()))
+        await started.wait()
+        task.cancel()
+        await asyncio.sleep(0)
+        gate.set()
+        with pytest.raises(asyncio.CancelledError) as info:
+            await task
+        assert info.value.__notes__ == ["cleanup also failed: OSError('cleanup failed')"]
+
+    async def test_a_failure_propagates_unchanged(self) -> None:
+        async def work() -> None:
+            raise OSError("cleanup failed")
+
+        with pytest.raises(OSError, match="cleanup failed"):
+            await run_to_completion(work())
 
 
 class TestShieldOrUndo:

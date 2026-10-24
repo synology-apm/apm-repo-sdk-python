@@ -23,8 +23,9 @@ from support.repo_builders import (
     write_bucket,
     write_composition_entries,
 )
-from support.store_fakes import CountingStore
+from support.store_fakes import CountingStore, WrappingStore
 from synology_apm_repo.sdk.dedup import chunk_walk
+from synology_apm_repo.sdk.dedup import dedup_file as dedup_file_mod
 from synology_apm_repo.sdk.dedup.composition_reader import CompositionReader
 from synology_apm_repo.sdk.dedup.dedup_file import (
     MAX_SINGLE_READ_SIZE,
@@ -38,10 +39,11 @@ from synology_apm_repo.sdk.dedup.export_sink import run_sink_export
 from synology_apm_repo.sdk.dedup.extent import DataExtent, ExportResult, ExtentKind, GapExtent
 from synology_apm_repo.sdk.dedup.local_file_sink import LocalFileSink
 from synology_apm_repo.sdk.dedup.pool import BucketReader, Pool
-from synology_apm_repo.sdk.errors import ResourceLimitExceededError
+from synology_apm_repo.sdk.errors import NotFoundError, ResourceLimitExceededError
 from synology_apm_repo.sdk.format import addressing
 from synology_apm_repo.sdk.format.chunkmap import ChunkMapKind
 from synology_apm_repo.sdk.identifiers import BucketId, ChunkIdx, StreamId
+from synology_apm_repo.sdk.storage.base import ObjectStore
 from synology_apm_repo.sdk.storage.dircache import DirCache
 from synology_apm_repo.sdk.storage.local import LocalFsStore
 from synology_apm_repo.sdk.units.base import ContentSource
@@ -269,8 +271,51 @@ class TestRead:
         assert await at_ceiling.read(0, 4096) == CHUNK_PLAINTEXTS[0]
 
 
+class _GatedBucketStore(WrappingStore):
+    """Parks every ``.buk`` read until ``release`` is set, counting how many
+    are parked at once (``in_flight``, ``peak``); ``arrived`` is set on each
+    new arrival."""
+
+    def __init__(self, backing: LocalFsStore) -> None:
+        super().__init__(backing)
+        self.in_flight = 0
+        self.peak = 0
+        self.arrived = asyncio.Event()
+        self.release = asyncio.Event()
+
+    async def read(self, path: str, offset: int = 0, length: int | None = None) -> bytes:
+        if path.endswith(".buk"):
+            self.in_flight += 1
+            self.peak = max(self.peak, self.in_flight)
+            self.arrived.set()
+            try:
+                await self.release.wait()
+            finally:
+                self.in_flight -= 1
+        return await self._backing.read(path, offset, length)
+
+
+def _bucket_per_chunk_file(
+    tmp_path: Path, num_buckets: int, wrap: Callable[[LocalFsStore], ObjectStore] = lambda store: store
+) -> tuple[DedupFile, ObjectStore, bytes]:
+    """A file of ``num_buckets`` single-chunk extents, extent ``b`` in bucket
+    ``b`` (``bytes([b])`` repeated); returns it, its store and its content."""
+    entries = b"".join(mapping_record(b * 4096, b, 0, map_num=1) for b in range(num_buckets))
+    comp_path = tmp_path / "Composition" / str(STREAM_ID) / f"{SESSION_ID}.com" / "c0"
+    comp_path.parent.mkdir(parents=True, exist_ok=True)
+    comp_path.write_bytes(composition_header_bytes() + record_head_bytes(map_num=num_buckets) + entries)
+    for b in range(num_buckets):
+        write_bucket(tmp_path / "Pool" / "0" / f"{b}.buk", [bytes([b]) * 4096])
+    store = wrap(LocalFsStore(tmp_path))
+    dir_cache = DirCache(store)
+    comp_reader = CompositionReader(store, dir_cache, "Composition", STREAM_ID, SESSION_ID)
+    pool = Pool(store, "Pool", dir_cache)
+    content = b"".join(bytes([b]) * 4096 for b in range(num_buckets))
+    return DedupFile(comp_reader, pool, HEAD_OFF, size=num_buckets * 4096), store, content
+
+
 class TestReadAcrossBuckets:
-    """``_fill_data_extent()``'s batch path via ``_resolve_bucket_group()``: several
+    """``DedupFile.read()``'s batch path via ``_resolve_bucket_group()``: several
     distinct chunks in one ``read()`` are fetched with one
     ``BucketReader.read_chunks()`` per bucket, still using ``Pool``'s chunk cache."""
 
@@ -279,7 +324,7 @@ class TestReadAcrossBuckets:
     ) -> None:
         """With ``BUCKET_MAX_CHUNK_NUM`` patched to 2, one DATA extent with
         ``map_num=2`` carries from (bucket 0, chunk 1) into (bucket 1, chunk 0),
-        so one ``_fill_data_extent()`` call needs chunks from two buckets."""
+        so one extent needs chunks from two buckets."""
         monkeypatch.setattr(addressing, "BUCKET_MAX_CHUNK_NUM", 2)
         monkeypatch.setattr(chunk_walk, "BUCKET_MAX_CHUNK_NUM", 2)
         entries = mapping_record(0, 0, 1, map_num=2)
@@ -356,11 +401,9 @@ class TestReadAcrossBuckets:
             stream_id: StreamId,
             bucket_id: BucketId,
             ranges: Sequence[tuple[int, int]],
-            *,
-            semaphore: asyncio.Semaphore | None = None,
         ) -> dict[int, bytes | memoryview]:
             # Simulates a concurrent release_caches() landing mid-fetch.
-            result = await real_read_chunks(self, stream_id, bucket_id, ranges, semaphore=semaphore)
+            result = await real_read_chunks(self, stream_id, bucket_id, ranges)
             pool.release_caches()
             return result
 
@@ -392,6 +435,113 @@ class TestReadAcrossBuckets:
 
         result = await file.read(0, 8192)
         assert result == CHUNK_PLAINTEXTS[0] + bucket_1_chunk0
+
+    async def test_buckets_are_read_side_by_side_up_to_the_cap(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(dedup_file_mod, "_READ_BUCKETS_IN_FLIGHT", 2)
+        file, store, content = _bucket_per_chunk_file(tmp_path, 5, wrap=_GatedBucketStore)
+        assert isinstance(store, _GatedBucketStore)
+        task = asyncio.create_task(file.read(0, 5 * 4096))
+        while store.in_flight < 2:
+            store.arrived.clear()
+            await store.arrived.wait()
+        # Every other bucket now waits on the cap, not on a store read.
+        for _ in range(20):
+            await asyncio.sleep(0)
+        assert store.in_flight == 2
+        store.release.set()
+        assert await task == content
+        assert store.peak == 2
+
+    async def test_a_failing_bucket_raises_its_own_error_not_a_group(self, tmp_path: Path) -> None:
+        file, _store, _content = _bucket_per_chunk_file(tmp_path, 3)
+        (tmp_path / "Pool" / "0" / "1.buk").unlink()
+        with pytest.raises(NotFoundError, match=r"1\.buk"):
+            await file.read(0, 3 * 4096)
+
+    async def test_one_buckets_groups_are_read_in_order_so_a_later_one_hits_the_cache(self, tmp_path: Path) -> None:
+        # Extents at [0, 8192) and [12288, 20480) both map bucket 0's chunks
+        # 0-1 (two batch groups of one bucket); [8192, 12288) maps bucket 1.
+        entries = (
+            mapping_record(0, 0, 0, map_num=2)
+            + mapping_record(8192, 1, 0, map_num=1)
+            + mapping_record(12288, 0, 0, map_num=2)
+        )
+        comp_path = tmp_path / "Composition" / str(STREAM_ID) / f"{SESSION_ID}.com" / "c0"
+        comp_path.parent.mkdir(parents=True, exist_ok=True)
+        comp_path.write_bytes(composition_header_bytes() + record_head_bytes(map_num=3) + entries)
+        write_bucket(tmp_path / "Pool" / "0" / "0.buk", CHUNK_PLAINTEXTS[:2])
+        bucket_1_chunk0 = bytes([200]) * 4096
+        write_bucket(tmp_path / "Pool" / "0" / "1.buk", [bucket_1_chunk0])
+        bucket_0_reads: list[tuple[int, int | None]] = []
+
+        class _Bucket0Log(WrappingStore):
+            async def read(self, path: str, offset: int = 0, length: int | None = None) -> bytes:
+                if path.endswith("/0.buk"):
+                    bucket_0_reads.append((offset, length))
+                return await self._backing.read(path, offset, length)
+
+        store = _Bucket0Log(LocalFsStore(tmp_path))
+        dir_cache = DirCache(store)
+        comp_reader = CompositionReader(store, dir_cache, "Composition", STREAM_ID, SESSION_ID)
+        file = DedupFile(comp_reader, Pool(store, "Pool", dir_cache), HEAD_OFF, size=20480)
+
+        result = await file.read(0, 20480)
+
+        both = CHUNK_PLAINTEXTS[0] + CHUNK_PLAINTEXTS[1]
+        assert result == both + bucket_1_chunk0 + both
+        # The header open, then one merged read of chunks 0-1; the second
+        # group is served from the chunks the first one cached.
+        assert len(bucket_0_reads) == 2
+
+    async def test_concurrent_reads_of_one_buckets_chunks_fetch_them_once(self, tmp_path: Path) -> None:
+        comp_path = tmp_path / "Composition" / str(STREAM_ID) / f"{SESSION_ID}.com" / "c0"
+        comp_path.parent.mkdir(parents=True, exist_ok=True)
+        comp_path.write_bytes(
+            composition_header_bytes() + record_head_bytes(map_num=1) + mapping_record(0, 0, 0, map_num=2)
+        )
+        write_bucket(tmp_path / "Pool" / "0" / "0.buk", CHUNK_PLAINTEXTS[:2])
+        bucket_reads: list[int] = []
+
+        class _BucketLog(WrappingStore):
+            async def read(self, path: str, offset: int = 0, length: int | None = None) -> bytes:
+                if path.endswith(".buk"):
+                    bucket_reads.append(offset)
+                return await self._backing.read(path, offset, length)
+
+        def open_file() -> DedupFile:
+            store = _BucketLog(LocalFsStore(tmp_path))
+            dir_cache = DirCache(store)
+            comp_reader = CompositionReader(store, dir_cache, "Composition", STREAM_ID, SESSION_ID)
+            return DedupFile(comp_reader, Pool(store, "Pool", dir_cache), HEAD_OFF, size=8192)
+
+        await open_file().read(0, 8192)
+        one_read = len(bucket_reads)
+        bucket_reads.clear()
+        file = open_file()
+        both = CHUNK_PLAINTEXTS[0] + CHUNK_PLAINTEXTS[1]
+        assert list(await asyncio.gather(file.read(0, 8192), file.read(0, 8192))) == [both, both]
+        # The second batch waits for the first and finds its chunks cached.
+        assert len(bucket_reads) == one_read
+
+    async def test_a_large_read_is_planned_and_fetched_in_batches(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(dedup_file_mod, "_READ_BATCH_CHUNKS", 2)
+        batches: list[int] = []
+        real_fill_groups = dedup_file_mod._fill_groups
+
+        async def logged_fill_groups(
+            pool: Pool, groups: list[dedup_file_mod._BucketGroup], out: memoryview, out_base: int
+        ) -> None:
+            batches.append(len(groups))
+            await real_fill_groups(pool, groups, out, out_base)
+
+        monkeypatch.setattr(dedup_file_mod, "_fill_groups", logged_fill_groups)
+        file, _store, content = _bucket_per_chunk_file(tmp_path, 5)
+        assert await file.read(0, 5 * 4096) == content
+        assert batches == [2, 2, 1]
 
 
 class TestStream:

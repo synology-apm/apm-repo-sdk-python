@@ -11,7 +11,7 @@ import pytest
 
 from support.repo_builders import write_bucket, write_inf_and_fgp, write_legacy_bucket
 from synology_apm_repo.sdk.dedup import verify_bucket_check as module
-from synology_apm_repo.sdk.dedup.pool import FULL_VERIFY, NO_VERIFY, BucketReaderCache, Pool, VerifyPolicy
+from synology_apm_repo.sdk.dedup.pool import FULL_VERIFY, NO_VERIFY, Pool, VerifyPolicy
 from synology_apm_repo.sdk.dedup.pool_descriptor import PoolDescriptor
 from synology_apm_repo.sdk.dedup.verify_bucket_check import (
     VerifyExecutor,
@@ -41,7 +41,7 @@ async def _check(
     root: Path, level: VerifyLevel = VerifyLevel.FULL, *, vault_key: bytes | None = None
 ) -> tuple[list[Finding], bool]:
     pool, _store = _pool(root, vault_key=vault_key)
-    return await check_one_bucket(pool, BucketReaderCache.for_verify(), _KEY, level)
+    return await check_one_bucket(pool, _KEY, level)
 
 
 def _one_bucket(root: Path, **kwargs: Any) -> Path:

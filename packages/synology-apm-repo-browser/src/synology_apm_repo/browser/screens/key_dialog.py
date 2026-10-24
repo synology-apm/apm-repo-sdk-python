@@ -15,14 +15,14 @@ from textual.containers import Vertical
 from textual.screen import ModalScreen
 from textual.widgets import Input, Static
 
-from synology_apm_repo.browser.screens._shared import modal_box_css, show_error
+from synology_apm_repo.browser.screens._shared import ReleasesOnPrune, modal_box_css, show_error
 from synology_apm_repo.browser.strings import KEY_INPUT_PLACEHOLDER, KEY_PROMPT
 from synology_apm_repo.browser.widgets.progress_hint import StaticTextSink
 from synology_apm_repo.browser.widgets.worker_progress import work
 from synology_apm_repo.sdk import ApmRepoError, Repository
 
 
-class KeyDialog(ModalScreen[bool]):
+class KeyDialog(ReleasesOnPrune, ModalScreen[bool]):
     """Keeps no ``COMMON_BINDINGS``: the App's ``q``/``d``/``?`` don't reach
     past a modal."""
 

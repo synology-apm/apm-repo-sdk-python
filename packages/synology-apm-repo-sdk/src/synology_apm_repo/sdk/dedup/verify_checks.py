@@ -138,7 +138,7 @@ async def _attempt_map_crc_repair(
 
 async def check_map_and_attr_crc(
     reader: CompositionReader, comp_offset: int, record_head: RecordHead, *, path: str
-) -> tuple[list[Finding], bytes | None]:
+) -> tuple[list[Finding], bytes | None, bytes | None]:
     """``mapCrc`` over the whole chunk-map array plus (when present)
     ``attrCrc`` over the trailing JSON attribute blob, in one merged read.
 
@@ -148,29 +148,31 @@ async def check_map_and_attr_crc(
     ``record_head.map_num == 0``.
 
     Returns:
-        ``(findings, repaired_array)``. ``repaired_array`` is the
-        confirmed-correct chunk-map array bytes exactly when a
-        ``map_crc`` mismatch was repaired via parity, ``None`` otherwise.
-        A caller that re-reads this array must pass a non-``None`` result to
+        ``(findings, verified_array, repaired_array)``, at most one array
+        set: the chunk-map array bytes ``map_crc`` confirmed as read, or the
+        ones a parity repair confirmed. A caller that re-reads this array
+        must pass a non-``None`` ``repaired_array`` to
         ``CompositionRecord.seed_pages_from_array``, or it reads the
         still-corrupted on-disk bytes.
     """
     if record_head.map_num == 0:
-        return [], None
+        return [], None, None
     findings: list[Finding] = []
     map_array_off = chunk_map_array_offset(comp_offset)
     map_array_len = record_head.map_num * CHUNK_MAP_RECORD_LENGTH
     try:
         combined_raw = await reader.read_at(map_array_off, map_array_len + record_head.attr_leng)
     except (NotFoundError, FormatError) as exc:
-        return [Finding(Stage.COMPOSITION, Symptom.DATA_MISSING, path, str(exc))], None
+        return [Finding(Stage.COMPOSITION, Symptom.DATA_MISSING, path, str(exc))], None, None
     array_raw = combined_raw[:map_array_len]
     attr_raw = combined_raw[map_array_len:]
 
+    verified_array: bytes | None = array_raw
     repaired_array: bytes | None = None
     try:
         await verify_chunk_map_crc_threaded(array_raw, record_head.map_crc)
     except DataCorruptError as exc:
+        verified_array = None
         repaired_array = await _attempt_map_crc_repair(
             reader, map_array_off, map_array_len, record_head.attr_leng, array_raw, record_head.map_crc
         )
@@ -187,7 +189,7 @@ async def check_map_and_attr_crc(
         except DataCorruptError as exc:
             findings.append(Finding(Stage.COMPOSITION, Symptom.MISMATCH, path, str(exc)))
 
-    return findings, repaired_array
+    return findings, verified_array, repaired_array
 
 
 async def check_bucket_structure(

@@ -11,9 +11,11 @@ instead of ``Pool``'s own).
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
 import dataclasses
 import hashlib
-from collections.abc import Iterable, Mapping
+from collections.abc import AsyncIterator, Iterable, Mapping
 
 from cryptography.hazmat.primitives.ciphers import algorithms
 
@@ -27,14 +29,16 @@ from ...storage.base import ObjectStore, join_path
 from ...storage.dircache import DirCache
 from ...storage.seqid import resolve_seq_path, resolve_seq_size
 from ..fingerprint import FingerprintIndex
-from ._bucket_reader import BucketReader
+from ._bucket_reader import DECODE_BLOCK_CHUNKS, BucketReader, ChunkBlockCallback
 from ._cache import BucketReaderCache
 
 __all__ = [
+    "DECODE_BLOCK_CHUNKS",
     "FULL_VERIFY",
     "NO_VERIFY",
     "BucketReader",
     "BucketReaderCache",
+    "ChunkBlockCallback",
     "Pool",
     "VerifyPolicy",
 ]
@@ -53,7 +57,8 @@ class VerifyPolicy:
     before decrypting."""
     fingerprint: bool = False
     """Check each decoded chunk's SHA-256 against its stored ``.fgp``
-    fingerprint (one extra ``.inf``/``.fgp`` read per bucket group)."""
+    fingerprint: the bucket group's ``.inf`` table is read once, then one
+    ``.fgp`` read per run of consecutive chunks checked."""
 
 
 NO_VERIFY = VerifyPolicy()
@@ -67,7 +72,8 @@ class Pool:
     two-level LRU caching: ``BucketReader``\\ s (cheap, kept many) and decoded
     plaintext chunks (kept fewer). Both are shared ``AsyncKeyedCache``
     instances, so concurrent callers missing the same key share one fetch;
-    ``backfill_chunks`` is the one direct insert that bypasses that.
+    ``backfill_chunks`` is the one direct insert that bypasses that, so its
+    callers take ``batch_fetch`` instead.
 
     Args:
         store: The repository's ``ObjectStore``.
@@ -104,6 +110,8 @@ class Pool:
         self._fingerprints = FingerprintIndex(store, dir_cache, pool_root, maxsize=limits.allocation_tables)
         self._release_epoch = 0
         self._aes_algorithm: algorithms.AES | None = None
+        # Per bucket: its lock and how many callers hold or await it.
+        self._batch_locks: dict[tuple[StreamId, BucketId], tuple[asyncio.Lock, list[int]]] = {}
 
     def release_caches(self) -> None:
         """Drop everything this pool holds in memory: decoded chunks, open
@@ -196,7 +204,8 @@ class Pool:
         bucket cache (no lookup, insert or eviction).
 
         Every ``bucket()`` cache miss, this pool's own cache or a sweep's
-        ``BucketReaderCache``, opens through it.
+        ``BucketReaderCache``, opens through it, as does a verify run's
+        bucket check.
         """
         path = await self.bucket_path(stream_id, bucket_id)
         return await BucketReader.open(
@@ -225,8 +234,8 @@ class Pool:
     async def read_chunk(self, addr: ChunkAddress) -> bytes:
         """Resolve ``addr`` to 4096 bytes of plaintext, cached, with this
         pool's ``verify`` checks (a cache hit's fingerprint is checked too).
-        Bucket-major export (``chunk_walk.exec_one_bucket_group``) calls
-        ``BucketReader.read_chunks`` directly instead.
+        Bucket-major export and verify FULL read through
+        ``chunk_walk.read_verified_blocks`` instead.
 
         Returns:
             The plaintext chunk.
@@ -266,6 +275,23 @@ class Pool:
                 hits[chunk_idx] = plain
         return hits, misses
 
+    @contextlib.asynccontextmanager
+    async def batch_fetch(self, stream_id: StreamId, bucket_id: BucketId) -> AsyncIterator[None]:
+        """Held around a batch caller's ``cached_chunks``-fetch-``backfill_chunks``
+        of one bucket, so concurrent batches of the same bucket run one at a
+        time and a later one finds what an earlier one cached instead of
+        fetching it again."""
+        key = (stream_id, bucket_id)
+        lock, users = self._batch_locks.setdefault(key, (asyncio.Lock(), [0]))
+        users[0] += 1
+        try:
+            async with lock:
+                yield
+        finally:
+            users[0] -= 1
+            if not users[0]:
+                del self._batch_locks[key]
+
     def backfill_chunks(
         self, stream_id: StreamId, bucket_id: BucketId, plaintexts: Mapping[int, bytes | memoryview]
     ) -> None:
@@ -299,11 +325,42 @@ class Pool:
             NotFoundError: The group's ``.inf`` or ``.fgp`` file is missing.
             FormatError: The ``.inf`` or ``.fgp`` file is truncated.
         """
+        expected = await self.expected_fingerprints(stream_id, bucket_id, chunks)
+        if expected is not None:
+            self.check_fingerprints(stream_id, bucket_id, chunks, expected)
+
+    async def expected_fingerprints(
+        self, stream_id: StreamId, bucket_id: BucketId, chunk_indices: Iterable[int]
+    ) -> dict[int, bytes] | None:
+        """The stored ``.fgp`` digest of every ``chunk_idx`` in
+        ``chunk_indices``, for ``check_fingerprints``; ``None`` when this
+        pool's ``verify.fingerprint`` is off. Consecutive indices share one
+        read.
+
+        Raises:
+            DataCorruptError: A sidecar is corrupt.
+            NotFoundError: The group's ``.inf`` or ``.fgp`` file is missing.
+            FormatError: The ``.inf`` or ``.fgp`` file is truncated.
+        """
         if not self._verify.fingerprint:
-            return
-        expected_by_chunk = await self._fingerprints.digests(stream_id, bucket_id, chunks)
+            return None
+        return await self._fingerprints.digests(stream_id, bucket_id, chunk_indices)
+
+    def check_fingerprints(
+        self,
+        stream_id: StreamId,
+        bucket_id: BucketId,
+        chunks: Mapping[int, bytes | memoryview],
+        expected: Mapping[int, bytes],
+    ) -> None:
+        """Check every entry in ``chunks`` against its digest in ``expected``
+        (from ``expected_fingerprints``), with no I/O.
+
+        Raises:
+            DataCorruptError: A chunk's plaintext SHA-256 doesn't match.
+        """
         sha256 = hashlib.sha256
         for chunk_idx, plain in chunks.items():
-            if sha256(plain).digest() != expected_by_chunk[chunk_idx]:
+            if sha256(plain).digest() != expected[chunk_idx]:
                 addr = ChunkAddress(stream_id, bucket_id, ChunkIdx(chunk_idx))
                 raise DataCorruptError(f"chunk fingerprint mismatch at {addr}", ref=self._pool_root, spec=_SPEC)

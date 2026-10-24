@@ -94,6 +94,7 @@ GOTO_REF_NOT_CANONICAL_WARNING = (
     "g only accepts a canonical ref (the form y copies) — human/raw refs aren't supported yet"
 )
 GOTO_REF_PARSE_ERROR_WARNING = "not a valid ref"
+GOTO_REF_MISSING_SIGIL_WARNING = "a canonical ref starts with '@' after the '#' (#@cat:…) — copy it again with y"
 GOTO_REF_NOT_FOUND_WARNING = "ref not found in this repository"
 
 # -- HexPreviewScreen -----------------------------------------------------

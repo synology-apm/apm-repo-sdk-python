@@ -77,15 +77,20 @@ async def _guarded_bucket_read_chunks(self: object, *args: object, **kwargs: obj
     raise ContentRecordingBlocked(_BLOCKED_MESSAGE)
 
 
+async def _guarded_bucket_read_chunk_blocks(self: object, *args: object, **kwargs: object) -> None:
+    raise ContentRecordingBlocked(_BLOCKED_MESSAGE)
+
+
 def _install_content_guard(request: pytest.FixtureRequest) -> None:
     """Installs the content guard for the rest of this one test (idempotent
     per test node), on a replay and a recording alike, so a read the
     recording never made (a background preview) fails the same way in both.
     Two choke points cover the two layers that read real content:
     ``RestorableUnit.of()`` (every unit a provider builds) and
-    ``BucketReader.read_chunk``/``read_chunks`` (the dedup layer, e.g. a
-    ``DedupFile`` from ``DedupRepo.open_file()``). A raw ``ObjectStore.read()``
-    stays unguarded: it can't be told apart from a catalog-metadata read."""
+    ``BucketReader.read_chunk``/``read_chunks``/``read_chunk_blocks`` (the
+    dedup layer, e.g. a ``DedupFile`` from ``DedupRepo.open_file()``). A raw
+    ``ObjectStore.read()`` stays unguarded: it can't be told apart from a
+    catalog-metadata read."""
     if request.node.stash.get(_CONTENT_GUARD_INSTALLED, False):
         return
     request.node.stash[_CONTENT_GUARD_INSTALLED] = True
@@ -93,6 +98,7 @@ def _install_content_guard(request: pytest.FixtureRequest) -> None:
         patch.object(RestorableUnit, "of", classmethod(_guarded_restorable_unit_of)),
         patch.object(BucketReader, "read_chunk", _guarded_bucket_read_chunk),
         patch.object(BucketReader, "read_chunks", _guarded_bucket_read_chunks),
+        patch.object(BucketReader, "read_chunk_blocks", _guarded_bucket_read_chunk_blocks),
     ):
         patcher.start()
         request.addfinalizer(patcher.stop)

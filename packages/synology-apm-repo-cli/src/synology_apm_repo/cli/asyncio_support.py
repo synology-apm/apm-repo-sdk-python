@@ -16,16 +16,16 @@ from synology_apm_repo.cli.errors import ExitCode, err_console, fail_unexpected
 def typer_async[**P, T](func: Callable[P, Coroutine[Any, Any, T]]) -> Callable[P, T]:
     """Wraps an ``async def`` Typer command callback so Typer can register
     and call it like a plain sync function. Any exception that escapes
-    without becoming a ``typer.Exit`` is treated as a bug and handed to
-    ``fail_unexpected``. A Ctrl-C a command doesn't handle itself exits
+    without becoming a ``typer.Exit`` or a Click usage error is treated as a
+    bug and handed to ``fail_unexpected``. A Ctrl-C a command doesn't handle itself exits
     ``ExitCode.CANCELLED`` (``export`` handles its first one, to clean up)."""
 
     @functools.wraps(func)
     def wrapper(*args: P.args, **kwargs: P.kwargs) -> T:
         try:
             return asyncio.run(func(*args, **kwargs))
-        except typer.Exit:
-            raise  # fail()/fail_unexpected() itself, or a plain clean exit — not a bug
+        except (typer.Exit, typer.TyperException):
+            raise  # fail()/fail_unexpected(), a usage error, or a plain clean exit — not a bug
         except KeyboardInterrupt:
             err_console.print("[yellow]cancelled[/yellow]")
             raise typer.Exit(code=ExitCode.CANCELLED) from None

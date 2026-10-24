@@ -1,5 +1,6 @@
 """Unit tests for ``synology_apm_repo.sdk.dedup.export_workers``: ``ExportExecutor``'s
-binding to one repository and destination, and the worker-process task/shutdown hooks."""
+size and its binding to one repository and destination, and the worker-process
+task/shutdown hooks."""
 
 from __future__ import annotations
 
@@ -15,9 +16,10 @@ from support.repo_builders import write_bucket, write_composition_entries
 from support.store_fakes import LoopCheckingStore
 from synology_apm_repo.sdk import concurrency
 from synology_apm_repo.sdk.dedup import export_workers as export_workers_mod
+from synology_apm_repo.sdk.dedup import pool_descriptor as pool_descriptor_mod
 from synology_apm_repo.sdk.dedup.chunk_walk import ChunkRun
 from synology_apm_repo.sdk.dedup.dedup_file import DedupFile
-from synology_apm_repo.sdk.dedup.export_scheduler import ExportTuning
+from synology_apm_repo.sdk.dedup.export_scheduler import SharedExportTuning
 from synology_apm_repo.sdk.dedup.export_sink import WorkerTarget, WorkerWriter
 from synology_apm_repo.sdk.dedup.export_workers import (
     ExportExecutor,
@@ -49,6 +51,31 @@ def dedup_file(tmp_path: Path) -> DedupFile:
     return dedup_file_at(tmp_path)
 
 
+class TestExecutorSize:
+    """``ExportExecutor``'s process count: the caller's ``max_workers``, else ``default_worker_count()``."""
+
+    async def test_a_given_count_sizes_the_process_pool(self, dedup_file: DedupFile, tmp_path: Path) -> None:
+        descriptor = PoolDescriptor.from_pool(dedup_file.pool)
+        assert descriptor is not None
+        executor = ExportExecutor(descriptor, LocalFileDescriptor(str(tmp_path / "out.bin")), max_workers=2)
+        try:
+            assert executor.max_workers == 2
+        finally:
+            await executor.close()
+
+    async def test_no_count_takes_the_default(
+        self, dedup_file: DedupFile, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(pool_descriptor_mod, "default_worker_count", lambda: 3)
+        descriptor = PoolDescriptor.from_pool(dedup_file.pool)
+        assert descriptor is not None
+        executor = ExportExecutor(descriptor, LocalFileDescriptor(str(tmp_path / "out.bin")))
+        try:
+            assert executor.max_workers == 3
+        finally:
+            await executor.close()
+
+
 class TestExecutorIdentityCheck:
     """A caller-supplied executor is bound at spawn to one ``PoolDescriptor``
     and one destination; ``export_to_writer`` rejects any mismatch."""
@@ -65,7 +92,7 @@ class TestExecutorIdentityCheck:
         executor = ExportExecutor(other_descriptor, LocalFileDescriptor(str(tmp_path / "unused.bin")))
         try:
             with pytest.raises(ValueError, match="was not built for"):
-                await export_to(dedup_file, tmp_path / "out.bin", tuning=ExportTuning(executor=executor))
+                await export_to(dedup_file, tmp_path / "out.bin", tuning=SharedExportTuning(executor=executor))
         finally:
             await executor.close()
 
@@ -101,7 +128,7 @@ class TestExecutorIdentityCheck:
         dst = tmp_path / "out.bin"
         executor = ExportExecutor(descriptor, LocalFileDescriptor(str(dst)))
         try:
-            result = await export_to(dedup_file, dst, tuning=ExportTuning(executor=executor))
+            result = await export_to(dedup_file, dst, tuning=SharedExportTuning(executor=executor))
         finally:
             # Caller-owned: export_to_writer() does not shut it down.
             await executor.close()
@@ -119,7 +146,7 @@ class TestExecutorIdentityCheck:
         executor = ExportExecutor(descriptor, LocalFileDescriptor(str(dst_a)))
         try:
             with pytest.raises(ValueError, match="was not built for"):
-                await export_to(dedup_file, dst_b, tuning=ExportTuning(executor=executor))
+                await export_to(dedup_file, dst_b, tuning=SharedExportTuning(executor=executor))
         finally:
             await executor.close()
 

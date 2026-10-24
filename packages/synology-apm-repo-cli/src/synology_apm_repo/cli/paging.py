@@ -7,6 +7,7 @@ is bounded, don't.
 
 from __future__ import annotations
 
+import codecs
 import contextlib
 import os
 import shlex
@@ -33,8 +34,9 @@ def pager_argv() -> list[str] | None:
 
 
 class _SubprocessPager(Pager):
-    """A Rich ``Pager`` that pipes ``content`` to ``argv``, printing it
-    directly instead when ``argv[0]`` isn't found."""
+    """A Rich ``Pager`` that pipes ``content`` to ``argv`` in the locale
+    encoding, escaping what it can't represent, printing it directly
+    instead when ``argv[0]`` isn't found."""
 
     def __init__(self, argv: list[str]) -> None:
         self._argv = argv
@@ -42,9 +44,9 @@ class _SubprocessPager(Pager):
     @override
     def show(self, content: str) -> None:
         try:
-            subprocess.run(self._argv, input=content, text=True, check=False)
+            subprocess.run(self._argv, input=content, text=True, errors="backslashreplace", check=False)
         except FileNotFoundError:
-            print(content, end="")  # noqa: T201 - plain text, past Rich, for the pager
+            print(content, end="")  # noqa: T201 - already rendered by Rich for the pager
 
 
 @contextlib.contextmanager
@@ -64,9 +66,11 @@ def paged(console: Console) -> Iterator[None]:
 
 def render(console: Console, state: CliState, *, json: object, human: Callable[[], None], page: bool = False) -> None:
     """Print ``json`` under ``--json``, else call ``human()`` — inside
-    ``paged(console)`` when ``page`` is true."""
+    ``paged(console)`` when ``page`` is true. JSON is ASCII-escaped on a
+    non-UTF-8 console: ``escape_unencodable_output``'s ``\\U...`` isn't a
+    valid JSON escape."""
     if state.json:
-        console.print_json(data=json)
+        console.print_json(data=json, ensure_ascii=codecs.lookup(console.encoding).name != "utf-8")
         return
     if page:
         with paged(console):

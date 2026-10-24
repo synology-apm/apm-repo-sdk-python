@@ -16,6 +16,7 @@ import heapq
 import itertools
 from collections.abc import AsyncIterator
 
+from ...concurrency import bounded_gather_first_error
 from ...dedup import export_scheduler
 from ...dedup.chunk_walk import count_planned_bytes
 from ...dedup.dedup_file import (
@@ -30,6 +31,10 @@ from ...dedup.export_scheduler import ExportTuning
 from ...dedup.export_sink import ExportWriter, WrittenBytesCallback
 from ...dedup.extent import ExportResult
 from ...dedup.pool_descriptor import PoolDescriptor
+
+#: Fragments one ``read()`` reads from at once; each fragment's
+#: ``DedupFile.read()`` in turn fetches several buckets at once.
+_FRAGMENTS_IN_FLIGHT = 4
 
 
 @dataclasses.dataclass(frozen=True, slots=True)
@@ -107,9 +112,16 @@ class VirtualDiskContentSource:
             # Fast path: one segment covers the whole range, so skip assembly.
             return await frag.dedup_file.read(offset, end - offset)
         out = bytearray(end - offset)
-        for frag, seg_start, seg_end in touching:
+
+        async def fill(segment: tuple[DiskFragment, int, int]) -> None:
+            frag, seg_start, seg_end = segment
             start, stop = max(seg_start, offset), min(seg_end, end)
-            out[start - offset : stop - offset] = await frag.dedup_file.read(start, stop - start)
+            data = await frag.dedup_file.read(start, stop - start)
+            # Sized by what came back, so a short read leaves a zero tail
+            # rather than resizing ``out`` under the other fills.
+            out[start - offset : start - offset + len(data)] = data
+
+        await bounded_gather_first_error(touching, fill, max_concurrent=_FRAGMENTS_IN_FLIGHT)
         return out
 
     def stream(self, block: int = DEFAULT_STREAM_BLOCK) -> AsyncIterator[tuple[int, bytes | bytearray]]:

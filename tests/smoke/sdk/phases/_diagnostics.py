@@ -21,9 +21,9 @@ from ..._shared_refs import close_if_closable, resolve_catalog
 from .._context import RepoInfo, SmokeContext
 
 #: Known, sample-specific data gaps rather than real bugs. A populated
-#: ``version.meta`` (see ``_browsable_versions``) only means the catalog
-#: *claims* the version is browsable; its ``copy_meta_file`` directory can be
-#: gone.
+#: ``version.meta`` or a SaaS version (see ``_browsable_versions``) only means
+#: the catalog *claims* the version is browsable; its ``copy_meta_file``
+#: directory or its stream's version row can be gone.
 _DEGRADE_ON = (NotFoundError, DataCorruptError, ChunkCompactedError, UnsupportedDataFormatError)
 
 
@@ -35,7 +35,8 @@ def _browsable_versions(
         for owner, catalog_id, _workload, versions in workloads
         if owner.sample_name == ri.sample_name
         for version in versions
-        if version.meta is not None
+        # A SaaS version has no copy_target_version_meta row; its stream holds what it browses.
+        if version.meta is not None or version.is_saas
     ]
 
 

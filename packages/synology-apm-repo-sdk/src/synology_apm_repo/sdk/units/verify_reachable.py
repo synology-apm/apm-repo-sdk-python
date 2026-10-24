@@ -34,7 +34,7 @@ from ..errors import (
     ApmRepoError,
     StorageBackendError,
 )
-from ..findings import Finding, VerifyLevel
+from ..findings import Finding, VerifyLevel, VerifyTuning
 from ..presentation.progress import Progress, ProgressCallback
 from .node_ref import canonical_ref_for
 from .saas.stream import SaasStreamCache
@@ -64,8 +64,9 @@ class _ReachabilityWalker(ReachabilitySweep):
         *,
         progress: ProgressCallback | None = None,
         executor: VerifyExecutor | None = None,
+        tuning: VerifyTuning | None = None,
     ) -> None:
-        super().__init__(repo, level, progress=progress, executor=executor)
+        super().__init__(repo, level, progress=progress, executor=executor, tuning=tuning)
         self._saas_streams = SaasStreamCache(repo)
 
     async def close(self) -> None:
@@ -115,9 +116,11 @@ async def verify_reachable(
     *,
     progress: ProgressCallback | None = None,
     executor: VerifyExecutor | None = None,
+    tuning: VerifyTuning | None = None,
 ) -> list[Finding]:
     """Run the top-down, reachability-scoped check and return every
-    ``Finding`` — see ``VerifyLevel`` for what ``level`` controls.
+    ``Finding`` — see ``VerifyLevel`` for what ``level`` controls and
+    ``VerifyTuning`` for ``tuning`` (default ``VerifyTuning()``).
 
     ``progress`` reports two phases: ``phase="discovering"`` (one tick per
     ``(workload, version)`` pair) then ``phase="verifying"`` (one tick
@@ -147,7 +150,7 @@ async def verify_reachable(
             vers = await _listed(versions(repo, workload, include_deleted=False), workload.display_name, findings)
             pairs.extend((workload, version) for version in vers)
 
-    walker = _ReachabilityWalker(repo, level, progress=progress, executor=executor)
+    walker = _ReachabilityWalker(repo, level, progress=progress, executor=executor, tuning=tuning)
     try:
         for index, (workload, version) in enumerate(pairs):
             if progress is not None:

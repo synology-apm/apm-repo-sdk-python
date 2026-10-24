@@ -21,6 +21,7 @@ from synology_apm_repo.sdk import (
 from synology_apm_repo.sdk.identifiers import CatalogId
 
 from ..._shared_refs import close_if_closable, pick_workload_with_retry, prefer_adversarial_name
+from ..._trace_step import trace_step
 from .._context import RepoInfo, SmokeContext
 from ._shared import bounded_read_and_export
 
@@ -54,7 +55,9 @@ async def run_for_repo(ctx: SmokeContext, ri: RepoInfo) -> None:
             )
             continue
 
-        picked, truncated = await pick_workload_with_retry(entries, _ANY_LEAF, prefer=prefer_adversarial_name)
+        # A trace label only: as a ctx.call step it would add a report row.
+        with trace_step("saas", f"{step_prefix}.pick"):
+            picked, truncated = await pick_workload_with_retry(entries, _ANY_LEAF, prefer=prefer_adversarial_name)
         if picked is None:
             if truncated:
                 ctx.check(

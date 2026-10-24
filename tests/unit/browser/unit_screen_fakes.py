@@ -122,7 +122,9 @@ class FakeRepo:
         assert self._version_for_ref_result is not None
         return SimpleNamespace(catalog=self.catalog, workload=None, version=self._version_for_ref_result)
 
-    async def verify(self, level: VerifyLevel = VerifyLevel.QUICK, *, progress: object = None) -> list[Finding]:
+    async def verify(
+        self, level: VerifyLevel = VerifyLevel.QUICK, *, progress: object = None, tuning: object = None
+    ) -> list[Finding]:
         return []
 
     async def invalidate_caches(self, *names: str) -> None:

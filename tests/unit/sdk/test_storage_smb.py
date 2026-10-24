@@ -9,13 +9,14 @@ from __future__ import annotations
 
 import asyncio
 import errno
+import stat
 import sys
 import threading
 from typing import Any
 
 import pytest
 import smbclient
-from smbprotocol.exceptions import SMBAuthenticationError, SMBException
+from smbprotocol.exceptions import FileClosed, SMBAuthenticationError, SMBException
 
 from support.fakes import unchecked_fake
 from synology_apm_repo.sdk.errors import NotFoundError, PermissionDeniedError, StorageBackendError
@@ -81,6 +82,9 @@ class _FakeSmbClientModule:
         self._rendezvous_lock = threading.Lock()
         # -- credit-exhaustion knob (TestCreditExhaustionRetry) --
         self._credit_exhaustion_fail_remaining = credit_exhaustion_fail_count
+        # -- handle-cache tracking (TestHandleCache) --
+        self.opened: list[str] = []
+        self.closed: list[str] = []
 
     def register_session(self, server: str, **kwargs: Any) -> None:
         self.register_calls.append({"server": server, **kwargs})
@@ -129,9 +133,17 @@ class _FakeSmbClientModule:
         return content
 
     def open_file(self, unc: str, mode: str = "rb", **kwargs: Any) -> Any:
+        self._maybe_block(kwargs.get("connection_cache"))
         content = self._content_or_raise(unc)
+        name = unc.rsplit("\\", 1)[-1]
+        self.opened.append(name)
+        fake = self
 
         class _File:
+            # Like a real handle, it reads the content as of its open.
+            pos = 0
+            session = kwargs.get("connection_cache")
+
             def __enter__(self_inner) -> Any:
                 return self_inner
 
@@ -139,10 +151,14 @@ class _FakeSmbClientModule:
                 return None
 
             def read(self_inner, length: int | None = None) -> bytes:
-                return content if length is None else content[:length]
+                end = len(content) if length is None else self_inner.pos + length
+                return content[self_inner.pos : end]
 
             def seek(self_inner, offset: int) -> None:
-                return None
+                self_inner.pos = offset
+
+            def close(self_inner) -> None:
+                fake.closed.append(name)
 
         return _File()
 
@@ -155,6 +171,7 @@ class _FakeSmbClientModule:
 
         class _Stat:
             st_size = len(content)
+            st_mode = stat.S_IFREG
 
         return _Stat()
 
@@ -194,6 +211,108 @@ def _patch_smbclient(monkeypatch: pytest.MonkeyPatch, fake: _FakeSmbClientModule
     monkeypatch.setattr(smbclient, "stat", fake.stat)
     monkeypatch.setattr(smbclient, "scandir", fake.scandir)
     monkeypatch.setattr(smbclient.path, "exists", fake.exists)
+
+
+class TestHandleCache:
+    """Reads keep their file open on the session for the next read of it."""
+
+    async def test_a_repeated_read_reuses_the_open_handle(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        fake = _FakeSmbClientModule({"a": b"aaaa", "b": b"bbbb"})
+        _patch_smbclient(monkeypatch, fake)
+        store = SmbStore("share", server="host")
+        assert await store.read("a", 1, 2) == b"aa"
+        assert await store.read("a") == b"aaaa"
+        await store.read("b")
+        assert fake.opened == ["a", "b"]
+        await store.close()
+        assert sorted(fake.closed) == ["a", "b"]
+
+    async def test_the_least_recently_used_handle_closes_past_the_bound(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        names = [f"f{i}" for i in range(smb_module._SLOT_OPEN_HANDLES + 1)]
+        fake = _FakeSmbClientModule(dict.fromkeys(names, b"x"))
+        _patch_smbclient(monkeypatch, fake)
+        store = SmbStore("share", server="host")
+        for n in names:
+            await store.read(n)
+        assert fake.closed == ["f0"]
+        await store.close()
+
+    async def test_an_idle_handle_is_closed_rather_than_reused(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        fake = _FakeSmbClientModule({"a": b"aaaa"})
+        _patch_smbclient(monkeypatch, fake)
+        clock = [1000.0]
+        monkeypatch.setattr(smb_module, "_monotonic", lambda: clock[0])
+        store = SmbStore("share", server="host")
+        await store.read("a")
+        clock[0] += smb_module._HANDLE_IDLE + 1
+        await store.read("a")
+        assert fake.opened == ["a", "a"]
+        assert fake.closed == ["a"]
+        await store.close()
+
+    @staticmethod
+    async def _break_kept_handle(store: SmbStore, failure: Exception) -> None:
+        await store.read("a")
+        (kept, _) = store._slots[-1].handles["a"]
+
+        def broken_read(length: int | None = None) -> bytes:
+            raise failure
+
+        kept.read = broken_read
+
+    # A handle the server closed fails its read with a raw FileClosed, which
+    # is not an OSError.
+    _STALE_FAILURES = pytest.mark.parametrize(
+        "failure", [OSError(errno.EIO, "boom"), FileClosed()], ids=["oserror", "file_closed"]
+    )
+
+    @_STALE_FAILURES
+    async def test_a_stale_handle_is_replaced_by_a_fresh_open(
+        self, monkeypatch: pytest.MonkeyPatch, failure: Exception
+    ) -> None:
+        fake = _FakeSmbClientModule({"a": b"aaaa"})
+        _patch_smbclient(monkeypatch, fake)
+        store = SmbStore("share", server="host")
+        await self._break_kept_handle(store, failure)
+        assert await store.read("a") == b"aaaa"
+        assert fake.opened == ["a", "a"]
+        assert fake.closed == ["a"]
+        await store.close()
+
+    async def test_a_credit_race_on_a_kept_handle_retries_on_it(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(smb_module, "_CREDIT_RETRY_DELAY", 0.0)
+        fake = _FakeSmbClientModule({"a": b"aaaa"})
+        _patch_smbclient(monkeypatch, fake)
+        store = SmbStore("share", server="host")
+        await store.read("a")
+        (kept, _) = store._slots[-1].handles["a"]
+        intact_read = kept.read
+        races = [SMBException("Request requires 1 credits but only 0 credits are available")]
+
+        def racing_read(length: int | None = None) -> bytes:
+            if races:
+                raise races.pop()
+            return intact_read(length)  # type: ignore[no-any-return]
+
+        kept.read = racing_read
+        assert await store.read("a") == b"aaaa"
+        assert fake.opened == ["a"]
+        assert fake.closed == []
+        await store.close()
+
+    @_STALE_FAILURES
+    async def test_the_fresh_open_after_a_stale_handle_decides(
+        self, monkeypatch: pytest.MonkeyPatch, failure: Exception
+    ) -> None:
+        fake = _FakeSmbClientModule({"a": b"aaaa"})
+        _patch_smbclient(monkeypatch, fake)
+        store = SmbStore("share", server="host")
+        await self._break_kept_handle(store, failure)
+        fake._files.clear()
+        with pytest.raises(NotFoundError, match="no such path"):
+            await store.read("a")
+        assert "a" not in store._slots[-1].handles
+        assert fake.closed == ["a"]
 
 
 class TestSessionLifecycle:
@@ -293,9 +412,9 @@ class TestConnectRetry:
 
 
 _STUCK_TIMEOUT = 0.5
-"""The operation timeout a retry test patches in when a later attempt
-succeeds: long enough that a fast fake operation (a thread round-trip)
-beats it on a heavily loaded machine."""
+"""The operation timeout a test patches in when a call has to reach its
+worker thread within it -- a later attempt that succeeds, or a stuck call a
+test records: long enough for a thread round-trip on a heavily loaded machine."""
 
 _ALWAYS_STUCK_TIMEOUT = 0.01
 """The operation timeout when every attempt is stuck: no fast call has to
@@ -338,6 +457,25 @@ class TestOperationTimeoutAndRetry:
 
         assert used_slot.connection_cache is not original_cache
 
+    async def test_a_timed_out_read_keeps_its_handle_out_of_the_new_session(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(smb_module, "NETWORK_READ_TIMEOUT", _STUCK_TIMEOUT)
+        fake = _FakeSmbClientModule({"a": b"aaaa"}, stuck=True, stuck_only_on_first_connection=True)
+        _patch_smbclient(monkeypatch, fake)
+        store = SmbStore("share", server="host")
+        slot = store._slots[-1]
+
+        try:
+            assert await store.read("a") == b"aaaa"  # 1st attempt's open is stuck; the retry reconnects
+        finally:
+            fake.unstick.set()
+        assert store._executor is not None
+        store._executor.shutdown(wait=True)  # the timed-out read finishes its open
+
+        assert fake.opened == ["a", "a"]
+        assert slot.handles["a"][0].session is slot.connection_cache
+
     async def test_a_persistently_stuck_operation_raises_timeout_after_exhausting_retries(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
@@ -359,7 +497,7 @@ class TestOperationTimeoutAndRetry:
     ) -> None:
         """A timed-out thread keeps running; on the loop's default executor it
         would starve every other ``to_thread()`` caller."""
-        monkeypatch.setattr(smb_module, "NETWORK_READ_TIMEOUT", _ALWAYS_STUCK_TIMEOUT)
+        monkeypatch.setattr(smb_module, "NETWORK_READ_TIMEOUT", _STUCK_TIMEOUT)
         fake = _FakeSmbClientModule({"f.txt": b"hello"}, stuck=True)
         _patch_smbclient(monkeypatch, fake)
         thread_names: list[str] = []

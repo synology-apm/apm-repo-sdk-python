@@ -40,12 +40,12 @@ class TestStrAndParseRoundTrip:
             extra=("Inbox", "Subject"),
         )
         text = str(ref)
-        assert text == "repo/path#cat:1/wl:2/ver:abc-uid/Inbox/Subject"
+        assert text == "repo/path#@cat:1/wl:2/ver:abc-uid/Inbox/Subject"
         assert NodeRef.parse(text) == ref
 
     def test_raw_ref(self) -> None:
         ref = NodeRef.raw("repo/path", "VM-uid/dir/disk.img")
-        assert str(ref) == "repo/path#raw/VM-uid/dir/disk.img"
+        assert str(ref) == "repo/path#@raw/VM-uid/dir/disk.img"
         assert NodeRef.parse(str(ref)) == ref
         assert "/".join(ref.extra_segments) == "VM-uid/dir/disk.img"
 
@@ -59,7 +59,7 @@ class TestStrAndParseRoundTrip:
         # a single logical segment whose *content* happens to contain "/"
         # (e.g. a file_map path) must not be mistaken for multiple
         # segments once encoded and re-split.
-        ref = NodeRef("repo", ("raw", "a/b/c"))
+        ref = NodeRef("repo", ("raw", "a/b/c"), RefKind.RAW)
         text = str(ref)
         assert NodeRef.parse(text) == ref
         assert NodeRef.parse(text).extra_segments == ("a/b/c",)
@@ -104,12 +104,28 @@ class TestCoerce:
 
 class TestKindClassification:
     def test_canonical(self) -> None:
-        ref = NodeRef("repo", ("cat:1", "wl:2", "ver:x"))
+        ref = NodeRef.parse("repo#@cat:1/wl:2/ver:x")
         assert ref.kind is RefKind.CANONICAL
+        assert ref.segments == ("cat:1", "wl:2", "ver:x")
 
     def test_raw(self) -> None:
-        ref = NodeRef("repo", ("raw", "some/path"))
+        ref = NodeRef.parse("repo#@raw/some%2Fpath")
         assert ref.kind is RefKind.RAW
+        assert ref.segments == ("raw", "some/path")
+
+    @pytest.mark.parametrize("name", ["raw", "cat:1", "@home"])
+    def test_a_human_name_that_looks_like_a_keyword_stays_human(self, name: str) -> None:
+        ref = NodeRef.human("repo", name, "wl")
+        assert NodeRef.parse(str(ref)) == ref
+        assert NodeRef.parse(str(ref)).kind is RefKind.HUMAN
+
+    def test_a_human_first_name_starting_with_at_is_escaped(self) -> None:
+        assert str(NodeRef.human("repo", "@home", "@x")) == "repo#%40home/@x"
+
+    @pytest.mark.parametrize("text", ["repo#@", "repo#@ver:1", "repo#@Inbox/raw"])
+    def test_an_unknown_at_form_is_not_a_ref(self, text: str) -> None:
+        with pytest.raises(ValueError, match="'@' must start '@cat:' or '@raw'"):
+            NodeRef.parse(text)
 
     def test_human_is_the_default(self) -> None:
         ref = NodeRef("repo", ("Test-Workload-02", "CORP-PC-001"))
@@ -136,11 +152,11 @@ class TestCanonicalIds:
 
     def test_none_for_a_malformed_canonical_prefix(self) -> None:
         # catalog_id is never int-parsed, so only workload_id can be malformed.
-        ref = NodeRef("repo", ("cat:1", "wl:notanumber", "ver:x"))
+        ref = NodeRef("repo", ("cat:1", "wl:notanumber", "ver:x"), RefKind.CANONICAL)
         assert ref.canonical_ids is None
 
     def test_none_when_canonical_prefix_is_truncated(self) -> None:
-        ref = NodeRef("repo", ("cat:1",))
+        ref = NodeRef("repo", ("cat:1",), RefKind.CANONICAL)
         assert ref.canonical_ids is None
 
 

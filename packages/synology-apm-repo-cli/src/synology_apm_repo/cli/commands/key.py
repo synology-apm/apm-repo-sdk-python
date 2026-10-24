@@ -8,18 +8,17 @@ verify every chunk *read* against its stored fingerprint, use ``verify
 
 from __future__ import annotations
 
-from typing import Annotated, TypedDict
+from typing import TypedDict
 
 import typer
 
 from synology_apm_repo.cli.asyncio_support import typer_async
 from synology_apm_repo.cli.consoles import console
 from synology_apm_repo.cli.errors import err_console
-from synology_apm_repo.cli.options import ProfileOption, RepoArgument
+from synology_apm_repo.cli.options import ProfileOption, RepoArgument, RequiredKeyOption
 from synology_apm_repo.cli.paging import render
 from synology_apm_repo.cli.repo_session import opened_repo_or_profile
 from synology_apm_repo.cli.state import CliState
-from synology_apm_repo.cli.strings import KEY_HELP
 from synology_apm_repo.sdk import KeyStatus, KeyVerification, Repository
 from synology_apm_repo.sdk.presentation import safe
 
@@ -49,13 +48,13 @@ async def key(
     ctx: typer.Context,
     # A required option must precede the defaulted REPO argument in Python;
     # the command line itself takes either order.
-    key_string: Annotated[str, typer.Option("--key", help=KEY_HELP)],
+    key_string: RequiredKeyOption,
     repo: RepoArgument = None,
     profile: ProfileOption = None,
 ) -> None:
     """Verify KEY against REPO and print whether it's correct."""
     state: CliState = ctx.obj
-    async with opened_repo_or_profile(repo, None, profile=profile, state=state) as repository:
+    async with opened_repo_or_profile(ctx, repo, None, profile=profile) as repository:
         result = await repository.set_key(key_string)
         if result.warning is not None:
             # The key verified, but reopening a sibling catalog failed:

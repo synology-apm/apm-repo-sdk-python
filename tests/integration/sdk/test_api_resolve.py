@@ -66,7 +66,7 @@ async def test_replayed_resolve_raw_ref_to_a_real_file_map_leaf(
             path.append(node.name)
 
         assert path == ["1fd2d9bd-faab-4b26-a610-109ccb5a093e", "50", "dedup.img"]
-        assert str(node.ref) == "@ActiveProtectVault#raw/1fd2d9bd-faab-4b26-a610-109ccb5a093e/50/dedup.img"
+        assert str(node.ref) == "@ActiveProtectVault#@raw/1fd2d9bd-faab-4b26-a610-109ccb5a093e/50/dedup.img"
 
         resolved = await (await session.resolve(str(node.ref))).unit()
         assert resolved.name == "dedup.img"

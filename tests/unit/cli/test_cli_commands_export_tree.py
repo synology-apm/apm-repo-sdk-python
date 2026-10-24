@@ -6,6 +6,7 @@ from __future__ import annotations
 import asyncio
 import dataclasses
 import errno
+import json
 import os
 import sys
 from collections.abc import AsyncIterator
@@ -40,12 +41,14 @@ def _file(*segments: str, name: str | None = None) -> Node:
 
 @faithful_to(ContentSource)
 class _Content:
-    """A ``ContentSource`` whose export writes ``data``, then raises ``behaviour`` when one is given."""
+    """A ``ContentSource`` whose export writes ``data``, then raises ``behaviour`` when one is given;
+    it records the ``tuning`` it received."""
 
     def __init__(self, data: bytes = b"data", behaviour: BaseException | None = None) -> None:
         self.size = len(data)
         self._data = data
         self._behaviour = behaviour
+        self.received_tuning: object = None
 
     async def read(self, offset: int = 0, length: int | None = None) -> bytes:
         raise AssertionError("not used in this test")
@@ -66,6 +69,7 @@ class _Content:
         progress: object = None,
         tuning: object = None,
     ) -> ExportResult:
+        self.received_tuning = tuning
         await sink.write_at(0, self._data)
         if self._behaviour is not None:
             raise self._behaviour
@@ -121,6 +125,20 @@ def test_exporting_a_folder_writes_each_item_at_its_path_below_it(
     assert result.stderr == ""
 
 
+def test_workers_flag_reaches_every_item_s_export(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    inner, top = _Content(b"inner"), _Content(b"top")
+    provider = _provider(
+        {_ref(): [_folder("d"), _file("top.txt")], _ref("d"): [_file("d", "f.bin")]},
+        {"d/f.bin": inner, "top.txt": top},
+    )
+    _install(monkeypatch, provider)
+
+    result = _export(tmp_path, "--workers", "3")
+
+    assert result.exit_code == 0, result.output
+    assert [getattr(content.received_tuning, "workers", None) for content in (inner, top)] == [3, 3]
+
+
 def test_quiet_drops_the_folder_summary(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     _install(monkeypatch, _two_files())
 
@@ -159,6 +177,28 @@ def test_an_unsafe_name_is_skipped_reported_and_makes_the_command_exit_1(
         "error: 1 item was not exported",
     ]
     assert " ".join(result.stdout.split()).startswith("exported 1 file to ")
+
+
+def test_json_reports_each_exported_and_skipped_item(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    provider = _provider(
+        {_ref(): [_file("ok.txt"), _file("bad", name="../escape.txt")]},
+        {"ok.txt": _Content(b"ok"), "bad": _Content(b"bad")},
+    )
+    _install(monkeypatch, provider)
+
+    result = _export(tmp_path, global_flags=("--json",))
+
+    assert result.exit_code == 1
+    counts = {"bytes_written": 2, "logical_size": 2, "holes": 0, "zeros": 0}
+    assert json.loads(result.stdout) == {
+        "kind": "folder",
+        "output": str(tmp_path / "out"),
+        "totals": counts,
+        "exported": [{"path": "ok.txt", **counts}],
+        "incomplete": [],
+        "skipped": [{"path": "../escape.txt", "reason": "unsafe_name"}],
+    }
+    assert result.stderr == "error: 1 item was not exported\n"
 
 
 def test_quiet_does_not_hide_a_skipped_item(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -334,7 +374,7 @@ def test_cancelling_reports_how_many_files_were_done(tmp_path: Path, monkeypatch
     result = _export(tmp_path)
 
     assert result.exit_code == 130, result.output
-    assert " ".join(result.stdout.split()) == (
+    assert " ".join(result.stderr.split()) == (
         "cancelled — partial file removed (use --keep-partial to keep it) 1 of 2 files had been exported"
     )
     assert (tmp_path / "out" / "a.txt").exists()
@@ -580,6 +620,6 @@ def test_a_cancel_while_opening_an_item_says_nothing_was_written_for_it(
     result = _export(tmp_path)
 
     assert result.exit_code == 130, result.output
-    assert " ".join(result.stdout.split()) == (
+    assert " ".join(result.stderr.split()) == (
         "cancelled — no output file was ever written 1 of 2 files had been exported"
     )

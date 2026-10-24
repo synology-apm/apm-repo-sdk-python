@@ -139,8 +139,10 @@ bound is visible in one place and `Repository.invalidate_caches()` (the TUI's
    registered first, so a `Table` is dropped before the connection it is bound to
    is closed.
 3. A cache whose values need closing (an `aiosqlite` connection) passes
-   `on_invalidate` that settles in-flight fetches, closes the values, then
-   clears; the default hook only waits for fetches and clears.
+   `on_invalidate` that settles in-flight fetches, clears before its next
+   `await` (`settle_all`'s contract), then closes what it settled; its fetch
+   refuses once the owner is closed. The default hook only waits for fetches
+   and clears.
 4. A cache private to one operation (a verify run's, an export's) is its own
    instance, sized from `CacheLimits`, and is not registered: its lifetime is
    the operation, and sharing it would let a sweep evict interactive entries.
@@ -164,10 +166,11 @@ and `LibiscsiDescriptor` are a worker-capable reference.
 1. Implement `open(logical_size, *, sparse)`, `write_at(offset, data)`,
    `write_zero(offset, length)`, `commit()` and `abort()`, all `async def`,
    plus the `caps` and `preallocated` properties. The lifecycle is the
-   `ExportSink` docstring's; the ordering, alignment and `write_zero` rules
-   are the `ExportWriter` docstring's. A destination that can't accept writes
-   at arbitrary offsets in arbitrary order is not a `RandomAccessExportSink`:
-   see "A destination that takes bytes in order only" below.
+   `ExportSink` docstring's; the ordering, concurrency (writes can overlap),
+   alignment and `write_zero` rules are the `ExportWriter` docstring's. A
+   destination that can't accept writes at arbitrary offsets in arbitrary
+   order is not a `RandomAccessExportSink`: see "A destination that takes
+   bytes in order only" below.
 2. Set `SinkCaps.supports_sparse` honestly: `True` only when a range never
    written reads back as zero. When it is `False`, the scheduler writes
    `HOLE`/`ZERO` ranges as zeros even for a sparse export. `preallocated`
@@ -176,7 +179,8 @@ and `LibiscsiDescriptor` are a worker-capable reference.
    `needs_zero_fill`), and `write_zero` itself must still zero whatever
    range it is given, because a later source can overlap an earlier one's
    data.
-3. Worker-process writes are optional. `RandomAccessExportSink`'s own
+3. Worker-process writes are optional, and happen only for an export whose
+   `ExportTuning.workers` asks for workers. `RandomAccessExportSink`'s own
    `worker_target()` returns `None` and its `note_worker_write()` does
    nothing, so the sink is written in the parent process only: the export
    decodes and writes in-process. To let worker processes write directly,
@@ -217,12 +221,13 @@ memory to `segment_size * max_buffered_segments` and paces the export: when the
 destination is slower, `begin_segment` waits, and `ExportResult.sink_wait_seconds`
 says for how long. `storage="memory"` (the default) holds segments in shared
 memory; `storage="spool"` in a temporary file in `spool_dir` (the default
-temporary directory may itself be memory-backed). Either way worker processes
-write into the buffer directly. A failed flush fails the export at the next
-write, and `abort` waits for the flush in progress before `discard_destination`.
-Choose `segment_size` for the destination's limits (a multipart part's size and
-count, say) and for the exporter, which decodes about one segment's data at a
-time: very small segments keep few worker processes busy.
+temporary directory may itself be memory-backed). Either way worker processes,
+when an export asks for them (`ExportTuning.workers`), write into the buffer
+directly. A failed flush fails the export at the next write, and `abort` waits
+for the flush in progress before `discard_destination`. Choose `segment_size`
+for the destination's limits (a multipart part's size and count, say) and for
+the exporter, which decodes about one segment's data at a time: very small
+segments keep few reads in flight (or few worker processes busy).
 
 ## Adding a New SaaS Workload Provider
 

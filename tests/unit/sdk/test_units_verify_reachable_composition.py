@@ -1,11 +1,12 @@
 """Unit tests for ``synology_apm_repo.sdk.units.verify_reachable``'s
 composition stage (``dedup.verify_walk.ReachabilitySweep.claim_extent``):
-composition-stage findings and map-CRC repair propagation through the
-shared composition-record cache."""
+composition-stage findings, map-CRC repair propagation through the
+shared composition-record cache, and reading each record's bytes once."""
 
 from __future__ import annotations
 
 import dataclasses
+import itertools
 from collections.abc import AsyncIterator
 from pathlib import Path
 
@@ -20,12 +21,14 @@ from support.repo_builders import (
     write_inf_and_fgp,
     write_repo_info,
 )
+from support.store_fakes import WrappingStore
 from synology_apm_repo.sdk.cachemanager import DEFAULT_LIMITS
 from synology_apm_repo.sdk.dedup import verify_walk as verify_walk_module
 from synology_apm_repo.sdk.dedup.composition_reader import CompositionRecord
 from synology_apm_repo.sdk.dedup.repository import DedupRepo
 from synology_apm_repo.sdk.errors import DataCorruptError, NotFoundError
 from synology_apm_repo.sdk.findings import Stage, Symptom, VerifyLevel
+from synology_apm_repo.sdk.format.composition import RecordHead
 from synology_apm_repo.sdk.format.const import REDUNDANCY_COVERAGE_COMPOSITION
 from synology_apm_repo.sdk.identifiers import BucketId, StreamId
 from synology_apm_repo.sdk.storage.layout import RepoKind, RepoLayout
@@ -200,7 +203,7 @@ class TestCompositionStageFindings:
         of ``iter_bucket_keys``, is a ``Finding`` too."""
         from synology_apm_repo.sdk.dedup.dedup_file import DedupFile
 
-        async def failing_get_record(self: DedupFile) -> None:
+        async def failing_get_record(self: DedupFile, *, record_head: RecordHead | None = None) -> None:
             raise NotFoundError("synthetic record-fetch failure", ref="synthetic")
 
         monkeypatch.setattr(DedupFile, "cached_record", failing_get_record)
@@ -544,3 +547,113 @@ class TestMapCrcRepairPropagation:
                 await verify_reachable(repo, VerifyLevel.QUICK)
         finally:
             await repo.close()
+
+
+class _RangeRecordingStore(WrappingStore):
+    """Records every ``read``'s ``(path, offset, length)``."""
+
+    def __init__(self, backing: LocalFsStore) -> None:
+        super().__init__(backing)
+        self.reads: list[tuple[str, int, int | None]] = []
+
+    async def read(self, path: str, offset: int = 0, length: int | None = None) -> bytes:
+        self.reads.append((path, offset, length))
+        return await super().read(path, offset, length)
+
+
+class TestCompositionReadOnce:
+    async def test_a_multi_page_record_is_read_once_per_byte(self, tmp_path: Path) -> None:
+        """The ``RecordHead`` and chunk-map array ``claim_extent``'s CRC check
+        reads are handed to the shared ``CompositionRecord``, so the bucket
+        walk re-reads none of the record's bytes."""
+        map_num = 2048 + 1  # two pages
+        plaintexts = [bytes([1]) * 4096]
+        dedup_img_path = write_fs_workload(
+            tmp_path,
+            workload_id=10,
+            version_uid="vuid-1",
+            target_id="fsA",
+            meta_dirname="FSA_meta",
+            dedup_version_id=1,
+            dedup_img_size=map_num * 4096,
+        )
+        write_file_map(tmp_path / "db" / "file_map", [(dedup_img_path, _STREAM_ID, _SESSION_ID, _COMP_OFFSET, 1, 2)])
+        write_composition_entries(
+            tmp_path / "@data" / "Composition",
+            b"".join(mapping_record(i * 4096, 0, 0, map_num=1) for i in range(map_num)),
+            stream_id=_STREAM_ID,
+            session_id=_SESSION_ID,
+        )
+        write_bucket(tmp_path / "@data" / "Pool" / "0" / "0.buk", plaintexts)
+        write_inf_and_fgp(tmp_path / "@data" / "Pool", plaintexts)
+        write_repo_info(tmp_path / "repo_info")
+        write_connection_config(tmp_path / "db" / "connection_config", [(1, "conn-a", 1)])
+        store = _RangeRecordingStore(LocalFsStore(tmp_path))
+
+        repo = await DedupRepo.open(store, RepoLayout(kind=RepoKind.VAULT, repo_root=""))
+        try:
+            findings = await verify_reachable(repo, VerifyLevel.QUICK)
+        finally:
+            await repo.close()
+
+        assert findings == []
+        spans = sorted(
+            (offset, offset + length)
+            for path, offset, length in store.reads
+            if "/Composition/" in path and length is not None
+        )
+        assert spans[-1][1] == _COMP_OFFSET + 32 + map_num * 20  # the walk did reach the array's end
+        assert all(end <= next_start for (_, end), (next_start, _) in itertools.pairwise(spans))
+
+    async def test_a_shared_records_head_is_read_once_after_the_record_cache_evicted_it(self, tmp_path: Path) -> None:
+        """Two versions share one record and ``composition_records=0`` evicts
+        it between their visits: the second visit's fresh
+        ``CompositionRecord`` takes the head the first check parsed."""
+        plaintexts = [bytes([1]) * 4096]
+        img_a = write_fs_workload(
+            tmp_path,
+            workload_id=10,
+            version_uid="vuid-a",
+            target_id="fsA",
+            meta_dirname="FSA_meta",
+            dedup_version_id=1,
+            dedup_img_size=4096,
+        )
+        img_b = write_fs_workload(
+            tmp_path,
+            workload_id=11,
+            version_uid="vuid-b",
+            target_id="fsB",
+            meta_dirname="FSB_meta",
+            dedup_version_id=1,
+            dedup_img_size=4096,
+        )
+        write_file_map(
+            tmp_path / "db" / "file_map",
+            [
+                (img_a, _STREAM_ID, _SESSION_ID, _COMP_OFFSET, 1, 2),
+                (img_b, _STREAM_ID, _SESSION_ID, _COMP_OFFSET, 1, 2),
+            ],
+        )
+        write_composition_entries(
+            tmp_path / "@data" / "Composition",
+            mapping_record(0, 0, 0, map_num=1),
+            stream_id=_STREAM_ID,
+            session_id=_SESSION_ID,
+        )
+        write_bucket(tmp_path / "@data" / "Pool" / "0" / "0.buk", plaintexts)
+        write_inf_and_fgp(tmp_path / "@data" / "Pool", plaintexts)
+        write_repo_info(tmp_path / "repo_info")
+        write_connection_config(tmp_path / "db" / "connection_config", [(1, "conn-a", 1)])
+        store = _RangeRecordingStore(LocalFsStore(tmp_path))
+        limits = dataclasses.replace(DEFAULT_LIMITS, composition_records=0)
+
+        repo = await DedupRepo.open(store, RepoLayout(kind=RepoKind.VAULT, repo_root=""), limits=limits)
+        try:
+            findings = await verify_reachable(repo, VerifyLevel.QUICK)
+        finally:
+            await repo.close()
+
+        assert findings == []
+        head_reads = [r for r in store.reads if "/Composition/" in r[0] and r[1:] == (_COMP_OFFSET, 32)]
+        assert len(head_reads) == 1

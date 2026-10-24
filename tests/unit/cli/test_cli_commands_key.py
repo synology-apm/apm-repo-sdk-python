@@ -33,7 +33,7 @@ def _fake_session(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 def test_partial_reopen_failure_reports_the_verified_key_and_warns_instead_of_failing(tmp_path: Path) -> None:
-    result = invoke(["key", str(tmp_path), "--key", "userKeyID@dGVzdA=="])
+    result = invoke(["key", str(tmp_path), "--key", "AliceKey0001@AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8="])
     # The warning goes to stderr, so a script reading stdout sees only the verified key.
     assert result.stdout == "verified\n  gcm_ok=True\n"
     assert " ".join(result.stderr.split()) == (

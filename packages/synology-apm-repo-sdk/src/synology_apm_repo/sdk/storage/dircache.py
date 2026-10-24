@@ -22,7 +22,7 @@ from ..asynccache import AsyncKeyedCache, CacheStats
 from ..cachemanager import DEFAULT_LIMITS
 from .base import ObjectStore
 
-_SEQ_SUFFIX_RE = re.compile(r"^(?P<base>.+)\.(?P<seq>\d+)$")
+_SEQ_SUFFIX_RE = re.compile(r"^(?P<base>.+)\.(?P<seq>[0-9]+)$")
 
 
 def split_seq_suffix(name: str) -> tuple[str, int | None]:
@@ -72,6 +72,12 @@ class DirCache:
         (``split_seq_suffix``).
         """
         return (await self._listings.resolve(dir_path)).grouped
+
+    async def entry_sizes(self, dir_path: str) -> dict[str, int | None]:
+        """Every entry name in ``dir_path`` with the size the listing reported
+        for it (``None``: no size, or a directory), from the cached listing."""
+        listing = await self._listings.resolve(dir_path)
+        return {name: listing.sizes.get(name) for names in listing.grouped.values() for name in names}
 
     async def size_of(self, dir_path: str, name: str) -> int | None:
         """The size of ``name`` (a physical entry name) in ``dir_path`` as the

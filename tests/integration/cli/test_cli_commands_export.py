@@ -32,7 +32,7 @@ def test_exports_a_small_non_dedup_file_replayed(tmp_path: Path) -> None:
 def test_failed_export_leaves_no_final_file_replayed(tmp_path: Path) -> None:
     dst = tmp_path / "out.bin"
     # A canonical ref naming a version UUID that doesn't exist.
-    bogus_ref = "#cat:1/wl:2/ver:00000000-0000-0000-0000-000000000000"
+    bogus_ref = "#@cat:1/wl:2/ver:00000000-0000-0000-0000-000000000000"
     result = invoke(["export", bogus_ref, "-o", str(dst), "--profile", "anything"], exit_code=None)
     assert result.exit_code != 0
     assert not dst.exists()

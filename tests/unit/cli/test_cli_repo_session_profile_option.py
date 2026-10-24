@@ -135,10 +135,10 @@ def test_doctor_shows_catalog_id_when_verbose(monkeypatch: pytest.MonkeyPatch) -
 
 
 def test_doctor_requires_exactly_one_of_repo_or_profile() -> None:
-    result = invoke(["doctor"], exit_code=1)
+    result = invoke(["doctor"], exit_code=2)
     assert "exactly one of REPO or --profile" in result.output
 
 
 def test_doctor_rejects_both_repo_and_profile(tmp_path: object) -> None:
-    result = invoke(["doctor", str(tmp_path), "--profile", "demo"], exit_code=1)
+    result = invoke(["doctor", str(tmp_path), "--profile", "demo"], exit_code=2)
     assert "exactly one of REPO or --profile" in result.output

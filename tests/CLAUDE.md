@@ -207,10 +207,10 @@ backed-up content's own meaning (a real file's content, a message's
 subject, a photo). A code path that can't be proven without asserting on
 content's meaning gets a synthetic test instead. `record_target` installs
 a `ContentRecordingBlocked` guard on every `RestorableUnit.of()`'s content
-and on `BucketReader.read_chunk`/`read_chunks`, on a replay as on a
-recording, so a test that reads real content fails the same way in both;
-`record_target(name, allow_content=True)` is the opt-out for a test that
-needs real content bytes as a structural oracle (see
+and on `BucketReader.read_chunk`/`read_chunks`/`read_chunk_blocks`, on a
+replay as on a recording, so a test that reads real content fails the same
+way in both; `record_target(name, allow_content=True)` is the opt-out for a
+test that needs real content bytes as a structural oracle (see
 `tests/integration/sdk/test_dedup_repository.py`). If a replay test can't
 prove real-data resolution without materializing content (e.g. a
 `LazyArtifact`, whose `.size` is `None` until assembled), assert on the
@@ -299,7 +299,7 @@ changes, not only its call shape.
 **Everything this repository stores is synthetic or anonymized** — every
 fixture, every test's source, every environment variable a test reads by
 name. A test that navigates to a specific real target uses a **canonical**
-ref (`cat:<id>/wl:<id>/ver:<uid>`, optionally `/device:<id>/object:<id>`)
+ref (`#@cat:<id>/wl:<id>/ver:<uid>`, optionally `/device:<id>/object:<id>`)
 or another stable catalog identifier (`workload_id`, `version_id`,
 `stream_uuid`, `connection_config_id`): anonymization never touches these,
 so the same ref resolves the same node in the anonymized fixture and in a
@@ -395,6 +395,9 @@ an SDK/Store/provider dispatch, even a fast one. To observe a transient
 state (a loading indicator), hold the operation behind it open until the
 test has seen it (see `test_browser_app_hex_filter_refresh.py`'s
 loading-indicator tests).
+
+To land a step between Textual removing a screen's widgets and its
+`on_unmount`, use `step_until_pruned`.
 
 To assert that something *never* happens, wait for the point at which it
 would have happened, then assert: `settle(pilot)` when only queued messages

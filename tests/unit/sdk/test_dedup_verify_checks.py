@@ -80,8 +80,9 @@ class TestCheckMapAndAttrCrcEmpty:
         record_head = RecordHead(
             status=CompositionStatus.COMPLETE, map_num=0, map_crc=0, mode=0, attr_leng=0, attr_crc=0
         )
-        findings, repaired = await check_map_and_attr_crc(reader, 64, record_head, path="some/path")
+        findings, verified, repaired = await check_map_and_attr_crc(reader, 64, record_head, path="some/path")
         assert findings == []
+        assert verified is None
         assert repaired is None
 
 
@@ -332,11 +333,12 @@ class TestCheckMapAndAttrCrcErrors:
             status=CompositionStatus.COMPLETE, map_num=1, map_crc=0, mode=0, attr_leng=0, attr_crc=0
         )
 
-        findings, repaired = await check_map_and_attr_crc(reader, 64, record_head, path="some/path")
+        findings, verified, repaired = await check_map_and_attr_crc(reader, 64, record_head, path="some/path")
 
         assert len(findings) == 1
         assert findings[0].stage is Stage.COMPOSITION
         assert findings[0].symptom is Symptom.DATA_MISSING
+        assert verified is None
         assert repaired is None
 
     async def test_map_crc_mismatch_is_repaired_via_parity_when_recoverable(self, tmp_path: Path) -> None:
@@ -360,11 +362,12 @@ class TestCheckMapAndAttrCrcErrors:
             status=CompositionStatus.COMPLETE, map_num=500, map_crc=map_crc, mode=0, attr_leng=0, attr_crc=0
         )
 
-        findings, repaired = await check_map_and_attr_crc(reader, 64, record_head, path="some/path")
+        findings, verified, repaired = await check_map_and_attr_crc(reader, 64, record_head, path="some/path")
 
         assert len(findings) == 1
         assert findings[0].stage is Stage.COMPOSITION
         assert findings[0].symptom is Symptom.REPAIRED_VIA_PARITY
+        assert verified is None
         assert repaired == map_array
 
     async def test_map_crc_mismatch_is_reported(self, tmp_path: Path) -> None:
@@ -380,11 +383,12 @@ class TestCheckMapAndAttrCrcErrors:
             attr_crc=0,
         )
 
-        findings, repaired = await check_map_and_attr_crc(reader, 64, record_head, path="some/path")
+        findings, verified, repaired = await check_map_and_attr_crc(reader, 64, record_head, path="some/path")
 
         assert len(findings) == 1
         assert findings[0].stage is Stage.COMPOSITION
         assert findings[0].symptom is Symptom.MISMATCH
+        assert verified is None
         assert repaired is None
 
     async def test_attr_crc_mismatch_is_reported(self, tmp_path: Path) -> None:
@@ -403,11 +407,12 @@ class TestCheckMapAndAttrCrcErrors:
             attr_crc=(zlib.crc32(attr_bytes) & 0xFFFFFFFF) ^ 0xFFFFFFFF,  # deliberately wrong
         )
 
-        findings, repaired = await check_map_and_attr_crc(reader, 64, record_head, path="some/path")
+        findings, verified, repaired = await check_map_and_attr_crc(reader, 64, record_head, path="some/path")
 
         assert len(findings) == 1
         assert findings[0].stage is Stage.COMPOSITION
         assert findings[0].symptom is Symptom.MISMATCH
+        assert verified == map_array  # map_crc matched; only the attribute blob is bad
         assert repaired is None
 
 

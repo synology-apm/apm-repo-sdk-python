@@ -1,10 +1,10 @@
 """Exporting a ``RestorableUnit``'s content: the sink contract a consumer
 implements for its own destination (``ExportSink`` and the writers it
 hands out), the built-in ``LocalFileSink``/``BufferedExportSink``,
-``run_export``, the folder-export helpers that plan, check and run a
-whole subtree into a local directory, and ``preload_resource_tracker``,
-the start-up hook a frontend that captures stderr calls before export or
-verify starts a worker pool.
+``run_export`` and the ``ExportTuning`` it takes, the folder-export
+helpers that plan, check and run a whole subtree into a local directory,
+and ``preload_resource_tracker``, the start-up hook a frontend that
+captures stderr calls before export or verify starts a worker pool.
 """
 
 from __future__ import annotations
@@ -27,6 +27,7 @@ from .api.export_tree import (
 )
 from .concurrency import preload_resource_tracker
 from .dedup.buffered_export_sink import BufferedExportSink, FlushableSegment
+from .dedup.export_scheduler import MAX_EXPORT_WORKERS, ExportTuning
 from .dedup.export_sink import (
     AbortOutcome,
     ExportSink,
@@ -43,11 +44,13 @@ from .dedup.extent import ExportResult
 from .dedup.local_file_sink import LocalFileSink
 
 __all__ = [
+    "MAX_EXPORT_WORKERS",
     "AbortOutcome",
     "BufferedExportSink",
     "ExportProgressCallback",
     "ExportResult",
     "ExportSink",
+    "ExportTuning",
     "ExportWriter",
     "FlushableSegment",
     "IncompleteItem",

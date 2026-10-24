@@ -49,9 +49,12 @@ class UnitKind(enum.Enum):
 class FileState(enum.Enum):
     """A disk-fs file's cloud-sync/encryption state, carried as
     ``Node.file_state`` — produced other than ``NORMAL`` only by ``units/content/
-    disk_fs/``'s NTFS/APFS backends. ``CLOUD_ONLY`` always wins over
-    ``ENCRYPTED`` when both apply: an evicted cloud placeholder has no
-    local bytes to export regardless of EFS encryption."""
+    disk_fs/``'s NTFS/APFS backends. ``CLOUD_ONLY`` marks a cloud-sync file
+    whose content may be missing: on APFS a dataless one, on NTFS any
+    cloud-tagged one, downloaded or not. A file both cloud-sync and
+    EFS-encrypted is listed ``CLOUD_ONLY``; opening it raises
+    ``ContentUnavailableError`` with the cloud-sync reason when it lacks
+    its complete data, else with the EFS reason."""
 
     NORMAL = "normal"
     ENCRYPTED = "encrypted"

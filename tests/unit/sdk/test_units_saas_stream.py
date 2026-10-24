@@ -11,7 +11,7 @@ import sqlite3
 from collections.abc import AsyncIterator
 from pathlib import Path
 from types import SimpleNamespace
-from typing import cast
+from typing import Any, cast
 
 import pytest
 
@@ -27,6 +27,7 @@ from support.repo_builders import (
     write_saas_version_db,
     write_vault_encryption_key_db,
 )
+from support.store_fakes import WrappingStore
 from synology_apm_repo.sdk.cachemanager import DEFAULT_LIMITS
 from synology_apm_repo.sdk.catalog.version import Version
 from synology_apm_repo.sdk.dedup.repository import DedupRepo
@@ -171,14 +172,16 @@ class TestVersionChain:
     async def test_stream_version_for_unknown_snapshot_uuid_raises_not_found(self, repo: DedupRepo) -> None:
         bad_version = dataclasses.replace(_version(), saas_snapshot_uuid=SnapshotUuid("no-such-uuid"))
         async with SaasStream(repo, _CCID, _STREAM_UUID) as stream:
-            with pytest.raises(NotFoundError, match="no snapshot_info row for snapshot_uuid"):
+            with pytest.raises(NotFoundError, match="snapshot is missing from its backup stream"):
                 await stream.stream_version_for(bad_version)
 
     async def test_stream_version_for_unknown_version_id_raises_not_found(self, repo: DedupRepo) -> None:
         bad_version = _version(saas_version_id=999)
         async with SaasStream(repo, _CCID, _STREAM_UUID) as stream:
-            with pytest.raises(NotFoundError, match="no version_info row for snapshot_id"):
+            with pytest.raises(NotFoundError, match="version is missing from its backup stream") as caught:
                 await stream.stream_version_for(bad_version)
+        assert caught.value.safe_message == "this version is missing from its backup stream"
+        assert caught.value.ref is not None and caught.value.ref.endswith(_STREAM_UUID)
 
     async def test_stream_version_for_raises_not_found_when_snapshot_info_table_is_missing(
         self, tmp_path: Path
@@ -507,6 +510,15 @@ class TestResourceManagement:
         assert closed == [second]
         assert len(stream._sources) == 0
 
+    async def test_a_closed_stream_refuses_to_open_a_source(self, repo: DedupRepo) -> None:
+        # A caller still holding a stream its cache closed would otherwise
+        # open a source nothing ever closes.
+        stream = SaasStream(repo, _CCID, _STREAM_UUID)
+        await stream.close()
+        with pytest.raises(RuntimeError, match="SaasStream is closed"):
+            await stream.stream_version_for(_version())
+        assert len(stream._sources) == 0
+
     async def test_context_manager_closes_on_exit(self, repo: DedupRepo) -> None:
         async with SaasStream(repo, _CCID, _STREAM_UUID) as stream:
             await stream.stream_version_for(_version())
@@ -569,6 +581,49 @@ class TestBoundedEviction:
         await cache._stream_for((2, "b"))
         await cache.close()
         assert sorted(closed) == [(1, "a"), (2, "b")]
+
+    async def test_invalidate_closes_every_stream_and_keeps_serving_lookups(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        closed = self._install_fake_stream(monkeypatch)
+        cache = SaasStreamCache(repo=None, maxsize=8)  # type: ignore[arg-type]
+        first = await cache._stream_for((1, "a"))
+        await cache.invalidate()
+        assert closed == [(1, "a")]
+        assert await cache._stream_for((1, "a")) is not first
+
+    async def test_an_invalidate_cancelled_mid_sweep_still_closes_every_stream(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        closed = self._install_fake_stream(monkeypatch)
+        cache = SaasStreamCache(repo=None, maxsize=8)  # type: ignore[arg-type]
+        first = await cache._stream_for((1, "a"))
+        await cache._stream_for((2, "b"))
+        closing, release = asyncio.Event(), asyncio.Event()
+        real_close = first.close
+
+        async def slow_close() -> None:
+            closing.set()
+            await release.wait()
+            await real_close()
+
+        monkeypatch.setattr(first, "close", slow_close)
+        task = asyncio.ensure_future(cache.invalidate())
+        await closing.wait()
+        task.cancel()
+        await asyncio.sleep(0)
+        release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert sorted(closed) == [(1, "a"), (2, "b")]
+
+    async def test_a_closed_cache_refuses_to_build_a_stream(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        closed = self._install_fake_stream(monkeypatch)
+        cache = SaasStreamCache(repo=None, maxsize=8)  # type: ignore[arg-type]
+        await cache.close()
+        with pytest.raises(RuntimeError, match="SaasStreamCache is closed"):
+            await cache._stream_for((1, "a"))
+        assert cache._streams == {} and closed == []
 
     async def test_cache_stats_count_hits_misses_and_evictions(self, monkeypatch: pytest.MonkeyPatch) -> None:
         self._install_fake_stream(monkeypatch)
@@ -794,23 +849,33 @@ class TestOneSourcePerFile:
 
             assert len(stream._sources) == 2  # saas_snapshot + saas_version, not three
 
-    async def test_a_healthy_bare_file_costs_no_directory_listing(self, tmp_path: Path) -> None:
+    async def test_a_healthy_bare_file_costs_one_listing_and_no_sidecar_probe(self, tmp_path: Path) -> None:
+        # One listing of the stream's db/ answers for both files' -wal/-shm,
+        # instead of four exists() probes.
         _build_saas_repo(tmp_path)
         listed: list[str] = []
+        probed: list[str] = []
         real_listdir = LocalFsStore.listdir
+        real_exists = LocalFsStore.exists
 
         async def spying_listdir(self: LocalFsStore, path: str) -> list[Entry]:
             listed.append(path)
             return await real_listdir(self, path)
+
+        async def spying_exists(self: LocalFsStore, path: str) -> bool:
+            probed.append(path)
+            return await real_exists(self, path)
 
         store = LocalFsStore(tmp_path)
         layout = RepoLayout(kind=RepoKind.VAULT, repo_root="")
         async with await DedupRepo.open(store, layout) as r, SaasStream(r, _CCID, _STREAM_UUID) as stream:
             with pytest.MonkeyPatch.context() as mp:
                 mp.setattr(LocalFsStore, "listdir", spying_listdir)
+                mp.setattr(LocalFsStore, "exists", spying_exists)
                 await stream.stream_version_for(_version())
 
-        assert not any(path.endswith("/db") and "saas" in path for path in listed)
+        assert len([path for path in listed if path.endswith("/db") and "saas" in path]) == 1
+        assert not [path for path in probed if path.endswith(("-wal", "-shm"))]
 
     async def test_the_stream_lists_its_db_directory_through_the_repositorys_shared_cache(self, tmp_path: Path) -> None:
         _build_saas_repo(tmp_path)
@@ -860,26 +925,32 @@ class TestOneSourcePerFile:
             assert len(stream._sources) == 3
 
 
-class TestBareFileProbedOncePerFile:
-    async def test_version_info_and_stream_info_ask_whether_the_bare_file_exists_once(self, tmp_path: Path) -> None:
+class TestBareFileAnsweredFromTheListing:
+    async def test_the_stream_db_dir_is_listed_once_and_no_bare_file_is_probed(self, tmp_path: Path) -> None:
         _build_saas_repo(tmp_path)
         store = LocalFsStore(tmp_path)
         layout = RepoLayout(kind=RepoKind.VAULT, repo_root="")
         probed: list[str] = []
+        listed: list[str] = []
         real_exists = LocalFsStore.exists
+        real_listdir = LocalFsStore.listdir
 
         async def spying_exists(self: LocalFsStore, path: str) -> bool:
             probed.append(path)
             return await real_exists(self, path)
 
+        async def spying_listdir(self: LocalFsStore, path: str) -> list[Entry]:
+            listed.append(path)
+            return await real_listdir(self, path)
+
         async with await DedupRepo.open(store, layout) as r, SaasStream(r, _CCID, _STREAM_UUID) as stream:
             with pytest.MonkeyPatch.context() as mp:
                 mp.setattr(LocalFsStore, "exists", spying_exists)
+                mp.setattr(LocalFsStore, "listdir", spying_listdir)
                 await stream.open_saas_obj(_version())  # snapshot_info, version_info and stream_info
 
-        bare_probes = [path for path in probed if path.endswith(("/saas_snapshot", "/saas_version"))]
-        assert sorted(bare_probes) == sorted(set(bare_probes))  # each bare file asked about exactly once
-        assert len(bare_probes) == 2
+        assert not [path for path in probed if path.endswith(("/saas_snapshot", "/saas_version"))]
+        assert listed.count(f"saas/{_CCID}/{_STREAM_UUID}/db") == 1
 
 
 class TestUnopenableBareFile:
@@ -891,15 +962,30 @@ class TestUnopenableBareFile:
         (stream_db_dir / "saas_snapshot.3").write_bytes((stream_db_dir / "saas_snapshot").read_bytes())
         real_open = SqliteSource.from_raw_store.__func__  # type: ignore[attr-defined]
 
-        async def failing_for_bare(cls: type[SqliteSource], store: object, path: str) -> SqliteSource:
+        async def failing_for_bare(cls: type[SqliteSource], /, store: object, path: str, **kwargs: Any) -> SqliteSource:
             if path.endswith("/saas_snapshot"):
                 raise DataCorruptError("simulated: not a database", ref=path)
-            return cast(SqliteSource, await real_open(cls, store, path))
+            return cast(SqliteSource, await real_open(cls, store, path, **kwargs))
 
         monkeypatch.setattr(SqliteSource, "from_raw_store", classmethod(failing_for_bare))
         store = LocalFsStore(tmp_path)
         layout = RepoLayout(kind=RepoKind.VAULT, repo_root="")
         async with await DedupRepo.open(store, layout) as r, SaasStream(r, _CCID, _STREAM_UUID) as stream:
+            assert await stream.stream_version_for(_version()) == 1
+
+
+class TestListedBareFileGone:
+    async def test_a_bare_file_gone_after_the_listing_falls_back_to_the_generation(self, tmp_path: Path) -> None:
+        _build_saas_repo(tmp_path)
+        stream_db_dir = tmp_path / "saas" / str(_CCID) / _STREAM_UUID / "db"
+        (stream_db_dir / "saas_snapshot.3").write_bytes((stream_db_dir / "saas_snapshot").read_bytes())
+        # Not a LocalFsStore: the file is read through the store, as remotely.
+        store = WrappingStore(LocalFsStore(tmp_path))
+        layout = RepoLayout(kind=RepoKind.VAULT, repo_root="")
+        async with await DedupRepo.open(store, layout) as r, SaasStream(r, _CCID, _STREAM_UUID) as stream:
+            # Listed (and kept: a snapshot), then gone before it is opened.
+            await r.dir_cache.entry_sizes(f"saas/{_CCID}/{_STREAM_UUID}/db")
+            (stream_db_dir / "saas_snapshot").unlink()
             assert await stream.stream_version_for(_version()) == 1
 
 

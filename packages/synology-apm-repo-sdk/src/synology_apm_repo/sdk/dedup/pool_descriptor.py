@@ -12,7 +12,13 @@ from typing import Any, Protocol, override, runtime_checkable
 
 from .._util.closing import AsyncClosing
 from ..cachemanager import DEFAULT_LIMITS, CacheLimits
-from ..concurrency import close_worker_loop, new_process_pool, run_in_worker_loop, shutdown_pool
+from ..concurrency import (
+    close_worker_loop,
+    default_worker_count,
+    new_process_pool,
+    run_in_worker_loop,
+    shutdown_pool,
+)
 from ..storage.base import ObjectStore
 from ..storage.dircache import DirCache
 from ..storage.store_descriptor import StoreDescriptor, describe_store, rebuild_store
@@ -29,6 +35,15 @@ class PoolDescriptor:
     vault_key: bytes | None
     verify: VerifyPolicy = NO_VERIFY
     limits: CacheLimits = DEFAULT_LIMITS
+
+    @override
+    def __repr__(self) -> str:
+        # vault_key is a secret like KeyMaterial.user_key; see its __repr__.
+        vault_key_repr = "<redacted>" if self.vault_key is not None else None
+        return (
+            f"PoolDescriptor(store_descriptor={self.store_descriptor!r}, pool_root={self.pool_root!r}, "
+            f"vault_key={vault_key_repr}, verify={self.verify!r}, limits={self.limits!r})"
+        )
 
     @classmethod
     def from_pool(cls, pool: Pool) -> PoolDescriptor | None:
@@ -117,14 +132,22 @@ class BoundProcessPool(AsyncClosing):
 
     Attributes:
         pool_descriptor: The repository the workers serve.
+        max_workers: How many worker processes there are, which is also how
+            many tasks to keep in flight.
         process_pool: The underlying executor, for ``concurrency.dispatch_to_pool``.
     """
 
     def __init__(
-        self, pool_descriptor: PoolDescriptor, *, initializer: Callable[..., None], initargs: tuple[Any, ...]
+        self,
+        pool_descriptor: PoolDescriptor,
+        *,
+        initializer: Callable[..., None],
+        initargs: tuple[Any, ...],
+        max_workers: int | None = None,
     ) -> None:
         self.pool_descriptor = pool_descriptor
-        self.process_pool = new_process_pool(initializer=initializer, initargs=initargs)
+        self.max_workers = max_workers if max_workers is not None else default_worker_count()
+        self.process_pool = new_process_pool(max_workers=self.max_workers, initializer=initializer, initargs=initargs)
 
     def accepts_pool(self, pool_descriptor: PoolDescriptor | None) -> bool:
         """Whether work on ``pool_descriptor``'s repository may run here."""

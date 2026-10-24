@@ -68,7 +68,9 @@ class _Format:
     content_unavailable: Callable[[object], str | None]
     """``entry -> reason``, or ``None`` if this format has no cloud-sync/
     encryption concept or this entry looks normal. Checked before
-    ``.open()``, so it must not read content."""
+    ``open_stream``, so it must not read content."""
+    open_stream: Callable[[object], BinaryIO]
+    """``entry -> stream`` over a resolved file entry's content."""
 
 
 def _module_open(module_path: str, class_name: str) -> Callable[[BinaryIO], object]:
@@ -98,6 +100,12 @@ def _default_size(entry: object) -> int | None:
         return None
 
 
+def _default_open_stream(entry: object) -> BinaryIO:
+    """``_Format.open_stream`` via the entry's own ``.open()``; every format
+    except APFS (``_apfs._apfs_open_stream``)."""
+    return entry.open()  # type: ignore[attr-defined,no-any-return]
+
+
 def _default_content_unavailable(entry: object) -> None:
     """``_Format.content_unavailable`` for a format with no cloud-sync/
     encryption concept (ext2/3/4, XFS, Btrfs, FAT): always ``None``."""
@@ -108,5 +116,5 @@ def _default_content_unavailable(entry: object) -> None:
 #: (unlike ``Node.file_state``, which a presentation layer renders its own
 #: way). ``_CLOUD_ONLY_REASON`` serves NTFS and APFS, ``_ENCRYPTED_REASON``
 #: NTFS only; this SDK has no key material to attempt decryption.
-_CLOUD_ONLY_REASON = "cloud-sync placeholder — no data at backup time"
+_CLOUD_ONLY_REASON = "cloud-sync placeholder — no complete data at backup time"
 _ENCRYPTED_REASON = "EFS-encrypted — no key to decrypt it"

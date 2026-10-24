@@ -10,6 +10,8 @@ from __future__ import annotations
 import asyncio
 from typing import Any, cast
 
+import pytest
+
 from support.fakes import faithful_to, unchecked_fake
 from synology_apm_repo.sdk.storage.azure import AzureStore, AzureStoreDescriptor
 from synology_apm_repo.sdk.storage.base import Entry, ObjectStore
@@ -119,3 +121,18 @@ def test_rebuilt_local_fs_store_reads_the_same_bytes_as_the_original(tmp_path: s
 
     original_bytes, rebuilt_bytes = asyncio.run(_read_both())
     assert original_bytes == rebuilt_bytes == b"world"
+
+
+@pytest.mark.parametrize(
+    "descriptor",
+    [
+        S3StoreDescriptor(bucket="b", client_kwargs={"aws_secret_access_key": "s3cr3t"}),
+        AzureStoreDescriptor(container="c", client_kwargs={"credential": "s3cr3t"}),
+        SmbStoreDescriptor(share="s", server="h", port=445, username="admin", password="s3cr3t"),
+    ],
+    ids=["s3", "azure", "smb"],
+)
+def test_a_descriptor_repr_redacts_its_credentials(descriptor: object) -> None:
+    # A descriptor travels to worker processes, where a traceback or log line may repr it.
+    assert "s3cr3t" not in repr(descriptor)
+    assert "<redacted>" in repr(descriptor)

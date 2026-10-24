@@ -10,11 +10,21 @@ import contextlib
 import dataclasses
 from collections.abc import AsyncIterator, Callable
 
+import typer
+
 from synology_apm_repo.cli.errors import fail_from_apm_error, require_one_of
 from synology_apm_repo.cli.progress_render import build_progress_meter, finish_live_progress
 from synology_apm_repo.cli.state import CliState
 from synology_apm_repo.cli.trace_render import build_trace_callback
-from synology_apm_repo.sdk import ApmRepoError, NotFoundError, ObjectStore, Repository, Session, TraceEvent
+from synology_apm_repo.sdk import (
+    ApmRepoError,
+    InvalidArgumentError,
+    NotFoundError,
+    ObjectStore,
+    Repository,
+    Session,
+    TraceEvent,
+)
 from synology_apm_repo.sdk.presentation import ProgressCallback
 from synology_apm_repo.sdk.profiles import store_from_profile
 
@@ -60,9 +70,9 @@ async def open_single_repo(
     ``fs_path`` is a local filesystem path.
 
     Raises:
-        NotFoundError: No repository, or more than one, is found under
-            ``fs_path`` (sibling repo-ids in one bucket are one
-            ``Repository`` with several catalogs, not several).
+        NotFoundError: No repository is found under ``fs_path``.
+        InvalidArgumentError: Several are (sibling repo-ids in one bucket
+            are one ``Repository`` with several catalogs).
     """
     if store is not None:
         repos = await session.open(store, key, root=fs_path, progress=progress, trace=trace)
@@ -72,7 +82,7 @@ async def open_single_repo(
         raise NotFoundError(f"no repository found at {fs_path!r}", ref=fs_path)
     if len(repos) > 1:
         roots = ", ".join(repo.layout.repo_root for repo in repos)
-        raise NotFoundError(
+        raise InvalidArgumentError(
             f"{len(repos)} repositories found under {fs_path!r} ({roots}) — point at one specifically",
             ref=fs_path,
         )
@@ -94,7 +104,7 @@ async def opened_repo(
     inside a ``cli_session`` and yield it; an ``ApmRepoError`` from the open
     or from the caller's own ``async with`` body is the CLI error exit.
 
-    Callers needing ``require_one_of(repo, profile)``-style validation of
+    Callers needing ``require_one_of(ctx, repo, profile)``-style validation of
     REPO/``--profile`` run it themselves before entering this context
     manager — a bare argument mismatch isn't an ``ApmRepoError``."""
     async with cli_session(state) as cli:
@@ -102,10 +112,10 @@ async def opened_repo(
 
 
 def opened_repo_or_profile(
-    repo: str | None, key: str | None, *, profile: str | None, state: CliState
+    ctx: typer.Context, repo: str | None, key: str | None, *, profile: str | None
 ) -> contextlib.AbstractAsyncContextManager[Repository]:
     """``require_one_of`` (REPO XOR ``--profile``), checked eagerly before
     any repository is opened, then ``opened_repo``; for
     ``doctor``/``key``/``verify``."""
-    require_one_of(repo, profile)
-    return opened_repo(repo or "", key, profile=profile, state=state)
+    require_one_of(ctx, repo, profile)
+    return opened_repo(repo or "", key, profile=profile, state=ctx.obj)

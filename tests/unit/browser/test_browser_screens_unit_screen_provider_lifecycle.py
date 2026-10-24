@@ -24,7 +24,7 @@ from textual.widgets import Tree
 import synology_apm_repo.sdk.api as _sdk_api
 from support.fakes import faithful_to
 from support.model_factories import make_version
-from support.pilot import SDK_TIMEOUT, wait_until
+from support.pilot import SDK_TIMEOUT, step_until_pruned, wait_for_workers, wait_until
 from synology_apm_repo.browser.core.unit.msg import RootRequested
 from synology_apm_repo.browser.screens.unit_screen import UnitScreen
 from synology_apm_repo.sdk.api import Catalog, RawView, Session, Version
@@ -181,6 +181,22 @@ async def test_navigating_away_closes_the_providers_own_connection() -> None:
         assert provider.close_calls == 1
 
 
+async def test_a_load_finishing_while_the_screen_is_being_removed_is_cancelled_not_rendered() -> None:
+    catalog = _GatedCatalog()
+    app = _FakeApp(make_version(), _FakeRepo(catalog))
+    async with app.run_test() as pilot:
+        screen = app.screen
+        assert isinstance(screen, UnitScreen)
+        await wait_until(pilot, lambda: catalog.gated_once)
+
+        app.pop_screen()
+        await step_until_pruned(screen, "#folder-tree")
+        catalog.gate.set()
+        await wait_for_workers(pilot, node=screen)
+
+        assert catalog.provided == []  # the load was cancelled, not published
+
+
 async def test_refresh_closes_the_old_provider_before_the_new_one_loads() -> None:
     catalog = _FakeCatalog()
     app = _FakeApp(make_version(), _FakeRepo(catalog))
@@ -253,7 +269,7 @@ async def test_repeated_refreshes_never_accumulate_live_provider_threads() -> No
         await wait_until(pilot, lambda: tree.root.data is not None)
         assert len(catalog.provided) == 1
         assert catalog.provided[0]._thread.is_alive()
-        baseline_thread_count = threading.active_count()
+        baseline_thread_count = _non_executor_thread_count()
 
         for expected_total in range(2, 6):
             old_provider = catalog.provided[-1]
@@ -261,11 +277,16 @@ async def test_repeated_refreshes_never_accumulate_live_provider_threads() -> No
             await wait_until(pilot, partial(lambda total: len(catalog.provided) == total, expected_total))
             await wait_until(pilot, partial(lambda provider: provider.close_calls > 0, old_provider))
             assert not old_provider._thread.is_alive()
-            assert threading.active_count() == baseline_thread_count
+            assert _non_executor_thread_count() == baseline_thread_count
 
-        live_threads = sum(1 for p in catalog.provided if p._thread.is_alive())
-        assert live_threads == 1
+        assert sum(p._thread.is_alive() for p in catalog.provided) == 1
         assert len(catalog.provided) == 5
+
+
+def _non_executor_thread_count() -> int:
+    """Live threads other than asyncio's default executor, which grows on
+    demand up to its ``max_workers``."""
+    return sum(not t.name.startswith("asyncio_") for t in threading.enumerate())
 
 
 @faithful_to(UnitProvider)

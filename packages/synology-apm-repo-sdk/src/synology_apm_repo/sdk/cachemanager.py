@@ -43,8 +43,6 @@ class CacheLimits:
             connections (snapshot and version files), 4 when a bare placeholder
             sits beside a numbered generation, so this caps open connections at
             2-4x the value.
-        verify_bucket_readers: The private reader cache of one verify run; at
-            most 8 buckets are ever mid-flight, doubled here as headroom.
         dir_scan: Directory listings of the cache serving bulk-scannable
             directories (Pool leaves, Composition). A Pool leaf holds up to
             ~1,030 names, about 265 KiB with the sizes a listing carries, so 256
@@ -65,7 +63,6 @@ class CacheLimits:
     composition_records: int = 64
     composition_pages: int = 128
     saas_streams: int = 8
-    verify_bucket_readers: int = 16
     dir_scan: int = 256
     dir_fixed: int = 64
     allocation_tables: int = 256

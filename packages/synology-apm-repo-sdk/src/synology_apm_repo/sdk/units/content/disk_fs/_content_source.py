@@ -1,8 +1,8 @@
 """``ContentSource`` for one already-resolved Dissect filesystem entry,
 built by ``_DissectEntry.open_file`` (``_disk_filesystem.py``).
-``DissectFileContentSource`` reads the entry through a lazily-opened,
-lock-serialized stream; ``_BlockingReadContentSource`` holds the shared
-blocking read/export logic.
+``DissectFileContentSource`` reads the entry through its format's stream;
+``_BlockingReadContentSource`` holds the shared blocking read/export
+logic.
 """
 
 from __future__ import annotations
@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import threading
 from collections.abc import AsyncIterator, Callable
+from typing import BinaryIO
 
 from ....dedup.dedup_file import (
     DEFAULT_STREAM_BLOCK,
@@ -114,15 +115,21 @@ class _BlockingReadContentSource:
 
 class DissectFileContentSource:
     """``ContentSource`` over one resolved Dissect filesystem entry, read
-    through its ``.open()`` stream (the read API every supported format
-    shares)."""
+    through the stream its format opens for it."""
 
-    def __init__(self, entry: object, size: int | None) -> None:
+    def __init__(self, entry: object, size: int | None, open_stream: Callable[[object], BinaryIO]) -> None:
+        """
+        Args:
+            entry: The resolved file entry.
+            size: The file's size, or ``None`` if unknown (treated as ``0``).
+            open_stream: ``entry -> stream`` over its content.
+        """
         self._entry = entry
-        #: Opened lazily and reused, since ``.open()`` re-resolves the
+        self._open_stream = open_stream
+        #: Opened lazily and reused, since opening re-resolves the
         #: file's layout. ``_fh_lock`` is a ``threading.Lock`` (reads run in
         #: executor threads) serializing every ``seek``/``read`` pair.
-        self._fh: object | None = None
+        self._fh: BinaryIO | None = None
         self._fh_lock = threading.Lock()
         self._blocking = _BlockingReadContentSource(size, self._read_blocking)
 
@@ -130,9 +137,9 @@ class DissectFileContentSource:
         with self._fh_lock:
             try:
                 if self._fh is None:
-                    self._fh = self._entry.open()  # type: ignore[attr-defined]
-                self._fh.seek(offset)  # type: ignore[union-attr]
-                return self._fh.read(length)  # type: ignore[union-attr,no-any-return]
+                    self._fh = self._open_stream(self._entry)
+                self._fh.seek(offset)
+                return self._fh.read(length)
             except Exception as exc:
                 # Stream state is unknown after a failure: reopen next time.
                 self._fh = None

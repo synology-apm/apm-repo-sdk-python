@@ -577,6 +577,51 @@ class TestSettleAll:
         assert errors == []
         assert calls == [1]
 
+    async def test_waits_for_a_fetch_that_starts_while_it_waits_on_another(self) -> None:
+        gates = {1: asyncio.Event(), 2: asyncio.Event()}
+
+        async def fetch(key: int) -> str:
+            await gates[key].wait()
+            return f"value-{key}"
+
+        cache: AsyncKeyedCache[int, str] = AsyncKeyedCache(fetch)
+        first = asyncio.ensure_future(cache.resolve(1))
+        await asyncio.sleep(0)
+        settle_task = asyncio.ensure_future(cache.settle_all())
+        await asyncio.sleep(0)  # settle_all() is now waiting on key 1
+        second = asyncio.ensure_future(cache.resolve(2))
+        await asyncio.sleep(0)
+        gates[1].set()
+        await asyncio.sleep(0)
+        assert not settle_task.done()  # key 2 is still in flight
+        gates[2].set()
+
+        settled, errors = await settle_task
+        assert settled == {1: "value-1", 2: "value-2"}
+        assert errors == []
+        await asyncio.gather(first, second)
+
+    async def test_returns_a_value_evicted_by_a_fetch_landing_during_the_wait(self) -> None:
+        gate = asyncio.Event()
+
+        async def fetch(key: int) -> str:
+            if key == 2:
+                await gate.wait()
+            return f"value-{key}"
+
+        cache: AsyncKeyedCache[int, str] = AsyncKeyedCache(fetch, maxsize=1)
+        await cache.resolve(1)
+        second = asyncio.ensure_future(cache.resolve(2))
+        await asyncio.sleep(0)
+        settle_task = asyncio.ensure_future(cache.settle_all())
+        await asyncio.sleep(0)
+        gate.set()  # key 2 lands and evicts key 1, which still needs closing
+
+        settled, errors = await settle_task
+        assert settled == {1: "value-1", 2: "value-2"}
+        assert errors == []
+        await second
+
     async def test_settles_both_an_already_resolved_and_a_still_in_flight_key(self) -> None:
         started = asyncio.Event()
         release = asyncio.Event()

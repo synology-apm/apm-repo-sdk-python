@@ -111,6 +111,27 @@ class TestRateSmoothing:
         )
 
 
+class TestRateNeverGoesNegative:
+    async def test_a_new_phase_restarts_the_rate(self) -> None:
+        clock = _ManualClock()
+        meter = ProgressMeter(now=clock)
+        await meter.update(_progress(0))
+        clock.advance(1.0)
+        await meter.update(_progress(500))
+        assert meter.rate > 0
+        clock.advance(0.5)
+        await meter.update(Progress(phase="verifying", determinate=True, done=0, total=9))
+        assert meter.rate == 0.0
+
+    async def test_a_count_going_back_within_a_phase_reads_as_no_progress(self) -> None:
+        clock = _ManualClock()
+        meter = ProgressMeter(now=clock)
+        await meter.update(_progress(900))
+        clock.advance(1.0)
+        await meter.update(_progress(300))
+        assert meter.rate == 0.0
+
+
 class TestEta:
     async def test_none_when_no_update_yet(self) -> None:
         meter = ProgressMeter()
@@ -304,6 +325,28 @@ class TestNotifyThrottling:
         clock.advance(advance)
         await meter.update(_progress(second_done))
         assert len(calls) == expected_calls
+
+    async def test_the_snapshot_completing_the_total_always_notifies_once(self) -> None:
+        calls, record = _recording_callback()
+        clock = _ManualClock()
+        meter = ProgressMeter(record, now=clock, min_interval=1.0)
+        await meter.update(_progress(0))
+        clock.advance(0.01)
+        await meter.update(_progress(500))  # throttled
+        clock.advance(0.01)
+        await meter.update(_progress(1000))  # completes: never throttled
+        clock.advance(0.01)
+        await meter.update(_progress(1000))  # already complete: throttled again
+        assert [c.done for c in calls] == [0, 1000]
+
+    async def test_the_first_snapshot_of_a_new_phase_always_notifies(self) -> None:
+        calls, record = _recording_callback()
+        clock = _ManualClock()
+        meter = ProgressMeter(record, now=clock, min_interval=1.0)
+        await meter.update(Progress(phase="discovering", determinate=False, done=0, unit="items", found=1))
+        clock.advance(0.01)
+        await meter.update(_progress(0))
+        assert [c.phase for c in calls] == ["discovering", "reading"]
 
     async def test_no_callback_is_fine(self) -> None:
         meter = ProgressMeter()

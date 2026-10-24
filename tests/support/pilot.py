@@ -11,6 +11,7 @@ a healthy run.
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import Callable
 from typing import Any
 
@@ -59,6 +60,18 @@ async def wait_until(
             return
         elapsed += interval
     raise TimeoutError(message)
+
+
+async def step_until_pruned(screen: Screen[Any], selector: str, *, max_turns: int = 500) -> None:
+    """Run the event loop a turn at a time until ``selector`` no longer
+    matches under ``screen``, which is being removed: Textual removes its
+    widgets a few turns before its ``on_unmount``, a stretch a ``Pilot``
+    pause steps over."""
+    for _ in range(max_turns):
+        await asyncio.sleep(0)
+        if not screen.query(selector):
+            return
+    raise TimeoutError(f"{selector!r} still under {screen!r} after {max_turns} loop turns")
 
 
 async def settle(pilot: Pilot[Any]) -> None:

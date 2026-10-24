@@ -11,10 +11,16 @@ that is not a safe path component, or a path another item already takes, is
 skipped and reported, and the command then exits 1. The first failure stops
 the run; files already finished stay.
 
+**``--json``** prints one object on stdout instead of the summary line:
+``kind`` (``item``/``folder``), ``output``, and the byte counts (an item's
+own, or a folder's ``totals`` plus one entry per ``exported`` file), with
+``incomplete`` — a list of ``{path, reason}`` either way, a single item's
+``path`` being the output's file name — and, for a folder, ``skipped``.
+
 **Ctrl-C**: the export body runs as its own ``asyncio.Task``; the first
 SIGINT cancels it for a clean unwind, the second exits immediately
 (``os._exit()``). ``--keep-partial`` decides whether the ``.part`` file
-survives a cancel or failure.
+survives a cancel or failure. The cancel report goes to stderr.
 
 **Pre-existing destination**: an already-present ``FILE`` is refused
 before anything is opened; ``--force`` overrides. For a folder REF every
@@ -37,20 +43,25 @@ from synology_apm_repo.cli.browse import parse_ref_argument
 from synology_apm_repo.cli.consoles import console
 from synology_apm_repo.cli.errors import ExitCode, err_console, fail
 from synology_apm_repo.cli.options import KeyOption, ObjectDbIdOption, ProfileOption, raw_view
+from synology_apm_repo.cli.paging import render
 from synology_apm_repo.cli.progress_render import build_progress_meter, finish_live_progress
 from synology_apm_repo.cli.repo_session import cli_session, open_repo
 from synology_apm_repo.cli.state import CliState
 from synology_apm_repo.cli.strings import (
+    EXPORT_CONCURRENT_READS_HELP,
     EXPORT_FORCE_HELP,
     EXPORT_KEEP_PARTIAL_HELP,
     EXPORT_OUTPUT_HELP,
     EXPORT_SPARSE_HELP,
+    EXPORT_WORKERS_HELP,
     REF_HELP_EXPORT,
 )
 from synology_apm_repo.sdk import NodeFrame
 from synology_apm_repo.sdk.export import (
+    MAX_EXPORT_WORKERS,
     ExportProgressCallback,
     ExportResult,
+    ExportTuning,
     LocalFileSink,
     TreeExport,
     TreeItem,
@@ -78,7 +89,10 @@ def _install_sigint_cancel[T](task: asyncio.Task[T]) -> Callable[[], None]:
     The second Ctrl-C exits immediately via ``os._exit()``.
 
     ``signal.signal()``, not ``loop.add_signal_handler()``, so the force quit
-    stays immediate even during a synchronous stretch."""
+    stays immediate even during a synchronous stretch. The handler can
+    interrupt a write to stderr (the progress line), so it writes its notices
+    straight to file descriptor 2, never through ``sys.stderr``: re-entering
+    that buffered writer raises ``RuntimeError``."""
     loop = asyncio.get_running_loop()
     sigint_count = 0
 
@@ -87,9 +101,9 @@ def _install_sigint_cancel[T](task: asyncio.Task[T]) -> Callable[[], None]:
         sigint_count += 1
         if sigint_count == 1:
             loop.call_soon_threadsafe(task.cancel)
-            err_console.print("\n[yellow]cancelling... (press Ctrl-C again to force quit)[/yellow]")
+            os.write(2, b"\ncancelling... (press Ctrl-C again to force quit)\n")
         else:  # pragma: no cover - os._exit() below would kill pytest itself if this branch actually ran
-            err_console.print("\n[red]force quit[/red]")
+            os.write(2, b"\nforce quit\n")
             # Bypasses all cleanup (atexit, finally blocks) — that's the point.
             os._exit(ExitCode.CANCELLED)
 
@@ -107,6 +121,7 @@ async def _export_tree(
     output: Path,
     sparse: bool,
     keep_partial: bool,
+    tuning: ExportTuning | None,
     force: bool,
     state: CliState,
     active: ExportTracker,
@@ -136,14 +151,36 @@ async def _export_tree(
         preflight=preflight,
         sparse=sparse,
         keep_partial=keep_partial,
+        tuning=tuning,
         on_item_start=on_item_start,
         on_item_done=on_item_done,
     )
 
 
-def _report_tree(done: TreeExport, output: Path, state: CliState) -> None:
-    """Prints the folder export's summary, which items are incomplete and what it skipped; exits 1
-    when anything was skipped."""
+def _result_json(result: ExportResult) -> dict[str, int]:
+    """``--json``'s byte counts of one export (``sink_wait_seconds`` is timing, left out)."""
+    return {
+        "bytes_written": result.bytes_written,
+        "logical_size": result.logical_size,
+        "holes": result.holes,
+        "zeros": result.zeros,
+    }
+
+
+def _tree_json(done: TreeExport, output: Path) -> dict[str, object]:
+    """``--json``'s report of a folder export."""
+    return {
+        "kind": "folder",
+        "output": str(output),
+        "totals": _result_json(done.totals),
+        "exported": [{"path": item.relative, **_result_json(result)} for item, result in done.exported],
+        "incomplete": [{"path": item.relative, "reason": item.reason} for item in done.incomplete],
+        "skipped": [{"path": item.relative, "reason": item.reason.value} for item in done.skipped],
+    }
+
+
+def _print_tree(done: TreeExport, output: Path, state: CliState) -> None:
+    """The folder export's summary, then which items are incomplete and what it skipped."""
     if not state.quiet:
         files = f"{len(done.exported)} {pluralize(len(done.exported), 'file')}"
         console.print(f"[green]exported[/green] {files} to {output} ({size_summary(done.totals)})")
@@ -151,9 +188,24 @@ def _report_tree(done: TreeExport, output: Path, state: CliState) -> None:
         err_console.print(f"[yellow]incomplete[/yellow] {safe(incomplete.relative)}: {safe(incomplete.reason)}")
     for item in done.skipped:
         err_console.print(f"[yellow]skipped[/yellow] {safe(item.relative)}: {item.reason.description}")
+
+
+def _report_tree(done: TreeExport, output: Path, state: CliState) -> None:
+    """Reports the folder export (``--json`` or text); exits 1 when anything was skipped."""
+    render(console, state, json=_tree_json(done, output), human=lambda: _print_tree(done, output, state))
     if done.skipped:
         count = len(done.skipped)
         fail(f"{count} {pluralize(count, 'item')} {pluralize(count, 'was', 'were')} not exported")
+
+
+def _tuning(*, workers: int | None, concurrent_reads: int | None) -> ExportTuning | None:
+    """The ``ExportTuning`` the given flags ask for, the SDK's defaults for the rest; ``None`` when neither is given."""
+    given = {
+        name: value
+        for name, value in (("workers", workers), ("max_concurrent_reads", concurrent_reads))
+        if value is not None
+    }
+    return ExportTuning(**given) if given else None
 
 
 @typer_async
@@ -166,6 +218,12 @@ async def export(
     object_db_id: ObjectDbIdOption = None,
     keep_partial: Annotated[bool, typer.Option("--keep-partial", help=EXPORT_KEEP_PARTIAL_HELP)] = False,
     force: Annotated[bool, typer.Option("--force", help=EXPORT_FORCE_HELP)] = False,
+    workers: Annotated[
+        int | None, typer.Option("--workers", min=0, max=MAX_EXPORT_WORKERS, help=EXPORT_WORKERS_HELP)
+    ] = None,
+    concurrent_reads: Annotated[
+        int | None, typer.Option("--concurrent-reads", min=1, help=EXPORT_CONCURRENT_READS_HELP)
+    ] = None,
     profile: ProfileOption = None,
 ) -> None:
     """Export REF's content to OUTPUT: one item to a file, or a folder's items to a directory
@@ -179,6 +237,7 @@ async def export(
             "(only for a single item; a folder REF needs a directory)"
         )
     active = ExportTracker(output)
+    tuning = _tuning(workers=workers, concurrent_reads=concurrent_reads)
     on_export_progress = reading_progress_callback(build_progress_meter(state))
     degraded: str | None = None
     async with cli_session(state, error_prefix=lambda: f"{active.label}: " if active.label else "") as cli:
@@ -194,12 +253,13 @@ async def export(
                 unit = await frame.unit()
                 degraded = unit.degraded
                 active.sink = sink = LocalFileSink(output, staged=True, keep_partial=keep_partial)
-                return await run_export(unit.content, sink, sparse=sparse, progress=on_export_progress)
+                return await run_export(unit.content, sink, sparse=sparse, progress=on_export_progress, tuning=tuning)
             return await _export_tree(
                 frame,
                 output=output,
                 sparse=sparse,
                 keep_partial=keep_partial,
+                tuning=tuning,
                 force=force,
                 state=state,
                 active=active,
@@ -213,9 +273,9 @@ async def export(
             finish_live_progress(state)  # before printing, so the message doesn't land on the progress line
             # run_export already aborted the sink; abort() is idempotent and repeats what it left.
             leftover = await active.leftover(keep_partial_hint=True)
-            console.print(f"[yellow]cancelled — {leftover}[/yellow]" if leftover else "[yellow]cancelled[/yellow]")
+            err_console.print(f"[yellow]cancelled — {leftover}[/yellow]" if leftover else "[yellow]cancelled[/yellow]")
             if (files := active.files_note()) is not None:
-                console.print(f"[yellow]{files}[/yellow]")
+                err_console.print(f"[yellow]{files}[/yellow]")
             raise typer.Exit(code=ExitCode.CANCELLED) from None
         except OSError as exc:
             if not is_out_of_space(exc):
@@ -228,6 +288,13 @@ async def export(
     if isinstance(result, TreeExport):
         _report_tree(result, output, state)
         return
+    incomplete = [{"path": output.name, "reason": degraded}] if degraded is not None else []
+    report = {"kind": "item", "output": str(output), **_result_json(result), "incomplete": incomplete}
+    render(console, state, json=report, human=lambda: _print_single(result, output, degraded, state))
+
+
+def _print_single(result: ExportResult, output: Path, degraded: str | None, state: CliState) -> None:
+    """The single-item export's summary line, then why it is incomplete if it is."""
     if not state.quiet:
         console.print(f"[green]exported[/green] {output} ({size_summary(result)})")
     if degraded is not None:

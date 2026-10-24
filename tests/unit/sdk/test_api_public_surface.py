@@ -16,9 +16,11 @@ _SINK_CONTRACT = [
     "AbortOutcome",
     "BufferedExportSink",
     "ExportSink",
+    "ExportTuning",
     "ExportWriter",
     "FlushableSegment",
     "LocalFileSink",
+    "MAX_EXPORT_WORKERS",
     "RandomAccessExportSink",
     "SegmentWriter",
     "SinkCaps",
@@ -28,7 +30,7 @@ _SINK_CONTRACT = [
     "run_export",
 ]
 
-_INTERNAL = ["ExportExecutor", "ExportTuning", "OffsetWriter", "needs_zero_fill", "run_sink_export"]
+_INTERNAL = ["ExportExecutor", "OffsetWriter", "SharedExportTuning", "needs_zero_fill", "run_sink_export"]
 
 
 @pytest.mark.parametrize("name", _SINK_CONTRACT)

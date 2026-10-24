@@ -4,9 +4,13 @@ script; the pytest suite only ever runs the CLI in-process.
 
 from __future__ import annotations
 
+import contextlib
+import locale
 import os
 import signal
 import subprocess
+import sys
+import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -14,10 +18,48 @@ from pathlib import Path
 #: Default wall-clock budget (seconds) for one invocation.
 _DEFAULT_TIMEOUT = 120
 
+#: Seconds for a kill to finish, then again to read what the killed
+#: invocation already wrote.
+_DRAIN_AFTER_KILL_TIMEOUT = 5
 
-def _decode(raw: bytes) -> str:
+
+def _stdio_encoding(env: dict[str, str]) -> str:
+    """The encoding a Python child started with ``env`` uses for its piped
+    stdin/stdout/stderr: ``PYTHONIOENCODING``, else UTF-8 in UTF-8 mode
+    (``PYTHONUTF8``, on by default from Python 3.15), else the locale's (the
+    ANSI code page on Windows). ``uv run`` starts the CLI on this process's
+    own interpreter version."""
+    configured = env.get("PYTHONIOENCODING", "").partition(":")[0]
+    if configured:
+        return configured
+    utf8_mode = env.get("PYTHONUTF8", "1" if sys.version_info >= (3, 15) else "0") == "1"
+    return "utf-8" if utf8_mode else locale.getencoding()
+
+
+def _decode(raw: bytes, encoding: str) -> str:
     """Lossy decode for report display: ``cat``'s stdout can be binary."""
-    return raw.decode("utf-8", errors="replace")
+    return raw.decode(encoding, errors="replace")
+
+
+def _kill_group(proc: subprocess.Popen[bytes]) -> None:
+    """Kills ``proc`` and every process under it (its process group on
+    POSIX, its process tree on Windows) and reaps ``proc``: killing
+    ``uv run``'s pid alone orphans the CLI process it started, which then
+    runs on with nobody reading its output."""
+    if sys.platform == "win32":
+        try:
+            subprocess.run(
+                ["taskkill", "/T", "/F", "/PID", str(proc.pid)],
+                capture_output=True,
+                check=False,
+                timeout=_DRAIN_AFTER_KILL_TIMEOUT,
+            )
+        except subprocess.TimeoutExpired:
+            proc.kill()
+    else:
+        with contextlib.suppress(ProcessLookupError):
+            os.killpg(proc.pid, signal.SIGKILL)
+    proc.wait()
 
 
 @dataclass(frozen=True)
@@ -53,61 +95,101 @@ class CliRunner:
     ) -> CliResult:
         argv = ["uv", "run", "synology-apm-repo-cli", "--no-input", *args]
         env = {**os.environ, "PAGER": "", **self.base_env, **(env_overrides or {})}
-        input_bytes = input_text.encode("utf-8") if input_text is not None else None
+        encoding = _stdio_encoding(env)
+        input_bytes = input_text.encode(encoding) if input_text is not None else None
+        proc = subprocess.Popen(
+            argv,
+            stdin=subprocess.PIPE if input_bytes is not None else None,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env=env,
+            start_new_session=True,
+        )
+        timed_out = False
         try:
-            proc = subprocess.run(argv, capture_output=True, env=env, timeout=timeout, input=input_bytes)
-        except subprocess.TimeoutExpired as exc:
-            stdout_raw = exc.stdout or b""
-            return CliResult(
-                list(args),
-                exit_code=-1,
-                stdout=_decode(stdout_raw),
-                stderr=_decode(exc.stderr or b""),
-                stdout_bytes=len(stdout_raw),
-                timed_out=True,
-            )
+            stdout_raw, stderr_raw = proc.communicate(input_bytes, timeout=timeout)
+        except subprocess.TimeoutExpired:
+            _kill_group(proc)
+            try:
+                stdout_raw, stderr_raw = proc.communicate(timeout=_DRAIN_AFTER_KILL_TIMEOUT)
+            except subprocess.TimeoutExpired:
+                # A descendant outside the killed group still holds the pipes.
+                stdout_raw, stderr_raw = b"", b""
+            timed_out = True
+        except BaseException:
+            _kill_group(proc)
+            raise
         return CliResult(
             list(args),
-            exit_code=proc.returncode,
-            stdout=_decode(proc.stdout),
-            stderr=_decode(proc.stderr),
-            stdout_bytes=len(proc.stdout),
+            exit_code=-1 if timed_out else proc.returncode,
+            stdout=_decode(stdout_raw, encoding),
+            stderr=_decode(stderr_raw, encoding),
+            stdout_bytes=len(stdout_raw),
+            timed_out=timed_out,
         )
 
     def run_cancellable(
         self,
         *args: str,
         env_overrides: dict[str, str] | None = None,
-        cancel_after: float,
+        cancel_on: str,
         timeout: float = _DEFAULT_TIMEOUT,
     ) -> CliResult:
-        """Start the subprocess, wait ``cancel_after`` seconds, then send one
-        ``SIGINT``."""
+        """Start the subprocess and send one ``SIGINT`` once ``cancel_on``
+        first appears on its stderr; never sent if the process exits first.
+
+        The subprocess runs in its own process group and the signal goes to
+        that whole group, as a terminal's Ctrl-C does: sent to ``uv run``'s
+        pid alone, it can be lost before the CLI's own handler is installed.
+        POSIX only: Windows delivers no Ctrl-C to another process group.
+        """
+        if sys.platform == "win32":
+            raise NotImplementedError("run_cancellable needs POSIX process groups")
         argv = ["uv", "run", "synology-apm-repo-cli", "--no-input", *args]
         env = {**os.environ, "PAGER": "", **self.base_env, **(env_overrides or {})}
-        proc: subprocess.Popen[bytes] = subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env)
-        time.sleep(cancel_after)
-        proc.send_signal(signal.SIGINT)
+        proc: subprocess.Popen[bytes] = subprocess.Popen(
+            argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env, start_new_session=True
+        )
+        assert proc.stdout is not None and proc.stderr is not None
+        encoding = _stdio_encoding(env)
+        marker = cancel_on.encode(encoding)
+        seen = threading.Event()
+        stdout = bytearray()
+        stderr = bytearray()
+
+        def _drain(fd: int, sink: bytearray, watch: bool) -> None:
+            while chunk := os.read(fd, 65536):
+                sink += chunk
+                if watch and marker in sink:
+                    seen.set()
+
+        readers = [
+            threading.Thread(target=_drain, args=(proc.stdout.fileno(), stdout, False), daemon=True),
+            threading.Thread(target=_drain, args=(proc.stderr.fileno(), stderr, True), daemon=True),
+        ]
+        for reader in readers:
+            reader.start()
+        deadline = time.monotonic() + timeout
+        while not seen.wait(0.01) and proc.poll() is None and time.monotonic() < deadline:
+            pass
+        if seen.is_set() and proc.poll() is None:
+            os.killpg(proc.pid, signal.SIGINT)
         try:
-            stdout, stderr = proc.communicate(timeout=timeout)
-            return CliResult(
-                list(args),
-                exit_code=proc.returncode,
-                stdout=_decode(stdout),
-                stderr=_decode(stderr),
-                stdout_bytes=len(stdout),
-            )
+            proc.wait(timeout=max(deadline - time.monotonic(), 0))
+            timed_out = False
         except subprocess.TimeoutExpired:
-            proc.kill()
-            stdout, stderr = proc.communicate()
-            return CliResult(
-                list(args),
-                exit_code=-1,
-                stdout=_decode(stdout),
-                stderr=_decode(stderr),
-                stdout_bytes=len(stdout),
-                timed_out=True,
-            )
+            _kill_group(proc)
+            timed_out = True
+        for reader in readers:
+            reader.join()
+        return CliResult(
+            list(args),
+            exit_code=-1 if timed_out else proc.returncode,
+            stdout=_decode(bytes(stdout), encoding),
+            stderr=_decode(bytes(stderr), encoding),
+            stdout_bytes=len(stdout),
+            timed_out=timed_out,
+        )
 
     def sandboxed_env(self, home_dir: Path) -> dict[str, str]:
         """``env_overrides`` for a ``profile add/list/show/remove`` round

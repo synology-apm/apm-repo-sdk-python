@@ -3,7 +3,8 @@
 
 from __future__ import annotations
 
-from typing import Any
+import asyncio
+from typing import Any, cast
 
 import pytest
 from textual.app import App, ComposeResult
@@ -11,7 +12,7 @@ from textual.widgets import Input, Static
 
 import synology_apm_repo.sdk.api as _sdk_api
 from support.fakes import faithful_to
-from support.pilot import SDK_TIMEOUT, focus_widget, settle, wait_until
+from support.pilot import SDK_TIMEOUT, focus_widget, settle, step_until_pruned, wait_for_workers, wait_until
 from synology_apm_repo.browser.screens.key_dialog import KeyDialog
 from synology_apm_repo.sdk.api import KeyVerification, SetKeyResult
 from synology_apm_repo.sdk.errors import ApmRepoError
@@ -149,3 +150,35 @@ async def test_set_key_error_shows_in_the_status_line() -> None:
         await wait_until(pilot, lambda: "error:" in str(status.render()), timeout=SDK_TIMEOUT, interval=0.02)
         assert "vault key not found" in str(status.render())
         assert isinstance(app.screen, KeyDialog)
+
+
+@faithful_to(_sdk_api.Repository)
+class _GatedRepo:
+    """``set_key()`` blocks on ``gate``, then verifies the key."""
+
+    def __init__(self) -> None:
+        self.gate = asyncio.Event()
+        self.set_key_started = False
+
+    async def set_key(self, key_string: str) -> SetKeyResult:
+        self.set_key_started = True
+        await self.gate.wait()
+        return SetKeyResult(KeyVerification(gcm_ok=True, vault_key=b"vault"))
+
+
+async def test_a_verification_finishing_after_esc_is_cancelled_not_shown() -> None:
+    """Nor does it dismiss the dialog a second time."""
+    repo = _GatedRepo()
+    app = _FakeApp(cast(_FakeRepo, repo))
+    async with app.run_test() as pilot:
+        screen = app.screen
+        assert isinstance(screen, KeyDialog)
+        screen.query_one("#key-input", Input).value = "userKeyID@dGVzdA=="
+        screen.action_verify()
+        await wait_until(pilot, lambda: repo.set_key_started, timeout=SDK_TIMEOUT)
+
+        screen.action_cancel()
+        await step_until_pruned(screen, "#key-status")
+        repo.gate.set()
+        await wait_for_workers(pilot, node=screen)
+        assert app.dismissed == [False]

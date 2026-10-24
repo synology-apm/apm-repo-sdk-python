@@ -13,6 +13,7 @@ never promised it as a file name.
 
 from __future__ import annotations
 
+import asyncio
 import dataclasses
 import enum
 import os
@@ -20,6 +21,7 @@ from collections.abc import Callable
 from pathlib import Path
 
 from ..api.export_paths import safe_export_join, safe_file_name
+from ..dedup.export_scheduler import ExportTuning
 from ..dedup.extent import ExportResult
 from ..dedup.local_file_sink import LocalFileSink
 from ..errors import NotRestorableError
@@ -304,6 +306,7 @@ async def run_tree_export(
     preflight: TreePreflight,
     sparse: bool = True,
     keep_partial: bool = False,
+    tuning: ExportTuning | None = None,
     on_item_start: Callable[[int, TreeItem, LocalFileSink], ExportProgressCallback | None] | None = None,
     on_item_done: Callable[[TreeItem, ExportResult], None] | None = None,
 ) -> TreeExport:
@@ -318,6 +321,8 @@ async def run_tree_export(
         preflight: What ``preflight_tree`` returned for ``plan``.
         sparse: Leave ``ZERO``/``HOLE`` ranges unwritten where the sink allows it.
         keep_partial: Keep an item's ``.part`` file when its export fails or is cancelled.
+        tuning: Each item's ``run_export`` ``tuning``; with ``workers`` each
+            item starts and stops its own pool of worker processes.
         on_item_start: Called with the item's index in ``plan.items``, the item, and its
             sink before ``provider.unit()`` opens it, so a caller can say what is in flight
             while that runs; the item may still turn out to have no content and be skipped.
@@ -333,12 +338,17 @@ async def run_tree_export(
     incomplete: list[IncompleteItem] = []
     written: set[tuple[int, int]] = set()
     parents = _ParentCheck(preflight.directories)
-    for index, item in enumerate(plan.items):
-        state = destination_state(item.path)
+
+    def path_taken(path: Path) -> bool:
+        state = destination_state(path)
         taken = state == "directory" or (
-            state != "missing" and (item.path not in preflight.preexisting or _file_identity(item.path) in written)
+            state != "missing" and (path not in preflight.preexisting or _file_identity(path) in written)
         )
-        if taken or parents.blocker(item.path, output) is not None:
+        return taken or parents.blocker(path, output) is not None
+
+    for index, item in enumerate(plan.items):
+        # Off the loop: a destination on a stalled network mount blocks its stat calls.
+        if await asyncio.to_thread(path_taken, item.path):
             skipped.append(SkippedItem(item.relative, SkipReason.PATH_TAKEN))
             continue
         sink = LocalFileSink(item.path, staged=True, keep_partial=keep_partial)
@@ -348,8 +358,8 @@ async def run_tree_export(
         except NotRestorableError:
             skipped.append(SkippedItem(item.relative, SkipReason.NO_CONTENT))
             continue
-        result = await run_export(unit.content, sink, sparse=sparse, progress=progress)
-        if (identity := _file_identity(item.path)) is not None:
+        result = await run_export(unit.content, sink, sparse=sparse, progress=progress, tuning=tuning)
+        if (identity := await asyncio.to_thread(_file_identity, item.path)) is not None:
             written.add(identity)
         exported.append((item, result))
         if unit.degraded is not None:

@@ -1,10 +1,13 @@
 """Unit tests for ``synology_apm_repo.sdk.units.verify_reachable``'s bucket
 stage: a reachable version's missing, corrupt, legacy or vault-encrypted
 bucket, each surfaced as its finding by a whole ``verify_reachable`` walk
-(``test_dedup_verify_bucket_check.py`` checks one bucket directly)."""
+(``test_dedup_verify_bucket_check.py`` checks one bucket directly), and how
+many buckets it checks at once."""
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
 import os
 from pathlib import Path
 
@@ -12,7 +15,8 @@ import pytest
 
 from support.format_builders import mapping_record
 from support.repo_builders import write_bucket, write_composition_entries, write_file_map, write_legacy_bucket
-from synology_apm_repo.sdk.findings import Stage, Symptom, VerifyLevel
+from synology_apm_repo.sdk.dedup.verify_bucket_check import check_one_bucket
+from synology_apm_repo.sdk.findings import Stage, Symptom, VerifyLevel, VerifyTuning
 from synology_apm_repo.sdk.identifiers import BucketId, StreamId
 from synology_apm_repo.sdk.units.verify_reachable import verify_reachable
 from unit.sdk.verify_reachable_fakes import open_vault_repo, write_fs_workload
@@ -95,10 +99,12 @@ class TestBucketStageFindings:
 
         import synology_apm_repo.sdk.dedup.pool as pool_module
 
-        async def failing_open(self: pool_module.Pool, key: tuple[StreamId, BucketId]) -> pool_module.BucketReader:
+        async def failing_open(
+            self: pool_module.Pool, stream_id: StreamId, bucket_id: BucketId
+        ) -> pool_module.BucketReader:
             raise RuntimeError("simulated unexpected open failure")
 
-        monkeypatch.setattr(pool_module.Pool, "_open_bucket_by_key", failing_open)
+        monkeypatch.setattr(pool_module.Pool, "open_bucket_uncached", failing_open)
 
         repo = await open_vault_repo(tmp_path)
         try:
@@ -109,6 +115,72 @@ class TestBucketStageFindings:
         assert findings[0].stage is Stage.BUCKET
         assert findings[0].symptom is Symptom.CORRUPTION
         assert "unexpected error" in findings[0].detail
+
+
+class TestBucketCheckConcurrency:
+    """In-process bucket checks run ``VerifyTuning.max_concurrent_reads`` at
+    once, FULL ones no more than ``max_concurrent_decodes``."""
+
+    @pytest.mark.parametrize(
+        ("level", "tuning", "ceiling"),
+        [
+            (VerifyLevel.QUICK, VerifyTuning(max_concurrent_reads=2), 2),
+            (VerifyLevel.FULL, VerifyTuning(max_concurrent_reads=2), 2),
+            (VerifyLevel.QUICK, VerifyTuning(max_concurrent_reads=3, max_concurrent_decodes=1), 3),
+            (VerifyLevel.FULL, VerifyTuning(max_concurrent_reads=3, max_concurrent_decodes=2), 2),
+        ],
+    )
+    async def test_checks_reach_but_never_pass_the_tuned_count(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, level: VerifyLevel, tuning: VerifyTuning, ceiling: int
+    ) -> None:
+        num_buckets = 5
+        dedup_img_path = write_fs_workload(
+            tmp_path,
+            workload_id=10,
+            version_uid="vuid-1",
+            target_id="fsA",
+            meta_dirname="FSA_meta",
+            dedup_version_id=1,
+            dedup_img_size=num_buckets * 4096,
+        )
+        write_file_map(tmp_path / "db" / "file_map", [(dedup_img_path, _STREAM_ID, _SESSION_ID, _COMP_OFFSET, 1, 2)])
+        write_composition_entries(
+            tmp_path / "@data" / "Composition",
+            stream_id=_STREAM_ID,
+            session_id=_SESSION_ID,
+            entries=b"".join(mapping_record(b * 4096, b, 0, map_num=1) for b in range(num_buckets)),
+        )
+        for b in range(num_buckets):
+            write_bucket(tmp_path / "@data" / "Pool" / "0" / f"{b}.buk", [bytes([b]) * 4096], bucket_id=b)
+
+        ceiling_reached = asyncio.Event()
+        active = peak = 0
+
+        async def tracking_check(*args: object, **kwargs: object) -> object:
+            nonlocal active, peak
+            active += 1
+            peak = max(peak, active)
+            if peak >= ceiling:
+                ceiling_reached.set()
+            try:
+                # Held until the ceiling is reached, so the checks overlap rather than finish one by one.
+                with contextlib.suppress(TimeoutError):
+                    await asyncio.wait_for(ceiling_reached.wait(), timeout=2.0)
+                return await check_one_bucket(*args, **kwargs)  # type: ignore[arg-type]
+            finally:
+                active -= 1
+
+        monkeypatch.setattr("synology_apm_repo.sdk.dedup.verify_walk.check_one_bucket", tracking_check)
+        # No worker pool, so FULL checks run in this process too.
+        monkeypatch.setattr("synology_apm_repo.sdk.dedup.verify_walk.PoolDescriptor.from_pool", lambda _pool: None)
+
+        repo = await open_vault_repo(tmp_path)
+        try:
+            await verify_reachable(repo, level, tuning=tuning)
+        finally:
+            await repo.close()
+
+        assert peak == ceiling
 
 
 class TestKeyMissing:

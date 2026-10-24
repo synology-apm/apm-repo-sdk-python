@@ -208,12 +208,13 @@ root, `suppl_transaction_ids`, `repo_transactions`).
 
 The only layer that knows about chunks, buckets, and encryption.
 `Pool`/`BucketReader` open `.buk` files and decode individual 4096-byte chunks
-(decrypt-then-decompress, never the other order). `CompositionReader` walks a
-composition record's chunk-map array. `DedupFile.read()`/`.stream()` combine
-these into a byte-addressable logical file, with the `_extents()`/`read()` split
-binary-searching into the chunk-map array rather than scanning linearly — this
-is a hard performance requirement, not a nice-to-have, once a single file's
-chunk-map array can be tens of millions of entries. `DedupRepo`
+(decrypt-then-decompress, never the other order). `CompositionReader` opens a
+composition record, whose `CompositionRecord` pages through its chunk-map
+array. `DedupFile.read()`/`.stream()` combine these into a byte-addressable
+logical file, with the `_extents()`/`read()` split binary-searching into the
+chunk-map array rather than scanning linearly — this is a hard performance
+requirement, not a nice-to-have, once a single file's chunk-map array can be
+tens of millions of entries. `DedupRepo`
 (`dedup/repository.py`, one opened repository) hands these out —
 `open_file()`/`open_composition()` for a `DedupFile`, `composition_reader()`,
 and `new_pool(verify=...)` for an operation that needs a `Pool` with its own
@@ -223,14 +224,18 @@ root paths.
 `chunk_walk.py` (`plan_chunks_windowed()`/`exec_chunks()`) is the plan/execute
 engine every unbounded-range sweep of more than one chunk uses (export,
 verify FULL's per-bucket decode) — DATA chunks grouped by
-`(stream_id, bucket_id)` and fetched with one merged
-`BucketReader.read_chunks()` call per bucket instead of one
-`Pool.read_chunk()` per chunk, so a dedup'd file's scattered chunk references
-get read in disk order instead of randomly re-visiting the same `.buk` file.
+`(stream_id, bucket_id)` and fetched with merged reads per bucket instead of
+one `Pool.read_chunk()` per chunk, so a dedup'd file's scattered chunk
+references get read in disk order instead of randomly re-visiting the same
+`.buk` file. Export and verify FULL both read through
+`chunk_walk.read_verified_blocks()`, which hands over each 1024-chunk block
+before decoding the next (a bucket in flight holds its reads plus one block
+of plaintext each) and reads the bucket's stored fingerprints once.
 An interactive `read()` (always caller-bounded, never a whole-file sweep)
-skips the planner: `dedup_file.py`'s `_fill_data_extent()` expands the same
-chunk runs (`chunk_walk.iter_chunk_runs()`) and reads them per bucket through
-`Pool`'s chunk cache.
+skips the planner: `dedup_file.py`'s `_bucket_groups()` expands the same
+chunk runs (`chunk_walk.iter_chunk_runs()`) per bucket, and `_fill_groups()`
+reads them through `Pool`'s chunk cache, one bucket's groups in order and up
+to `_READ_BUCKETS_IN_FLIGHT` buckets at once.
 `export_scheduler.py::export_to_writer()` (used by `DedupFile.export_range()`/
 `ByteRangeView.export_range()` and, per fragment through
 `export_fragments_to_writer()`, the Content Layer's `VirtualDiskContentSource`)
@@ -277,12 +282,14 @@ full disk fails before any data is decoded and the zero-fill is skipped.
 `api/export.py::run_export()` is the one entry point `synology-apm-repo-cli
 export` and the TUI both use; a folder export is `api/export_tree.py`'s
 `plan_tree_export()` / `preflight_tree()` / `run_tree_export()`, which run
-`run_export()` once per file. A writer without a `worker_target` decodes and
-writes in-process; the multiprocess path below needs a destination every
-worker can open itself. A window touching too few bucket groups
-(`_MIN_WORKER_GROUPS`) also runs in-process, since a worker pool's start-up costs more
-than it saves; `export_fragments_to_writer()` is the exception and builds its
-shared pool up front.
+`run_export()` once per file; both take an `ExportTuning`, which the CLI's
+`export --workers`/`--concurrent-reads` fill. Even when its `workers` asks
+for worker processes, a writer without a `worker_target` decodes and writes
+in-process (the
+multiprocess path needs a destination every worker can open itself), and so
+does a window touching too few bucket groups (`_MIN_WORKER_GROUPS`), since a
+worker pool's start-up costs more than it saves; `export_fragments_to_writer()`
+is the exception and builds its shared pool up front.
 
 `synology-apm-repo-cli verify` (`units/verify_reachable.py::verify_reachable()`,
 what `Repository.verify()`/`Catalog.verify()` call) walks Catalog → Workload →
@@ -298,18 +305,23 @@ bucket they reach; the check primitives both levels use live in
 check goes — every reachable composition record and bucket is checked
 structurally, exhaustively, at both levels (no row/bucket-count cap):
 `VerifyLevel.FULL` routes every live
-(non-`COMPACTED`) physical chunk in a touched bucket through `exec_chunks()`
-itself (ciphertext CRC and decrypt+decompress+fingerprint together, one
-merged read per chunk) — as thorough, and as costly, as a real full export of
+(non-`COMPACTED`) physical chunk in a touched bucket through
+`chunk_walk.read_verified_blocks()` (ciphertext CRC and
+decrypt+decompress+fingerprint together, in merged reads) — as thorough, and
+as costly, as a real full export of
 every live version in the repository, and deliberately not limited to only
 the specific chunk-map-referenced indices that caused the bucket to be
 touched. `VerifyLevel.QUICK` reads no chunk content at all — its own
 per-chunk "depth" is zero, by design; there is no sampled middle tier. Only
 FULL does any per-chunk checking.
 Buckets are *discovered* by walking Catalog/Workload/Version serially, but
-*checked* concurrently once claimed, in batches bounded by a semaphore —
-each bucket its own isolated task, so one bucket's failure never aborts its
-batch siblings.
+*checked* concurrently once every one is claimed —
+`VerifyTuning.max_concurrent_reads` (16) at a time (`verify
+--concurrent-reads`), or at FULL in worker processes when the store can be
+reopened in one; FULL checks run in-process are also capped by
+`max_concurrent_decodes` (4, `--concurrent-decodes`). A bucket's integrity
+problem is a `Finding`, so it never cancels its siblings; only a
+`StorageBackendError` ends the run.
 
 **Validation strength is tiered by context**, because `mapCrc` covers a
 chunk-map array that can be hundreds of MB — validating it on every open would
@@ -365,6 +377,9 @@ installed, imported lazily for the same import-cost reason; the
 `ContentSource` itself stays in `units/base.py` —
 a pure structural `Protocol`, no external-library dependency — only its
 concrete implementations live here.
+Dissect reads a disk one small block at a time and waits for each, so
+`disk_fs/`'s bridge reads through `readahead.py`'s `SequentialReadahead`,
+which serves a sequential run of them from a few growing windows.
 
 ### Unit Layer — `units/` (minus `content/`), the minimal restorable unit
 
@@ -452,7 +467,7 @@ three so a caller never needs to know that split exists.
 which re-exports this whole facade plus the value types, node helpers,
 ids, errors and the `ObjectStore` contract (with `TracingStore`) — and four public modules,
 each the only place its names are exported: `sdk.export` (the
-export-sink contract, `run_export`, folder export and the
+export-sink contract, `run_export` and its `ExportTuning`, folder export and the
 `preload_resource_tracker()` start-up hook), `sdk.presentation`
 (rendering every frontend shares, `Progress` and the verify-report
 grouping included), `sdk.profiles` (saved connection profiles, their form
@@ -518,12 +533,12 @@ than presumed encrypted.
 `NodeRef` is the canonical, round-trippable address format shared by CLI
 arguments, TUI breadcrumbs, and error messages, with a `human` display
 form (`#Test-Workload-02/CORP-PC-001/...`) and a `canonical` form
-(`#cat:1/wl:2/ver:<uid>/...`) that both parse back to the same `Node`.
+(`#@cat:1/wl:2/ver:<uid>/...`) that both parse back to the same `Node`.
 The `cat:` segment is a `CatalogId` (a plain string) — a vault's
-`str(connection_config_id)` (already unique
-within it), or an object-storage catalog's own repo-id string (needed
-since each sibling's own `connection_config` table independently starts
-at 1, so a bare `connection_config_id` can't tell two siblings apart).
+`str(connection_config_id)` (already unique within it), or an
+object-storage catalog's own repo-id string (needed since each sibling's
+own `connection_config` table independently starts at 1, so a bare
+`connection_config_id` can't tell two siblings apart).
 `Catalog.provider()`/`workloads()`/`versions()` are always reached
 *through* a `Catalog` obtained from `Repository.catalogs()` or
 `Repository.catalog_by_id()` — nothing above the Repository Layer scans
@@ -553,24 +568,35 @@ The whole SDK, CLI, and TUI are async-native end to end:
   same thread rather than a hop of its own — the single-chunk
   path, `BucketReader.read_chunk`, decodes inline instead, since one
   4096-byte decode is cheaper than a thread hop). It never parallelizes
-  CPU-bound work: decompress/decrypt/hash all serialize under CPython's
-  GIL regardless.
+  CPU-bound Python work: decrypt, hash and the per-chunk decode loop hold
+  CPython's GIL, so more threads only contend for it. The one exception
+  is ZSTD decompression, whose batch call (`decompress_many`) releases the
+  GIL and runs on zstd's own threads (`format/compression.py`'s
+  `_ZSTD_BATCH_THREADS`), in every process that decodes, worker or not.
 - **Real multi-core parallelism, when CPU-bound work is heavy enough to be
   worth it, comes from a `concurrent.futures.ProcessPoolExecutor`** —
   verify FULL's per-bucket decode sweep
-  (`dedup/verify_walk.py::ReachabilitySweep.check_all_buckets`) and export's
-  bucket-group decode (`dedup/chunk_walk.py::exec_chunks`'s multiprocess
-  counterpart in `dedup/export_workers.py`, dispatched per window from
-  `dedup/export_scheduler.py`). Sized by
+  (`dedup/verify_walk.py::ReachabilitySweep.check_all_buckets`) and, when
+  its caller asks for workers, export's bucket-group decode
+  (`dedup/chunk_walk.py::exec_chunks`'s multiprocess counterpart in
+  `dedup/export_workers.py`, dispatched per window from
+  `dedup/export_scheduler.py`). Verify's pool is sized by
   `concurrency.default_worker_count()` (`clamp(os.cpu_count() // 2, 1, 8)`
   — the `// 2` biases toward a machine's faster cores, since an
   asymmetric-core machine's slowest task drags down the whole batch's
-  completion time). Applied except when the repository's
-  `ObjectStore` can't be reconstructed in a fresh process
-  (`storage.store_descriptor.describe_store()` returns `None`), falling
-  back to the single-process/`asyncio` path; export also stays on that path
-  for a writer with no `worker_target()` and for a window that touches few
-  bucket groups. `concurrency.dispatch_to_pool()`
+  completion time); export's by `ExportTuning.workers`, which defaults to
+  0: export decodes in-process, `ExportTuning.max_concurrent_reads` (4)
+  bucket groups at once, which hides a remote store's latency at about half
+  the memory of four workers (each holds its own decode buffers and reads
+  its groups one at a time). Workers pay off when one process can't keep
+  up: a fast destination past what one process decodes (about 1 GB/s of
+  encrypted data on an Apple M2), or a destination each worker writes
+  through its own `worker_target` handle (`examples/restore_to_nutanix_ahv.py`'s
+  iSCSI sessions). Neither pool runs when the repository's `ObjectStore`
+  can't be reconstructed in a fresh process
+  (`storage.store_descriptor.describe_store()` returns `None`); the
+  single-process/`asyncio` path runs instead, as it does for export's other
+  in-process cases ("Dedup Layer" above). `concurrency.dispatch_to_pool()`
   is the shared "bounded, dynamically load-balanced dispatch of N items to
   a process pool" primitive both call sites use — a free worker always
   picks up the next item via the executor's own queue, which measurably
@@ -599,12 +625,15 @@ The whole SDK, CLI, and TUI are async-native end to end:
   the interpreter never exits — whatever opens a connection owns closing it,
   on every path including error paths (`Repository` tracks every provider it
   hands out; `SaasWorkloadProvider.close()` closes the SQLite sources it
-  opened;
-  `ObjectDb.from_bytes()` closes its `SqliteSource` on introspection
-  failure). A cache reusing many such connections also needs an upper bound
-  on how many stay open *concurrently*, not just a guarantee they eventually
-  close — `units.saas.stream.SaasStreamCache` is an LRU-bounded cache that
-  closes an evicted stream immediately, hand-rolled instead of built on
+  opened; `ObjectDb.from_bytes()` closes its `SqliteSource` on introspection
+  failure), and refuses to open one once closed (`Repository`, `DedupRepo`,
+  `SaasStream`, `SaasStreamCache`). Cleanup that hops to a thread goes
+  through `_util/closing.py`'s `run_to_completion`: a cancelled
+  `to_thread()` job still queued in the executor never runs. A cache reusing
+  many such connections also needs an upper bound on how many stay open
+  *concurrently*, not just a guarantee they eventually close —
+  `units.saas.stream.SaasStreamCache` is an LRU-bounded cache that closes an
+  evicted stream immediately, hand-rolled instead of built on
   `AsyncKeyedCache`, which has no hook for eager close on eviction.
 - **Cancellation is native `asyncio.CancelledError`/`Task.cancel()`**, not a
   `threading.Event` parameter threaded through every long-running call.

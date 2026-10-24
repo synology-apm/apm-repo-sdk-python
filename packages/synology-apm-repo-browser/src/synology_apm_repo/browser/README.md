@@ -96,7 +96,17 @@ cursor/expansion state (already preserved by reconciliation).
   fails Textual's coroutine-function check. Host a worker on `self.app`
   when it must outlive the screen that started it (closing a provider or
   repository, an export): a screen-hosted worker is cancelled when the
-  screen unmounts.
+  screen unmounts, or as soon as its removal starts for a screen mixing in
+  `ReleasesOnPrune` (below).
+- **A screen whose workers or store subscriptions write to its widgets
+  mixes in `screens/_shared/prune_release.py`'s `ReleasesOnPrune`**
+  (`NavigableScreen` already does).
+  Textual removes a popped screen's widgets before its `on_unmount`, and
+  workers and store dispatches, unlike the screen's own timers and
+  watchers, keep running in between. `ReleasesOnPrune` cancels the
+  screen's workers as removal starts, then runs `_release_on_prune`
+  (`StoreScreen` closes its store, `ExportScreen` unsubscribes from the
+  app store).
 - **A `screens/*.py` worker uses `work` from `widgets/worker_progress.py`,
   and a `runtime/*_effects.py` dispatch uses `run_worker_with_progress`/
   `run_worker_no_progress`** (enforced by ruff's `TID251` ban on
@@ -128,9 +138,9 @@ cursor/expansion state (already preserved by reconciliation).
   breadcrumb, `DebouncedProgress`'s "Loading" suffix included. The two
   with a `Store` (`BrowseScreen`, `UnitScreen`) subclass its
   `screens/_shared/store_screen.py` `StoreScreen` instead, which builds the
-  store (`_open_store`) and owns the teardown order: close the store, then
-  cancel and drain the screen's own workers, then `_after_store_closed`
-  (`UnitScreen` closes its provider there).
+  store (`_open_store`) and owns the teardown order: close the store (when
+  removal starts), then on unmount drain the screen's own workers, then
+  `_after_store_closed` (`UnitScreen` closes its provider there).
   **Everything else (`ConnectDialog`, `KeyDialog`, `ExportScreen`,
   `WorklistScreen`, `HelpScreen`) is a centered `ModalScreen[T]`** mixing in
   `AppStateMixin` when it needs typed `app_state` access, whether a

@@ -11,6 +11,7 @@ import pytest
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
 from support.repo_builders import write_vault_encryption_key_db
+from support.store_fakes import WrappingStore
 from synology_apm_repo.sdk.dedup.keys import KeyMaterial, KeyVerification, probe_encrypted
 from synology_apm_repo.sdk.errors import DataCorruptError, KeyMismatchError
 from synology_apm_repo.sdk.storage.layout import RepoKind, RepoLayout
@@ -53,6 +54,19 @@ class TestResolveVaultKeyFromVaultDb:
         layout = RepoLayout(kind=RepoKind.VAULT, repo_root="")
         km = KeyMaterial(user_key_id=_USER_KEY_ID, user_key=os.urandom(32))
         assert await km.resolve_vault_key(store, layout) is None
+
+    async def test_a_key_db_gone_after_it_was_found_is_corrupt(self, tmp_path: Path) -> None:
+        class _SeesAGoneFile(WrappingStore):
+            async def exists(self, path: str) -> bool:
+                return True  # the probe saw it; the read that follows does not
+
+        store = _SeesAGoneFile(LocalFsStore(tmp_path))
+        layout = RepoLayout(kind=RepoKind.VAULT, repo_root="")
+        km = KeyMaterial(user_key_id=_USER_KEY_ID, user_key=os.urandom(32))
+        with pytest.raises(DataCorruptError, match="is not a readable vault_encryption_key database") as raised:
+            await km.resolve_vault_key(store, layout)
+        assert raised.value.safe_message == "db/vault_encryption_key is not a readable vault_encryption_key database"
+        assert raised.value.ref == "db/vault_encryption_key"
 
     async def test_wrong_user_key_raises_key_mismatch(self, tmp_path: Path) -> None:
         correct_user_key = os.urandom(32)

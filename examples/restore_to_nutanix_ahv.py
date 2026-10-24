@@ -16,7 +16,7 @@ Caveats:
     * Written against ``ntnx-*-py-client`` 4.x and ``cython-iscsi`` 1.0.
     * The VM gets 1 vCPU / 2 GiB RAM by default and no NIC; its firmware is detected from the first
       disk (``--firmware``). Other guest hardware settings are not read from the backup.
-    * Throughput comes from several worker processes, each with its own iSCSI session (see
+    * Throughput comes from ``_EXPORT_WORKERS`` worker processes, each with its own iSCSI session (see
       ``LibiscsiDescriptor``).
 
 Requirements (not dependencies of this repository)::
@@ -64,6 +64,7 @@ from synology_apm_repo.sdk import (
 )
 from synology_apm_repo.sdk.export import (
     AbortOutcome,
+    ExportTuning,
     RandomAccessExportSink,
     SinkCaps,
     SinkDescriptor,
@@ -82,6 +83,9 @@ _HYDRATION_SETTLE_SECONDS = 10.0
 _TASK_TIMEOUT_SECONDS = 300.0
 _HYDRATION_TIMEOUT_SECONDS = 300.0
 _GPT_MAX_TABLE_BYTES = 1 << 20
+_EXPORT_WORKERS = 4
+"""Worker processes per disk export, each writing over its own iSCSI session: one session's writes are
+serial, so throughput grows with the sessions until the network is full."""
 
 
 # --------------------------------------------------------------------------- #
@@ -919,7 +923,9 @@ async def export_to_lun(
     label = f"disk {index + 1}/{total}"
     progress = DiskProgress(label)
     started = time.monotonic()
-    result = await run_export(disk.unit.content, sink, sparse=True, progress=progress.update)
+    result = await run_export(
+        disk.unit.content, sink, sparse=True, progress=progress.update, tuning=ExportTuning(workers=_EXPORT_WORKERS)
+    )
     progress.finish()
     seconds = max(time.monotonic() - started, 1e-9)
     print(
@@ -1040,7 +1046,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument(
         "ref",
-        help="<path>#<source>/<workload>/<version> (display names) or a canonical <path>#cat:N/wl:N/ver:UID ref, "
+        help="<path>#<source>/<workload>/<version> (display names) or a canonical <path>#@cat:N/wl:N/ver:UID ref, "
         "exactly as the CLI takes it (with --profile, <path> is store-relative); every disk at or below it is "
         "restored. VM, PC and PS versions all work.",
     )

@@ -14,7 +14,7 @@ from support.format_builders import zstd_frame_without_content_size
 from synology_apm_repo.sdk.errors import ChunkCompactedError, DataCorruptError
 from synology_apm_repo.sdk.format import compression
 from synology_apm_repo.sdk.format.compression import (
-    _ZSTD_BATCH_THREADS_MIN_ENTRIES,
+    _ZSTD_BATCH_MAX_ENTRIES,
     ZSTD_FRAME_MAGIC,
     CompressType,
     decompress,
@@ -345,15 +345,52 @@ class TestDecompressMany:
         assert bytes(result[0]) == plaintexts[0]
         assert bytes(result[1]) == plaintexts[1]
 
-    def test_large_all_zstd_batch_crosses_the_multithreaded_threshold(self) -> None:
-        """At ``_ZSTD_BATCH_THREADS_MIN_ENTRIES`` and above,
-        ``multi_decompress_to_buffer`` runs multithreaded."""
-        n = _ZSTD_BATCH_THREADS_MIN_ENTRIES + 50
+    def test_zstd_entries_past_one_batch_keep_order_and_correspondence(self) -> None:
+        # Every 7th entry is NONE, so each batch's ZSTD entries map back to non-contiguous positions.
+        n = 2 * _ZSTD_BATCH_MAX_ENTRIES + 300
         plaintexts = [_distinct_plaintext(i) for i in range(n)]
         compressor = zstandard.ZstdCompressor()
+        items = [
+            (CompressType.NONE, p) if i % 7 == 0 else (CompressType.ZSTD, compressor.compress(p))
+            for i, p in enumerate(plaintexts)
+        ]
+
+        assert decompress_many(items) == plaintexts
+
+    @pytest.mark.parametrize(
+        ("frames", "expected_calls"),
+        [
+            (400, [(400, 1)]),
+            (600, [(600, 4)]),
+            (1500, [(750, 4), (750, 4)]),
+            (2547, [(849, 4)] * 3),
+            (8192, [(1024, 4)] * 8),
+        ],
+    )
+    def test_zstd_frames_are_split_into_even_threaded_batches(
+        self, monkeypatch: pytest.MonkeyPatch, frames: int, expected_calls: list[tuple[int, int]]
+    ) -> None:
+        """A run is split into even calls of at most ``_ZSTD_BATCH_MAX_ENTRIES``
+        frames, each threaded from ``_ZSTD_BATCH_THREADS_MIN_ENTRIES`` frames up."""
+        calls: list[tuple[int, int]] = []
+
+        @unchecked_fake("zstandard.ZstdDecompressor's multi_decompress_to_buffer")
+        class _RecordingDecompressor:
+            def multi_decompress_to_buffer(
+                self, frames: list[bytes | bytearray | memoryview], *, decompressed_sizes: bytes, threads: int
+            ) -> Any:
+                calls.append((len(frames), threads))
+                return zstandard.ZstdDecompressor().multi_decompress_to_buffer(
+                    frames, decompressed_sizes=decompressed_sizes, threads=threads
+                )
+
+        monkeypatch.setattr(compression, "_zstd_decompressor", _RecordingDecompressor)
+        compressor = zstandard.ZstdCompressor()
+        plaintexts = [_distinct_plaintext(i) for i in range(frames)]
         items = [(CompressType.ZSTD, compressor.compress(p)) for p in plaintexts]
 
         assert decompress_many(items) == plaintexts
+        assert calls == expected_calls
 
 
 def test_is_zstd_frame_checks_only_the_leading_magic() -> None:

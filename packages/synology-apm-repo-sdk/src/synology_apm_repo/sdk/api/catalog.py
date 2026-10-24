@@ -11,8 +11,8 @@ from ..catalog.connection import Connection
 from ..catalog.version import Version, version_by_uid, versions
 from ..catalog.workload import DEVICE_TARGET_TYPES, Workload, workload_by_id, workloads
 from ..dedup.repository import DedupRepo
-from ..errors import NotFoundError, NotRestorableError
-from ..findings import Finding, VerifyLevel
+from ..errors import InvalidArgumentError, NotFoundError, NotRestorableError
+from ..findings import Finding, VerifyLevel, VerifyTuning
 from ..format.repo_info import RepoInfo
 from ..identifiers import CatalogId, VersionUid, WorkloadId, resolve_catalog_id
 from ..presentation.progress import ProgressCallback
@@ -205,6 +205,7 @@ class Catalog:
         level: VerifyLevel = VerifyLevel.QUICK,
         *,
         progress: ProgressCallback | None = None,
+        tuning: VerifyTuning | None = None,
     ) -> list[Finding]:
         """Integrity check over this catalog's ``DedupRepo`` — on a vault,
         the same check as every sibling catalog's, not one scoped to this
@@ -213,6 +214,7 @@ class Catalog:
         Args:
             level: How deep to check.
             progress: Receives a ``Progress`` snapshot as checking advances.
+            tuning: How the check spreads its reads (default ``VerifyTuning()``).
 
         Returns:
             Every ``Finding`` from the check.
@@ -221,7 +223,7 @@ class Catalog:
             StorageBackendError: A store call failed mid-check.
         """
         self._keys.require_verified()
-        return await verify_reachable(self._dedup_repo, level, progress=progress)
+        return await verify_reachable(self._dedup_repo, level, progress=progress, tuning=tuning)
 
     async def locate(self, segments: Sequence[str], *, raw: RawView | None = None) -> WorkloadFrame | NodeFrame:
         """Walks human-ref display names below this catalog: workload ->
@@ -236,7 +238,8 @@ class Catalog:
 
         Raises:
             ValueError: ``segments`` is empty.
-            NotFoundError: A segment matches nothing, or matches ambiguously.
+            NotFoundError: A segment matches nothing.
+            InvalidArgumentError: A segment matches ambiguously.
             KeyRequiredError: The repository is encrypted and no key was
                 supplied.
             KeyMismatchError: The last key supplied was rejected.
@@ -292,15 +295,15 @@ def match_or_raise[T](
     kind: str,
     hints: Sequence[str | None] | None = None,
 ) -> T:
-    """``match_display_name``, raising ``NotFoundError`` on a miss; when
-    ``segment`` is the pre-suffix name of several candidates the message
-    names them (see ``ambiguous_matches``)."""
+    """``match_display_name``, raising ``NotFoundError`` on a miss, or
+    ``InvalidArgumentError`` naming the candidates when ``segment`` is the
+    pre-suffix name of several (see ``ambiguous_matches``)."""
     matched = match_display_name(segment, pairs, objects, hints=hints)
     if matched is not None:
         return matched
     candidates = ambiguous_matches(segment, pairs, hints=hints)
     if candidates:
-        raise NotFoundError(
+        raise InvalidArgumentError(
             f"{kind} named {segment!r} is ambiguous ({len(candidates)} matches) — "
             f"use one of: {', '.join(repr(c) for c in candidates)}",
             ref=segment,
