@@ -62,16 +62,24 @@ async def wait_until(
     raise TimeoutError(message)
 
 
-async def step_until_pruned(screen: Screen[Any], selector: str, *, max_turns: int = 500) -> None:
+async def step_until_pruned(
+    screen: Screen[Any],
+    selector: str,
+    *,
+    timeout: float = UI_TIMEOUT,  # noqa: ASYNC109 - a poll budget, not a cancellation scope
+) -> None:
     """Run the event loop a turn at a time until ``selector`` no longer
     matches under ``screen``, which is being removed: Textual removes its
     widgets a few turns before its ``on_unmount``, a stretch a ``Pilot``
-    pause steps over."""
-    for _ in range(max_turns):
+    pause steps over. The budget is wall-clock seconds, not turns: how many
+    turns removal takes depends on the platform and load."""
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout
+    while loop.time() < deadline:
         await asyncio.sleep(0)
         if not screen.query(selector):
             return
-    raise TimeoutError(f"{selector!r} still under {screen!r} after {max_turns} loop turns")
+    raise TimeoutError(f"{selector!r} still under {screen!r} after {timeout} s")
 
 
 async def settle(pilot: Pilot[Any]) -> None:
