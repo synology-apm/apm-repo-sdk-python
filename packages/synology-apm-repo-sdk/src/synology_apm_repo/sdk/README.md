@@ -160,8 +160,8 @@ usually in its own distribution; it is its own `ExportWriter`, and its single
 segment is the whole export.
 Import the contract from `synology_apm_repo.sdk.export` (`RandomAccessExportSink`,
 `SinkCaps`, `AbortOutcome`, `WorkerTarget`, `SinkDescriptor`, `WorkerWriter`,
-`run_export`); `examples/restore_to_nutanix_ahv.py`'s `BlockSink`
-and `LibiscsiDescriptor` are a worker-capable reference.
+`run_export`); `examples/hypervisor-restore/restore_to_nutanix_ahv.py`'s
+`BlockSink` and `LibiscsiDescriptor` are a worker-capable reference.
 
 1. Implement `open(logical_size, *, sparse)`, `write_at(offset, data)`,
    `write_zero(offset, length)`, `commit()` and `abort()`, all `async def`,
@@ -197,15 +197,18 @@ and `LibiscsiDescriptor` are a worker-capable reference.
 4. Test it with `tests/unit/sdk/test_dedup_export_sink.py`'s recording-sink
    shape (lifecycle order, abort on failure/cancel) and
    `test_dedup_export_scheduler.py`'s `_MemorySink` shape (a full export
-   into the sink, byte-compared against the naive export). The fixture
-   classes are per-file by convention; copy the one you need.
+   into the sink, byte-compared against the naive export). A class a second
+   test file needs moves into `tests/unit/sdk/dedup_export_fakes.py`
+   (`tests/CLAUDE.md`).
 
 ### A destination that takes bytes in order only
 
 A zip entry, an upload stream or the parts of a multipart upload cannot be
 written in the order the exporter produces bytes, so subclass
-`BufferedExportSink` (`dedup/buffered_export_sink.py`); `examples/export_disk_to_zip.py`'s
-`ZipSink` is a complete reference. It cuts the export into segments of
+`BufferedExportSink` (`dedup/buffered_export_sink.py`);
+`examples/export_disk_to_zip.py`'s `ZipSink` is a complete reference, and
+`examples/hypervisor-restore/stream_vmdk.py`'s `StreamOptimizedVmdkSink` one
+that streams into an HTTP upload. It cuts the export into segments of
 `segment_size` bytes (a multiple of 4096), takes each in a buffer where writes
 may land in any order, and calls your `flush_segment(segment)` once per
 completed segment, in order, on a background task while the exporter fills the

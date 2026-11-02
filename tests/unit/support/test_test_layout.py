@@ -80,7 +80,9 @@ def _naming_rules() -> dict[Path, tuple[str, set[str]]]:
         for split in ("unit", "integration"):
             rules[_TESTS / split / distribution] = (prefix, modules)
     rules[_TESTS / "unit" / "scripts"] = ("", module_paths(_REPO / "scripts"))
-    rules[_TESTS / "unit" / "examples"] = ("", module_paths(_REPO / "examples"))
+    # The hypervisor restore scripts sit in a folder that is not a package: each is named by its own stem.
+    examples = module_paths(_REPO / "examples") | module_paths(_REPO / "examples" / "hypervisor-restore")
+    rules[_TESTS / "unit" / "examples"] = ("", examples)
     rules[_TESTS / "unit" / "support"] = ("", module_paths(_TESTS / "support") | {_SUITE_LAYOUT})
     return rules
 

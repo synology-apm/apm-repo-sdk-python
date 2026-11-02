@@ -1,8 +1,6 @@
-"""Tests for the Nutanix half of examples/restore_to_nutanix_ahv.py: ``AhvTarget``'s logic (task waiting,
-Volume Group creation and its cleanup, hydration waiting, deletes of what this run created) over ``_FakeSdk``.
-
-The ``NutanixSdk`` adapter itself (model construction against the real ``ntnx_*`` packages) is not
-exercised here.
+"""Tests for the Nutanix half of examples/hypervisor-restore/restore_to_nutanix_ahv.py: ``AhvTarget``'s logic
+(task waiting, Volume Group creation and its cleanup, hydration waiting, deletes of what this run created)
+over ``_FakeSdk``.
 
 ``_FakeSdk`` offers no way to look an object up by name, so any code path that tried would fail at once:
 everything ``AhvTarget`` does must go by id.
@@ -101,8 +99,6 @@ class _FakeTasks:
 
 @unchecked_fake("the ntnx_* SDK's VolumeGroups API")
 class _FakeVolumeGroups:
-    """Everything is by id; there is deliberately no list/lookup-by-name method."""
-
     def __init__(self, cloud: _Cloud) -> None:
         self._cloud = cloud
 
@@ -202,6 +198,10 @@ class _FakeClient:
         return f"etag-{response.data.name}"
 
 
+class _Refused(Exception):
+    """What the fake raises for a call Prism Central refuses (the ``ntnx_*`` packages' ``ApiException``)."""
+
+
 @unchecked_fake("the ntnx_* SDK's Sdk API")
 class _FakeSdk:
     """The ``NutanixSdk`` surface ``AhvTarget`` uses, over ``_Cloud``; models are plain namespaces."""
@@ -211,6 +211,9 @@ class _FakeSdk:
         self.volume_groups = _FakeVolumeGroups(cloud)
         self.vms = _FakeVms(cloud)
         self.tasks = _FakeTasks(cloud)
+
+    def api_error(self, exc: BaseException) -> str | None:
+        return f"HTTP 404 NOT FOUND: {exc}" if isinstance(exc, _Refused) else None
 
     def scoped(self, kind: str) -> tuple[_FakeClient, Any]:
         return _FakeClient(self.cloud, kind), (self.volume_groups if kind == "volume_group" else self.vms)
@@ -318,20 +321,20 @@ async def test_wait_polls_until_the_task_succeeds(
 
 @pytest.mark.parametrize("status", ["FAILED", "CANCELED"])
 async def test_wait_raises_for_a_failed_or_canceled_task(
-    cloud: _Cloud, target_factory: Callable[..., Any], status: str
+    ex: ModuleType, cloud: _Cloud, target_factory: Callable[..., Any], status: str
 ) -> None:
     cloud.task_scripts["create_volume_group"] = [status]
 
-    with pytest.raises(RuntimeError, match=rf"task-\d+ {status}: legacy boom"):
+    with pytest.raises(ex.RestoreError, match=rf"task-\d+ {status}: legacy boom"):
         await target_factory().create_volume_group("g", "cluster", "container", [])
 
 
 async def test_wait_gives_up_on_a_task_that_never_finishes_and_asks_it_to_cancel(
-    cloud: _Cloud, clock: _Clock, target_factory: Callable[..., Any]
+    ex: ModuleType, cloud: _Cloud, clock: _Clock, target_factory: Callable[..., Any]
 ) -> None:
     cloud.task_scripts["create_volume_group"] = ["RUNNING"]
 
-    with pytest.raises(TimeoutError, match=r"task-\d+ still RUNNING after 5 s"):
+    with pytest.raises(ex.RestoreError, match=r"task-\d+ still RUNNING after 5 s"):
         await target_factory(task_timeout_seconds=5.0).create_volume_group("g", "cluster", "container", [])
 
     assert cloud.names().count("cancel_task") == 1
@@ -339,23 +342,23 @@ async def test_wait_gives_up_on_a_task_that_never_finishes_and_asks_it_to_cancel
 
 
 async def test_the_rollback_of_a_timed_out_create_waits_for_the_cancel_and_removes_what_the_task_made(
-    cloud: _Cloud, target_factory: Callable[..., Any]
+    ex: ModuleType, cloud: _Cloud, target_factory: Callable[..., Any]
 ) -> None:
     cloud.task_scripts["create_volume_group"] = ["RUNNING"]
 
-    with pytest.raises(TimeoutError, match=r"Nutanix task .* still RUNNING after"):
+    with pytest.raises(ex.RestoreError, match=r"Nutanix task .* still RUNNING after"):
         await target_factory(task_timeout_seconds=5.0).create_volume_group("g", "cluster", "container", [])
 
     assert cloud.groups == {}
 
 
 async def test_the_rollback_of_a_create_that_will_not_end_reports_the_task_instead_of_deleting(
-    cloud: _Cloud, clock: _Clock, target_factory: Callable[..., Any]
+    ex: ModuleType, cloud: _Cloud, clock: _Clock, target_factory: Callable[..., Any]
 ) -> None:
     cloud.task_scripts["create_volume_group"] = ["RUNNING"]
     cloud.cancel_ends_task = False
 
-    with pytest.raises(TimeoutError, match=r"Nutanix task .* still RUNNING after") as caught:
+    with pytest.raises(ex.RestoreError, match=r"Nutanix task .* still RUNNING after") as caught:
         await target_factory(task_timeout_seconds=5.0).create_volume_group("g", "cluster", "container", [])
 
     assert len(cloud.groups) == 1  # not deleted: what the task makes is unknown while it runs
@@ -364,12 +367,12 @@ async def test_the_rollback_of_a_create_that_will_not_end_reports_the_task_inste
 
 
 async def test_a_failed_cancel_request_does_not_hide_the_timeout(
-    cloud: _Cloud, target_factory: Callable[..., Any]
+    ex: ModuleType, cloud: _Cloud, target_factory: Callable[..., Any]
 ) -> None:
     cloud.task_scripts["create_volume_group"] = ["RUNNING"]
     cloud.fail_calls["cancel_task"] = RuntimeError("cannot cancel")
 
-    with pytest.raises(TimeoutError, match="still RUNNING"):
+    with pytest.raises(ex.RestoreError, match="still RUNNING"):
         await target_factory(task_timeout_seconds=5.0).create_volume_group("g", "cluster", "container", [])
 
 
@@ -385,11 +388,13 @@ async def test_wait_accepts_a_task_that_succeeds_on_its_last_poll_before_the_dea
     assert clock.now == 4.0  # one 1 s poll after each RUNNING
 
 
-async def test_wait_prefers_the_structured_error_messages(cloud: _Cloud, target_factory: Callable[..., Any]) -> None:
+async def test_wait_prefers_the_structured_error_messages(
+    ex: ModuleType, cloud: _Cloud, target_factory: Callable[..., Any]
+) -> None:
     cloud.task_scripts["create_volume_group"] = ["FAILED"]
     cloud.error_messages = ["structured message"]
 
-    with pytest.raises(RuntimeError, match="structured message"):
+    with pytest.raises(ex.RestoreError, match="structured message"):
         await target_factory().create_volume_group("g", "cluster", "container", [])
 
 
@@ -440,27 +445,27 @@ async def test_create_volume_group_takes_the_size_from_what_the_disk_reports_not
 
 @pytest.mark.parametrize("missing", ["report_no_index", "report_no_size"])
 async def test_create_volume_group_refuses_a_disk_that_reports_no_index_or_size(
-    cloud: _Cloud, target_factory: Callable[..., Any], missing: str
+    ex: ModuleType, cloud: _Cloud, target_factory: Callable[..., Any], missing: str
 ) -> None:
     setattr(cloud, missing, True)
 
-    with pytest.raises(RuntimeError, match=r"Volume Group disk disk-\d+ reports no index or size"):
+    with pytest.raises(ex.RestoreError, match=r"Volume Group disk disk-\d+ reports no index or size"):
         await target_factory().create_volume_group("vg-name", "cluster", "container", [10])
 
     assert cloud.groups == {}  # and the group made so far is removed
 
 
 async def test_create_volume_group_needs_the_task_to_name_the_group(
-    cloud: _Cloud, target_factory: Callable[..., Any]
+    ex: ModuleType, cloud: _Cloud, target_factory: Callable[..., Any]
 ) -> None:
     cloud.omit_entities = True
 
-    with pytest.raises(RuntimeError, match=r"task-\d+ finished without exactly one reference to the Volume Group"):
+    with pytest.raises(ex.RestoreError, match=r"task-\d+ finished without exactly one reference to the Volume Group"):
         await target_factory().create_volume_group("vg-name", "cluster", "container", [10])
 
 
 async def test_create_volume_group_needs_each_disk_task_to_name_its_disk(
-    cloud: _Cloud, target_factory: Callable[..., Any]
+    ex: ModuleType, cloud: _Cloud, target_factory: Callable[..., Any]
 ) -> None:
     class NoDiskRef(_FakeVolumeGroups):
         def create_volume_disk(self, group_id: str, body: Any) -> SimpleNamespace:
@@ -471,7 +476,7 @@ async def test_create_volume_group_needs_each_disk_task_to_name_its_disk(
     target = target_factory()
     target._sdk.volume_groups = NoDiskRef(cloud)
 
-    with pytest.raises(RuntimeError, match="the Volume Group disk it created"):
+    with pytest.raises(ex.RestoreError, match="the Volume Group disk it created"):
         await target.create_volume_group("vg-name", "cluster", "container", [10])
 
     assert cloud.groups == {}  # the group made before the failure is removed, by its id
@@ -490,12 +495,12 @@ async def test_create_volume_group_takes_the_disk_that_is_not_the_group_whatever
 
 
 async def test_create_volume_group_refuses_a_disk_task_that_names_two_disks(
-    cloud: _Cloud, target_factory: Callable[..., Any]
+    ex: ModuleType, cloud: _Cloud, target_factory: Callable[..., Any]
 ) -> None:
     _list_instead(cloud, "create_volume_disk", lambda e: [*e, ("another-disk", "volumes:config:volume-group:disk")])
 
     with pytest.raises(
-        RuntimeError, match=r"Volume Group disk it created \(found 2 ending with ':volume-group:disk'\)"
+        ex.RestoreError, match=r"Volume Group disk it created \(found 2 ending with ':volume-group:disk'\)"
     ):
         await target_factory().create_volume_group("vg-name", "cluster", "container", [10])
 
@@ -515,21 +520,21 @@ async def test_create_volume_group_ignores_entities_of_other_types_in_its_tasks(
 
 
 async def test_create_volume_group_needs_a_reference_whose_rel_ends_with_volume_group(
-    cloud: _Cloud, target_factory: Callable[..., Any]
+    ex: ModuleType, cloud: _Cloud, target_factory: Callable[..., Any]
 ) -> None:
     _list_instead(cloud, "create_volume_group", lambda e: [(e[0][0], "volumes:config:something-else")])
 
-    with pytest.raises(RuntimeError, match=r"Volume Group it created \(found 0 ending with ':volume-group'\)"):
+    with pytest.raises(ex.RestoreError, match=r"Volume Group it created \(found 0 ending with ':volume-group'\)"):
         await target_factory().create_volume_group("vg-name", "cluster", "container", [10])
 
 
 async def test_create_volume_group_needs_a_disk_reference_whose_rel_ends_with_volume_group_disk(
-    cloud: _Cloud, target_factory: Callable[..., Any]
+    ex: ModuleType, cloud: _Cloud, target_factory: Callable[..., Any]
 ) -> None:
     _list_instead(cloud, "create_volume_disk", lambda e: [(i, "volumes:config:volume-group:vdisk") for i, _ in e])
 
     with pytest.raises(
-        RuntimeError, match=r"Volume Group disk it created \(found 0 ending with ':volume-group:disk'\)"
+        ex.RestoreError, match=r"Volume Group disk it created \(found 0 ending with ':volume-group:disk'\)"
     ):
         await target_factory().create_volume_group("vg-name", "cluster", "container", [10])
 
@@ -550,13 +555,13 @@ async def test_a_volume_group_disk_task_ignores_the_group_and_a_vm_disk_by_their
 
 
 async def test_a_group_labelled_as_a_volume_group_disk_makes_the_task_untrustworthy(
-    cloud: _Cloud, target_factory: Callable[..., Any]
+    ex: ModuleType, cloud: _Cloud, target_factory: Callable[..., Any]
 ) -> None:
     _list_instead(cloud, "create_volume_disk", lambda e: [(i, "volumes:config:volume-group:disk") for i, _ in e])
 
     # Nothing excludes the group by id: two entities now claim to be the disk, so the task is refused.
     with pytest.raises(
-        RuntimeError, match=r"Volume Group disk it created \(found 2 ending with ':volume-group:disk'\)"
+        ex.RestoreError, match=r"Volume Group disk it created \(found 2 ending with ':volume-group:disk'\)"
     ):
         await target_factory().create_volume_group("vg-name", "cluster", "container", [10])
 
@@ -564,12 +569,12 @@ async def test_a_group_labelled_as_a_volume_group_disk_makes_the_task_untrustwor
 
 
 async def test_the_rollback_of_a_volume_group_removes_only_the_entity_ending_with_volume_group(
-    cloud: _Cloud, target_factory: Callable[..., Any]
+    ex: ModuleType, cloud: _Cloud, target_factory: Callable[..., Any]
 ) -> None:
     _list_instead(cloud, "create_volume_group", lambda e: [*e, ("a-client", "volumes:config:iscsi-client")])
     cloud.task_scripts["create_volume_disk"] = ["FAILED"]
 
-    with pytest.raises(RuntimeError, match="FAILED") as caught:
+    with pytest.raises(ex.RestoreError, match="FAILED") as caught:
         await target_factory().create_volume_group("vg-name", "cluster", "container", [10])
 
     assert cloud.groups == {}  # the group was removed although its task listed something else as well
@@ -577,11 +582,11 @@ async def test_the_rollback_of_a_volume_group_removes_only_the_entity_ending_wit
 
 
 async def test_create_volume_group_removes_the_group_when_a_disk_task_fails(
-    cloud: _Cloud, target_factory: Callable[..., Any]
+    ex: ModuleType, cloud: _Cloud, target_factory: Callable[..., Any]
 ) -> None:
     cloud.task_scripts["create_volume_disk"] = ["FAILED"]
 
-    with pytest.raises(RuntimeError, match="FAILED"):
+    with pytest.raises(ex.RestoreError, match="FAILED"):
         await target_factory().create_volume_group("vg-name", "cluster", "container", [10])
 
     assert cloud.groups == {}
@@ -598,12 +603,27 @@ async def test_create_volume_group_removes_the_group_when_a_disk_call_raises(
     assert cloud.groups == {}
 
 
+async def test_a_call_prism_central_refuses_raises_a_restore_error_and_removes_the_group(
+    ex: ModuleType, cloud: _Cloud, target_factory: Callable[..., Any]
+) -> None:
+    cloud.fail_calls["create_volume_disk"] = _Refused("no storage container 0000")
+
+    with pytest.raises(
+        ex.RestoreError,
+        match=r"^Prism Central refused create_volume_disk: HTTP 404 NOT FOUND: no storage container 0000$",
+    ) as caught:
+        await target_factory().create_volume_group("vg-name", "cluster", "container", [10])
+
+    assert isinstance(caught.value.__cause__, _Refused)
+    assert cloud.groups == {}
+
+
 async def test_create_volume_group_removes_a_group_a_failed_task_still_named(
-    cloud: _Cloud, target_factory: Callable[..., Any]
+    ex: ModuleType, cloud: _Cloud, target_factory: Callable[..., Any]
 ) -> None:
     cloud.task_scripts["create_volume_group"] = ["FAILED"]
 
-    with pytest.raises(RuntimeError, match="FAILED"):
+    with pytest.raises(ex.RestoreError, match="FAILED"):
         await target_factory().create_volume_group("vg-name", "cluster", "container", [10])
 
     assert cloud.groups == {}  # a failed task that reports an entity it made does not leave it behind
@@ -665,36 +685,40 @@ async def test_create_vm_is_not_confused_by_another_vm_of_the_same_name(
     assert cloud.vms["vm-someone-elses"] == {"name": "web-01"}
 
 
-async def test_create_vm_raises_when_the_task_fails(cloud: _Cloud, target_factory: Callable[..., Any]) -> None:
+async def test_create_vm_raises_when_the_task_fails(
+    ex: ModuleType, cloud: _Cloud, target_factory: Callable[..., Any]
+) -> None:
     cloud.task_scripts["create_vm"] = ["FAILED"]
 
-    with pytest.raises(RuntimeError, match="FAILED"):
+    with pytest.raises(ex.RestoreError, match="FAILED"):
         await _create_vm(target_factory())
 
 
 async def test_create_vm_does_not_guess_when_the_task_names_no_vm(
-    cloud: _Cloud, target_factory: Callable[..., Any]
+    ex: ModuleType, cloud: _Cloud, target_factory: Callable[..., Any]
 ) -> None:
     cloud.omit_entities = True
 
-    with pytest.raises(RuntimeError, match=r"task-\d+ finished without exactly one reference to the VM it created"):
+    with pytest.raises(ex.RestoreError, match=r"task-\d+ finished without exactly one reference to the VM it created"):
         await _create_vm(target_factory())
 
 
 async def test_create_vm_needs_a_reference_whose_rel_ends_with_vm(
-    cloud: _Cloud, target_factory: Callable[..., Any]
+    ex: ModuleType, cloud: _Cloud, target_factory: Callable[..., Any]
 ) -> None:
     _list_instead(cloud, "create_vm", lambda e: [(e[0][0], "anything:at:all")])  # the VM itself, mislabelled
 
-    with pytest.raises(RuntimeError, match=r"\(found 0 ending with ':vm'\)"):
+    with pytest.raises(ex.RestoreError, match=r"\(found 0 ending with ':vm'\)"):
         await _create_vm(target_factory(), "web-01")
 
 
-async def test_create_vm_refuses_a_task_that_names_two_vms(cloud: _Cloud, target_factory: Callable[..., Any]) -> None:
+async def test_create_vm_refuses_a_task_that_names_two_vms(
+    ex: ModuleType, cloud: _Cloud, target_factory: Callable[..., Any]
+) -> None:
     _list_instead(cloud, "create_vm", lambda e: [*e, ("vm-other", _VM_REL)])
     cloud.vms["vm-other"] = {"name": "another"}  # a second entity that is a VM too
 
-    with pytest.raises(RuntimeError, match=r"\(found 2 ending with ':vm'\)"):
+    with pytest.raises(ex.RestoreError, match=r"\(found 2 ending with ':vm'\)"):
         await _create_vm(target_factory())
 
 
@@ -713,22 +737,22 @@ async def test_create_vm_finds_the_vm_among_the_disks_its_task_also_lists_in_any
 
 
 async def test_the_rollback_of_a_failed_create_vm_removes_the_vm_its_task_named(
-    cloud: _Cloud, target_factory: Callable[..., Any]
+    ex: ModuleType, cloud: _Cloud, target_factory: Callable[..., Any]
 ) -> None:
     cloud.task_scripts["create_vm"] = ["FAILED"]
 
-    with pytest.raises(RuntimeError, match="FAILED"):
+    with pytest.raises(ex.RestoreError, match="FAILED"):
         await target_factory().create_vm("web-01", "c", "k", _GROUP, [10, 20], cpus=1, memory_bytes=2, uefi=False)
 
     assert cloud.vms == {}
 
 
 async def test_create_vm_refuses_a_task_that_lists_disks_but_no_vm(
-    cloud: _Cloud, target_factory: Callable[..., Any]
+    ex: ModuleType, cloud: _Cloud, target_factory: Callable[..., Any]
 ) -> None:
     _list_instead(cloud, "create_vm", lambda e: e[1:])  # drop the VM itself
 
-    with pytest.raises(RuntimeError, match=r"reference to the VM it created \(found 0 ending with ':vm'\)"):
+    with pytest.raises(ex.RestoreError, match=r"reference to the VM it created \(found 0 ending with ':vm'\)"):
         await target_factory().create_vm("web-01", "c", "k", _GROUP, [10], cpus=1, memory_bytes=2, uefi=False)
 
 
@@ -741,25 +765,25 @@ async def test_create_vm_counts_a_repeated_id_once(cloud: _Cloud, target_factory
 
 
 async def test_a_failed_create_task_that_names_nothing_leaves_no_rollback_noise(
-    cloud: _Cloud, target_factory: Callable[..., Any]
+    ex: ModuleType, cloud: _Cloud, target_factory: Callable[..., Any]
 ) -> None:
     cloud.task_scripts["create_vm"] = ["FAILED"]
     cloud.omit_entities = True  # the failed task made nothing, so it lists nothing
 
-    with pytest.raises(RuntimeError, match="FAILED") as caught:
+    with pytest.raises(ex.RestoreError, match="FAILED") as caught:
         await _create_vm(target_factory())
 
     assert getattr(caught.value, "__notes__", []) == []  # there was nothing to roll back, so nothing to report
 
 
 async def test_rollback_does_not_guess_when_a_failed_task_names_several_things(
-    cloud: _Cloud, target_factory: Callable[..., Any]
+    ex: ModuleType, cloud: _Cloud, target_factory: Callable[..., Any]
 ) -> None:
     _list_instead(cloud, "create_vm", lambda e: [*e, ("vm-existing", "vmm:ahv:config:vm")])
     cloud.task_scripts["create_vm"] = ["FAILED"]
     cloud.vms["vm-existing"] = {"name": "someone-elses"}
 
-    with pytest.raises(RuntimeError, match="FAILED") as caught:
+    with pytest.raises(ex.RestoreError, match="FAILED") as caught:
         await _create_vm(target_factory())
 
     assert "vm-existing" in cloud.vms  # not deleted
@@ -802,20 +826,22 @@ async def test_wait_hydrated_restarts_the_settle_period_when_progress_shows_up_l
 
 
 async def test_wait_hydrated_gives_up_when_a_disk_never_finishes_hydrating(
-    cloud: _Cloud, clock: _Clock, target_factory: Callable[..., Any]
+    ex: ModuleType, cloud: _Cloud, clock: _Clock, target_factory: Callable[..., Any]
 ) -> None:
     cloud.hydration_script = ["IN_PROGRESS"]
 
-    with pytest.raises(TimeoutError, match="still hydrating after 30 s"):
+    with pytest.raises(ex.RestoreError, match="still hydrating after 30 s"):
         await target_factory(hydration_timeout_seconds=30.0).wait_hydrated("vm")
 
     assert clock.now == 30.0
 
 
-async def test_wait_hydrated_raises_when_hydration_failed(cloud: _Cloud, target_factory: Callable[..., Any]) -> None:
+async def test_wait_hydrated_raises_when_hydration_failed(
+    ex: ModuleType, cloud: _Cloud, target_factory: Callable[..., Any]
+) -> None:
     cloud.hydration_script = ["FAILED"]
 
-    with pytest.raises(RuntimeError, match="failed to hydrate"):
+    with pytest.raises(ex.RestoreError, match="failed to hydrate"):
         await target_factory().wait_hydrated("vm")
 
 
@@ -867,7 +893,7 @@ async def test_delete_vm_deletes_a_vm_this_run_created(cloud: _Cloud, target_fac
 
 
 async def test_delete_refuses_a_volume_group_this_run_did_not_create_and_touches_nothing(
-    cloud: _Cloud, target_factory: Callable[..., Any]
+    ex: ModuleType, cloud: _Cloud, target_factory: Callable[..., Any]
 ) -> None:
     cloud.groups["vg-existing"] = {
         "name": "someone-elses",
@@ -875,39 +901,43 @@ async def test_delete_refuses_a_volume_group_this_run_did_not_create_and_touches
         "attachments": [SimpleNamespace(ext_id="client-1", iqn="iqn.other")],
     }
 
-    with pytest.raises(RuntimeError, match="refusing to delete vg-existing: it was not created by this run"):
+    with pytest.raises(ex.RestoreError, match="refusing to delete vg-existing: it was not created by this run"):
         await target_factory().delete_volume_group("vg-existing")
 
     assert cloud.log == []  # not even a read, and in particular its iSCSI client was not detached
     assert len(cloud.groups["vg-existing"]["attachments"]) == 1
 
 
-async def test_delete_refuses_a_vm_this_run_did_not_create(cloud: _Cloud, target_factory: Callable[..., Any]) -> None:
+async def test_delete_refuses_a_vm_this_run_did_not_create(
+    ex: ModuleType, cloud: _Cloud, target_factory: Callable[..., Any]
+) -> None:
     cloud.vms["vm-existing"] = {"name": "web-01"}
 
-    with pytest.raises(RuntimeError, match="refusing to delete vm-existing"):
+    with pytest.raises(ex.RestoreError, match="refusing to delete vm-existing"):
         await target_factory().delete_vm("vm-existing")
 
     assert cloud.log == [] and "vm-existing" in cloud.vms
 
 
-async def test_one_target_cannot_delete_what_another_created(cloud: _Cloud, target_factory: Callable[..., Any]) -> None:
+async def test_one_target_cannot_delete_what_another_created(
+    ex: ModuleType, cloud: _Cloud, target_factory: Callable[..., Any]
+) -> None:
     vm_id = await _create_vm(target_factory())
 
-    with pytest.raises(RuntimeError, match="not created by this run"):
+    with pytest.raises(ex.RestoreError, match="not created by this run"):
         await target_factory().delete_vm(vm_id)  # a fresh target has created nothing
 
     assert vm_id in cloud.vms
 
 
 async def test_a_same_named_vm_does_not_make_its_id_deletable(
-    cloud: _Cloud, target_factory: Callable[..., Any]
+    ex: ModuleType, cloud: _Cloud, target_factory: Callable[..., Any]
 ) -> None:
     cloud.vms["vm-someone-elses"] = {"name": "web-01"}
     target = target_factory()
     await _create_vm(target, "web-01")
 
-    with pytest.raises(RuntimeError, match="vm-someone-elses"):
+    with pytest.raises(ex.RestoreError, match="vm-someone-elses"):
         await target.delete_vm("vm-someone-elses")
 
     assert "vm-someone-elses" in cloud.vms

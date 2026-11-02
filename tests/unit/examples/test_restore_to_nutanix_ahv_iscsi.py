@@ -1,5 +1,5 @@
-"""Tests for the iSCSI half of examples/restore_to_nutanix_ahv.py: the CDB builders, ``LibiscsiWriter`` and
-``BlockSink``.
+"""Tests for the iSCSI half of examples/hypervisor-restore/restore_to_nutanix_ahv.py: the CDB builders,
+``LibiscsiWriter`` and ``BlockSink``.
 
 ``LibiscsiWriter`` runs against ``_FakeIscsi`` through the module's ``_load_iscsi`` seam.
 """
@@ -229,7 +229,7 @@ def test_descriptor_pickles_and_opens_a_writer(ex: ModuleType, fake_iscsi: _Fake
 # -- BlockSink ---------------------------------------------------------------
 
 
-@unchecked_fake("examples/restore_to_nutanix_ahv.py's BlockWriter, loaded at test time")
+@unchecked_fake("examples/hypervisor-restore/restore_to_nutanix_ahv.py's BlockWriter, loaded at test time")
 class _FakeWriter:
     """A ``BlockWriter`` over memory that records its writes."""
 

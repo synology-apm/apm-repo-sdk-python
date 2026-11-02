@@ -29,17 +29,19 @@ test that also imports the SDK for setup stays in `cli`/`browser`. All tests
 live under the root `tests/`, not per package.
 
 Code outside the three distributions is tested under `tests/unit/scripts/`
-(`scripts/*.py`) and `tests/unit/examples/` (`examples/*.py`). Each test
-file loads its module by path with `support.modules.load_module` through a
-fixture — for an example, `tests/unit/examples/conftest.py`'s module-scoped
-`ex`, picked by the test file's name — and changes the module's attributes
-only through `monkeypatch`. An example's third-party packages this
-repository doesn't depend on (`ntnx_*`, `iscsi`) are reached only through
-seams in the example itself (`NutanixSdk`, `_load_iscsi`), which the tests
-replace with fakes; what those seams do against the real packages is
-checked by a run against the real service. Coverage measures only
-`synology_apm_repo`, so neither `scripts/` nor `examples/` counts toward its
-gate.
+(`scripts/*.py`) and `tests/unit/examples/` (`examples/**/*.py`, named by
+the module's stem alone: `examples/hypervisor-restore/stream_vmdk.py` →
+`test_stream_vmdk_<behaviour>.py`). Each test file loads its module by path
+with `support.modules.load_module` through a fixture — for an example,
+`tests/unit/examples/conftest.py`'s module-scoped `ex`, picked by the test
+file's name — and changes the module's attributes only through
+`monkeypatch`. An example's third-party packages this repository doesn't
+depend on (`ntnx_*`, `iscsi`, `pyVmomi`), and a hypervisor's REST API, are
+reached only through seams in the example itself (`NutanixSdk`,
+`_load_iscsi`, `VsphereSdk`, `PveApi`), which the tests replace with fakes;
+what those seams do against the real service is checked by a run against
+it. Coverage measures only `synology_apm_repo`, so neither `scripts/` nor
+`examples/` counts toward its gate.
 
 A test file is named after the source module or package it tests: its
 path relative to the distribution's package, each part's leading
@@ -129,8 +131,8 @@ by how widely it is used:
   `pool_fakes`, `saas_fakes`, `storage_fakes`, `tree_strategy_fakes`,
   `verify_reachable_fakes`, and the hypothesis strategies in
   `format_strategies`), `unit/cli/` (`export_fakes`, `listing_fakes`,
-  `session_fakes`), `integration/browser/pilot_drivers`,
-  `integration/sdk/vault_key_drivers`.
+  `session_fakes`), `unit/examples/hypervisor_restore_fakes`,
+  `integration/browser/pilot_drivers`, `integration/sdk/vault_key_drivers`.
   `tests/unit/support/test_test_layout_duplicate_helpers.py` fails when two
   test files define a structurally identical top-level function or class of
   five or more statements (names and docstrings aside); the copy belongs in

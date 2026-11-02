@@ -591,8 +591,9 @@ The whole SDK, CLI, and TUI are async-native end to end:
   its groups one at a time). Workers pay off when one process can't keep
   up: a fast destination past what one process decodes (about 1 GB/s of
   encrypted data on an Apple M2), or a destination each worker writes
-  through its own `worker_target` handle (`examples/restore_to_nutanix_ahv.py`'s
-  iSCSI sessions). Neither pool runs when the repository's `ObjectStore`
+  through its own `worker_target` handle
+  (`examples/hypervisor-restore/restore_to_nutanix_ahv.py`'s iSCSI
+  sessions). Neither pool runs when the repository's `ObjectStore`
   can't be reconstructed in a fresh process
   (`storage.store_descriptor.describe_store()` returns `None`); the
   single-process/`asyncio` path runs instead, as it does for export's other
