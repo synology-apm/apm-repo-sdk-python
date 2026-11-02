@@ -10,7 +10,9 @@ import io
 
 from ..._util.jsonparse import parse_json_object
 
-# M365 Outlook-compatible CSV column order (FORMAT-SPEC.md: M365 Contact).
+# M365 Outlook-compatible CSV column order, each filled from the Graph
+# ``contact`` field ``build_contact_csv`` names (FORMAT-SPEC.md: M365 Contact
+# has the field shape).
 _CSV_HEADER = [
     "First Name",
     "Middle Name",
@@ -33,8 +35,9 @@ _CSV_HEADER = [
 def build_contact_csv(meta_bytes: bytes) -> bytes:
     """M365 only: an Outlook-compatible CSV (UTF-8 BOM, header plus one
     row) from a contact META object's ``client_metadata`` (Graph API
-    contact fields), using a subset of the fields documented in
-    FORMAT-SPEC.md: M365 Contact.
+    contact fields): names, the first e-mail address and phone of each
+    list, job, company, business address and notes. M365 contacts carry no
+    photo, so the export has none.
 
     Raises:
         DataCorruptError: ``meta_bytes`` is not a JSON object.

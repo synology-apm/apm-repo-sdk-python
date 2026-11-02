@@ -25,6 +25,9 @@ docs = [
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
+# Every async fixture is function-scoped; pytest-asyncio warns (an error here,
+# see filterwarnings) when this is left unset.
+asyncio_default_fixture_loop_scope = "function"
 # importlib (not the default "prepend") mode: tests/unit/ and
 # tests/integration/ share basenames (both have a test_units_device.py), and
 # importlib mode identifies each test file by its own path rather than its
@@ -44,8 +47,9 @@ xfail_strict = true
 # follows, and the connection's non-daemon thread then blocks interpreter
 # exit. It still prints.
 filterwarnings = ["error", "default::ResourceWarning"]
-# Shared test modules import by their path under tests/ (support.pilot, unit.sdk.api_fakes).
-pythonpath = ["tests"]
+# Shared test modules import by their path under tests/ (support.pilot, unit.sdk.api_fakes);
+# the hypervisor restore scripts import their shared modules as top-level ones (apm_restore_common).
+pythonpath = ["tests", "examples/hypervisor-restore"]
 # A deadlocked test fails instead of hanging the run (pytest-timeout). Generous:
 # the slowest Textual pilot test takes ~28 s on a heavily loaded machine.
 timeout = 180
@@ -79,6 +83,8 @@ mypy_path = [
     # mypy reports "Duplicate module named". Listing "tests" resolves each
     # file to unit.<pkg>.test_x / integration.<pkg>.test_x.
     "tests",
+    # The hypervisor restore scripts' shared modules, imported as top-level ones.
+    "examples/hypervisor-restore",
 ]
 # The Makefile invokes bare `uv run mypy` (no command-line path argument), so
 # this list is what `make test` actually checks — add any new top-level
@@ -94,9 +100,9 @@ files = [
 ]
 
 # lz4/boto3/botocore/aioboto3/aiobotocore/dissect.*/smbprotocol/smbclient
-# and examples/'s ntnx_*_py_client/iscsi ship no type stubs or py.typed
-# marker — the standard mypy escape hatch, not a project-wide relaxation
-# (azure-storage-blob, by contrast, ships its own stubs).
+# ship no type stubs or py.typed marker, and examples/'s ntnx_*_py_client/
+# iscsi/pyVmomi aren't installed here — the standard mypy escape hatch, not a
+# project-wide relaxation (azure-storage-blob, by contrast, ships its own stubs).
 [[tool.mypy.overrides]]
 # Production code only: in tests, mypy narrows Textual's mutable
 # `app.screen` across Pilot steps and reports the later screen as unreachable.
@@ -127,6 +133,8 @@ module = [
     "ntnx_volumes_py_client.*",
     "ntnx_prism_py_client.*",
     "iscsi",
+    "pyVmomi.*",
+    "pyVim.*",
 ]
 ignore_missing_imports = true
 
@@ -139,6 +147,7 @@ src = [
     "packages/synology-apm-repo-sdk/src",
     "packages/synology-apm-repo-cli/src",
     "packages/synology-apm-repo-browser/src",
+    "examples/hypervisor-restore",
 ]
 
 [tool.ruff.lint]

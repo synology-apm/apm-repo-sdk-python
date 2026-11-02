@@ -20,7 +20,6 @@ from __future__ import annotations
 import dataclasses
 
 from .._util.jsonparse import json_bool, json_int
-from ..errors import DataCorruptError
 from .headers import MAGIC as _MAGICS
 from .headers import parse_json_payload_header
 
@@ -35,7 +34,13 @@ _SPEC = "FORMAT-SPEC.md: repo_info"
 @dataclasses.dataclass(frozen=True, slots=True)
 class RepoInfo:
     """Parsed ``repo_info``: header UUID plus the display-only JSON body
-    fields below; ``raw`` keeps the whole decoded payload."""
+    fields below; ``raw`` keeps the whole decoded payload.
+
+    ``uuid`` is the 16 header bytes at offset 20 as text when they are
+    ASCII (as every writer makes them), otherwise their lowercase hex. The
+    field is display-only in the format, so odd bytes never fail an open,
+    but frontends derive ids from it, so distinct bytes stay distinct.
+    """
 
     uuid: str
     major: int
@@ -54,16 +59,14 @@ def parse_repo_info(data: bytes) -> RepoInfo:
     body field of the wrong JSON type reads as ``None``.
 
     Raises:
-        DataCorruptError: A magic or CRC32 mismatch, a uuid that is not
-            ASCII, or a payload that is not a JSON object.
+        DataCorruptError: A magic or CRC32 mismatch, or a payload that is
+            not a JSON object.
         FormatError: ``data`` is shorter than the 64-byte header, or the
             payload is truncated relative to the length the header declares.
     """
     header, raw = parse_json_payload_header(data, expect_magic=MAGIC, spec=_SPEC, payload_kind="repo_info")
     raw_uuid = data[_OFF_REPO_UUID : _OFF_REPO_UUID + _REPO_UUID_LEN]
-    if not raw_uuid.isascii():
-        raise DataCorruptError(f"repo_info uuid {raw_uuid!r} is not ASCII", spec=_SPEC)
-    uuid = raw_uuid.decode("ascii")
+    uuid = raw_uuid.decode("ascii") if raw_uuid.isascii() else raw_uuid.hex()
     storage_algorithm = raw.get("storage_algorithm")
     if not isinstance(storage_algorithm, dict):
         storage_algorithm = {}

@@ -86,10 +86,11 @@ def test_truncated_payload_raises_format_error() -> None:
         parse_repo_info(data[:-5])
 
 
-def test_a_non_ascii_uuid_raises_data_corrupt() -> None:
-    data = repo_info_bytes({}, uuid=bytes(15) + b"\x80")
-    with pytest.raises(DataCorruptError, match=r"repo_info uuid .* is not ASCII"):
-        parse_repo_info(data)
+def test_a_non_ascii_uuid_reads_as_hex_instead_of_failing() -> None:
+    info = parse_repo_info(repo_info_bytes({}, uuid=b"a" * 15 + b"\x80"))
+    assert info.uuid == "61" * 15 + "80"
+    other = parse_repo_info(repo_info_bytes({}, uuid=b"a" * 15 + b"\x81"))
+    assert other.uuid != info.uuid, "distinct bytes stay distinct ids"
 
 
 def test_too_short_raises_format_error() -> None:

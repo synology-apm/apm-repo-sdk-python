@@ -172,7 +172,7 @@ Then open `docs/_build/html/index.html` in your browser.
 | [`packages/synology-apm-repo-sdk/README.md`](packages/synology-apm-repo-sdk/README.md) | SDK install and usage example |
 | [`packages/synology-apm-repo-cli/README.md`](packages/synology-apm-repo-cli/README.md) | CLI install and full command list |
 | [`packages/synology-apm-repo-browser/README.md`](packages/synology-apm-repo-browser/README.md) | Browser (TUI) install, usage, and flags |
-| [`examples/restore_to_nutanix_ahv.py`](examples/restore_to_nutanix_ahv.py) | Example: restore the disks of a VM, PC or PS version into a new Nutanix AHV VM through a custom `RandomAccessExportSink` (Nutanix Volumes over iSCSI) |
+| [`examples/hypervisor-restore/`](examples/hypervisor-restore/README.md) | Examples: restore the disks of a VM, PC or PS version into a new VMware vSphere, Proxmox VE, Nutanix AHV or QEMU VM, through a `BufferedExportSink` that uploads a streamOptimized VMDK as it exports (vSphere, Proxmox VE) or a custom `RandomAccessExportSink` over iSCSI (AHV) |
 | [`examples/export_disk_to_zip.py`](examples/export_disk_to_zip.py) | Example: export the disks of a VM, PC or PS version into one zip file, compressed on the fly, through a `BufferedExportSink` (a destination that takes bytes in order only) |
 | [API Reference](https://synology-apm.github.io/apm-repo-sdk-python/) | Full SDK API reference — every public class, method, and type signature (Sphinx, hosted on GitHub Pages) |
 | [`tests/CLAUDE.md`](tests/CLAUDE.md) | Testing conventions: synthetic vs real-data-replay tests, fixture recording/replay mechanisms |
