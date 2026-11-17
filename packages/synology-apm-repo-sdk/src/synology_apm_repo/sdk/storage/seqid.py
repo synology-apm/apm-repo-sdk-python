@@ -1,4 +1,4 @@
-"""Sequence-id resolution (FORMAT-SPEC.md: Sequence-id suffix mechanism) — "take the largest
+"""Sequence-id resolution (FORMAT-SPEC.md: Sequence suffixes) — "take the largest
 ``.<N>`` suffix, a bare name is also valid" — for ``.buk``, ``c<subID>``,
 ``.inf``, ``.fgp``, ``.ref``, and similar per-generation files.
 """

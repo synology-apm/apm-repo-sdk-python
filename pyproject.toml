@@ -15,6 +15,8 @@ dev = [
     "types-pyyaml>=6.0",
     "pytest-timeout>=2.3",
     "inline-snapshot>=0.23",
+    "pip-audit>=2.10",
+    "deptry>=0.25",
 ]
 # Separate from dev so `uv sync` doesn't pull Sphinx for ordinary test/lint
 # work — building the docs requires `uv sync --group docs` explicitly.
@@ -236,8 +238,7 @@ raises-require-match-for = [
 # blocking-I/O postcondition checks), not real production layering violations.
 "tests/**" = ["E501", "SLF001", "ASYNC240"]
 # Command-line tools whose output is their purpose.
-"{scripts,examples,tests/smoke}/**" = ["T20"]
-"tests/support/recording/anonymize_catalog_metadata.py" = ["T20"]
+"{scripts,examples}/**" = ["T20"]
 # Sphinx reads the module-level name `copyright`.
 "docs/conf.py" = ["A001"]
 # The tracked wrapper itself.

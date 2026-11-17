@@ -282,8 +282,7 @@ head_off=64         status=COMPLETE   map_num=2        mode=0x0001 attr_leng=0
     ) -> None:
         result = invoke(["dump", "composition", composition_trailing_garbage_path.name])
         assert result.stdout == snapshot("""\
-(stopped walking at offset 196: bad magic b'\\x00\\x00', expected b'Mu' \n\
-[spec=FORMAT-SPEC.md: RecordHead])
+(stopped walking at offset 196: bad magic b'\\x00\\x00', expected b'Mu')
 file : c0
 header : major=1 minor=1
 head_off=64         status=COMPLETE   map_num=2        mode=0x0001 attr_leng=0

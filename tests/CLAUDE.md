@@ -4,11 +4,11 @@
 
 The split is about one thing only: **is the data real or synthetic**. Every
 test runs with no external state (no live sample tree, network or real key
-material); a real-data test replays bytes recorded once from a real sample
-and committed alongside it.
+material); a real-data test replays bytes recorded once from an actual
+backup repository and committed alongside it.
 
-- **`tests/unit/`** — synthetic: hand-built bytes and fakes, no real sample
-  involved. The Codec Layer (`format/`) is entirely testable this way.
+- **`tests/unit/`** — synthetic: hand-built bytes and fakes, no recorded
+  data involved. The Codec Layer (`format/`) is entirely testable this way.
 - **`tests/integration/`** — real, production-shaped data: a `test_*.py`
   file replays a committed `tests/fixtures/*.json.gz` fixture through
   `ReplayStore` (see "`RecordingStore` / `ReplayStore`" below). Classify by
@@ -119,10 +119,9 @@ by how widely it is used:
     in-process and fails the test, with the command's output, unless the exit
     code matches; `exit_code=None` when the test inspects the outcome itself.
   - `modules.py`: `load_module(name, path)`.
-  - `recording/`: `fixture_store.py`, `manifest.py` and
-    `anonymize_catalog_metadata.py` (see "`RecordingStore` /
+  - `recording/`: `fixture_store.py` (see "`RecordingStore` /
     `ReplayStore`"), and `sample_constants.py`, the recorded samples' own
-    real values.
+    generated values.
 - `<split>/<distribution>/*_fakes.py` / `*_drivers.py` — fakes, builders and
   multi-step drives that several test files of one component share:
   `unit/browser/` (`screen_host_fakes`, `unit_screen_fakes`,
@@ -166,7 +165,7 @@ class to compare against — a third-party API (`boto3`, `azure`,
 `smbclient`, `dissect`, `ntnx_*`) or an `examples/` seam loaded at test
 time — carries `@unchecked_fake("<what it stands in for>")` instead.
 `tests/unit/support/test_fakes_conventions.py` checks that every fake-shaped
-class under `tests/` (`tests/smoke/` aside) carries one of the two.
+class under `tests/` carries one of the two.
 
 ## Property tests
 
@@ -196,8 +195,8 @@ answers the same calls with zero real I/O. An unrecorded call raises
 `UnrecordedCallError`, which is not an SDK error, and `record_target` fails
 the test at teardown for any unrecorded call, even one the code under test
 caught, so a stale fixture fails loudly. `ReplayStore` reads only the
-current fixture format (`"format": 2`) and raises `FixtureFormatError`,
-naming the re-record command, for any other. Reach for it before inventing
+current fixture format (`"format": 2`) and raises `FixtureFormatError`
+for any other. Reach for it before inventing
 a new fixture mechanism for Codec-through-Unit-Layer logic. Fixtures live
 in `tests/fixtures/`, committed gzip-compressed as `*.json.gz`.
 
@@ -211,80 +210,28 @@ content's meaning gets a synthetic test instead. `record_target` installs
 a `ContentRecordingBlocked` guard on every `RestorableUnit.of()`'s content
 and on `BucketReader.read_chunk`/`read_chunks`/`read_chunk_blocks`, on a
 replay as on a recording, so a test that reads real content fails the same
-way in both; `record_target(name, allow_content=True)` is the opt-out for a
+way whether or not the fixture covers the read;
+`record_target(name, allow_content=True)` is the opt-out for a
 test that needs real content bytes as a structural oracle (see
 `tests/integration/sdk/test_dedup_repository.py`). If a replay test can't
 prove real-data resolution without materializing content (e.g. a
 `LazyArtifact`, whose `.size` is `None` until assembled), assert on the
 node's listed shape (kind, leaf-ness) and prove content assembly
-synthetically — `tests/integration/sdk/test_units_saas_mail.py` does this
-for a whole workload type.
+synthetically. SaaS item content is never recorded at all: the
+`tests/unit/sdk/test_units_saas_*.py` files cover it with synthetic data.
 
-**Recording a fixture**: the replay test *is* the recipe.
-`tests/integration/conftest.py`'s `record_target(name)` returns
-`ReplayStore.from_path(...)` on a normal run, and a `RecordingStore` over a
-real backend when pytest runs with `--record-against=local:<path>` or
-`--record-against=profile:<profile-name>`. Every integration test gets its
-store through it, directly or through `replay_local_store`/
-`patch_profile_store`. Recording runs in one process (no `-n`).
-`record_target()` shares one `RecordingStore` across every test in the
-invocation requesting the same name and writes it at session end only if
-all of them passed. `tests/support/recording/manifest.py` prints the
-command for every fixture, and with `--check` lists those not yet in the
-current fixture format:
-
-```
-PYTHONPATH=tests uv run python -m support.recording.manifest
-make record-fixture TARGET=local:<path>/@ActiveProtectVault \
-    TEST="tests/integration/<path>/test_<name>.py::<test_a> tests/integration/<path>/test_<name>.py::<test_b>"
-```
-
-The manifest computes each fixture's owning file and recipe — every test
-that names it, directly or through a module constant, helper or pytest
-fixture — from the source, and holds one hand-maintained entry per fixture
-in `TARGETS`: the root it is recorded against, as `sample:<alias>` or
-`sample:<alias>/<subpath>` (`sample:vault-plain/@ActiveProtectVault`).
-
-**A sample is named by its alias everywhere in the repository.** An alias
-says what the sample holds (`vault-plain`, `objstore-encrypted`, `pcps`);
-the untracked `tests/support/recording/targets.toml` (copy
-`targets.toml.example`, which lists every alias with a one-line
-description) maps it to its real `local:<path>` or `profile:<name>`. A
-fixture name, a constant, a docstring, a comment and a recorded path all use
-the alias (`cli_doctor_vault_plain.json.gz`, `VAULT_ENCRYPTED_KEY_STRING`),
-so the real sample directory, profile, bucket and host names stay in
-`targets.toml` alone. A `local:` recording goes through
-`fixture_store.py`'s `AliasedStore`, which presents each sample directory
-under its alias, so a recording rooted above the samples (`all-local`)
-records alias paths.
-
-Each fixture belongs to one `test_*.py` file, recorded independently even
-when a sibling file opens the same real root. A new fixture gets its
-`TARGETS` entry in the same change, and a new sample its alias in
-`targets.toml.example`. `tests/unit/support/test_recording_manifest.py`
-fails on a committed fixture no test uses or two test files use, a fixture
-a test names that isn't committed, a fixture without a target or a stale
-target, one test recording against two targets, an alias missing from the
-example, or an integration `conftest.py` naming a fixture. Where
-`targets.toml` exists, it also fails on any real name it holds appearing in
-a committed or addable file, fixtures decompressed; CI has no
-`targets.toml`, so that check runs on a maintainer's machine.
-
-Every written fixture is then anonymized in the same step
-(`tests/support/recording/anonymize_catalog_metadata.py`, run by
-`tests/integration/conftest.py`'s `pytest_sessionfinish`); `--no-anonymize`
-skips it, e.g. to inspect the real bytes first. `make anonymize-fixtures`
-re-runs it over committed fixtures after its `SENSITIVE_FIELDS` grows. A
-value is redacted from a recorded path only when a fixture in the same
-batch carries the catalog row it comes from, so a sample whose fixtures
-span several targets is recorded with `--no-anonymize` per target, then
-anonymized as one `make anonymize-fixtures FIXTURES="..."` batch.
-
-After recording, check the fixture's *decompressed* size: `RecordingStore`
-stores every real `(path, offset, length)` call verbatim, so an uncapped
-traversal can grow to many MB — a sign the code path itself is expensive.
-Keep that number out of the test's docstring; it changes with every
-re-recording.
+**Where a test's store comes from.** Every integration test gets its
+store through `tests/integration/conftest.py`'s `record_target(name)`,
+directly or through `replay_local_store`/`patch_profile_store`, which
+returns `ReplayStore.from_path(tests/fixtures/<name>)`. The test *is* the
+fixture's recipe: the calls it makes are the calls the fixture holds.
+Each fixture belongs to one `test_*.py` file, and a sample is named by its
+alias everywhere — the alias says what the sample holds (`vault-plain`,
+`objstore-encrypted`, `pcps`), and a fixture name, a constant, a
+docstring, a comment and a recorded path all use it
+(`cli_doctor_vault_plain.json.gz`, `VAULT_ENCRYPTED_KEY_STRING`).
+A change that needs a new or re-recorded fixture says so in its pull
+request.
 
 A committed `.json.gz` diffs as binary by default; `CONTRIBUTING.md`'s
 "Sample data" section has the one-time `git config` step for readable
@@ -293,50 +240,43 @@ diffs.
 **Detects call-sequence drift, not semantic drift.** `ReplayStore` fails
 only on a call it never recorded. If production code starts interpreting
 the *same* recorded bytes differently, the test keeps passing against the
-stale interpretation, so re-record by hand whenever a code path's *meaning*
-changes, not only its call shape.
+stale interpretation, so a fixture needs re-recording whenever a code
+path's *meaning* changes, not only its call shape.
 
-### Real targets, anonymized fields and real values
+### Anonymized fields and sample constants
 
 **Everything this repository stores is synthetic or anonymized** — every
 fixture, every test's source, every environment variable a test reads by
-name. A test that navigates to a specific real target uses a **canonical**
+name. `tests/unit/support/test_recording_fixture_privacy.py` checks the
+fixtures: it decodes every read and every chunk of each one and fails on an
+email address outside the reserved domains (`example.com`, `.test`, ...), a
+Windows domain SID other than the synthetic one, a tar member owned by
+anyone but root, or a gzip header carrying a file name or timestamp.
+
+A test that navigates to a specific target uses a **canonical**
 ref (`#@cat:<id>/wl:<id>/ver:<uid>`, optionally `/device:<id>/object:<id>`)
 or another stable catalog identifier (`workload_id`, `version_id`,
 `stream_uuid`, `connection_config_id`): anonymization never touches these,
-so the same ref resolves the same node in the anonymized fixture and in a
-fresh recording, where a display-name path would only match
-post-anonymization text. Human-ref parsing belongs in a synthetic unit test
+so the ref stays valid when a fixture is re-recorded, where a display-name
+path would not. Human-ref parsing belongs in a synthetic unit test
 (`tests/unit/cli/test_cli_commands_tree.py`, `test_cli_commands_ls.py`,
 `tests/unit/sdk/test_units_node_ref.py`).
 
 **A replay test checks an anonymized field structurally, or against another
-value fetched in the same session** — any field `SENSITIVE_FIELDS` scrubs
+value fetched in the same session** — any field the anonymization scrubs
 (a connection/workload `display_name`, a device's `host_name`-derived name,
 a SaaS site/team/group name, ...); a synthetic unit test covers the logic
 with a fake name. Prefer a structural check (row/line count, shape) to a
 negative one (`not in`, `!=`) against a placeholder string: placeholder
-text can shift between recording sessions (a hash-slot collision moves it),
-so after re-recording, check what the fixture actually renders. Fields
-outside `SENSITIVE_FIELDS` may be asserted literally: a version's
+text can change when a fixture is re-recorded. Fields it leaves alone may be asserted literally: a version's
 `display_name` (a timestamp, see "Timezone-rendered assertions"), the fixed
 `gws_domain` `gwsdemo.example.com`, `subtitle`, `workload_type`,
-`sub_type`, real disk/SaaS content names.
+`sub_type`, disk content names.
 
-A fixture recording an encrypted sample's AHLT-encrypted `target.db`
-(`copy_meta_file/<vm>/target.db`) or its encrypted
-`copy_target_version.version_spec` values also records one
-`KeyMaterial.resolve_vault_key()` probe (opening the repository with its
-key does), even if no test needs it, so the anonymizer can resolve the
-vault key from it (`iter_repository_layouts()` searches up to 2 levels, so
-the fixture may be rooted at `@ActiveProtectVault` or one level higher).
-Without one, anonymization raises `LookupError` in `pytest_sessionfinish`
-unless another fixture written in the same run carries that sample's probe.
-
-**Real-value constants live in `tests/support/recording/sample_constants.py`**
+**Sample constants live in `tests/support/recording/sample_constants.py`**
 — a sample's own generated artifacts that replay tests need verbatim, not
-customer data. Replay tests and the anonymizer import them from there; add
-a new one with a `#:` line naming its sample's alias. `tests/unit/` uses
+customer data. Replay tests import them from there; a new one gets a `#:`
+line naming its sample's alias. `tests/unit/` uses
 synthetic values (e.g. a hand-built `"AliceKey0001@<base64>"` key string).
 
 ## Disk image fixtures
@@ -416,8 +356,7 @@ rather than through `Catalog.provider()` (whose providers the `Repository`
 closes) owns its `SqliteSource`/`aiosqlite` connection and closes it under
 `async with`, as for every `ClosableUnitProvider` (the SDK README's Design
 Conventions). A helper that returns a still-open provider leaves closing to
-its caller (e.g. `tests/integration/sdk/test_units_saas_calendar.py`'s
-`_open_provider`).
+its caller.
 
 A `monkeypatch.setattr(obj, "close", ...)` that simulates a close failure
 also stops the real cleanup: have the replacement delegate to the original
@@ -451,15 +390,8 @@ commit"). `make test-fast` (pytest only), `make test-quick` (pytest
 without the Textual `Pilot` tests), `make test-unit` and
 `make test-integration` are quicker loops; every pytest run replays the
 committed `tests/integration/` fixtures, and re-recording one is a
-separate, by-hand `make record-fixture` step (see "Detects call-sequence
-drift, not semantic drift"). `tests/conftest.py` marks every test in a
+separate step (see "Detects call-sequence drift, not semantic drift"). `tests/conftest.py` marks every test in a
 module that drives a `Pilot` (itself or through a `tests/` module it
 imports) with `pilot`, so `-m pilot` selects only those.
-
-## Real-sample smoke tests
-
-`tests/smoke/` holds three non-pytest tools, one per distribution, run by
-hand against the real samples in `tests/smoke/smoke_samples.toml` via
-`make smoke-test`, outside `make test`/CI. See `tests/smoke/README.md`.
 
 See [`CONTRIBUTING.md`](../CONTRIBUTING.md) for commit message conventions.

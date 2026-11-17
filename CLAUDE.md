@@ -19,7 +19,7 @@ only cross-cutting rules and pointers, not a second copy of it.
 
 See [`README.md`](README.md)'s Documentation Index for `ARCHITECTURE.md`,
 `FORMAT-SPEC.md`, `CONTRIBUTING.md`, and `tests/CLAUDE.md` — not repeated
-here. The rest are dev/internal-only and don't appear there:
+here. The rest are for development and don't appear there:
 
 | Document | Description | Priority |
 |---|---|---|
@@ -29,6 +29,7 @@ here. The rest are dev/internal-only and don't appear there:
 | [`scripts/check_version_consistency.py`](scripts/check_version_consistency.py) | Checks the three packages' `project.version` fields and their cross-package dependency pins stay in lockstep. Run by `make test`, not invoked directly in normal workflow. | consult when a version bump or dependency pin edit isn't caught by `make test` |
 | [`scripts/check_sdk_import_boundary.py`](scripts/check_sdk_import_boundary.py) | Verifies the CLI/browser packages and `examples/` import the SDK only through its public modules, and that neither frontend (nor `examples/`) imports the other. Run by `make test`, not invoked directly in normal workflow. | consult when a new SDK-facing import isn't caught by `make test` |
 | [`scripts/check_sdk_layers.py`](scripts/check_sdk_layers.py) | Verifies SDK-internal imports only point downward through `ARCHITECTURE.md`'s layers (leaf packages import no layered package) and form no import cycle (for cycles only, `TYPE_CHECKING` imports are excluded). Run by `make test`, not invoked directly in normal workflow. | consult when a new cross-layer import or cycle isn't caught by `make test` |
+| [`scripts/check_lock_sources.py`](scripts/check_lock_sources.py) | Verifies every package in `uv.lock` comes from PyPI or the workspace. Run by `make audit` (CI's `audit` job), not invoked directly in normal workflow. | consult when a new dependency source is rejected |
 | [`scripts/check_browser_layers.py`](scripts/check_browser_layers.py) | Verifies each browser layer below `screens/` imports only what it builds on (the browser README's "MVU" section), `TYPE_CHECKING` imports included. Run by `make test`, not invoked directly in normal workflow. | consult when a new cross-layer browser import isn't caught by `make test` |
 | [`.github/CLAUDE.md`](.github/CLAUDE.md) | GitHub Actions conventions: action-pin verification, what `make github-act-simulation` covers (build/test jobs, not deploy/publish), the PyPI trusted-publishing setup `release.yml` needs. | required when touching `.github/workflows/` |
 | `docs/` | Sphinx build of `synology-apm-repo-sdk`'s API reference from its own Google-style docstrings (`make docs`). See the SDK README's "Docstring Conventions" before adding an SDK module or docstring. | required when adding an SDK module |
@@ -59,10 +60,8 @@ crossing exists*.
 
 ### Language
 
-Code, docstrings, comments, CLI help strings, and user-visible output strings
-are **English**, no exceptions. Chat/commit-message discussion may mix
-Chinese and English — that's fine for working conversation, not for anything
-that ships in source.
+Code, docstrings, comments, CLI help strings and user-visible output are
+English.
 
 ### Async-native, everywhere
 
@@ -70,7 +69,7 @@ The whole SDK/CLI/TUI is `async def` end to end. Use `asyncio.to_thread()`
 only to get a *single* blocking call off the event loop — see
 `ARCHITECTURE.md`'s "Async-native, by design" section for that boundary.
 Concurrency added for throughput rather than responsiveness needs measuring
-against a real sample first.
+first.
 
 ### Pythonic conventions
 
@@ -155,7 +154,7 @@ See [`tests/CLAUDE.md`](tests/CLAUDE.md).
   docstring.
 - **Any change**: `make test` — see `CONTRIBUTING.md`'s "Before every
   commit" for exactly what that runs and when a `tests/integration/`
-  fixture also needs re-recording by hand.
+  fixture needs re-recording.
 - **Editing `ARCHITECTURE.md` or any other guideline doc**: verify each
   concrete claim you touch (a described default behavior, a cited count, an
   inline "quoted" section heading) against the actual current code/heading —

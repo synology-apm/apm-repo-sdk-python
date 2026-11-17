@@ -75,7 +75,7 @@ class CompositionReader:
     async def read_at(self, global_offset: int, n: int) -> bytes:
         """Read ``n`` bytes starting at the session-global ``global_offset``,
         transparently crossing 16 MiB sub-file boundaries
-        (FORMAT-SPEC.md: Composition file splitting).
+        (FORMAT-SPEC.md: Composition sessions).
 
         Raises:
             NotFoundError: A sub-file the range touches is missing.
@@ -366,7 +366,7 @@ class CompositionRecord:
 
         ``units/device_pcps.py`` uses it for a PC/PS disk fragment, whose
         ``file_meta.file_size`` is the whole disk's capacity
-        (FORMAT-SPEC.md: PC/PS disk fragments).
+        (FORMAT-SPEC.md: PC/PS).
         """
         if self.map_num == 0:
             return (0, 0)

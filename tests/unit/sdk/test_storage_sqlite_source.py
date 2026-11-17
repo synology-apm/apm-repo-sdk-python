@@ -1,6 +1,6 @@
 """Unit tests for ``storage.sqlite_source`` using synthetic ``aHlT``/zstd
 envelopes; ``tests/integration/sdk/test_storage_sqlite_source_envelopes.py``
-covers the real-sample envelope combinations."""
+covers the recorded fixtures' envelope combinations."""
 
 from __future__ import annotations
 
@@ -784,7 +784,7 @@ class TestFromEnvelopedStore:
     """``from_enveloped_store``: the entry point for a source that may be
     ``aHlT``-enveloped and have a ``-wal``/``-shm`` sidecar
     (``copy_meta_file/*/target.db``, opened by ``catalog/version.py``'s
-    ``open_target_db()``; see FORMAT-SPEC.md: Landing directory layout; File-level encryption)."""
+    ``open_target_db()``; see FORMAT-SPEC.md: Metadata directory; File-level encryption)."""
 
     async def test_reads_a_plaintext_file_with_no_vault_key(self, tmp_path: Path) -> None:
         (tmp_path / "target.db").write_bytes(_real_sqlite_bytes())

@@ -1,5 +1,5 @@
 """S3/Azure ``db/<name>.<N>`` generation selection (FORMAT-SPEC.md:
-Multi-generation selection). The single place this rule lives;
+Generation selection). The single place this rule lives;
 ``dedup/repository.py`` uses it for ``db/<name>`` and ``repo_info``.
 
 The naive "largest ``.<N>`` suffix" rule (``resolve_seq_file``) is not enough
@@ -34,7 +34,7 @@ from ..format.repo_transaction import parse_repo_transaction
 from .base import ObjectStore, join_path, list_names
 
 #: The supplemental tables, resolved by the ``suppl_transaction_ids/`` marker
-#: rule, not the transaction-log rule (FORMAT-SPEC.md: Multi-generation
+#: rule, not the transaction-log rule (FORMAT-SPEC.md: Generation
 #: selection). ``copy_target_file`` is listed for completeness; it shares
 #: ``copy_target_version``'s physical file (see ``PHYSICAL_NAME_ALIASES``).
 SUPPLEMENTAL_TABLES = frozenset(
@@ -78,7 +78,7 @@ def _numeric_suffixes(names: list[str], base: str) -> list[int]:
 
 async def latest_transaction_id(store: ObjectStore, transactions_dir: str, *, listdir: Listdir | None = None) -> int:
     """The latest *committed* transaction id, per FORMAT-SPEC.md:
-    Multi-generation selection: the ``transaction_id`` embedded in the
+    Generation selection: the ``transaction_id`` embedded in the
     highest-numbered ``repo_transaction.<N>`` file.
 
     Args:
@@ -115,7 +115,7 @@ async def resolve_generation(
     ``OBJECT_STORE`` layout: the largest ``.<N>`` strictly less than the
     latest *committed* transaction for most tables, or the largest ``.<N>``
     with a matching ``suppl_transaction_ids`` marker for the 9 supplemental
-    tables (FORMAT-SPEC.md: Multi-generation selection). A name with no
+    tables (FORMAT-SPEC.md: Generation selection). A name with no
     ``.<N>`` variant resolves to the bare name.
 
     Args:

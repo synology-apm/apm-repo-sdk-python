@@ -1,7 +1,5 @@
 """Unit tests for ``browser.list_overview_table``'s pure, widget-free
-``truncate_cell``, ``overview_columns`` and ``overview_console_width``. The
-rendered overview is covered by
-``tests/integration/browser/test_browser_screens_unit_screen_preview.py``."""
+``truncate_cell``, ``overview_columns`` and ``overview_console_width``."""
 
 from __future__ import annotations
 

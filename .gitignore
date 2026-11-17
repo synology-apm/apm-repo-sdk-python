@@ -1,21 +1,49 @@
+# The common sections come first; what only this repository makes goes under "This repository".
+
+# Build output
+/target/
+
+# Python
 __pycache__/
 *.py[cod]
 *.egg-info/
-build/
-dist/
-.venv/
-.mypy_cache/
-.ruff_cache/
+/.venv/
 .pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# Scratch files: disk images made by hand or by tests, atomic writes, downloads
+*.img
+*.vhd
+*.vhdx
+*.tmp~
+*.part
+
+# Local agent and editor state
+/.claude/
+/.vscode/
+/.idea/
+*.swp
+*~
+
+# Operating system metadata (Finder, Explorer)
+.DS_Store
+._*
+.AppleDouble/
+.Spotlight-V100/
+.Trashes/
+Thumbs.db
+ehthumbs.db
+desktop.ini
+$RECYCLE.BIN/
+
+# This repository
+/build/
+/dist/
 .hypothesis/
 .coverage
 .coverage.*
-htmlcov/
+/htmlcov/
 uv.lock.bak
-.DS_Store
-*.swp
-docs/_build/
-docs/api/
-tests/smoke/reports/
-tests/smoke/smoke_samples.toml
-tests/support/recording/targets.toml
+/docs/_build/
+/docs/api/

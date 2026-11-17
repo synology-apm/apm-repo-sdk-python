@@ -1,8 +1,7 @@
 """Unit tests for ``synology_apm_repo.sdk.units.saas.mail`` over a
 synthetic repository root (``unit.sdk.saas_fakes``), plus
 ``units.content.saas_mail``'s ``build_eml`` (``X-ABL-ID`` fragment
-reassembly), which ``tests/integration/sdk/test_units_saas_mail.py`` leaves
-to this file."""
+reassembly)."""
 
 from __future__ import annotations
 

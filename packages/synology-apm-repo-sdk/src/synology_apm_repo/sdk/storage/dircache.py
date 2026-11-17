@@ -27,7 +27,7 @@ _SEQ_SUFFIX_RE = re.compile(r"^(?P<base>.+)\.(?P<seq>[0-9]+)$")
 
 def split_seq_suffix(name: str) -> tuple[str, int | None]:
     """Split a trailing ``.<digits>`` sequence-id suffix off ``name``
-    (FORMAT-SPEC.md: Sequence-id suffix mechanism). Returns ``(name, None)``
+    (FORMAT-SPEC.md: Sequence suffixes). Returns ``(name, None)``
     if there is none. Only the last dot-segment counts: ``"132.buk.1"`` ->
     ``("132.buk", 1)``, ``"132.buk"`` -> ``("132.buk", None)``.
     """

@@ -37,34 +37,6 @@ class TestGroupFindings:
         assert groups[0][0].ref_value == "shared-obj"
         assert {aug.finding.path for aug in groups[0]} == {"wl-a/2026-01-01 00:00:01", "wl-b/2026-01-01 00:00:02"}
 
-    def test_a_spec_tag_stays_placeholdered_even_in_a_ref_based_group(self) -> None:
-        """Only the ``ref`` tag is kept verbatim in a group's ``template``; a
-        ``[spec=...]`` tag becomes a ``[spec]`` placeholder, and its real
-        value stays in each member's ``variable_parts``."""
-        findings = [
-            Finding(
-                Stage.VERSION,
-                Symptom.DATA_MISSING,
-                "wl-a/2026-01-01 00:00:01",
-                "no file_map entry for path 'shared-obj' [ref=shared-obj] [spec=FORMAT-SPEC.md: A]",
-            ),
-            Finding(
-                Stage.VERSION,
-                Symptom.DATA_MISSING,
-                "wl-b/2026-01-01 00:00:02",
-                "no file_map entry for path 'shared-obj' [ref=shared-obj] [spec=FORMAT-SPEC.md: B]",
-            ),
-        ]
-        groups = group_findings(sorted(findings, key=finding_sort_key))
-        assert len(groups) == 1
-        assert groups[0][0].template == snapshot("no file_map entry for path '…' [ref=shared-obj] [spec]")
-        assert {aug.finding.path: aug.variable_parts for aug in groups[0]} == snapshot(
-            {
-                "wl-a/2026-01-01 00:00:01": "[spec=FORMAT-SPEC.md: A]",
-                "wl-b/2026-01-01 00:00:02": "[spec=FORMAT-SPEC.md: B]",
-            }
-        )
-
     def test_a_quoted_value_with_both_quote_characters_is_matched_as_one_span(self) -> None:
         """A ``repr()`` containing both quote characters (backslash-escaped
         inner ``'``) is normalized as one quoted span, leaving no fragment

@@ -17,7 +17,7 @@ counter; several catalog ``Version`` rows can share one. It records which
 generation a version was written into, not where its content lives now:
 a later generation's composition record is a superset of an earlier
 one's, and older generations are garbage-collected server-side
-(FORMAT-SPEC.md: Generic SaaS object addressing). So a missing
+(FORMAT-SPEC.md: Stream generations). So a missing
 generation is routine rotation, and ``resolve_saas_obj`` forward-resolves
 to the nearest later live generation, bounded by
 ``stream_info.latest_complete_version``.
@@ -50,7 +50,7 @@ from ...storage.sqlite_source import SqliteSource
 from ...storage.table import Column, Table, as_int
 
 #: The suffix every generation's ``saas_obj`` ``file_map`` path ends with
-#: (FORMAT-SPEC.md: Generic SaaS object addressing).
+#: (FORMAT-SPEC.md: ``saas_obj``).
 _SAAS_OBJ_SUFFIX = "/saas_obj"
 
 
@@ -250,7 +250,7 @@ class SaasStream(AsyncClosing):
     async def _fetch_latest_complete_version(self, _key: None) -> int | None:
         """``stream_info.latest_complete_version``: forward resolution never
         goes past it, since a later generation isn't committed
-        (FORMAT-SPEC.md: Generation resolution). ``None`` when ``stream_info`` can't be read;
+        (FORMAT-SPEC.md: Stream generations). ``None`` when ``stream_info`` can't be read;
         resolution is then unbounded."""
         try:
             table = await self._open_table("saas_version", "stream_info", [Column("latest_complete_version")])

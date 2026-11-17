@@ -1,4 +1,4 @@
-"""Chunk and key-material cryptography (FORMAT-SPEC.md: Key hierarchy).
+"""Chunk and key-material cryptography (FORMAT-SPEC.md: Keys).
 
 Four independent AES schemes, never confused with each other:
 
@@ -14,7 +14,7 @@ Four independent AES schemes, never confused with each other:
   encryption).
 - ``db/copy_target_version.version_spec``: AES-256-CTR with the same DEK and
   an IV derived from ``hex(MD5(version_uid))`` (FORMAT-SPEC.md:
-  ``copy_target_version.version_spec`` encryption).
+  ``version_spec`` encryption).
 
 Nothing here decides *whether* something is encrypted; callers decide by
 mode bit or magic.
@@ -35,11 +35,6 @@ from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from ..errors import KeyMaterialError, KeyMismatchError
 from .addressing import ChunkAddress
 from .headers import HEADER_LEN, MAGIC, parse_index_header
-
-_SPEC_CHUNK = "FORMAT-SPEC.md: Chunk pool encryption"
-_SPEC_GCM = "FORMAT-SPEC.md: VaultKey custody"
-_SPEC_AHLT = "FORMAT-SPEC.md: File-level encryption"
-_SPEC_VERSION_SPEC = "FORMAT-SPEC.md: `copy_target_version.version_spec` encryption"
 
 AES_KEY_SIZE = 32
 AES_GCM_NONCE_SIZE = 12
@@ -80,7 +75,7 @@ def build_aes_algorithm(vault_key: bytes) -> algorithms.AES:
         KeyMaterialError: ``vault_key`` is not 32 bytes.
     """
     if len(vault_key) != AES_KEY_SIZE:
-        raise KeyMaterialError(f"vault_key must be {AES_KEY_SIZE} bytes, got {len(vault_key)}", spec=_SPEC_CHUNK)
+        raise KeyMaterialError(f"vault_key must be {AES_KEY_SIZE} bytes, got {len(vault_key)}")
     return algorithms.AES(vault_key)
 
 
@@ -117,7 +112,7 @@ def decrypt_chunk(
     """
     iv = chunk_iv(addr)
     if algorithm is None and len(vault_key) != AES_KEY_SIZE:
-        raise KeyMaterialError(f"vault_key must be {AES_KEY_SIZE} bytes, got {len(vault_key)}", spec=_SPEC_CHUNK)
+        raise KeyMaterialError(f"vault_key must be {AES_KEY_SIZE} bytes, got {len(vault_key)}")
     return _aes_ctr_decrypt(vault_key, iv, ciphertext, algorithm=algorithm)
 
 
@@ -145,7 +140,7 @@ class ChunkDecryptor:
 
 def parse_key_string(key_string: str) -> tuple[str, bytes]:
     """Split an administrator-provided key string
-    ``"<userKeyID>@<base64(userKey)>"`` (FORMAT-SPEC.md: Key hierarchy) into
+    ``"<userKeyID>@<base64(userKey)>"`` (FORMAT-SPEC.md: Keys) into
     ``(user_key_id, user_key)``. Splits on the last ``@`` and validates
     ``user_key_id`` is 12 ASCII characters (the GCM nonce's 12 bytes)
     without a path separator and ``user_key`` decodes to 32 bytes.
@@ -156,23 +151,22 @@ def parse_key_string(key_string: str) -> tuple[str, bytes]:
         KeyMaterialError: The string is malformed.
     """
     if "@" not in key_string:
-        raise KeyMaterialError("key string is not '<userKeyID>@<base64(userKey)>'", spec=_SPEC_GCM)
+        raise KeyMaterialError("key string is not '<userKeyID>@<base64(userKey)>'")
     user_key_id, b64_user_key = key_string.rsplit("@", 1)
     if len(user_key_id) != USER_KEY_ID_LENGTH:
         raise KeyMaterialError(
             f"userKeyID must be {USER_KEY_ID_LENGTH} characters, got {len(user_key_id)}",
-            spec=_SPEC_GCM,
         )
     if not user_key_id.isascii():
-        raise KeyMaterialError(f"userKeyID must be ASCII, got {user_key_id!r}", spec=_SPEC_GCM)
+        raise KeyMaterialError(f"userKeyID must be ASCII, got {user_key_id!r}")
     if _USER_KEY_ID_PATH_SEPARATORS.search(user_key_id):
-        raise KeyMaterialError(f"userKeyID must not contain a path separator, got {user_key_id!r}", spec=_SPEC_GCM)
+        raise KeyMaterialError(f"userKeyID must not contain a path separator, got {user_key_id!r}")
     try:
         user_key = base64.b64decode(b64_user_key, validate=True)
     except (ValueError, binascii.Error) as exc:
-        raise KeyMaterialError(f"userKey is not valid base64: {exc}", spec=_SPEC_GCM) from exc
+        raise KeyMaterialError(f"userKey is not valid base64: {exc}") from exc
     if len(user_key) != AES_KEY_SIZE:
-        raise KeyMaterialError(f"userKey must decode to {AES_KEY_SIZE} bytes, got {len(user_key)}", spec=_SPEC_GCM)
+        raise KeyMaterialError(f"userKey must decode to {AES_KEY_SIZE} bytes, got {len(user_key)}")
     return user_key_id, user_key
 
 
@@ -191,18 +185,16 @@ def unwrap_vault_key(user_key_id: str, user_key: bytes, wrapped: bytes) -> bytes
         KeyMismatchError: The GCM tag check fails (wrong key pair).
     """
     if len(user_key) != AES_KEY_SIZE:
-        raise KeyMaterialError(f"userKey must be {AES_KEY_SIZE} bytes, got {len(user_key)}", spec=_SPEC_GCM)
+        raise KeyMaterialError(f"userKey must be {AES_KEY_SIZE} bytes, got {len(user_key)}")
     if len(user_key_id) != USER_KEY_ID_LENGTH:
         raise KeyMaterialError(
             f"userKeyID must be {USER_KEY_ID_LENGTH} characters, got {len(user_key_id)}",
-            spec=_SPEC_GCM,
         )
     if not user_key_id.isascii():
-        raise KeyMaterialError(f"userKeyID must be ASCII, got {user_key_id!r}", spec=_SPEC_GCM)
+        raise KeyMaterialError(f"userKeyID must be ASCII, got {user_key_id!r}")
     if len(wrapped) != AES_KEY_SIZE + AES_GCM_TAG_SIZE:
         raise KeyMaterialError(
             f"wrapped VaultKey must be {AES_KEY_SIZE + AES_GCM_TAG_SIZE} bytes, got {len(wrapped)}",
-            spec=_SPEC_GCM,
         )
     nonce = user_key_id.encode("ascii")[:AES_GCM_NONCE_SIZE]
     try:
@@ -210,7 +202,6 @@ def unwrap_vault_key(user_key_id: str, user_key: bytes, wrapped: bytes) -> bytes
     except InvalidTag as exc:
         raise KeyMismatchError(
             "AES-256-GCM tag check failed — userKeyID/userKey do not match this wrapped VaultKey",
-            spec=_SPEC_GCM,
         ) from exc
 
 
@@ -234,7 +225,7 @@ def ahlt_decrypt(data: bytes | bytearray, vault_key: bytes) -> bytes:
         FormatError: ``data`` is shorter than the 64-byte header.
         DataCorruptError: A magic or header-CRC mismatch.
     """
-    parse_index_header(data, expect_magic=MAGIC["ahlt"], spec=_SPEC_AHLT)
+    parse_index_header(data, expect_magic=MAGIC["ahlt"])
     iv = bytes(data[_OFF_AHLT_IV : _OFF_AHLT_IV + _AHLT_IV_LEN])
     # A view: slicing would copy the whole body before decrypting it.
     return _aes_ctr_decrypt(vault_key, iv, memoryview(data)[HEADER_LEN:])
@@ -243,7 +234,7 @@ def ahlt_decrypt(data: bytes | bytearray, vault_key: bytes) -> bytes:
 def version_spec_iv(version_uid: str) -> bytes:
     """16-byte AES-CTR IV for one ``copy_target_version.version_spec``: the
     first 16 ASCII bytes of the hex string ``hex(MD5(version_uid))``, not the
-    raw 16-byte digest (FORMAT-SPEC.md: ``copy_target_version.version_spec``
+    raw 16-byte digest (FORMAT-SPEC.md: ``version_spec``
     encryption).
     """
     hex_digest = hashlib.md5(version_uid.encode("utf-8")).hexdigest()
@@ -255,7 +246,7 @@ def decrypt_version_spec(ciphertext_b64: str, version_uid: str, vault_key: bytes
     same DEK as chunk-pool/``aHlT`` (``vault_key``), IV from
     ``version_spec_iv``. The value is plain base64 with no magic to sniff, so
     the caller decides whether to call this (``repo.vault_key is not None``)
-    (FORMAT-SPEC.md: ``copy_target_version.version_spec`` encryption).
+    (FORMAT-SPEC.md: ``version_spec`` encryption).
 
     Returns:
         The decoded UTF-8 plaintext (a JSON string).
@@ -267,7 +258,7 @@ def decrypt_version_spec(ciphertext_b64: str, version_uid: str, vault_key: bytes
             (``binascii.Error``).
     """
     if len(vault_key) != AES_KEY_SIZE:
-        raise KeyMaterialError(f"vault_key must be {AES_KEY_SIZE} bytes, got {len(vault_key)}", spec=_SPEC_VERSION_SPEC)
+        raise KeyMaterialError(f"vault_key must be {AES_KEY_SIZE} bytes, got {len(vault_key)}")
     ciphertext = base64.b64decode(ciphertext_b64, validate=True)
     iv = version_spec_iv(version_uid)
     plaintext = _aes_ctr_decrypt(vault_key, iv, ciphertext)

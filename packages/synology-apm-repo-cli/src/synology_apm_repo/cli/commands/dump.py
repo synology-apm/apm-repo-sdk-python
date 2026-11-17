@@ -7,7 +7,7 @@ Each subcommand takes a path to one ``.buk`` or composition sub-file, not a
 
 Without ``--profile``, ``path`` is a local filesystem path; with it, a
 store-relative sub-path instead — a ``.<N>`` sequence-id suffix
-(FORMAT-SPEC.md: Sequence-id suffix mechanism) is never resolved from a logical name
+(FORMAT-SPEC.md: Sequence suffixes) is never resolved from a logical name
 in either case, so type the exact on-disk filename.
 """
 

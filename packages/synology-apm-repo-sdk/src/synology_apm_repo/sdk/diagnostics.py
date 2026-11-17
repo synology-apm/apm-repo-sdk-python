@@ -6,7 +6,7 @@ uses the same parsers as the read path, so callers need no
 
 Every function takes an already-resolved ``ObjectStore`` (``open_local()``
 builds one for a local path) and the literal on-disk filename: a ``.<N>``
-sequence-id suffix (FORMAT-SPEC.md: Sequence-id suffix mechanism) is not
+sequence-id suffix (FORMAT-SPEC.md: Sequence suffixes) is not
 resolved from a logical name.
 """
 

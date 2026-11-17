@@ -1,18 +1,26 @@
-# Quality gate on every push and pull request, in three parts that run in
-# parallel where they can: `lint` runs the static checks once (`make lint`:
-# format, ruff, the check scripts, mypy for linux/win32/darwin); `pytest` runs
-# the suite on every supported OS and Python version, each leg recording
-# coverage data; `coverage` combines that data and enforces the 95% gate, so
-# platform- and version-branched code is measured where it runs. `test` only
-# reports whether all three passed — it is the required status check (branch
-# protection, Dependabot auto-merge), so it keeps that name. release.yml reuses
-# this workflow (workflow_call) so a release re-verifies the same gate first.
+# Quality gate on pushes to main, pull requests, a weekly run and a release
+# (release.yml calls it when the tagged commit has no passing run), every
+# step a Makefile target a developer runs locally:
+# - `lint`: the static checks once (`make lint`: format, ruff, the check
+#   scripts, mypy for linux/win32/darwin).
+# - `pytest`: the suite on every supported OS and Python version, each leg
+#   recording coverage data.
+# - `coverage`: `make coverage-gate` gates each OS on its own (its three
+#   Python versions combined), so platform-branched code is measured where
+#   it runs.
+# - `audit` (advisories, lock sources), `unused-deps` (deptry).
+# `test` aggregates them as the one required status check (branch
+# protection, Dependabot auto-merge); keep its name and `if: always()`.
+# Actions are pinned to commit SHAs; see .github/CLAUDE.md.
 name: CI
 
 on:
   push:
-    branches: ['**']   # branches only — tag pushes run this via release.yml instead
+    branches: [main]
   pull_request:
+  schedule:
+    # New advisories, even with no commits.
+    - cron: "17 3 * * 1"
   workflow_call:
 
 permissions:
@@ -141,11 +149,8 @@ jobs:
           merge-multiple: true
 
       # `coverage report` exits non-zero below pyproject's fail_under (95).
-      - name: Combine and enforce the coverage gate
-        run: |
-          uv run coverage combine
-          uv run coverage html --fail-under=0
-          uv run coverage report --skip-covered
+      - name: Gate each OS's coverage (make coverage-gate)
+        run: make coverage-gate
 
       - name: Upload coverage report
         if: always()
@@ -155,12 +160,58 @@ jobs:
           path: htmlcov/
           retention-days: 14
 
+  audit:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+        with:
+          enable-cache: true
+          python-version: "3.14"
+
+      - name: Install dependencies
+        run: uv sync --all-packages --locked
+
+      - name: Lock sources (make check-lock-sources)
+        run: make check-lock-sources
+
+      # A new advisory against an unchanged lockfile shouldn't block an
+      # unrelated pull request; the push and weekly runs still fail on it.
+      - name: Advisories (make audit-advisories)
+        run: make audit-advisories
+        continue-on-error: ${{ github.event_name == 'pull_request' }}
+
+  unused-deps:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+        with:
+          enable-cache: true
+          python-version: "3.14"
+
+      - name: Install dependencies
+        run: uv sync --all-packages --locked
+
+      - name: Unused dependencies (make deptry)
+        env:
+          NO_COLOR: "1"
+        run: make deptry
+
   # Fails unless every job above succeeded. `if: always()` matters: without it
   # this job would be *skipped* when one above fails, and a skipped required
   # check counts as passing.
   test:
     if: always()
-    needs: [lint, pytest, coverage]
+    needs: [lint, pytest, coverage, audit, unused-deps]
     runs-on: ubuntu-latest
 
     steps:

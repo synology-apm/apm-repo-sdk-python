@@ -17,8 +17,6 @@ from ..errors import DataCorruptError, FormatError
 from .addressing import ChunkAddress
 from .const import CHUNK_MAP_RECORD_LENGTH, FIXED_CHUNK_BIT_NUM, FIXED_CHUNK_LENGTH
 
-_SPEC = "FORMAT-SPEC.md: ChunkMapRecord"
-
 # Byte 0 of the big-endian uint64 at [0,8): low nibble is Type, bit 4 is INHERIT.
 _TYPE_FILTER = 0x0F
 _TYPE_INHERIT_BIT = 0x10
@@ -61,7 +59,7 @@ class ChunkMapEntry:
     is_inherit: bool
     """The ``INHERIT`` bit, purely descriptive ("carried over unchanged
     from a reference version"); reading never depends on it
-    (FORMAT-SPEC.md: Hole vs. Zero vs. INHERIT)."""
+    (FORMAT-SPEC.md: Holes, Zero and INHERIT)."""
     addr: ChunkAddress | None
     """The chunk's base address in Pool. ``None`` for ``ChunkMapKind.ZERO``."""
     map_num: int
@@ -91,7 +89,7 @@ def parse_chunk_map_record(data: bytes) -> ChunkMapEntry:
         DataCorruptError: The type nibble is neither 0 (Mapping) nor 1 (Zero).
     """
     if len(data) < CHUNK_MAP_RECORD_LENGTH:
-        raise FormatError(f"ChunkMapRecord too short: {len(data)} bytes < {CHUNK_MAP_RECORD_LENGTH}", spec=_SPEC)
+        raise FormatError(f"ChunkMapRecord too short: {len(data)} bytes < {CHUNK_MAP_RECORD_LENGTH}")
     return _parse_at(data, 0)
 
 
@@ -99,7 +97,7 @@ def _kind_of(word0: int) -> ChunkMapKind:
     kind_value = (word0 >> _TYPE_DATA_SHIFT) & _TYPE_FILTER
     kind = _KIND_BY_VALUE.get(kind_value)
     if kind is None:
-        raise DataCorruptError(f"unknown ChunkMapRecord type {kind_value}", spec=_SPEC)
+        raise DataCorruptError(f"unknown ChunkMapRecord type {kind_value}")
     return kind
 
 
@@ -135,7 +133,7 @@ def chunk_map_end_offset(page_bytes: bytes, index: int) -> int:
     try:
         word0, _addr_raw, num = _RECORD.unpack_from(page_bytes, index * CHUNK_MAP_RECORD_LENGTH)
     except struct.error as exc:
-        raise FormatError(f"chunk map page ends before record {index}", spec=_SPEC) from exc
+        raise FormatError(f"chunk map page ends before record {index}") from exc
     file_offset = (word0 & _FILE_IDX_FILTER) << FIXED_CHUNK_BIT_NUM
     if _kind_of(word0) is ChunkMapKind.ZERO:
         return file_offset + num * FIXED_CHUNK_LENGTH
@@ -153,7 +151,7 @@ def iter_chunk_map_page(page_bytes: bytes, count: int) -> Iterator[ChunkMapEntry
     """
     if len(page_bytes) < count * CHUNK_MAP_RECORD_LENGTH:
         raise FormatError(
-            f"chunk map page holds {len(page_bytes) // CHUNK_MAP_RECORD_LENGTH} records, expected {count}", spec=_SPEC
+            f"chunk map page holds {len(page_bytes) // CHUNK_MAP_RECORD_LENGTH} records, expected {count}"
         )
     for i in range(count):
         yield _parse_at(page_bytes, i * CHUNK_MAP_RECORD_LENGTH)

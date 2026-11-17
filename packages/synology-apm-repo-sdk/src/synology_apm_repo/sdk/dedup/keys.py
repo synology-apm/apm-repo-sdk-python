@@ -28,8 +28,6 @@ from ..storage.sqlite_source import SqliteSource
 _VAULT_KEY_DB = "db/vault_encryption_key"
 """A vault's key table, relative to its repository root."""
 
-_SPEC = "FORMAT-SPEC.md: Chunk pool encryption; VaultKey custody"
-
 
 async def _vault_db_row(
     store: ObjectStore, db_path: str, query: str, params: tuple[object, ...] = ()

@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "synology-apm-repo-sdk"
-version = "0.4.0"
+version = "0.4.1"
 description = "Offline, read-only Python SDK for Synology APM/APV/Object-Storage dedup repository formats"
 readme = "README.md"
 license = "Apache-2.0"
@@ -51,3 +51,12 @@ Documentation = "https://synology-apm.github.io/apm-repo-sdk-python/"
 [tool.setuptools.packages.find]
 where = ["src"]
 namespaces = true
+
+# `make deptry` (unused, missing and transitive dependencies).
+[tool.deptry.per_rule_ignores]
+# Imported by module name at runtime (units/content/disk_fs/_base.py's
+# `_try_import`), so no import statement names them.
+DEP002 = ["dissect.volume", "dissect.ntfs", "dissect.extfs", "dissect.xfs", "dissect.btrfs", "dissect.fat", "dissect.apfs"]
+# Arrives with aioboto3, whose aiobotocore pins it to a narrow range; a
+# constraint of our own could only conflict with that pin.
+DEP003 = ["botocore"]

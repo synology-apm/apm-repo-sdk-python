@@ -308,7 +308,7 @@ class TestVerifyFingerprints:
 class TestVerifyCiphertextCrc:
     """A ``Pool`` built with ``VerifyPolicy(ciphertext_crc=True)`` (or a
     ``BucketReader`` opened with ``verify_ciphertext_crc=True``): the
-    ``ChunkCrcStore`` check (FORMAT-SPEC.md §4.4), against a chunk's raw stored
+    ``ChunkCrcStore`` check (FORMAT-SPEC.md: ChunkCrcStore), against a chunk's raw stored
     bytes before any decrypt/decompress. It needs no vault key, so these use
     unencrypted buckets."""
 

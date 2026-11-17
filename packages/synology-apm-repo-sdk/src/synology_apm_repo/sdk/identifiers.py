@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from typing import NewType
 
-# --- dedup addressing (FORMAT-SPEC.md: ChunkAddress; Composition file splitting;
+# --- dedup addressing (FORMAT-SPEC.md: ChunkAddress; Composition sessions;
 #     `file_map` relationship) ---
 
 StreamId = NewType("StreamId", int)

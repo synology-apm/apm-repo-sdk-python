@@ -7,12 +7,12 @@ Pure ``bytes -> dataclass`` decode; callers fetch the bytes via an
 ``DedupRepo.open()`` always parses this file, and a missing or corrupt one
 blocks opening. No parsed value drives a chunk-decode decision:
 ``storage_algorithm.encrypt_algorithm`` is not a reliable encryption signal
-(FORMAT-SPEC.md: Header & mode bits; see
+(FORMAT-SPEC.md: Bucket header; see
 ``BucketFileHeader.is_vault_encrypted``), and every other field is for
 display and diagnostics.
 
 Generation selection (``repo_info.<N>`` on S3/Azure, FORMAT-SPEC.md:
-Multi-generation selection) lives in ``storage/generations.py``.
+Generation selection) lives in ``storage/generations.py``.
 """
 
 from __future__ import annotations
@@ -27,8 +27,6 @@ MAGIC = _MAGICS["repo_info"]
 
 _OFF_REPO_UUID = 20
 _REPO_UUID_LEN = 16
-
-_SPEC = "FORMAT-SPEC.md: repo_info"
 
 
 @dataclasses.dataclass(frozen=True, slots=True)
@@ -64,7 +62,7 @@ def parse_repo_info(data: bytes) -> RepoInfo:
         FormatError: ``data`` is shorter than the 64-byte header, or the
             payload is truncated relative to the length the header declares.
     """
-    header, raw = parse_json_payload_header(data, expect_magic=MAGIC, spec=_SPEC, payload_kind="repo_info")
+    header, raw = parse_json_payload_header(data, expect_magic=MAGIC, payload_kind="repo_info")
     raw_uuid = data[_OFF_REPO_UUID : _OFF_REPO_UUID + _REPO_UUID_LEN]
     uuid = raw_uuid.decode("ascii") if raw_uuid.isascii() else raw_uuid.hex()
     storage_algorithm = raw.get("storage_algorithm")

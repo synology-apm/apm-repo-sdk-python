@@ -401,7 +401,7 @@ class Repository:
             catalog = match_or_raise(segments[0], catalog_pairs(catalogs_list), catalogs_list, kind="backup source")
         except NotFoundError as exc:
             if hint := _sigil_hint(segments[0]):
-                raise NotFoundError(f"{exc.safe_message}{hint}", ref=exc.ref, spec=exc.spec) from exc
+                raise NotFoundError(f"{exc.safe_message}{hint}", ref=exc.ref) from exc
             raise
         if len(segments) == 1:
             return CatalogFrame(catalog)

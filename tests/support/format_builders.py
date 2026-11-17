@@ -17,10 +17,10 @@ from pathlib import Path
 
 import zstandard
 
-#: FORMAT-SPEC.md: Composition sub-file size (16 MiB).
+#: FORMAT-SPEC.md: Composition sessions (16 MiB).
 COMPOSITION_SUB_FILE_SIZE = 16 << 20
 
-#: FORMAT-SPEC.md §4: the bucket SizeStore region's fixed on-disk length.
+#: FORMAT-SPEC.md: Bucket layout; the bucket SizeStore region's fixed on-disk length.
 SIZE_STORE_REGION_LEN = 16320
 
 #: FORMAT-SPEC.md: ChunkMapRecord ``Type`` values.

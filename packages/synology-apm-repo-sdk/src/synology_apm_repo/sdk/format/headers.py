@@ -1,5 +1,5 @@
 """The generic 64-byte ``IndexHeader`` shell shared by every binary format in
-this project (FORMAT-SPEC.md: 64-byte header shell):
+this project (FORMAT-SPEC.md: Header shell):
 
 ::
 
@@ -10,7 +10,7 @@ this project (FORMAT-SPEC.md: 64-byte header shell):
     8       52    format-specific payload
     60      4     header CRC32 (BE u32) = crc32(0, buf, 60)
 
-Validation order (identical for every format, FORMAT-SPEC.md: 64-byte header
+Validation order (identical for every format, FORMAT-SPEC.md: Header
 shell): magic, then header CRC, then major-only version acceptance. Any minor
 is accepted.
 
@@ -38,7 +38,7 @@ OFF_HEADER_CRC = 60
 _OFF_JSON_CRC = 8
 _OFF_DATA_SIZE = 12
 
-# Magic constants for every binary format (FORMAT-SPEC.md: 64-byte header shell
+# Magic constants for every binary format (FORMAT-SPEC.md: Header shell
 # table); not every format has a parser module.
 MAGIC = {
     "repo_info": b"RpiF",
@@ -72,7 +72,6 @@ def parse_index_header(
     *,
     expect_magic: bytes,
     max_major: int | None = None,
-    spec: str | None = None,
 ) -> IndexHeader:
     """Validate and parse the generic 64-byte header shell at the start of
     ``data`` (which may be longer; only the first 64 bytes are read).
@@ -81,7 +80,6 @@ def parse_index_header(
         data: Bytes starting at the header.
         expect_magic: The format's magic (see ``MAGIC``).
         max_major: Highest accepted major version; ``None`` accepts any.
-        spec: ``FORMAT-SPEC.md: ...`` citation attached to errors.
 
     Returns:
         The validated shell.
@@ -93,25 +91,25 @@ def parse_index_header(
             it.
     """
     if len(data) < HEADER_LEN:
-        raise FormatError(f"header too short: {len(data)} bytes < {HEADER_LEN}", spec=spec)
+        raise FormatError(f"header too short: {len(data)} bytes < {HEADER_LEN}")
     data = bytes(data[:HEADER_LEN])
 
     magic = data[OFF_MAGIC : OFF_MAGIC + MAGIC_LEN]
     if magic != expect_magic:
-        raise DataCorruptError(f"bad magic {magic!r}, expected {expect_magic!r}", spec=spec)
+        raise DataCorruptError(f"bad magic {magic!r}, expected {expect_magic!r}")
 
     header_crc = int.from_bytes(data[OFF_HEADER_CRC : OFF_HEADER_CRC + 4], "big")
-    verify_crc32(data[:OFF_HEADER_CRC], header_crc, label="header", spec=spec)
+    verify_crc32(data[:OFF_HEADER_CRC], header_crc, label="header")
 
     major, minor = struct.unpack(">HH", data[OFF_MAJOR : OFF_MINOR + 2])
     if max_major is not None and major > max_major:
-        raise UnsupportedVersionError(f"major version {major} > max supported {max_major}", spec=spec)
+        raise UnsupportedVersionError(f"major version {major} > max supported {max_major}")
 
     return IndexHeader(magic=magic, major=major, minor=minor, raw=data[:HEADER_LEN])
 
 
 def parse_json_payload_header(
-    data: bytes, *, expect_magic: bytes, spec: str | None = None, payload_kind: str = "payload"
+    data: bytes, *, expect_magic: bytes, payload_kind: str = "payload"
 ) -> tuple[IndexHeader, dict[str, Any]]:
     """Shared shell for a format whose 64-byte header (validated via
     ``parse_index_header``) is followed by a CRC32'd JSON payload:
@@ -122,7 +120,6 @@ def parse_json_payload_header(
     Args:
         data: Bytes starting at the header.
         expect_magic: The format's magic.
-        spec: ``FORMAT-SPEC.md: ...`` citation attached to errors.
         payload_kind: Names the payload in error messages.
 
     Returns:
@@ -134,14 +131,12 @@ def parse_json_payload_header(
             ``parse_index_header``'s own magic/header-CRC checks), or a
             payload that is not a JSON object.
     """
-    header = parse_index_header(data, expect_magic=expect_magic, spec=spec)
+    header = parse_index_header(data, expect_magic=expect_magic)
     json_crc, data_size = struct.unpack(">IQ", data[_OFF_JSON_CRC : _OFF_DATA_SIZE + 8])
     payload = data[HEADER_LEN : HEADER_LEN + data_size]
     if len(payload) != data_size:
-        raise FormatError(
-            f"{payload_kind} payload truncated: expected {data_size} bytes, got {len(payload)}", spec=spec
-        )
-    verify_crc32(payload, json_crc, label="payload", spec=spec)
+        raise FormatError(f"{payload_kind} payload truncated: expected {data_size} bytes, got {len(payload)}")
+    verify_crc32(payload, json_crc, label="payload")
     return header, parse_json_object(payload, f"{payload_kind} payload")
 
 
@@ -152,14 +147,13 @@ def compute_crc32(data: bytes | bytearray | memoryview) -> int:
     return zlib.crc32(data) & 0xFFFFFFFF
 
 
-def verify_crc32(data: bytes | bytearray | memoryview, expected: int, *, label: str, spec: str | None = None) -> None:
+def verify_crc32(data: bytes | bytearray | memoryview, expected: int, *, label: str) -> None:
     """Raise ``DataCorruptError`` unless ``compute_crc32(data)`` matches
     ``expected``; the verify-or-raise shape shared by every binary format.
 
     Args:
         data: The checked bytes.
         expected: The stored CRC32.
-        spec: ``FORMAT-SPEC.md: ...`` citation attached to the error.
         label: Names the checked region in the error message (e.g.
             ``"header"``, ``"payload"``, ``"RecordHead"``).
 
@@ -170,5 +164,4 @@ def verify_crc32(data: bytes | bytearray | memoryview, expected: int, *, label: 
     if computed != expected:
         raise DataCorruptError(
             f"{label} CRC mismatch: computed {computed:#010x} != stored {expected:#010x}",
-            spec=spec,
         )

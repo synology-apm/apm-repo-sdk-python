@@ -43,8 +43,6 @@ __all__ = [
     "VerifyPolicy",
 ]
 
-_SPEC = "FORMAT-SPEC.md: Sidecar files; Chunk pool encryption"
-
 
 @dataclasses.dataclass(frozen=True, slots=True)
 class VerifyPolicy:
@@ -363,4 +361,4 @@ class Pool:
         for chunk_idx, plain in chunks.items():
             if sha256(plain).digest() != expected[chunk_idx]:
                 addr = ChunkAddress(stream_id, bucket_id, ChunkIdx(chunk_idx))
-                raise DataCorruptError(f"chunk fingerprint mismatch at {addr}", ref=self._pool_root, spec=_SPEC)
+                raise DataCorruptError(f"chunk fingerprint mismatch at {addr}", ref=self._pool_root)

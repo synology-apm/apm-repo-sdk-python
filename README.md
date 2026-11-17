@@ -142,8 +142,7 @@ uv run synology-apm-repo-browser
 See [`CLAUDE.md`](CLAUDE.md) for the development guide and
 [`CONTRIBUTING.md`](CONTRIBUTING.md) for the full pre-commit gate and
 sample-data conventions; see [`tests/CLAUDE.md`](tests/CLAUDE.md) for how
-the test suite is organized and how to (re-)record a fixture against a
-real sample.
+the test suite is organized and how it replays its recorded fixtures.
 
 ### API Reference
 

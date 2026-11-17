@@ -17,11 +17,11 @@ _STAGE_ORDER = {stage: i for i, stage in enumerate(Stage)}
 _SYMPTOM_ORDER = {symptom.value: i for i, symptom in enumerate(Symptom)}
 
 #: An instance-specific value a ``Finding.detail`` sentence embeds: a
-#: quoted path/name, a bracketed ``[ref=...]``/``[spec=...]`` tag, or a
+#: quoted path/name, a bracketed ``[ref=...]`` tag, or a
 #: bare run of digits. Quoted/bracketed spans are tried first so a digit
 #: run inside one isn't matched again. The quoted span honors backslash
 #: escapes, since ``repr()`` can escape an inner ``'``.
-_VARIABLE_RE = re.compile(r"'(?:[^'\\]|\\.)*'|\[(?:ref|spec)=[^\]]*\]|\d+")
+_VARIABLE_RE = re.compile(r"'(?:[^'\\]|\\.)*'|\[ref=[^\]]*\]|\d+")
 
 #: The value half of an embedded ``[ref=...]`` tag: it names the exact
 #: missing/stale object, a more precise "same root cause" signal than the

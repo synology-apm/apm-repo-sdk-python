@@ -1,4 +1,4 @@
-"""Composition file format (FORMAT-SPEC.md: Composition file splitting; RecordHead).
+"""Composition file format (FORMAT-SPEC.md: Composition sessions; RecordHead).
 
 Two independent binary structures live in a composition sub-file:
 
@@ -30,9 +30,6 @@ from .const import (
 from .headers import MAGIC, parse_index_header, verify_crc32
 from .redundancy import redundancy_size
 
-_SPEC_HEADER = "FORMAT-SPEC.md: Composition file splitting"
-_SPEC_RECORD = "FORMAT-SPEC.md: RecordHead"
-
 _COMPOSITION_MAJOR = 1
 """The only composition major version ever written or supported; major=0
 is an obsolete, no-longer-supported composition format."""
@@ -53,7 +50,7 @@ class CompositionHeader:
 
 def parse_composition_header(data: bytes) -> CompositionHeader:
     """Parse the 64-byte header at the start of a session's ``subID=0``
-    file (FORMAT-SPEC.md: Composition file splitting).
+    file (FORMAT-SPEC.md: Composition sessions).
 
     Raises:
         FormatError: ``data`` is shorter than 64 bytes.
@@ -62,15 +59,14 @@ def parse_composition_header(data: bytes) -> CompositionHeader:
         UnsupportedVersionError: ``major`` is not exactly 1 (the only value
             ever written).
     """
-    header = parse_index_header(data, expect_magic=MAGIC["composition"], spec=_SPEC_HEADER)
+    header = parse_index_header(data, expect_magic=MAGIC["composition"])
     if header.major != _COMPOSITION_MAJOR:
         raise UnsupportedVersionError(
             f"composition major {header.major} != supported {_COMPOSITION_MAJOR}",
-            spec=_SPEC_HEADER,
         )
     sub_file_size = struct.unpack(">I", data[_OFF_SUB_FILE_SIZE : _OFF_SUB_FILE_SIZE + 4])[0]
     if sub_file_size != SUB_FILE_SIZE:
-        raise DataCorruptError(f"subFileSize {sub_file_size} != expected {SUB_FILE_SIZE}", spec=_SPEC_HEADER)
+        raise DataCorruptError(f"subFileSize {sub_file_size} != expected {SUB_FILE_SIZE}")
     return CompositionHeader(major=header.major, minor=header.minor)
 
 
@@ -109,12 +105,12 @@ def parse_record_head(data: bytes) -> RecordHead:
         UnsupportedVersionError: The ``Redundancy`` mode bit is absent.
     """
     if len(data) < RECORD_HEAD_LENGTH:
-        raise FormatError(f"RecordHead too short: {len(data)} bytes < {RECORD_HEAD_LENGTH}", spec=_SPEC_RECORD)
+        raise FormatError(f"RecordHead too short: {len(data)} bytes < {RECORD_HEAD_LENGTH}")
     if data[0:2] != _RECORD_MAGIC:
-        raise DataCorruptError(f"bad magic {data[0:2]!r}, expected {_RECORD_MAGIC!r}", spec=_SPEC_RECORD)
+        raise DataCorruptError(f"bad magic {data[0:2]!r}, expected {_RECORD_MAGIC!r}")
 
     head_crc = struct.unpack(">I", data[28:32])[0]
-    verify_crc32(data[:28], head_crc, label="RecordHead", spec=_SPEC_RECORD)
+    verify_crc32(data[:28], head_crc, label="RecordHead")
 
     # status_value/map_num/map_crc/mode/attr_leng/attr_crc, contiguous
     # over [2, 28) with a 2-byte reserved gap at [4, 6) between status
@@ -123,7 +119,7 @@ def parse_record_head(data: bytes) -> RecordHead:
     try:
         status = CompositionStatus(status_value)
     except ValueError as exc:
-        raise DataCorruptError(f"unknown RecordHead status {status_value}", spec=_SPEC_RECORD) from exc
+        raise DataCorruptError(f"unknown RecordHead status {status_value}") from exc
 
     record = RecordHead(
         status=status,
@@ -136,7 +132,6 @@ def parse_record_head(data: bytes) -> RecordHead:
     if not record.has_redundancy:
         raise UnsupportedVersionError(
             "RecordHead lacks the Redundancy mode bit — pre-Redundancy composition format is not supported",
-            spec=_SPEC_RECORD,
         )
     return record
 
@@ -152,7 +147,7 @@ def verify_chunk_map_crc(map_array_bytes: bytes, expected_crc: int) -> None:
     Raises:
         DataCorruptError: The CRC32 does not match.
     """
-    verify_crc32(map_array_bytes, expected_crc, label="chunk-map array", spec=_SPEC_RECORD)
+    verify_crc32(map_array_bytes, expected_crc, label="chunk-map array")
 
 
 def verify_attr_crc(attr_bytes: bytes, expected_crc: int) -> None:
@@ -163,14 +158,14 @@ def verify_attr_crc(attr_bytes: bytes, expected_crc: int) -> None:
     Raises:
         DataCorruptError: The CRC32 does not match.
     """
-    verify_crc32(attr_bytes, expected_crc, label="attribute blob", spec=_SPEC_RECORD)
+    verify_crc32(attr_bytes, expected_crc, label="attribute blob")
 
 
 def record_total_length(map_num: int, attr_leng: int) -> int:
     """Total byte length of one composition record starting at its
     ``headOff``: ``RECORD_HEAD_LENGTH + map_num*20 + attr_leng +
     redundancy_size(map_num*20, 8192)`` (FORMAT-SPEC.md: RecordHead;
-    ChunkCrcStore & Redundancy).
+    Redundancy blob).
 
     Records are packed back-to-back with no padding, so ``headOff +
     record_total_length(...)`` is exactly the next record's ``headOff``.

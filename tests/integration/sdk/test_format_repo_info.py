@@ -1,9 +1,8 @@
 """Regression tests for ``parse_repo_info`` against two real ``repo_info``
 files.
 
-Fixture: ``repo_info_real_samples.json.gz``, recorded against the directory
-holding every sample repository. Each test reads a different sample, so
-recording needs both run together.
+Fixture: ``repo_info_all_samples.json.gz``, recorded against the directory
+holding every sample repository; each test reads a different sample.
 """
 
 from __future__ import annotations
@@ -15,7 +14,7 @@ from synology_apm_repo.sdk.storage.base import ObjectStore
 
 
 async def test_replayed_vault_plain_repo_info(record_target: Callable[[str], Awaitable[ObjectStore]]) -> None:
-    store = await record_target("repo_info_real_samples.json.gz")
+    store = await record_target("repo_info_all_samples.json.gz")
     info = parse_repo_info(await store.read("vault-plain/@ActiveProtectVault/repo_info"))
 
     assert info.uuid == "m7e61v80stMAZgru"
@@ -32,7 +31,7 @@ async def test_replayed_vault_plain_repo_info(record_target: Callable[[str], Awa
 async def test_replayed_vault_m365_repo_info_has_a_different_uuid(
     record_target: Callable[[str], Awaitable[ObjectStore]],
 ) -> None:
-    store = await record_target("repo_info_real_samples.json.gz")
+    store = await record_target("repo_info_all_samples.json.gz")
     info = parse_repo_info(await store.read("vault-m365/@ActiveProtectVault/repo_info"))
     assert info.uuid == "C8EQPjxuuAWsB3Wh"
     assert info.repo_type == 2

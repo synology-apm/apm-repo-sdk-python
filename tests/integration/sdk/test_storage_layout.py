@@ -1,4 +1,4 @@
-"""Regression tests for ``storage.layout`` against every real sample.
+"""Regression tests for ``storage.layout`` against every recorded sample repository.
 Layout detection only calls ``exists()``/``listdir()``.
 
 Fixture: ``storage_layout_all_samples.json.gz``, recorded against the

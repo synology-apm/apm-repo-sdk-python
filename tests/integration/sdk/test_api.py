@@ -108,7 +108,7 @@ async def test_replayed_repository_raw_file_and_file_map_tree_fallback_axes(
         assert unit.content.size == 893317120
 
 
-async def test_replayed_repository_is_encrypted_matches_every_real_sample(
+async def test_replayed_repository_is_encrypted_matches_every_sample(
     record_target: Callable[[str], Awaitable[ObjectStore]],
 ) -> None:
     """``is_encrypted`` resolves from ``probe_encrypted()`` alone, with no key

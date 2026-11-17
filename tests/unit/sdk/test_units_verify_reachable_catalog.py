@@ -184,7 +184,7 @@ class TestUnresolvableVersion:
         import synology_apm_repo.sdk.units.verify_extents as verify_extents_module
 
         async def fake_fs_extents(repo: DedupRepo, version: Version) -> list[CompositionExtent]:
-            raise DataCorruptError("simulated corrupt target.db", spec="test")
+            raise DataCorruptError("simulated corrupt target.db")
 
         monkeypatch.setattr(verify_extents_module, "_fs_extents", fake_fs_extents)
 
@@ -209,7 +209,7 @@ class TestCatalogEnumerationFailure:
     ) -> None:
 
         async def fake_connections(repo: DedupRepo) -> list[Connection]:
-            raise DataCorruptError("simulated corrupt connection_config", spec="test")
+            raise DataCorruptError("simulated corrupt connection_config")
 
         monkeypatch.setattr(verify_reachable_module, "connections", fake_connections)
 

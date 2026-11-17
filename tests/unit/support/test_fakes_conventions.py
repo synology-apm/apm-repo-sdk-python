@@ -47,7 +47,6 @@ def test_every_fake_under_tests_declares_what_it_stands_in_for() -> None:
     problems = [
         f"{path.relative_to(_TESTS)}:{entry}"
         for path in sorted(_TESTS.rglob("*.py"))
-        if "smoke" not in path.parts
         for entry in undeclared_fakes(path.read_text(encoding="utf-8"))
     ]
     assert problems == [], "add @faithful_to(Real) or @unchecked_fake(...):\n" + "\n".join(problems)

@@ -11,7 +11,6 @@ from typing import Any
 from textual.coordinate import Coordinate
 from textual.pilot import Pilot
 from textual.widgets import Button, DataTable, Input, Tree
-from textual.widgets.tree import TreeNode
 
 from support.pilot import SDK_TIMEOUT, UI_TIMEOUT, focus_widget, move_cursor_to, wait_for_screen, wait_until
 from synology_apm_repo.browser.app import ApmRepoBrowserApp
@@ -19,7 +18,7 @@ from synology_apm_repo.browser.core.unit.msg import ChildrenRequested
 from synology_apm_repo.browser.screens.browse_screen import BrowseScreen
 from synology_apm_repo.browser.screens.connect_dialog import ConnectDialog
 from synology_apm_repo.browser.screens.unit_screen import UnitScreen
-from synology_apm_repo.sdk.api import Catalog, Workload
+from synology_apm_repo.sdk.api import Catalog
 from synology_apm_repo.sdk.units.base import Node
 from synology_apm_repo.sdk.units.node_ref import NodeRef
 
@@ -107,54 +106,6 @@ async def drill_to_first_unit_screen(app: ApmRepoBrowserApp, pilot: Pilot[Any]) 
     await focus_widget(pilot, workloads_tree)
     await pilot.press("enter")
     await _open_first_version(app, pilot, browse)
-
-
-async def drill_to_first_workload_of_type(
-    app: ApmRepoBrowserApp, pilot: Pilot[Any], *, connection_config_id: int, type_hint: str
-) -> None:
-    """From a populated ``BrowseScreen``, open in a ``UnitScreen`` the first
-    version of the first workload with ``type_hint`` under the connection
-    with ``connection_config_id``, expanding the groups above it."""
-    browse = app.screen
-    assert isinstance(browse, BrowseScreen), browse
-    cat_tree = browse.query_one("#col-catalogs", Tree)
-    connection_node = next(
-        (
-            n
-            for repo_node in cat_tree.root.children
-            for n in repo_node.children
-            if n.data is not None
-            and isinstance(n.data.payload, Catalog)
-            and n.data.payload.connection.connection_config_id == connection_config_id
-        ),
-        None,
-    )
-    assert connection_node is not None, f"no connection with connection_config_id {connection_config_id!r}"
-    await move_cursor_to(pilot, cat_tree, connection_node)
-    await focus_widget(pilot, cat_tree)
-    await pilot.press("enter")
-
-    wl_tree = browse.query_one("#col-workloads", Tree)
-    await wait_until(pilot, lambda: wl_tree.root.children, timeout=SDK_TIMEOUT)
-    path = _path_to_workload(wl_tree.root, type_hint)
-    assert path is not None, f"no workload with type_hint {type_hint!r}"
-    for ancestor in path[:-1]:
-        ancestor.expand()
-    await move_cursor_to(pilot, wl_tree, path[-1])
-    await focus_widget(pilot, wl_tree)
-    await pilot.press("enter")
-    await _open_first_version(app, pilot, browse)
-
-
-def _path_to_workload(node: TreeNode[Any], type_hint: str) -> list[TreeNode[Any]] | None:
-    """The nodes from below ``node`` down to the first ``Workload`` with ``type_hint``, depth first."""
-    for child in node.children:
-        payload = child.data.payload if child.data is not None else None
-        if isinstance(payload, Workload) and payload.type_hint == type_hint:
-            return [child]
-        if (found := _path_to_workload(child, type_hint)) is not None:
-            return [child, *found]
-    return None
 
 
 def version_rows_ready(app: ApmRepoBrowserApp) -> bool:

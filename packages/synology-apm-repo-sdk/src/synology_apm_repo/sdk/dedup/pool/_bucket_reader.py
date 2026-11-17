@@ -37,8 +37,6 @@ from ...identifiers import BucketId, ChunkIdx, StreamId
 from ...storage.base import ObjectStore, SyncReadable
 from ..redundancy_repair import repair_via_trailer
 
-_SPEC = "FORMAT-SPEC.md: ChunkCrcStore & Redundancy"
-
 #: Locator byte-ranges within this many bytes of each other merge into one
 #: ``ObjectStore.read``, trading read amplification for fewer reads. A merged
 #: run has no size cap; the bucket's chunk count bounds it.
@@ -56,7 +54,7 @@ async def _attempt_size_store_repair(
     store: ObjectStore, path: str, header: BucketFileHeader, sizestore_region: bytes
 ) -> tuple[bytes, int] | None:
     """On a ``chunk_size_crc`` mismatch, fetch this bucket's trailing
-    Redundancy blob (FORMAT-SPEC.md: ChunkCrcStore & Redundancy; the last
+    Redundancy blob (FORMAT-SPEC.md: Redundancy blob; the last
     thing in the file) and attempt in-memory self-repair
     (``dedup.redundancy_repair.repair_via_trailer``).
 
@@ -220,7 +218,7 @@ class BucketReader:
                 index = parse_size_store(repaired, header.chunk_num, verify_crc=None)
         else:
             # Uncompressed layout: no SizeStore at all, every chunk is
-            # implicitly CompressType.NONE (FORMAT-SPEC.md: Header & mode bits).
+            # implicitly CompressType.NONE (FORMAT-SPEC.md: Bucket header).
             index = BucketIndex.uncompressed(header.chunk_num)
         return cls(
             store,
@@ -236,7 +234,7 @@ class BucketReader:
 
     async def ensure_chunk_crc_store(self) -> tuple[int, ...]:
         """Lazily read and self-validate this bucket's ChunkCrcStore trailer
-        (FORMAT-SPEC.md: ChunkCrcStore & Redundancy), caching the per-chunk
+        (FORMAT-SPEC.md: ChunkCrcStore), caching the per-chunk
         ciphertext CRC32 values.
 
         Returns:
@@ -268,7 +266,7 @@ class BucketReader:
             "ensure_chunk_crc_store() must run before a ciphertext CRC check"
         )
         expected = self._chunk_crc_values[self._chunk_crc_positions[chunk_idx]]
-        verify_crc32(raw, expected, label="chunk ciphertext", spec=_SPEC)
+        verify_crc32(raw, expected, label="chunk ciphertext")
 
     def _chunk_decryptor(self) -> ChunkDecryptor:
         """A ``ChunkDecryptor`` on this bucket's key, for an encrypted bucket.
@@ -350,7 +348,7 @@ class BucketReader:
     async def read_chunk(self, chunk_idx: ChunkIdx, addr: ChunkAddress) -> bytes:
         """Decrypt (if vault-encrypted) and decompress chunk ``chunk_idx``,
         first checking its stored bytes against its ``ChunkCrcStore`` entry
-        (FORMAT-SPEC.md: ChunkCrcStore & Redundancy) when opened with
+        (FORMAT-SPEC.md: ChunkCrcStore) when opened with
         ``verify_ciphertext_crc`` (one trailer read per bucket).
 
         Args:
@@ -384,7 +382,7 @@ class BucketReader:
     async def read_raw_chunk(self, chunk_idx: ChunkIdx) -> bytes:
         """Chunk ``chunk_idx``'s stored bytes exactly as written (still
         compressed and/or encrypted), for ChunkCrcStore checks
-        (FORMAT-SPEC.md: ChunkCrcStore & Redundancy).
+        (FORMAT-SPEC.md: ChunkCrcStore).
 
         Raises:
             DataCorruptError: ``chunk_idx`` is past this bucket's chunks.

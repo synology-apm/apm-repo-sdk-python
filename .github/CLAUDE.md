@@ -21,10 +21,12 @@ and rewrites its SHA/tag comment in place. The repository has no `.github/depend
 (no scheduled version updates), which "Dependabot Auto-Merge" below relies on.
 
 > **Warning:** `make github-act-simulation` runs `docs.yml`'s
-> `build` job, then `release.yml`'s `verify-dist` job (which pulls in `test` — the
-> reusable call into `ci.yml` — and `build` as `needs:` dependencies, so all three run).
+> `build` job, then `release.yml`'s `verify-dist` job, which pulls in its `needs:` chain:
+> `verified` (it cannot reach the GitHub API under `act`, so it asks for CI), `ci` (the
+> reusable call into `ci.yml`), `advisories`, `gate` and `build`.
 > `act` has no Windows/macOS runners, so `ci.yml`'s `pytest` legs on those two only ever run
-> on GitHub itself.
+> on GitHub itself; the simulation passes `COVERAGE_OSES=Linux` so `make coverage-gate`
+> gates only the legs that ran.
 > Keep it to those build/test jobs: `docs.yml`'s `deploy` and `release.yml`'s
 > `publish-sdk`/`publish-cli`/`publish-browser`/`github-release` publish to GitHub
 > Pages / PyPI via OIDC (`pages: write` / `id-token: write`, PyPI Trusted Publishing) or
@@ -43,11 +45,11 @@ alone (no label check) is sufficient because this repository has no `dependabot.
 version-updates configured for any ecosystem, "Dependabot security updates" is the only
 mechanism that can make `dependabot[bot]` open a PR here, so every such PR is a security
 update. This applies uniformly regardless of semver bump size, including to
-`pypa/gh-action-pypi-publish` and `softprops/action-gh-release`.
+`pypa/gh-action-pypi-publish`.
 
-> **Warning:** `pypa/gh-action-pypi-publish` and `softprops/action-gh-release` are exercised
-> only by `release.yml` on a tag push, never by a PR — so the `test` check passing does not
-> mean a security bump to either of these two has actually been run with its new pin. That gap
+> **Warning:** `pypa/gh-action-pypi-publish` is exercised only by `release.yml` on a tag
+> push, never by a PR — so the `test` check passing does not mean a security bump to it has
+> actually been run with its new pin. That gap
 > is accepted for simplicity rather than special-cased.
 
 > **Warning:** If `dependabot.yml` version-updates are ever added for any ecosystem, this
@@ -59,7 +61,8 @@ security updates), General → Pull Requests (Allow auto-merge, Allow squash mer
 branch protection rule on `main` requiring the `test` status check.
 
 `test` is `ci.yml`'s aggregating job: it needs `lint`, every `pytest` matrix leg (each leg
-reports under its own matrix name, which no rule requires) and `coverage`, and fails unless all
+reports under its own matrix name, which no rule requires), `coverage`, `audit` and
+`unused-deps`, and fails unless all
 of them succeeded. It runs under `if: always()` because a job skipped after a failed dependency
 reports as skipped, and a skipped required check counts as passing. Keep that name and that
 condition when changing the workflow's jobs.
@@ -67,6 +70,20 @@ condition when changing the workflow's jobs.
 ## Release / publish channel
 
 `release.yml` publishes to public PyPI on every `v*` tag push — see `CONTRIBUTING.md`'s
-"Release / publish channel" for what triggers it and the trusted-publishing prerequisite. The one
-detail not covered there: where to set it up — Settings → Publishing → Trusted Publishers, pointing
-at this repository and the matching `environment:` name.
+"Release / publish channel" for what triggers it and the trusted-publishing prerequisite. Where
+to set that up: Settings → Publishing → Trusted Publishers, pointing at this repository and the
+matching `environment:` name.
+
+- `ci.yml` also runs as a reusable workflow (`workflow_call`) from `release.yml`; keep it free
+  of anything that only makes sense for a push or a pull request.
+- `verified` looks for a CI run on the tagged commit, counting only `push` and `schedule` runs
+  (a pull request's run tests a merge commit): passed skips `ci`, running is waited for,
+  failed stops the release, and cancelled, absent or an API error runs `ci`, the whole of
+  `ci.yml`. Any doubt runs CI; never make it skip. `advisories` runs every time, `gate`
+  passes only when all of them did.
+- A job after one that can be skipped (`ci`) is skipped as well unless its `if:` overrides
+  that: `gate` uses `always()`, and every later job `!cancelled() && needs.<job>.result ==
+  'success'`.
+- `github-release` waits for all three `publish-*` jobs, so a release is never announced with
+  a package missing from PyPI; it attaches each file's `.sha256` (kept out of the PyPI
+  `packages-dir`) and creates the release with no generated notes.

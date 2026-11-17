@@ -19,8 +19,6 @@ import zstandard
 from ..errors import ChunkCompactedError, DataCorruptError
 from .const import FIXED_CHUNK_LENGTH
 
-_SPEC = "FORMAT-SPEC.md: SizeStore"
-
 ZSTD_FRAME_MAGIC = b"\x28\xb5\x2f\xfd"
 """Standard ZSTD frame magic, the first 4 bytes of every ZSTD frame (LZ4
 blocks carry none)."""
@@ -59,7 +57,7 @@ def _lz4_decompress(data: bytes | memoryview) -> bytes:
         plain: bytes = lz4.block.decompress(data, uncompressed_size=FIXED_CHUNK_LENGTH)
         return plain
     except lz4.block.LZ4BlockError as exc:
-        raise DataCorruptError(f"lz4 decompress failed: {exc}", spec=_SPEC) from exc
+        raise DataCorruptError(f"lz4 decompress failed: {exc}") from exc
 
 
 def decompress(ctype: CompressType, data: bytes | memoryview) -> bytes:
@@ -77,7 +75,7 @@ def decompress(ctype: CompressType, data: bytes | memoryview) -> bytes:
     """
     match ctype:
         case CompressType.COMPACTED:
-            raise ChunkCompactedError("chunk is COMPACTED — reclaimed by compaction, cannot be recovered", spec=_SPEC)
+            raise ChunkCompactedError("chunk is COMPACTED — reclaimed by compaction, cannot be recovered")
         case CompressType.NONE:
             plain = bytes(data)
         case CompressType.LZ4:
@@ -89,14 +87,13 @@ def decompress(ctype: CompressType, data: bytes | memoryview) -> bytes:
                 with _zstd_decompressor().stream_reader(io.BytesIO(data)) as reader:
                     plain = reader.read(FIXED_CHUNK_LENGTH + 1)
             except zstandard.ZstdError as exc:
-                raise DataCorruptError(f"zstd decompress failed: {exc}", spec=_SPEC) from exc
+                raise DataCorruptError(f"zstd decompress failed: {exc}") from exc
         case _:  # pragma: no cover - CompressType is exhaustive above
-            raise DataCorruptError(f"unknown CompressType {ctype}", spec=_SPEC)
+            raise DataCorruptError(f"unknown CompressType {ctype}")
 
     if len(plain) != FIXED_CHUNK_LENGTH:
         raise DataCorruptError(
             f"decompressed chunk is {len(plain)} bytes, expected {FIXED_CHUNK_LENGTH}",
-            spec=_SPEC,
         )
     return plain
 
@@ -144,9 +141,7 @@ def decompress_many(items: Sequence[tuple[CompressType, bytes | memoryview]]) ->
             continue
         match ctype:
             case CompressType.COMPACTED:
-                raise ChunkCompactedError(
-                    "chunk is COMPACTED — reclaimed by compaction, cannot be recovered", spec=_SPEC
-                )
+                raise ChunkCompactedError("chunk is COMPACTED — reclaimed by compaction, cannot be recovered")
             case CompressType.NONE:
                 # Already plaintext (bytes or the caller's view).
                 plain = data
@@ -154,11 +149,10 @@ def decompress_many(items: Sequence[tuple[CompressType, bytes | memoryview]]) ->
                 # The lz4 binding has no batch call, and LZ4 chunks are rare.
                 plain = _lz4_decompress(data)
             case _:  # pragma: no cover - CompressType is exhaustive above
-                raise DataCorruptError(f"unknown CompressType {ctype}", spec=_SPEC)
+                raise DataCorruptError(f"unknown CompressType {ctype}")
         if len(plain) != FIXED_CHUNK_LENGTH:
             raise DataCorruptError(
                 f"decompressed chunk at position {i} is {len(plain)} bytes, expected {FIXED_CHUNK_LENGTH}",
-                spec=_SPEC,
             )
         result[i] = plain
 
@@ -177,7 +171,7 @@ def decompress_many(items: Sequence[tuple[CompressType, bytes | memoryview]]) ->
             # decompressed_sizes is an exact expectation, so a mismatch raises
             # here; translated so both paths give callers DataCorruptError.
             # ValueError: every ZSTD entry of the batch is empty.
-            raise DataCorruptError(f"batch zstd decompress failed: {exc}", spec=_SPEC) from exc
+            raise DataCorruptError(f"batch zstd decompress failed: {exc}") from exc
         for pos, i in enumerate(zstd_positions[start : start + len(batch)]):
             # memoryview, not a bare BufferSegment: BufferSegment.__eq__ is identity-based.
             result[i] = memoryview(decoded[pos])  # type: ignore[arg-type]
@@ -260,8 +254,6 @@ def iter_decompressed_zstd(data: bytes | bytearray, *, max_output_size: int | No
                 raise zstandard.ZstdError(f"decompressed output exceeds max_output_size ({effective_max} bytes)")
             yield piece
     if declared is not None and total != declared:
-        # No spec= citation: this function serves several sources
-        # (version.db.zst, SaaS service-DB snapshots, target.db), and _SPEC names SizeStore.
         raise DataCorruptError(
             f"zstd frame declared a decompressed size of {declared} bytes, actually produced {total}"
         )

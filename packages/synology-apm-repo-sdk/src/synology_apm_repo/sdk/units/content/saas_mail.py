@@ -1,6 +1,6 @@
 """Content Layer — Mail's ``.eml`` reassembly. Pure ``bytes -> bytes``
-splicing of the ``X-ABL-ID`` MIME tree (FORMAT-SPEC.md: ``X-ABL-ID``
-MIME-tree mechanism); the tree-navigation and object-fetching logic that
+splicing of the ``X-ABL-ID`` MIME tree (FORMAT-SPEC.md:
+Mail); the tree-navigation and object-fetching logic that
 calls this lives in ``units/saas/mail.py``.
 """
 

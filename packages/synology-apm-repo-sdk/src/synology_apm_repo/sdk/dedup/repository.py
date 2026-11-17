@@ -2,8 +2,8 @@
 ``RepoInfo``/key material/``Pool``/``CompositionReader`` together behind
 ``open_file()``/``open_composition()``.
 
-Repository-root path constants (FORMAT-SPEC.md: Locating the repository
-root, and directory layout) are **uniform across both layout kinds** —
+Repository-root path constants (FORMAT-SPEC.md: Repository root; Directory
+tree) are **uniform across both layout kinds** —
 ``<repo_root>/@data/Pool``, ``<repo_root>/@data/Composition``,
 ``<repo_root>/db/``; only ``layout.repo_root`` itself differs (the vault
 root directly for ``RepoKind.VAULT``, or
@@ -64,7 +64,7 @@ async def _resolve_versioned(
     store: ObjectStore, dir_cache: DirCache, layout: RepoLayout, dir_path: str, logical_name: str
 ) -> str:
     """The generation-aware counterpart to ``resolve_seq_path``, for the two
-    logical names FORMAT-SPEC.md: Multi-generation selection governs
+    logical names FORMAT-SPEC.md: Generation selection governs
     (``repo_info``, ``db/<name>``). ``VAULT`` layouts have no
     ``.<N>``-suffixed files, so only ``RepoKind.OBJECT_STORE`` takes the
     generation path. ``dir_cache`` is the fixed-directory ``DirCache``, so
@@ -288,7 +288,7 @@ class DedupRepo(AsyncClosing):
         file), so both names share one connection.
 
         On a ``RepoKind.OBJECT_STORE`` layout the generation is chosen by
-        FORMAT-SPEC.md: Multi-generation selection (``resolve_generation``),
+        FORMAT-SPEC.md: Generation selection (``resolve_generation``),
         not the largest ``.<N>`` suffix, since a generation can exist on disk
         before its transaction commits. ``db/<name>`` is always raw (never
         ``aHlT``/zstd-enveloped).
@@ -357,12 +357,10 @@ class DedupRepo(AsyncClosing):
                 raise DataCorruptError(
                     f"file_map row for path {path!r} has status={status} (Corrupted/Tainted)",
                     ref=path,
-                    spec="FORMAT-SPEC.md: db/file_map",
                 )
             raise NotFoundError(
                 f"file_map row for path {path!r} has status={status}, not Complete",
                 ref=path,
-                spec="FORMAT-SPEC.md: db/file_map",
             )
 
         file_size = await self._file_size_from_meta(path)

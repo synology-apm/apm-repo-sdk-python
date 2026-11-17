@@ -1,5 +1,5 @@
 """``VirtualDiskContentSource`` reassembles a PC/PS physical disk's
-per-region dedup objects ("fragments", FORMAT-SPEC.md: PC/PS disk fragments) into one
+per-region dedup objects ("fragments", FORMAT-SPEC.md: PC/PS) into one
 ``ContentSource`` that behaves like a single disk image.
 
 Two facts it depends on: a fragment's chunk-map offsets are

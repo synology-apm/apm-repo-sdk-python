@@ -5,7 +5,7 @@ topic or its other members).
 
 Unlike other SaaS workloads, the object-name index entry points at an INDEX
 object listing one message DB per channel/chat plus the container, since
-their number is only known at backup time (FORMAT-SPEC.md: Teams/Chat container discrimination).
+their number is only known at backup time (FORMAT-SPEC.md: Teams and Chat).
 """
 
 from __future__ import annotations

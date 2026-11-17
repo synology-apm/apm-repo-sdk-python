@@ -108,7 +108,7 @@ class Catalog:
     provider operations scoped to it. Never constructed directly.
 
     A vault's sibling ``Catalog``s share one ``DedupRepo``; on object
-    storage each has its own (FORMAT-SPEC.md: Locating the repository root). ``workloads``,
+    storage each has its own (FORMAT-SPEC.md: Repository root). ``workloads``,
     ``versions``, ``version_by_uid`` and ``verify`` raise
     ``KeyRequiredError``/``KeyMismatchError`` before any I/O while the
     owning repository is encrypted and not key-verified.

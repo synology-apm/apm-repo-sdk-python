@@ -25,8 +25,8 @@ def replay_local_store(
     recipe (see ``tests/CLAUDE.md``). Each open gets its own
     ``WrappingStore``, whose ``close()`` leaves the shared store open: the
     app closes a repository's store when it closes the repository, and
-    under ``--record-against`` the shared store is the session's
-    ``RecordingStore`` over a real backend."""
+    the store ``record_target`` returns may be shared beyond this one
+    test."""
 
     async def install(fixture_name: str, *, label: str = "vault-plain", allow_content: bool = False) -> None:
         store = await record_target(fixture_name, allow_content=allow_content)

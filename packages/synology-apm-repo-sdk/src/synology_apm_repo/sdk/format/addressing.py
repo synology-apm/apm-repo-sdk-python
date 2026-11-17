@@ -1,8 +1,8 @@
 """Chunk addressing and the two path-layering schemes that key off it
-(FORMAT-SPEC.md: Pool path layering; Composition file splitting).
+(FORMAT-SPEC.md: Path layering; Composition sessions).
 
 Directory-name constants (``Pool``, ``Composition``, ...) live in the Dedup
-Layer's ``repository.py`` (FORMAT-SPEC.md: directory layout). This module
+Layer's ``repository.py`` (FORMAT-SPEC.md: Directory tree). This module
 computes only the id-layering fragment relative to a caller-supplied root.
 """
 
@@ -82,7 +82,7 @@ class ChunkAddress(NamedTuple):
 def _id_layer_ancestors(id_: int) -> list[str]:
     """Ancestor directory names of the 10-bit id-layering scheme, outermost
     first, excluding the leaf: ``id >> 10``, ``>> 20``, ... until the quotient
-    is 0 (FORMAT-SPEC.md: Pool path layering). Empty for ``id_ < 1024``.
+    is 0 (FORMAT-SPEC.md: Path layering). Empty for ``id_ < 1024``.
     """
     ancestors: list[str] = []
     shifted = id_ >> BUCKET_ID_LAYER_SHIFT
@@ -95,7 +95,7 @@ def _id_layer_ancestors(id_: int) -> list[str]:
 def pool_layer_path(stream_id: StreamId, bucket_id: BucketId) -> str:
     """Relative path (no ``Pool/`` prefix, no ``.buk``/``.inf``/... suffix)
     for ``bucket_id`` within ``stream_id``'s pool:
-    ``<streamID>/[ancestor layers.../]<bucketID>`` (FORMAT-SPEC.md: Pool path
+    ``<streamID>/[ancestor layers.../]<bucketID>`` (FORMAT-SPEC.md: Path
     layering).
 
     For a ``.inf``/``.fgp``/``.ref`` group path, pass the group's starting
@@ -107,7 +107,7 @@ def pool_layer_path(stream_id: StreamId, bucket_id: BucketId) -> str:
 def composition_session_dir(stream_id: StreamId, session_id: SessionId) -> str:
     """Relative path (no ``Composition/`` prefix) to a session's directory:
     ``<streamID>/[ancestor layers.../]<sessionID>.com`` (FORMAT-SPEC.md:
-    Composition file splitting). Unlike the Pool leaf, the leaf carries a
+    Composition sessions). Unlike the Pool leaf, the leaf carries a
     ``.com`` suffix.
     """
     return "/".join([str(stream_id), *_id_layer_ancestors(session_id), f"{session_id}.com"])
@@ -116,7 +116,7 @@ def composition_session_dir(stream_id: StreamId, session_id: SessionId) -> str:
 def composition_path(stream_id: StreamId, session_id: SessionId, sub_id: int) -> str:
     """Full relative path (no ``Composition/`` prefix, no sequence-id
     suffix) to a composition sub-file: ``<sessionDir>/[ancestor
-    layers.../]c<subID>`` (FORMAT-SPEC.md: Composition file splitting).
+    layers.../]c<subID>`` (FORMAT-SPEC.md: Composition sessions).
     """
     session_dir = composition_session_dir(stream_id, session_id)
     return "/".join([session_dir, *_id_layer_ancestors(sub_id), f"c{sub_id}"])
@@ -133,7 +133,7 @@ def split_layer_leaf(layer_path: str) -> tuple[str, str]:
 def split_composition_offset(global_offset: int) -> tuple[int, int]:
     """Split a composition-record global offset into ``(sub_id,
     offset_within_subfile)``: ``off >> 24`` and ``off & (16 MiB - 1)``
-    (FORMAT-SPEC.md: Composition file splitting)."""
+    (FORMAT-SPEC.md: Composition sessions)."""
     return global_offset >> SUB_FILE_SIZE_SHIFT, global_offset & (SUB_FILE_SIZE - 1)
 
 

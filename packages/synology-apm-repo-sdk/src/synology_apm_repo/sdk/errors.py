@@ -1,11 +1,8 @@
 """Exception hierarchy for synology-apm-repo-sdk.
 
-Every ``ApmRepoError`` carries two optional pieces of context:
-
-- ``ref``: the node/file the error refers to, as a plain string (a
-  store-relative path, a ``file_map`` path, ``str(node_ref)``, ...).
-- ``spec``: the ``FORMAT-SPEC.md`` subsection explaining why this is an
-  error.
+Every ``ApmRepoError`` may carry a ``ref``: the node/file the error refers
+to, as a plain string (a store-relative path, a ``file_map`` path,
+``str(node_ref)``, ...). A message says what failed and what to do.
 
 The hierarchy covers repository data, backend and worker failures, and
 ``InvalidArgumentError``; other argument and programmer errors raise stdlib
@@ -19,27 +16,18 @@ from __future__ import annotations
 class ApmRepoError(Exception):
     """Base of all errors raised by synology-apm-repo-sdk."""
 
-    def __init__(
-        self,
-        message: str,
-        *,
-        ref: str | None = None,
-        spec: str | None = None,
-    ) -> None:
+    def __init__(self, message: str, *, ref: str | None = None) -> None:
         self.ref = ref
-        self.spec = spec
         self._message = message
         parts = [message]
         if ref is not None:
             parts.append(f"[ref={ref}]")
-        if spec is not None:
-            parts.append(f"[spec={spec}]")
         super().__init__(" ".join(parts))
 
     @property
     def safe_message(self) -> str:
-        """The message alone, without the ``[ref=...]``/``[spec=...]`` tags
-        ``str(exc)`` appends — for a presentation layer's non-verbose
+        """The message alone, without the ``[ref=...]`` tag ``str(exc)``
+        appends — for a presentation layer's non-verbose
         rendering. ``str(exc)`` keeps the full detail."""
         return self._message
 
@@ -56,11 +44,11 @@ class DataCorruptError(FormatError):
 
     @classmethod
     def from_missing(cls, exc: NotFoundError) -> DataCorruptError:
-        """``exc``'s message, ``ref`` and ``spec`` as corruption: for a file
+        """``exc``'s message and ``ref`` as corruption: for a file
         the repository's own records name (a listing, a probe that just
         found it), absent is damage, not a lookup miss. Raise it ``from
         exc``."""
-        return cls(exc.safe_message, ref=exc.ref, spec=exc.spec)
+        return cls(exc.safe_message, ref=exc.ref)
 
 
 class UnsupportedVersionError(FormatError):
@@ -86,7 +74,7 @@ class KeyRequiredError(KeyMaterialError):
 
 class KeyMismatchError(KeyMaterialError):
     """The supplied key does not unwrap this repository's VaultKey, or was
-    already rejected by ``Repository.set_key()`` (FORMAT-SPEC.md: Key hierarchy)."""
+    already rejected by ``Repository.set_key()`` (FORMAT-SPEC.md: Keys)."""
 
 
 class InvalidArgumentError(ApmRepoError, ValueError):

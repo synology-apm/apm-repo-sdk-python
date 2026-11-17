@@ -1,10 +1,8 @@
-"""Recorded fixtures: ``RecordingStore`` captures a real sample's
-``ObjectStore`` traffic once (``dump``), and ``ReplayStore`` answers the same
-calls from that fixture with no real sample. Fixtures are committed
-gzip-compressed (``tests/fixtures/*.json.gz``) via ``write_fixture_text``;
+"""Recorded fixtures: ``RecordingStore`` captures an ``ObjectStore``'s
+traffic once (``dump``), and ``ReplayStore`` answers the same calls from
+that fixture with no backend at all. Fixtures are committed gzip-compressed
+(``tests/fixtures/*.json.gz``) via ``write_fixture_text``;
 ``load_fixture_text``/``ReplayStore.from_path`` decompress on read.
-``AliasedStore`` shows a local recording each sample's alias in place of
-its real directory name.
 
 A fixture is a JSON object with a ``"format"`` version, the ``reads``,
 ``sizes``, ``exists`` and ``listdirs`` a call answered, and ``missing``: per
@@ -16,10 +14,13 @@ from __future__ import annotations
 import base64
 import gzip
 import json
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
 from typing import override
+
+import pytest
 
 from support.fakes import faithful_to
 from synology_apm_repo.sdk.errors import NotFoundError
@@ -37,6 +38,14 @@ from synology_apm_repo.sdk.storage.recording import (
 #: The fixture format ``RecordingStore.dump`` writes, and the only one
 #: ``ReplayStore`` reads.
 FORMAT_VERSION = 2
+
+#: Another source for ``record_target``'s stores: called with the requesting
+#: test and the fixture's path.
+StoreSource = Callable[[pytest.FixtureRequest, Path], Awaitable[ObjectStore]]
+
+#: A ``StoreSource`` in ``config.stash``; unset (the default), every test
+#: replays its committed fixture.
+STORE_SOURCE = pytest.StashKey[StoreSource]()
 
 #: ``missing``'s sections, one per ``ObjectStore`` method that can raise
 #: ``NotFoundError``.
@@ -89,62 +98,18 @@ def load_fixture_text(path: Path) -> str:
 
 
 def write_fixture_text(path: Path, text: str) -> None:
-    """Write fixture text, gzip-compressing when ``path`` ends in ``.gz``.
+    """Write fixture text, gzip-compressing when ``path`` ends in ``.gz``
+    (with no timestamp in the gzip header, so the same text always writes
+    the same bytes).
 
     Args:
         path: Destination file.
         text: Fixture text to write.
     """
     if path.suffix == ".gz":
-        path.write_bytes(gzip.compress(text.encode("utf-8"), compresslevel=6))
+        path.write_bytes(gzip.compress(text.encode("utf-8"), compresslevel=6, mtime=0))
     else:
         path.write_text(text, encoding="utf-8")
-
-
-@faithful_to(ObjectStore)
-class AliasedStore:
-    """An ``ObjectStore`` presenting each local sample directory under its
-    alias: a path segment naming an alias, or a file named after one
-    (``<alias>.key``), reaches the real directory, and a listing reports the
-    alias. A recording rooted above the samples (``manifest``'s
-    ``all-local``) thereby records alias paths only.
-
-    Args:
-        inner: The real store.
-        renames: Real directory name -> alias
-            (``manifest.sample_directory_renames``).
-    """
-
-    def __init__(self, inner: ObjectStore, renames: dict[str, str]) -> None:
-        self._inner = inner
-        self._to_alias = dict(renames)
-        self._to_real = {alias: real for real, alias in renames.items()}
-
-    @staticmethod
-    def _renamed(segment: str, mapping: dict[str, str]) -> str:
-        for old, new in mapping.items():
-            if segment == old or segment.startswith(f"{old}."):
-                return new + segment[len(old) :]
-        return segment
-
-    def _real(self, path: str) -> str:
-        return "/".join(self._renamed(segment, self._to_real) for segment in path.split("/"))
-
-    async def read(self, path: str, offset: int = 0, length: int | None = None) -> bytes:
-        return await self._inner.read(self._real(path), offset, length)
-
-    async def size(self, path: str) -> int:
-        return await self._inner.size(self._real(path))
-
-    async def exists(self, path: str) -> bool:
-        return await self._inner.exists(self._real(path))
-
-    async def listdir(self, path: str) -> list[Entry]:
-        entries = await self._inner.listdir(self._real(path))
-        return [entry._replace(name=self._renamed(entry.name, self._to_alias)) for entry in entries]
-
-    async def close(self) -> None:
-        await self._inner.close()
 
 
 class RecordingStore(InstrumentedStore):
@@ -178,8 +143,8 @@ class RecordingStore(InstrumentedStore):
                 self._exists[path] = found
             case ListCall(path=path, entries=entries):
                 # A listing is stored as its names plus each reported size as that
-                # file's size, so the fixture format (and the anonymizer that
-                # rewrites it) has no section of its own for it.
+                # file's size, so the fixture format has no section of its own
+                # for it.
                 self._listdirs[path] = [entry.name for entry in entries]
                 for entry in entries:
                     if entry.size is not None:
@@ -220,11 +185,7 @@ class _Fixture:
     def decode(cls, fixture_json: str, *, source: str = "this fixture") -> _Fixture:
         payload = json.loads(fixture_json)
         if payload.get("format") != FORMAT_VERSION:
-            raise FixtureFormatError(
-                f"{source} is not in fixture format {FORMAT_VERSION}; re-record it with the make record-fixture "
-                "command `PYTHONPATH=tests uv run python -m support.recording.manifest` prints for it "
-                '(tests/CLAUDE.md, "Recording a fixture")'
-            )
+            raise FixtureFormatError(f"{source} is not in fixture format {FORMAT_VERSION}; it needs re-recording")
         return cls(
             reads={k: base64.b64decode(v) for k, v in payload["reads"].items()},
             sizes=payload["sizes"],
@@ -254,8 +215,8 @@ class ReplayStore:
         fixture_json: A ``RecordingStore.dump`` string.
         strict: ``False`` answers every unrecorded call with
             ``NotFoundError`` and leaves ``misses`` empty, for a caller
-            probing a fixture with calls its recording test never made (the
-            anonymizer's vault-key probe).
+            probing a fixture with calls its test never made (e.g.
+            ``fixture_privacy``'s vault-key probe).
 
     Raises:
         FixtureFormatError: The fixture is not in ``FORMAT_VERSION``.
@@ -292,7 +253,7 @@ class ReplayStore:
         self.misses.append(f"{method} {description}")
         return UnrecordedCallError(
             f"ReplayStore has no recorded {method}() for {description} -- the fixture does not cover this call; "
-            're-record it (tests/CLAUDE.md, "Recording a fixture")'
+            "re-record it"
         )
 
     async def read(self, path: str, offset: int = 0, length: int | None = None) -> bytes:

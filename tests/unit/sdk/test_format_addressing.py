@@ -119,7 +119,7 @@ class TestGroupStartBucketId:
 
 
 class TestCompositionPaths:
-    def test_session_dir_matches_real_sample_shape(self) -> None:
+    def test_session_dir_matches_the_recorded_shape(self) -> None:
         # Real shape: ``Composition/<stream>/<session>.com/c<sub_id>.<seq>``;
         # the ``.<seq>`` suffix is resolved separately by ``storage/seqid.py``.
         assert composition_session_dir(StreamId(132), SessionId(4)) == "132/4.com"

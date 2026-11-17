@@ -4,8 +4,7 @@ composition record: header verify, record head, a full sequential
 and a bounded ``[start, end)`` walk.
 
 Fixture: ``dedup_composition_reader_c0_8_vault_plain.json.gz``, recorded against
-``vault-plain``. No single test makes every call, so recording needs the
-whole file run together.
+``vault-plain``; the tests share it.
 """
 
 from __future__ import annotations

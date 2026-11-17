@@ -257,7 +257,7 @@ def _build_saas_repo_multi_gen(
     ``stream_version=1`` for ``_version()``'s default row (the
     "requested" generation) while ``file_map`` only has rows for
     ``live_stream_versions`` — the real shape left behind once older
-    generations are server-side GC'd (FORMAT-SPEC.md: Generic SaaS object addressing). Every live
+    generations are server-side GC'd (FORMAT-SPEC.md: Stream generations). Every live
     generation shares one physical composition/bucket (same
     stream_id/session_id) — these tests only need to prove *which*
     generation resolution picks, not that content differs across

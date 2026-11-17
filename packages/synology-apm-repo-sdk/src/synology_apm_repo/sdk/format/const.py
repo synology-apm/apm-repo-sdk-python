@@ -17,12 +17,12 @@ is ``(streamID << BUCKET_ID_BIT_NUM | bucketID) << CHUNK_BIT_NUM | chunkIdx``.""
 
 MAX_BUCKET_NUM = 1 << BUCKET_ID_BIT_NUM
 
-# --- Bucket capacity / Pool path layering (FORMAT-SPEC.md: ChunkAddress; Pool path layering) ------
+# --- Bucket capacity / Pool path layering (FORMAT-SPEC.md: ChunkAddress; Path layering) ------
 
 BUCKET_ID_LAYER_SHIFT = 10
 """The 10-bit layering shift of both Pool paths and Composition sub-paths,
-the same algorithm applied to different id domains (see FORMAT-SPEC.md, Pool
-path layering and Composition file splitting)."""
+the same algorithm applied to different id domains (FORMAT-SPEC.md: Path
+layering; Composition sessions)."""
 
 GROUP_BUCKET_NUM = 1 << BUCKET_ID_LAYER_SHIFT
 """Buckets per ``.inf``/``.fgp``/``.ref`` group (1024)."""
@@ -37,7 +37,7 @@ FIXED_CHUNK_BIT_NUM = 12
 FIXED_CHUNK_LENGTH = 1 << FIXED_CHUNK_BIT_NUM  # 4096
 """The fixed chunk granularity; every chunk-map offset is a multiple of it."""
 
-# --- Bucket file physical layout (FORMAT-SPEC.md: Physical layout) ----------------------
+# --- Bucket file physical layout (FORMAT-SPEC.md: Bucket layout) ----------------------
 
 RESERVED_LENG = 4096
 """Uncompressed bucket layout's data start offset."""
@@ -45,24 +45,24 @@ RESERVED_LENG = 4096
 COMPRESS_RESERVED_LENG = 16384
 """Compressed bucket layout's data start offset (64-byte header + SizeStore
 blob padded to this length), the layout current writers always use
-(FORMAT-SPEC.md: Header & mode bits)."""
+(FORMAT-SPEC.md: Bucket header)."""
 
 # --- SizeStore (FORMAT-SPEC.md: SizeStore) ----------------------------------------
 
 SIZE_STORE_REC_BIT_NUM = 15
 """Bits per chunk in the SizeStore bitstream — 3-bit CompressType + 12-bit size."""
 
-# --- ChunkCrcStore (FORMAT-SPEC.md: ChunkCrcStore & Redundancy) ------------------------------------
+# --- ChunkCrcStore (FORMAT-SPEC.md: ChunkCrcStore) ------------------------------------
 
 CHUNK_CRC_SIZE = 4
 """Bytes per non-empty chunk's entry in the (verify-only) ChunkCrcStore trailer."""
 
-# --- Redundancy coverage (FORMAT-SPEC.md: ChunkCrcStore & Redundancy) ------------------------------
+# --- Redundancy coverage (FORMAT-SPEC.md: Redundancy blob) ------------------------------
 
 REDUNDANCY_COVERAGE_BUCKET = 256
 REDUNDANCY_COVERAGE_COMPOSITION = 8192
 
-# --- Composition (FORMAT-SPEC.md: Composition file splitting; RecordHead) --------------------------------
+# --- Composition (FORMAT-SPEC.md: Composition sessions; RecordHead) --------------------------------
 
 SUB_FILE_SIZE_SHIFT = 24
 SUB_FILE_SIZE = 1 << SUB_FILE_SIZE_SHIFT  # 16 MiB

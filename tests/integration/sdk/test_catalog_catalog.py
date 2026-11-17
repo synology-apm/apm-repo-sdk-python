@@ -1,6 +1,5 @@
 """Regression test for ``catalog.connection``/``catalog.workload``/
-``catalog.version``, replayed from a committed fixture recorded against
-real bytes.
+``catalog.version``, replayed from a committed fixture.
 
 Fixture: ``catalog_catalog_vault_plain.json.gz``, recorded against
 ``vault-plain/@ActiveProtectVault``: ``connections()``/``workloads()``
@@ -11,6 +10,7 @@ is its recording recipe (a superset of every other test's calls).
 
 from __future__ import annotations
 
+import re
 from collections.abc import AsyncIterator, Awaitable, Callable
 
 import pytest
@@ -28,9 +28,10 @@ _WINDOWS_VM_WORKLOAD_ID = 2
 _FS_WORKLOAD_ID = 1
 #: The MAIL workload sharing one anonymized persona with its
 #: CALENDAR/CONTACT/DRIVE siblings (workload_ids 6/7/8); persona
-#: correlation itself is tested by
-#: ``tests/unit/support/test_recording_anonymize_catalog_metadata.py``.
+#: correlation itself is a property of the fixtures' anonymization.
 _MAIL_PERSONA_WORKLOAD_ID = 5
+#: A GUID, as an anonymized M365 ``tenant_id`` is.
+_GUID_RE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
 
 
 @pytest.fixture
@@ -80,26 +81,28 @@ async def test_replayed_saas_workload_sub_type_counts_match_vault_plain(repo: De
     assert len([w for w in all_workloads if w.sub_type == "GROUP_EXCHANGE"]) == 1
 
 
-async def test_replayed_m365_and_gws_workloads_carry_the_real_tenant_id_and_domain(repo: DedupRepo) -> None:
-    """M365 workloads carry the tenant GUID and GWS workloads one shared
-    ``domain``. ``tenant_id`` is never anonymized, so it is hardcoded;
-    ``domain`` is, so only its sharing is asserted, which holds both against
-    the anonymized fixture and when recording fresh."""
+async def test_replayed_m365_and_gws_workloads_carry_one_tenant_id_and_domain(repo: DedupRepo) -> None:
+    """M365 workloads share one GUID-shaped ``tenant_id`` and GWS workloads
+    one ``domain``; no other workload carries either. Both values are
+    anonymized, so only their shape and sharing are asserted."""
     conns = await connections(repo)
     all_workloads = [w for c in conns for w in await workloads(repo, c)]
     m365_workloads = [w for w in all_workloads if w.workload_type == "M365"]
     gws_workloads = [w for w in all_workloads if w.workload_type == "GW"]
     assert m365_workloads and gws_workloads
 
+    tenant_ids = set()
     for w in m365_workloads:
-        assert w.tenant_id == "87c467dd-ac00-45d8-babb-e2b0787e2d13", (w.display_name, w.sub_type, w.tenant_id)
+        assert w.tenant_id is not None and _GUID_RE.match(w.tenant_id), (w.display_name, w.sub_type, w.tenant_id)
         assert w.domain is None, (w.display_name, w.sub_type, w.domain)
+        tenant_ids.add(w.tenant_id)
+    assert len(tenant_ids) == 1, tenant_ids  # every M365 workload here belongs to one tenant
     gws_domains = set()
     for w in gws_workloads:
         assert w.domain is not None, (w.display_name, w.sub_type, w.domain)
         assert w.tenant_id is None, (w.display_name, w.sub_type, w.tenant_id)
         gws_domains.add(w.domain)
-    assert len(gws_domains) == 1, gws_domains  # every real GWS workload here shares one tenant domain
+    assert len(gws_domains) == 1, gws_domains  # every GWS workload here shares one tenant domain
 
     for w in all_workloads:
         if w.workload_type not in ("M365", "GW"):

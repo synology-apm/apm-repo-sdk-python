@@ -20,7 +20,7 @@ from synology_apm_repo.sdk.format.redundancy import (
 @pytest.mark.parametrize(
     ("data_size", "expected"),
     [
-        # FORMAT-SPEC.md: a full bucket's SizeStore (chunkNum=8192 -> 15360
+        # FORMAT-SPEC.md: SizeStore; a full bucket's SizeStore (chunkNum=8192 -> 15360
         # bytes) through the redundancy-size formula with coverage 256:
         # 16 + 4*ceil(15360/256) + min(15360, 512) = 16 + 240 + 512 = 768.
         pytest.param(15360, 768, id="worked_example_from_spec"),

@@ -1,6 +1,6 @@
 """Unit tests for ``tests/support/recording/fixture_store.py``:
-``RecordingStore`` (an ``InstrumentedStore``) and ``ReplayStore``, the
-gzip-aware fixture I/O, and ``AliasedStore``."""
+``RecordingStore`` (an ``InstrumentedStore``) and ``ReplayStore``, and the
+gzip-aware fixture I/O."""
 
 from __future__ import annotations
 
@@ -13,7 +13,6 @@ import pytest
 
 from support.fakes import faithful_to
 from support.recording.fixture_store import (
-    AliasedStore,
     FixtureFormatError,
     RecordingStore,
     ReplayStore,
@@ -154,17 +153,13 @@ async def test_recording_a_not_found_replays_as_not_found_and_is_not_a_miss(back
     assert replay.misses == []
 
 
-def test_a_fixture_without_the_current_format_is_rejected_with_the_re_record_command(
-    backing: LocalFsStore, tmp_path: Path
-) -> None:
+def test_a_fixture_without_the_current_format_is_rejected(backing: LocalFsStore, tmp_path: Path) -> None:
     payload = json.loads(RecordingStore(backing).dump())
     del payload["format"], payload["missing"]
     path = tmp_path / "old.json.gz"
     write_fixture_text(path, json.dumps(payload))
 
-    with pytest.raises(
-        FixtureFormatError, match=r"old\.json\.gz is not in fixture format 2.*support\.recording\.manifest"
-    ):
+    with pytest.raises(FixtureFormatError, match=r"old\.json\.gz is not in fixture format 2; it needs re-recording"):
         ReplayStore.from_path(path)
     with pytest.raises(FixtureFormatError, match="not in fixture format 2"):
         ReplayStore(json.dumps(payload), strict=False)
@@ -321,19 +316,3 @@ async def test_from_path_rereads_a_fixture_file_rewritten_since(backing: LocalFs
     os.utime(path, ns=(path.stat().st_atime_ns, path.stat().st_mtime_ns + 1_000_000))
 
     assert await ReplayStore.from_path(path).size("a.txt") == 10
-
-
-async def test_aliased_store_shows_each_sample_directory_and_its_key_file_by_alias(tmp_path: Path) -> None:
-    (tmp_path / "alice-backup").mkdir()
-    (tmp_path / "alice-backup" / "repo_info").write_bytes(b"info")
-    (tmp_path / "alice-backup.key").write_bytes(b"key")
-    (tmp_path / "bob").mkdir()
-    store = AliasedStore(LocalFsStore(tmp_path), {"alice-backup": "vault-plain"})
-
-    assert sorted(entry.name for entry in await store.listdir("")) == ["bob", "vault-plain", "vault-plain.key"]
-    assert await store.read("vault-plain/repo_info", 1, 2) == b"nf"
-    assert await store.read("vault-plain.key") == b"key"
-    assert await store.size("vault-plain/repo_info") == 4
-    assert await store.exists("vault-plain") is True
-    assert await store.exists("alice-backup-old") is False
-    await store.close()

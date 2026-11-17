@@ -1,6 +1,6 @@
 """Regression tests for ``synology_apm_repo.sdk.storage.sqlite_source``
 and ``synology_apm_repo.sdk.storage.table``. Each fixture is shared by two
-tests that read different files, so recording needs both run together.
+tests that read different files.
 
 - ``storage_sqlite_source_envelopes_vault_plain.json.gz`` — recorded against
   ``vault-plain/@ActiveProtectVault``: the raw ``db/repo_state`` and one
@@ -71,7 +71,12 @@ async def test_replayed_ahlt_then_zstd_version_db(record_target: Callable[[str],
 
         matching = [row async for row in table.select("basename = ?", ["relink_config.sql.gz"])]
         assert len(matching) == 1
-        assert matching[0]["dirname"] == "/test/ActiveBackup_2026-05-13_123726/test"
+        # ``/<share>/<session directory>/<source>``: names are anonymized, the
+        # backup session's directory is not.
+        dirname = matching[0]["dirname"]
+        assert isinstance(dirname, str)
+        _, _share, session, _source = dirname.split("/")
+        assert session == "ActiveBackup_2026-05-13_123726"
 
 
 async def test_replayed_ahlt_only_target_db(record_target: Callable[[str], Awaitable[ObjectStore]]) -> None:

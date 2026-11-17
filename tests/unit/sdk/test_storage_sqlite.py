@@ -169,7 +169,7 @@ async def test_transform_forces_slow_path_even_with_no_wal(tmp_path: Path) -> No
 
 async def test_transform_applied_independently_to_main_file_and_wal(tmp_path: Path) -> None:
     # The main file and its sidecars are wrapped independently: each file is
-    # detected on its own (FORMAT-SPEC.md §6.1, §5.5).
+    # detected on its own (FORMAT-SPEC.md: Database files; File-level encryption).
     db_path = tmp_path / "test.db"
     writer = sqlite3.connect(str(db_path))
     writer.execute("PRAGMA journal_mode=WAL")

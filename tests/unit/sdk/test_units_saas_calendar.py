@@ -371,7 +371,7 @@ class TestBuildIcs:
         "time_zone",
         [
             # A legacy Windows zone name (Graph's default without an IANA
-            # "Prefer: outlook.timezone"): no real sample data confirms its
+            # "Prefer: outlook.timezone"): no recorded backup confirms its
             # mapping, so it is not guessed.
             pytest.param("Pacific Standard Time", id="unresolvable_timezone"),
             # ZoneInfo raises ValueError, not ZoneInfoNotFoundError, for a

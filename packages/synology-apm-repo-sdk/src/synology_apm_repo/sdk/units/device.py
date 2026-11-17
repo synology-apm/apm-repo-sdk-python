@@ -1,7 +1,7 @@
 """``DeviceProvider``: VM/PC/PS workloads via ``copy_meta_file``.
 
 The smallest backed-up unit for these workload types is a whole
-disk/volume image (FORMAT-SPEC.md: Landing directory layout); this
+disk/volume image (FORMAT-SPEC.md: Metadata directory); this
 provider's disk-image leaves are exactly that. When a Dissect package is
 installed, every supported dedup disk image also gets one sibling node,
 "``<name>`` (filesystem)", built via

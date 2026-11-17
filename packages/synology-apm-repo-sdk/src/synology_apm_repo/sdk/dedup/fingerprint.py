@@ -31,8 +31,6 @@ from ..storage.base import ObjectStore, join_path
 from ..storage.dircache import DirCache
 from ..storage.seqid import resolve_seq_path
 
-_SPEC = "FORMAT-SPEC.md: Sidecar files; Chunk pool encryption"
-
 # .inf's allocation table: 1024 8-byte entries starting at a
 # fixed offset within the (otherwise per-bucket-record) .inf file.
 _ALLOC_TABLE_OFFSET = 12288
@@ -153,7 +151,7 @@ class FingerprintIndex:
             full_dir, prefix = _group_dir_and_prefix(self._pool_root, stream_id, bucket_id)
             inf_path = await resolve_seq_path(self._dir_cache, full_dir, f"{prefix}.inf")
             header_bytes = await self._store.read(inf_path, 0, HEADER_LEN)
-            parse_index_header(header_bytes, expect_magic=MAGIC["bucket_meta"], spec=_SPEC)
+            parse_index_header(header_bytes, expect_magic=MAGIC["bucket_meta"])
             table = await self._store.read(inf_path, _ALLOC_TABLE_OFFSET, _ALLOC_TABLE_LENGTH)
             return _GroupTable(full_dir, prefix, inf_path, table)
 
@@ -179,7 +177,6 @@ class FingerprintIndex:
             raise DataCorruptError(
                 f"chunk_idx {last} has no fingerprint recorded for bucket {bucket_id} (recNum={allocation.rec_num})",
                 ref=group.inf_path,
-                spec=_SPEC,
             )
         fp_start = allocation.byte_off + run_start * _FGP_RECORD_LENGTH
         seg_idx = fp_start // _FGP_SEGMENT_SIZE

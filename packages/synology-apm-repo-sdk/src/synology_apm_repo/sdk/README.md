@@ -242,9 +242,9 @@ from "look up one fixed table name"; only then does it get its own provider
 class.
 
 1. Pick the `TreeStrategy` (`units/saas/tree_strategy/`) that matches the
-   workload's tree shape in real sample data. A wrong shape produces subtly
+   workload's tree shape in an actual backup of it. A wrong shape produces subtly
    wrong navigation, not an error.
-2. Write `content()` against real sample bytes for that workload type:
+2. Write `content()` against an actual backup's bytes for that workload type:
    service-DB schemas drift across connector versions, so read them through
    `storage/table.py`'s `Table`. Put the byte-producing logic (building an
    EML/ICS/CSV, rendering HTML, ...) in a new `units/content/saas_<name>.py`

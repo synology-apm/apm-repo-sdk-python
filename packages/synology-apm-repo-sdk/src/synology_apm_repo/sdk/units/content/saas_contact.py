@@ -11,7 +11,7 @@ import io
 from ..._util.jsonparse import parse_json_object
 
 # M365 Outlook-compatible CSV column order, each filled from the Graph
-# ``contact`` field ``build_contact_csv`` names (FORMAT-SPEC.md: M365 Contact
+# ``contact`` field ``build_contact_csv`` names (FORMAT-SPEC.md: Contact
 # has the field shape).
 _CSV_HEADER = [
     "First Name",

@@ -3,9 +3,8 @@ files on plaintext and encrypted repositories:
 
 - ``fingerprint_vault_plain.json.gz`` — recorded against
   ``vault-plain/@ActiveProtectVault``: one bucket's chunk 0 plus another
-  bucket's three chunks straddling a ``.fgp`` 4 MiB segment boundary.
-  Neither test's calls are a subset of the other's, so recording needs
-  both run together.
+  bucket's three chunks straddling a ``.fgp`` 4 MiB segment boundary;
+  two tests share it.
 - ``fingerprint_vault_encrypted.json.gz`` — recorded against
   ``vault-encrypted/@ActiveProtectVault``; its one test.
 - ``fingerprint_objstore_encrypted.json.gz`` — recorded against one repo

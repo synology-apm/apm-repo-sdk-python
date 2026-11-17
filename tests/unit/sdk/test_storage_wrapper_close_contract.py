@@ -11,7 +11,7 @@ from pathlib import Path
 
 import pytest
 
-from support.recording.fixture_store import AliasedStore, RecordingStore, ReplayStore
+from support.recording.fixture_store import RecordingStore, ReplayStore
 from support.store_fakes import CloseCountingStore
 from synology_apm_repo.sdk.storage.azure import AzureStore
 from synology_apm_repo.sdk.storage.base import ObjectStore
@@ -23,7 +23,6 @@ from synology_apm_repo.sdk.storage.smb import SmbStore
 #: Every ``ObjectStore`` wrapper the SDK (``TracingStore``) and the suite's
 #: recording tooling define.
 _WRAPPERS: list[tuple[str, Callable[[ObjectStore], ObjectStore]]] = [
-    ("AliasedStore", lambda backing: AliasedStore(backing, {})),
     ("RecordingStore", lambda backing: RecordingStore(backing)),
     ("TracingStore", lambda backing: TracingStore(backing, lambda _event: None)),
 ]

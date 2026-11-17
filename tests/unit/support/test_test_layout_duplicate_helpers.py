@@ -1,9 +1,9 @@
 """No two test files define the same helper: a top-level function or class
 of ``MIN_STATEMENTS`` or more statements in one ``tests/**/test_*.py`` file
-must not be structurally identical to one in another (``tests/smoke``
-excluded). Identity is the AST with positions, the definition's own name and
-its docstring left out, so a renamed or re-documented copy still counts. A
-shared helper lives in an importable module (``tests/CLAUDE.md``)."""
+must not be structurally identical to one in another. Identity is the AST
+with positions, the definition's own name and its docstring left out, so a
+renamed or re-documented copy still counts. A shared helper lives in an
+importable module (``tests/CLAUDE.md``)."""
 
 from __future__ import annotations
 
@@ -63,9 +63,7 @@ def duplicate_helpers(sources: dict[str, str]) -> list[str]:
 
 def test_no_two_test_files_define_the_same_helper() -> None:
     sources = {
-        str(path.relative_to(_TESTS)): path.read_text(encoding="utf-8")
-        for path in sorted(_TESTS.rglob("test_*.py"))
-        if "smoke" not in path.relative_to(_TESTS).parts
+        str(path.relative_to(_TESTS)): path.read_text(encoding="utf-8") for path in sorted(_TESTS.rglob("test_*.py"))
     }
     found = duplicate_helpers(sources)
     assert found == [], "move the shared helper into an importable module:\n" + "\n".join(found)

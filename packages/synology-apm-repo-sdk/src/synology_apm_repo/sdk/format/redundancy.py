@@ -1,4 +1,4 @@
-"""Redundancy blob sizing and self-repair (FORMAT-SPEC.md: ChunkCrcStore & Redundancy).
+"""Redundancy blob sizing and self-repair (FORMAT-SPEC.md: Redundancy blob).
 
 Every Composition record and ``.buk`` bucket carries a trailing Redundancy
 blob: a ``2*coverage``-byte ring-buffer XOR parity (even-indexed windows
@@ -27,16 +27,14 @@ REDUNDANCY_MAGIC = b"RD"
 _HEAD_LENGTH = 16
 _VERSION = 0
 
-_SPEC = "FORMAT-SPEC.md: ChunkCrcStore & Redundancy"
-
 
 def redundancy_size(data_size: int, coverage: int) -> int:
     """Total byte length of a Redundancy blob covering ``data_size`` bytes
     of underlying data, checkpointed every ``coverage`` bytes:
 
     ``16 (header) + 4 * ceil(data_size / coverage) (StepCrc array) +
-    min(data_size, 2 * coverage) (parity)`` (FORMAT-SPEC.md: ChunkCrcStore &
-    Redundancy).
+    min(data_size, 2 * coverage) (parity)`` (FORMAT-SPEC.md: Redundancy
+    blob).
 
     ``coverage`` is 256 for bucket trailers (``REDUNDANCY_COVERAGE_BUCKET``),
     8192 for composition record trailers (``REDUNDANCY_COVERAGE_COMPOSITION``).
@@ -69,7 +67,7 @@ class RedundancyBlob:
 
 def parse_redundancy_blob(data: bytes, *, data_size: int, coverage: int) -> RedundancyBlob:
     """Parse a Redundancy trailer of ``redundancy_size(data_size, coverage)``
-    bytes (FORMAT-SPEC.md: ChunkCrcStore & Redundancy). The header's
+    bytes (FORMAT-SPEC.md: Redundancy blob). The header's
     coverage and data size are checked against the caller's values (known
     independently from the record or bucket header), not trusted.
 
@@ -79,18 +77,17 @@ def parse_redundancy_blob(data: bytes, *, data_size: int, coverage: int) -> Redu
     """
     expected_len = redundancy_size(data_size, coverage)
     if len(data) < expected_len:
-        raise FormatError(f"Redundancy blob too short: {len(data)} bytes < {expected_len}", spec=_SPEC)
+        raise FormatError(f"Redundancy blob too short: {len(data)} bytes < {expected_len}")
     if data[0:2] != REDUNDANCY_MAGIC:
-        raise FormatError(f"bad Redundancy magic {data[0:2]!r}, expected {REDUNDANCY_MAGIC!r}", spec=_SPEC)
+        raise FormatError(f"bad Redundancy magic {data[0:2]!r}, expected {REDUNDANCY_MAGIC!r}")
     (version,) = struct.unpack(">H", data[2:4])
     if version != _VERSION:
-        raise FormatError(f"unsupported Redundancy blob version {version}", spec=_SPEC)
+        raise FormatError(f"unsupported Redundancy blob version {version}")
     stored_coverage, stored_data_size = struct.unpack(">IQ", data[4:16])
     if stored_coverage != coverage or stored_data_size != data_size:
         raise FormatError(
             f"Redundancy blob header (coverage={stored_coverage}, data_size={stored_data_size}) doesn't match "
             f"expected (coverage={coverage}, data_size={data_size})",
-            spec=_SPEC,
         )
 
     step_crc_len, parity_len = _blob_component_lengths(data_size, coverage)
@@ -149,7 +146,7 @@ def _reconstruct_window(data: bytes, blob: RedundancyBlob, idx: int, num_windows
 def attempt_repair(data: bytes, redundancy_raw: bytes, *, coverage: int, expected_crc: int) -> bytes | None:
     """Best-effort, in-memory self-repair of ``data`` (known not to match
     ``expected_crc``) using its trailing Redundancy blob (FORMAT-SPEC.md:
-    ChunkCrcStore & Redundancy).
+    Redundancy blob).
 
     Reconstructs windows ``[bad_idx, bad_idx+1]`` around the first divergent
     rolling checkpoint (the checkpoint alone can't tell whether

@@ -50,7 +50,7 @@ def _missing_fids_diagnostic(fids: list[int], *, scope: str, table: str) -> str:
     )
 
 
-# FORMAT-SPEC.md: PC/PS disk fragments. D(diskUuid)O(offset)[V(volumeUuid)]S(diskIndex)[_{seq}].img
+# FORMAT-SPEC.md: PC/PS. D(diskUuid)O(offset)[V(volumeUuid)]S(diskIndex)[_{seq}].img
 #
 # O and V may be absent; D and S are required, since without them an
 # object can't be tied to one physical disk.
@@ -75,7 +75,7 @@ def _pcps_disk_sort_key(key: tuple[str, str]) -> tuple[int, int, str]:
 def _pcps_disk_key(fid: int, path: str) -> tuple[str, str]:
     """Group key for one PC/PS fragment: ``(disk_uuid, disk_index)``
     parsed from the ``D(...)[O(...)][V(...)]S(...)`` fragment naming
-    (FORMAT-SPEC.md: PC/PS disk fragments) Windows ``VOL_BASE`` clients use; a
+    (FORMAT-SPEC.md: PC/PS) Windows ``VOL_BASE`` clients use; a
     non-matching filename (e.g. a macOS PC's single whole-disk object)
     is a singleton group keyed by its own ``fid``."""
     leaf = path.rsplit("/", 1)[-1]
@@ -89,7 +89,7 @@ def _pcps_disk_key(fid: int, path: str) -> tuple[str, str]:
 class PcpsDiskTree:
     """One ``DeviceProvider``'s PC/PS disk listing/assembly — resolves
     ``copy_target_version`` → ``copy_target_file`` → ``file_meta``
-    (FORMAT-SPEC.md: dedup data mapping chain) into disk nodes, and assembles a disk's
+    (FORMAT-SPEC.md: Version file tables) into disk nodes, and assembles a disk's
     fragments into one ``ContentSource`` only when opened.
     """
 
@@ -150,7 +150,7 @@ class PcpsDiskTree:
         all_nodes = disk_fs_containers_before_leaves(all_nodes)
 
         # Registrations can age out of file_meta/file_map's generation
-        # window (FORMAT-SPEC.md: Multi-generation selection); the diagnostic doesn't guess why.
+        # window (FORMAT-SPEC.md: Generation selection); the diagnostic doesn't guess why.
         never_resolved = [fid for fid in fids if fid not in resolved]
         return all_nodes, never_resolved
 

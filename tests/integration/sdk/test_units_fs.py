@@ -27,12 +27,21 @@ from synology_apm_repo.sdk.dedup.repository import DedupRepo
 from synology_apm_repo.sdk.identifiers import WorkloadId
 from synology_apm_repo.sdk.storage.base import ObjectStore
 from synology_apm_repo.sdk.storage.layout import catalog_repo_layouts, detect_repository_layout, iter_repository_layouts
-from synology_apm_repo.sdk.units.base import UnitKind
+from synology_apm_repo.sdk.units.base import Node, UnitKind
 from synology_apm_repo.sdk.units.fs import FsProvider
 
 #: Looked up by id: two FS workloads in this sample share one display name.
 _FS_WORKLOAD_ID = WorkloadId(1)
 _FS_NO_DUP_CHILDREN_WORKLOAD_ID = WorkloadId(4)
+
+#: The top-level directory holding the known ``config.json`` (an anonymized
+#: name; each fixture records only this directory's listing).
+_CONFIG_DIR = "CORP-PC-0a08"
+
+
+async def _config_json(provider: FsProvider, top: list[Node]) -> Node:
+    directory = next(n for n in top if n.name == _CONFIG_DIR)
+    return next(n for n in await provider.children(directory) if n.name == "config.json")
 
 
 async def test_replayed_fs_tree_resolves_to_a_known_json_config_file(
@@ -49,12 +58,10 @@ async def test_replayed_fs_tree_resolves_to_a_known_json_config_file(
 
         async with FsProvider(repo, version) as provider:
             top = await provider.children(provider.root())
-            assert {n.name for n in top} == {"ActiveBackupforBusiness", "docker", "test", "web", "web_packages"}
+            assert len({n.name for n in top}) == 5
             assert all(not n.is_leaf for n in top)
 
-            test_dir = next(n for n in top if n.name == "test")
-            test_children = await provider.children(test_dir)
-            config = next(n for n in test_children if n.name == "config.json")
+            config = await _config_json(provider, top)
             assert config.size == 2420
 
             # The unit's content reports its size without reading any bytes.
@@ -101,8 +108,7 @@ async def test_replayed_fs_files_listed_when_repo_root_is_non_empty(
 
         async with FsProvider(repo, version) as provider:
             top = await provider.children(provider.root())
-            assert {n.name for n in top} == {"ActiveBackupforBusiness", "docker", "test", "web", "web_packages"}
+            assert len({n.name for n in top}) == 5
 
-            test_dir = next(n for n in top if n.name == "test")
-            config = next(n for n in await provider.children(test_dir) if n.name == "config.json")
+            config = await _config_json(provider, top)
             assert config.is_leaf and config.kind is UnitKind.FILE

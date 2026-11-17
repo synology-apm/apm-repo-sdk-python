@@ -3,8 +3,8 @@ present), the queries that list or look one up, its meta-directory
 resolution, and ``open_target_db()`` for the Device and FS providers.
 
 ``version_spec`` is AES-256-CTR ciphertext whenever the repository has a
-vault key (FORMAT-SPEC.md: ``copy_target_version.version_spec``
-encryption); ``parse_version_spec`` decrypts and
+vault key (FORMAT-SPEC.md: ``version_spec`` encryption);
+``parse_version_spec`` decrypts and
 parses it.
 """
 
@@ -107,7 +107,7 @@ _BROWSABLE_VERSION_STATUSES = frozenset({"COMPLETED", "PARTIAL", "CANCELED"})
 def resolve_meta_filename(meta: VersionMeta, name: str, *, ref: str | None = None) -> str:
     """Return ``name`` (e.g. ``"target.db"``) after confirming it is in
     ``meta.meta_filenames``, the meta directory's authoritative file list
-    (FORMAT-SPEC.md: dedup data mapping chain).
+    (FORMAT-SPEC.md: Version file tables).
 
     Raises:
         NotFoundError: ``name`` was never registered for this version.
@@ -116,7 +116,6 @@ def resolve_meta_filename(meta: VersionMeta, name: str, *, ref: str | None = Non
         raise NotFoundError(
             f"{name!r} is not registered in this version's meta_filenames",
             ref=ref,
-            spec="FORMAT-SPEC.md: dedup data mapping chain",
         )
     return name
 
@@ -151,7 +150,7 @@ def resolve_copy_meta_dir(version: Version, repo_root: str) -> str:
 
 async def open_target_db(repo: DedupRepo, version: Version, meta_dir: str) -> SqliteSource:
     """Open ``<meta_dir>/target.db`` (``aHlT``-enveloped or not, with any
-    ``-wal``/``-shm`` sidecar; FORMAT-SPEC.md: Landing directory layout), checked against
+    ``-wal``/``-shm`` sidecar; FORMAT-SPEC.md: Metadata directory), checked against
     ``meta_filenames``. ``version.meta`` must be set, as
     ``resolve_copy_meta_dir`` already required.
 

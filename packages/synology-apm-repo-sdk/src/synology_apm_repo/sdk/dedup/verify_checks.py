@@ -118,7 +118,7 @@ async def _attempt_map_crc_repair(
     reader: CompositionReader, map_array_off: int, map_array_len: int, attr_leng: int, array_raw: bytes, map_crc: int
 ) -> bytes | None:
     """On a ``map_crc`` mismatch, fetch the record's trailing Redundancy blob
-    (FORMAT-SPEC.md: RecordHead; ChunkCrcStore & Redundancy; stored after the
+    (FORMAT-SPEC.md: RecordHead; Redundancy blob; stored after the
     attribute blob, coverage 8192) and try in-memory self-repair
     (``redundancy_repair.repair_via_trailer``). Not read on the healthy path.
 
@@ -249,7 +249,7 @@ async def check_chunk_ciphertext_crc(
     reader: BucketReader, chunk_idx: int, raw: bytes | memoryview | None = None
 ) -> Finding | None:
     """One chunk's *stored* bytes against its ChunkCrcStore entry
-    (FORMAT-SPEC.md: ChunkCrcStore & Redundancy): ``raw`` when the caller
+    (FORMAT-SPEC.md: ChunkCrcStore): ``raw`` when the caller
     already holds them (e.g. from ``read_raw_chunks``), else read here.
     Nothing is decrypted, so no vault key is needed."""
     try:

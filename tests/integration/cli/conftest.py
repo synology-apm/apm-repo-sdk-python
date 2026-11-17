@@ -24,8 +24,8 @@ def patch_profile_store(
     ``cli.repo_session``, except ``dump``, which resolves its own store, so
     ``test_cli_commands_dump.py`` patches ``cli.commands.dump`` instead.
 
-    Routes through ``record_target`` so these tests get ``--record-against``
-    support and its real-content recording guard."""
+    Routes through ``record_target`` so these tests get the same store, and
+    its real-content guard, as every other integration test."""
 
     def _patch(fixture_name: str, module: ModuleType = repo_session, *, allow_content: bool = False) -> None:
         async def _resolve(name: str) -> ObjectStore:

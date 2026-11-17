@@ -48,7 +48,7 @@ def test_safe_preserves_the_full_message_through_console_print() -> None:
     assert "ref=@ActiveProtectVault/@data/Pool/45/0" in output
 
 
-def test_safe_handles_the_exact_real_sample_shape() -> None:
+def test_safe_handles_the_exact_recorded_shape() -> None:
     buf = io.StringIO()
     console = Console(file=buf, width=200)
     console.print(f"[red]error:[/red] {safe(_REAL_SHAPE_MESSAGE)}")  # must not raise

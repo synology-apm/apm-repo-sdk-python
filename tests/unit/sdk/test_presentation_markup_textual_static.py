@@ -67,7 +67,7 @@ def test_safe_prevents_the_crash() -> None:
     assert _rendered(f"[red]error:[/red] {safe(exc)}") == f"error: {exc}"
 
 
-def test_safe_handles_the_exact_real_sample_shape() -> None:
+def test_safe_handles_the_exact_recorded_shape() -> None:
     assert _rendered(f"[red]error:[/red] {safe(_REAL_SHAPE_MESSAGE)}") == f"error: {_REAL_SHAPE_MESSAGE}"
 
 

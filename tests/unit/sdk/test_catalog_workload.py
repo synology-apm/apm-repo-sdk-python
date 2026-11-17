@@ -344,7 +344,7 @@ class TestTenantAndDomain:
                     20,
                     "m365-uid",
                     "M365",
-                    {"spec": {"workload_type": "SITE", "tenant_id": "87c467dd-ac00-45d8-babb-e2b0787e2d13"}},
+                    {"spec": {"workload_type": "SITE", "tenant_id": "00000000-0000-4000-8000-000000001234"}},
                 )
             ],
         )
@@ -356,7 +356,7 @@ class TestTenantAndDomain:
         layout = RepoLayout(kind=RepoKind.VAULT, repo_root="")
         async with await DedupRepo.open(store, layout) as repo:
             wl = (await workloads(repo, (await connections(repo))[0]))[0]
-            assert wl.tenant_id == "87c467dd-ac00-45d8-babb-e2b0787e2d13"
+            assert wl.tenant_id == "00000000-0000-4000-8000-000000001234"
             assert wl.domain is None
 
     async def test_user_info_read_from_status_entity_meta(self, tmp_path: Path) -> None:

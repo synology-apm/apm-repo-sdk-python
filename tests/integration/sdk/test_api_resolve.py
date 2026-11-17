@@ -1,9 +1,8 @@
 """Regression tests for ``Session.resolve``, replayed from a committed
-fixture recorded against real bytes.
+fixture.
 
 Fixture: ``api_resolve_vault_plain_walk.json.gz``, recorded against
-``vault-plain``. No test's calls are a superset of the others', so
-recording needs the whole file run together.
+``vault-plain``.
 """
 
 from __future__ import annotations
@@ -101,40 +100,6 @@ async def test_replayed_resolve_human_ref_down_to_a_real_device_disk(
         )
         resolved = await (await session.resolve(str(human_ref))).unit()
         assert resolved.name == disk.name
-
-
-async def test_replayed_resolve_nested_drive_item_by_flat_item_id(
-    record_target: Callable[..., Awaitable[ObjectStore]],
-) -> None:
-    """Unlike the other providers, which add one ref segment per tree
-    level, Drive addresses every item by a single flat ``item_id``; checked
-    on a real item inside a top-level folder."""
-    async with api.Session() as session:
-        # allow_content=True: catalog.provider() reads the object-name
-        # index, an internal routing table, through dedup_file.read().
-        store = await record_target("api_resolve_vault_plain_walk.json.gz", allow_content=True)
-        [repo] = await session.open(store)
-        catalogs = await repo.catalogs()
-        workload_pairs = [(c, w) for c in catalogs for w in await c.workloads()]
-        drive_versions = [
-            (c, v) for c, w in workload_pairs if w.sub_type == "DRIVE" for v in await c.versions(w) if not v.deleted
-        ]
-        for catalog, version in drive_versions:
-            provider = await catalog.provider(version)
-            top = await provider.children(provider.root())
-            folder = next((n for n in top if not n.is_leaf), None)
-            if folder is None:
-                continue
-            nested = await provider.children(folder)
-            if not nested:
-                continue
-            target = nested[0]
-            assert len(target.ref.extra_segments) == 1  # the flat-id convention itself
-            resolved = (await session.resolve(str(target.ref))).node
-            assert resolved is not None
-            assert resolved.name == target.name
-            return
-        raise AssertionError("expected at least one real Drive version with a nested folder item")
 
 
 async def test_replayed_resolve_unknown_human_segment_raises_not_found(

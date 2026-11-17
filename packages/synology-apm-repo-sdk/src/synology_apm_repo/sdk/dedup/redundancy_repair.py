@@ -1,5 +1,5 @@
 """Self-repair of a CRC-mismatched region from its on-disk Redundancy
-trailer (FORMAT-SPEC.md: ChunkCrcStore & Redundancy): fetch the trailer,
+trailer (FORMAT-SPEC.md: Redundancy blob): fetch the trailer,
 then run ``format.redundancy.attempt_repair`` off the event loop."""
 
 from __future__ import annotations

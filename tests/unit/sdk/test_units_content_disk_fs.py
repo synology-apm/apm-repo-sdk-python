@@ -21,8 +21,11 @@ Fixtures:
   ``ntfs-3g`` loop mount; its root carries a literal ``"."`` entry that
   ``_ntfs_iterdir`` filters.
 
-The ``.raw.tar.gz`` fixtures are single-member ``tar --sparse`` archives:
-each image is mostly unallocated, and ``tarfile`` restores the holes as real
+The ``.raw.tar.gz`` fixtures are single-member sparse archives, owned by
+root and compressed with no name or timestamp in the gzip header
+(``tar --format=gnu --sparse --owner=0 --group=0 --numeric-owner -cf - <image>
+| gzip -n -9``; the plain ``.raw.gz`` images use ``gzip -n -9`` too): each
+image is mostly unallocated, and ``tarfile`` restores the holes as real
 holes, so ``disk_fs_fakes.extracted_image`` never materializes the full logical size.
 """
 

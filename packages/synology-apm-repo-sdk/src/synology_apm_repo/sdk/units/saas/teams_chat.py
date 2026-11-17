@@ -5,7 +5,7 @@ Channels are listed under Standard/Private/Shared categories
 (``CategorizedGroupTree`` over ``channel_info_table.channel_type``); chats
 are one flat list. The service DBs are located by ``teams_discovery.py``,
 which doesn't fit ``SaasWorkloadProvider``'s per-table model. Chat support
-follows FORMAT-SPEC.md: Teams/Chat container discrimination, and has not
+follows FORMAT-SPEC.md: Teams and Chat, and has not
 been checked against an observed chat backup.
 
 Every leaf is ``UnitKind.TEAMS_CHAT_MESSAGE``, and every container

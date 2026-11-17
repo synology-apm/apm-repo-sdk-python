@@ -1,5 +1,21 @@
-# Builds and publishes synology-apm-repo-sdk, synology-apm-repo-cli, and
-# synology-apm-repo-browser to PyPI for the pushed tag.
+# Builds synology-apm-repo-sdk, synology-apm-repo-cli and
+# synology-apm-repo-browser for the pushed `vX.Y.Z` tag and publishes them
+# to PyPI, then as one GitHub release:
+# - `verified`: looks for ci.yml's push or scheduled run on the tagged
+#   commit. Passed: CI is not repeated. Still running: waits for it.
+#   Failed: stops the release. Cancelled, absent or unreadable: `ci` runs.
+# - `ci`: the whole of ci.yml (workflow_call), only when `verified` says so.
+# - `advisories`: `make audit-advisories` every time, so a release that
+#   reuses an older CI run still sees today's advisories.
+# - `gate`: passes only when all three did; everything after it needs it.
+# - `build`, `verify-dist`: the wheels and sdists with their `.sha256`,
+#   installed and run before anything is published.
+# - `publish-*`: PyPI (trusted publishing), the SDK first.
+# - `github-release`: once every PyPI upload succeeded, checks every file
+#   against its `.sha256` and the tag's version, then one GitHub release.
+# A job after one that may be skipped (`ci`) is skipped too unless its
+# `if:` says otherwise, hence `!cancelled() && needs.X.result == 'success'`.
+# Actions are pinned to commit SHAs; see .github/CLAUDE.md.
 
 name: Release
 
@@ -9,19 +25,95 @@ on:
       - "v*"
 
 permissions:
-  contents: read   # publish-* jobs elevate their own
+  contents: read   # jobs that need more elevate their own
 
+# One release at a time, whatever the tag.
 concurrency:
   group: release
   cancel-in-progress: false
 
 jobs:
-  # Same gate as every push — a tag must never ship code that would fail CI.
-  test:
+  verified:
+    runs-on: ubuntu-latest
+    permissions:
+      actions: read
+    outputs:
+      ci: ${{ steps.check.outputs.ci }}
+    steps:
+      - id: check
+        name: Look for a CI run on this commit
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          SHA: ${{ github.sha }}
+        run: |
+          set -u
+          out() { echo "ci=$1" >> "$GITHUB_OUTPUT"; }
+          # Newest first. Pull-request runs test a merge commit, not this one.
+          run=$(gh api "repos/$GH_REPO/actions/workflows/ci.yml/runs?head_sha=$SHA&per_page=100" \
+            --jq '[.workflow_runs[] | select(.event == "push" or .event == "schedule")] | .[0] // empty | "\(.id) \(.status)"') || {
+            echo "::warning::Could not list the CI runs of $SHA; running CI"; out run; exit 0; }
+          if [ -z "$run" ]; then
+            echo "No push or scheduled CI run on $SHA; running CI"; out run; exit 0
+          fi
+          read -r id status <<< "$run"
+          if [ "$status" != completed ]; then
+            echo "Waiting for CI run $id ($status)"
+            gh run watch "$id" --interval 30 > /dev/null || true
+          fi
+          conclusion=$(gh run view "$id" --json conclusion --jq .conclusion) || {
+            echo "::warning::Could not read CI run $id; running CI"; out run; exit 0; }
+          case "$conclusion" in
+            success) echo "CI run $id passed on $SHA"; out skip ;;
+            cancelled) echo "CI run $id was cancelled; running CI"; out run ;;
+            *) echo "::error::CI run $id on $SHA concluded '$conclusion'"; exit 1 ;;
+          esac
+
+  ci:
+    needs: verified
+    if: needs.verified.outputs.ci == 'run'
     uses: ./.github/workflows/ci.yml
 
+  advisories:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+        with:
+          enable-cache: true
+          python-version: "3.14"
+
+      - name: Install dependencies
+        run: uv sync --all-packages --locked
+
+      - name: Advisories (make audit-advisories)
+        run: make audit-advisories
+
+  gate:
+    if: always()
+    needs: [verified, ci, advisories]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Verified or tested, and no advisory
+        env:
+          VERIFIED: ${{ needs.verified.result }}
+          DECISION: ${{ needs.verified.outputs.ci }}
+          CI: ${{ needs.ci.result }}
+          ADVISORIES: ${{ needs.advisories.result }}
+        run: |
+          echo "verified=$VERIFIED ($DECISION) ci=$CI advisories=$ADVISORIES"
+          [ "$VERIFIED" = success ] && [ "$ADVISORIES" = success ] || exit 1
+          case "$DECISION/$CI" in
+            skip/skipped | run/success) ;;
+            *) exit 1 ;;
+          esac
+
   build:
-    needs: test
+    needs: gate
+    if: ${{ !cancelled() && needs.gate.result == 'success' }}
     runs-on: ubuntu-latest
     strategy:
       matrix:
@@ -38,16 +130,30 @@ jobs:
       - name: Build synology-apm-repo-${{ matrix.package }}
         run: uv build --package synology-apm-repo-${{ matrix.package }} -o dist/synology-apm-repo-${{ matrix.package }}
 
+      # Beside the dist, not in it: PyPI takes every file of packages-dir.
+      - name: Checksums of synology-apm-repo-${{ matrix.package }}
+        run: |
+          mkdir sha256
+          cd dist/synology-apm-repo-${{ matrix.package }}
+          for f in *; do sha256sum -- "$f" > "../../sha256/$f.sha256"; done
+
       - name: Upload synology-apm-repo-${{ matrix.package }} dist
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: synology-apm-repo-${{ matrix.package }}
           path: dist/synology-apm-repo-${{ matrix.package }}/
 
+      - name: Upload synology-apm-repo-${{ matrix.package }} checksums
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: sha256-synology-apm-repo-${{ matrix.package }}
+          path: sha256/
+
   # The wheels are installed and exercised before anything reaches PyPI —
   # PyPI uploads are immutable, so a broken artifact would burn the version.
   verify-dist:
     needs: build
+    if: ${{ !cancelled() && needs.build.result == 'success' }}
     runs-on: ubuntu-latest
     steps:
       # Each artifact lands in dist/<artifact name>/, i.e. dist/synology-apm-repo-<package>/.
@@ -82,6 +188,7 @@ jobs:
 
   publish-sdk:
     needs: [build, verify-dist]
+    if: ${{ !cancelled() && needs.verify-dist.result == 'success' }}
     runs-on: ubuntu-latest
     environment:
       name: pypi-synology-apm-repo-sdk
@@ -102,6 +209,7 @@ jobs:
 
   publish-cli:
     needs: [build, publish-sdk]
+    if: ${{ !cancelled() && needs.publish-sdk.result == 'success' }}
     runs-on: ubuntu-latest
     environment:
       name: pypi-synology-apm-repo-cli
@@ -123,6 +231,7 @@ jobs:
   # publish-browser runs in parallel with publish-cli — both depend only on publish-sdk.
   publish-browser:
     needs: [build, publish-sdk]
+    if: ${{ !cancelled() && needs.publish-sdk.result == 'success' }}
     runs-on: ubuntu-latest
     environment:
       name: pypi-synology-apm-repo-browser
@@ -141,27 +250,46 @@ jobs:
         with:
           packages-dir: dist/synology-apm-repo-browser
 
-  # Runs alongside publish-sdk (both need only verify-dist) — the GitHub
-  # Release is independent of the PyPI uploads.
+  # Last, so a release is announced only once every package is on PyPI.
   github-release:
-    needs: [build, verify-dist]
+    needs: [publish-sdk, publish-cli, publish-browser]
+    if: >-
+      ${{ !cancelled() && needs.publish-sdk.result == 'success' &&
+      needs.publish-cli.result == 'success' && needs.publish-browser.result == 'success' }}
     runs-on: ubuntu-latest
     permissions:
       contents: write
     steps:
-      # Each artifact lands in dist/<artifact name>/, i.e. dist/synology-apm-repo-<package>/.
       - name: Download every package's dist
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           pattern: synology-apm-repo-*
           path: dist
+          merge-multiple: true
 
-      - name: Create GitHub Release
-        uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3
+      - name: Download every package's checksums
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
-          files: |
-            dist/synology-apm-repo-sdk/*
-            dist/synology-apm-repo-cli/*
-            dist/synology-apm-repo-browser/*
-          make_latest: true
-          generate_release_notes: false
+          pattern: sha256-*
+          path: dist
+          merge-multiple: true
+
+      - name: Check the files
+        working-directory: dist
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          sha256sum -c -- *.sha256
+          for sum in *.sha256; do
+            case "$sum" in
+              *-"${TAG#v}"-* | *-"${TAG#v}".tar.gz.sha256) ;;
+              *) echo "::error::$sum is not version ${TAG#v}"; exit 1 ;;
+            esac
+          done
+
+      - name: Create the release
+        run: gh release create "$TAG" --verify-tag --title "$TAG" --notes "" dist/*
+        env:
+          TAG: ${{ github.ref_name }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}

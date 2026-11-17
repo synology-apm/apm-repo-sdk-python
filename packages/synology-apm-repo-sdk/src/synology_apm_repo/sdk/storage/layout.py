@@ -1,4 +1,4 @@
-"""Repository layout detection (FORMAT-SPEC.md: Locating the repository root).
+"""Repository layout detection (FORMAT-SPEC.md: Repository root).
 
 Two shapes exist, both at a fixed depth:
 

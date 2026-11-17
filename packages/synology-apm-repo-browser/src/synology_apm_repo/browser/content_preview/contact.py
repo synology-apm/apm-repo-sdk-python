@@ -17,7 +17,7 @@ def _join_nonempty(*parts: str, sep: str = ", ") -> str:
 
 def _render_m365_contact_csv(data: bytes) -> str:
     """Full Name/Email always (``_NONE_LABEL`` when absent); every other
-    column (``FORMAT-SPEC.md``: M365 Contact) only when set, since most contacts are
+    column (``FORMAT-SPEC.md``: Contact) only when set, since most contacts are
     sparse."""
     reader = csv.reader(io.StringIO(data.decode("utf-8-sig")))
     header = next(reader, [])

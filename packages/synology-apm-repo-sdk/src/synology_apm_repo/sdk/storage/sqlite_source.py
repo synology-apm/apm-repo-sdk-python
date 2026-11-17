@@ -300,7 +300,7 @@ class SqliteSource(AsyncClosing):
     ) -> Self:
         """Read and open ``path`` from ``store`` — for a source that may be
         ``aHlT``-enveloped (``copy_meta_file/*/target.db``,
-        FORMAT-SPEC.md: Landing directory layout) and may have a real
+        FORMAT-SPEC.md: Metadata directory) and may have a real
         ``-wal``/``-shm`` sidecar. The main file and each sidecar are
         unwrapped independently, streaming into the temp file, with the
         decompressed size bounded by ``_MAX_TARGET_DB_DECOMPRESS_SIZE_FALLBACK``

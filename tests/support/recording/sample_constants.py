@@ -1,11 +1,10 @@
-"""Real values belonging to the recorded samples behind ``tests/fixtures/``.
+"""Generated values of the samples the fixtures in ``tests/fixtures/`` were recorded from.
 
 Each is a generated artifact of one sample (its vault key, a wrapped key
 record, a stable catalog identifier), not customer data, so it is safe to
-commit. Each ``#:`` line names its sample by its ``manifest.TARGETS`` alias
-(``targets.toml.example``). Replay tests under ``tests/integration/`` and
-the anonymizer import them from here; ``tests/unit/`` uses synthetic values
-only.
+commit. Each ``#:`` line names its sample by its alias. Replay tests under
+``tests/integration/`` import them from here; ``tests/unit/`` uses synthetic
+values only.
 """
 
 from __future__ import annotations

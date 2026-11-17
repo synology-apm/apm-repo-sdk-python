@@ -1,8 +1,6 @@
 """Unit tests for ``synology_apm_repo.sdk.units.saas.services``: synthetic
 bytes for ``sniff()`` and ``open_service_db()``, ``saas_fakes.FakeDedupFile``
-for ``inspect_object()``'s read pattern
-(``tests/integration/sdk/test_units_saas_stream_objectdb_discovery.py`` is
-the real-data counterpart). ``sniff()`` only guesses which service owns an
+for ``inspect_object()``'s read pattern. ``sniff()`` only guesses which service owns an
 already-located ``SERVICE_DB`` blob from its table names."""
 
 from __future__ import annotations

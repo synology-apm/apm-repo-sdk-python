@@ -1,9 +1,6 @@
 """Unit tests for ``synology_apm_repo.sdk.units.saas.site`` over a synthetic
 repository root whose ``saas_obj`` content embeds two ZSTD-compressed service
-DBs (``list_version_table`` + ``item_version_table``). Item content and
-names are content, so they are proven here; the real-data counterpart,
-``tests/integration/browser/test_browser_screens_unit_screen_preview.py``,
-checks a replayed Site listing's shape only."""
+DBs (``list_version_table`` + ``item_version_table``)."""
 
 from __future__ import annotations
 

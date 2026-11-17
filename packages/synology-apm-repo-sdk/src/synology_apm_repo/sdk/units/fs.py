@@ -1,7 +1,7 @@
 """``FsProvider``: FS workloads. The whole version is one shared virtual
 image, ``<snapshotUuid>/<versionId>/dedup.img``, and every file is a
 ``[content_dedup_id, content_dedup_id + file_size)`` byte range within it
-(FORMAT-SPEC.md: Workload-specific addressing, FS). ``entry_table.dirname`` is a full absolute path,
+(FORMAT-SPEC.md: FS). ``entry_table.dirname`` is a full absolute path,
 so ``children()`` is one indexed equality query per level.
 
 ``dedup.img`` is located through the version's ``target.db``: its

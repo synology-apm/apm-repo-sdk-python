@@ -207,7 +207,7 @@ def _write_saas_workload_multi_generation(
     catalog versions (``saas_version_id`` 1..``total_versions``) in one
     snapshot, each mapped to the equal-numbered ``stream_version`` -- the
     shape left once older generations are server-side GC'd (FORMAT-SPEC.md:
-    Generic SaaS object addressing). Returns the ``live_stream_version``
+    Stream generations). Returns the ``live_stream_version``
     generation's ``saas_obj`` path; the caller writes its rows."""
     saas_spec: dict[str, object] = {
         "namespace": "ns-a",

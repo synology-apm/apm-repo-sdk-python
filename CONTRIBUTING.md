@@ -34,16 +34,12 @@ so you can redo it correctly.
 
 See `tests/CLAUDE.md`'s "`RecordingStore` / `ReplayStore`" section for
 what a recorded fixture proves (repository structure, never backed-up
-content's own meaning), how to record one, how samples are named by alias
-(real names live only in the untracked
-`tests/support/recording/targets.toml`), and how a recording is anonymized.
-
-A recording's catalog-layer data (`db/connection_config`, `workload_config`,
-`copy_target_version`, `file_map`, `file_meta`, and similar SQLite files) is
-anonymized automatically when the recording session ends — the fields are
-registered in `tests/support/recording/anonymize_catalog_metadata.py`
-(`SENSITIVE_FIELDS` and the path columns beside it), and no real-to-fake
-mapping is stored anywhere.
+content's own meaning) and how the tests replay it. Every committed fixture
+is an anonymized recording: the samples are named by an alias, the
+catalog-layer data (`db/connection_config`, `workload_config`,
+`copy_target_version`, `file_map`, `file_meta`, and similar SQLite files)
+has its names, emails and other identifying fields replaced, and no
+real-to-fake mapping is stored anywhere.
 
 **Fixture storage**: `tests/fixtures/*.json.gz` cassettes are committed
 gzip-compressed. Run this one-time local setup to get a readable `git
@@ -126,26 +122,33 @@ comment either way.
 > for new screens/commands/backends is what actually closes that gap, not
 > the percentage.
 
-If the change touches a code path `tests/integration/` replays real bytes
-against, re-record the affected fixture by hand with the `make record-fixture`
-command `PYTHONPATH=tests uv run python -m support.recording.manifest`
-prints for it — see [`tests/CLAUDE.md`](tests/CLAUDE.md)'s "Detects
-call-sequence drift, not semantic drift" for why `make test` alone doesn't
-catch this.
+If the change touches a code path `tests/integration/` replays recorded
+bytes against, say so in the pull request: the affected fixture may need
+re-recording — see [`tests/CLAUDE.md`](tests/CLAUDE.md)'s
+"Detects call-sequence drift, not semantic drift" for why `make test` alone
+doesn't catch this.
 
-CI (`.github/workflows/ci.yml`) runs `make test` split in two on every push
-and pull request: `make lint` once, and `make test-cov` on every
-supported OS and Python version in parallel; a final job combines their
-coverage data and enforces the 95% gate on the combined number, so
-platform- and version-specific branches count where they run. A local
-`make test` enforces the same gate on one platform's run alone, which is
-never higher than the combined one. `docs.yml` builds the Sphinx API docs
-(`make docs`) on every pull request and push to `main`, and on push to
-`main` deploys them to GitHub Pages. Before pushing a change
+CI (`.github/workflows/ci.yml`) runs on every pull request, push to
+`main` and once a week: `make lint` once, `make test-cov` on every
+supported OS and Python version in parallel, then `make coverage-gate`,
+which enforces the 95% gate on each OS alone (its three Python versions
+combined), the same gate a local `make test` enforces on one platform.
+Beside them, `make audit` (known advisories, and every locked package
+from PyPI or the workspace) and `make deptry` (unused or transitive-only
+dependencies). `docs.yml` builds the Sphinx API docs (`make docs`) on
+every pull request and push to `main`, and on push to `main` deploys
+them to GitHub Pages. Before pushing a change
 that touches a workflow file itself, run `make github-act-simulation` (needs
 `act` and Docker) to exercise it locally.
 
 ## Release / publish channel
+
+A pushed `v*` tag starts `.github/workflows/release.yml`. It reuses the
+tagged commit's CI run when that run passed (waiting for it while it
+runs), stops when it failed, and runs `ci.yml` itself only when there is
+no run to reuse; known advisories are checked again either way. Then it
+builds and tries the packages, publishes them to PyPI, and once all
+three are there, creates the GitHub release with their `.sha256` files.
 
 Public PyPI, via each package's own trusted-publishing environment in
 `.github/workflows/release.yml` (`pypi-synology-apm-repo-sdk`,

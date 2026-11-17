@@ -29,7 +29,7 @@ class Connection:
         connection_config_id: The row's id, local to this catalog's database.
         connection_id: The source's own id, as named in link records.
         display_name: The source's name from its link record (FORMAT-SPEC.md:
-            ``vault_link_key`` / connection naming), or ``connection_id``
+            Connections), or ``connection_id``
             when none matches.
         namespaces: The distinct non-empty workload namespaces under this
             source, in first-seen order.

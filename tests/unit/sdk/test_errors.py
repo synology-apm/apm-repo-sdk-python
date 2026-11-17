@@ -35,27 +35,23 @@ def test_none_of_the_hierarchy_shadows_builtin_keyerror() -> None:
 
 
 def test_a_missing_file_the_records_name_becomes_corruption() -> None:
-    missing = errors.NotFoundError("no such file", ref="db/x", spec="FORMAT-SPEC.md: X")
+    missing = errors.NotFoundError("no such file", ref="db/x")
     corrupt = errors.DataCorruptError.from_missing(missing)
     assert type(corrupt) is errors.DataCorruptError
-    assert (corrupt.safe_message, corrupt.ref, corrupt.spec) == ("no such file", "db/x", "FORMAT-SPEC.md: X")
+    assert (corrupt.safe_message, corrupt.ref) == ("no such file", "db/x")
 
 
-def test_message_includes_ref_and_spec() -> None:
-    exc = errors.NotFoundError("no such file", ref="db/file_map", spec="FORMAT-SPEC.md: repo_info")
-    text = str(exc)
-    assert "no such file" in text
-    assert "db/file_map" in text
-    assert "FORMAT-SPEC.md: repo_info" in text
+def test_message_includes_ref() -> None:
+    exc = errors.NotFoundError("no such file", ref="db/file_map")
+    assert str(exc) == "no such file [ref=db/file_map]"
+    assert exc.safe_message == "no such file"
     assert exc.ref == "db/file_map"
-    assert exc.spec == "FORMAT-SPEC.md: repo_info"
 
 
-def test_message_without_ref_or_spec_is_just_the_message() -> None:
+def test_message_without_ref_is_just_the_message() -> None:
     exc = errors.ApmRepoError("plain message")
     assert str(exc) == "plain message"
     assert exc.ref is None
-    assert exc.spec is None
 
 
 def test_profile_not_found_is_a_not_found() -> None:
@@ -102,14 +98,9 @@ def _all_error_classes() -> list[type[errors.ApmRepoError]]:
 @pytest.mark.parametrize("cls", _all_error_classes(), ids=lambda cls: cls.__name__)
 def test_every_error_survives_a_pickle_round_trip(cls: type[errors.ApmRepoError]) -> None:
     """An export worker's failure reaches its parent process by pickle."""
-    original = cls("bad thing", ref="a/b", spec="FORMAT-SPEC.md: X")
+    original = cls("bad thing", ref="a/b")
 
     copy = pickle.loads(pickle.dumps(original))
 
     assert type(copy) is cls
-    assert (str(copy), copy.safe_message, copy.ref, copy.spec) == (
-        str(original),
-        original.safe_message,
-        "a/b",
-        "FORMAT-SPEC.md: X",
-    )
+    assert (str(copy), copy.safe_message, copy.ref) == (str(original), original.safe_message, "a/b")

@@ -236,7 +236,7 @@ class TestCheckRepoInfo:
     async def test_object_storage_checks_the_committed_generation_not_the_newest_file(self, tmp_path: Path) -> None:
         """The latest committed transaction is 7, so ``repo_info.5`` is the
         repository's generation; the newer, uncommitted ``repo_info.9`` is
-        not checked (FORMAT-SPEC.md: Multi-generation selection)."""
+        not checked (FORMAT-SPEC.md: Generation selection)."""
         write_repo_info(tmp_path / "repo_info.5", uuid=bytes(16))
         (tmp_path / "repo_info.9").write_bytes(b"not a repo_info")
         (tmp_path / "repo_transactions").mkdir()

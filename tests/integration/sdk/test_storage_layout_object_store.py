@@ -9,8 +9,7 @@ request mapping is covered synthetically in
 
 - ``storage_layout_object_store_objstore_m365_encrypted_layout_and_small_reads.json.gz``
   — ``iter_repository_layouts``'s walk plus byte-for-byte reads of small
-  real files. No test's calls are a superset of the others', so recording
-  needs every test using it run together.
+  real files, shared by several tests.
 - ``storage_layout_object_store_objstore_m365_encrypted_dedup_query.json.gz``
   — opening both repositories and querying ``db("file_map")`` on each; its
   one test.

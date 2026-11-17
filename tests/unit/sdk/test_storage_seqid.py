@@ -50,7 +50,7 @@ def test_bare_name_wins_when_alone() -> None:
 
 def test_suffixed_wins_over_bare() -> None:
     # A bare name coexisting with suffixed generations is a stale artifact:
-    # the largest suffix wins (FORMAT-SPEC.md: Sequence-id suffix mechanism).
+    # the largest suffix wins (FORMAT-SPEC.md: Sequence suffixes).
     index = {"0.buk": ["0.buk", "0.buk.5"]}
     assert resolve_seq_file(index, "0.buk") == "0.buk.5"
 

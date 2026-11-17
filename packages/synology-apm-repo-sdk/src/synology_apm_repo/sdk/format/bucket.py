@@ -1,4 +1,4 @@
-"""Bucket file (``.buk``) format (FORMAT-SPEC.md §4).
+"""Bucket file (``.buk``) format (FORMAT-SPEC.md: Pool).
 
 Pure ``bytes -> dataclass`` decode, zero I/O. The Dedup Layer's
 ``BucketReader`` fetches bytes at the offsets this module computes, then
@@ -6,7 +6,7 @@ hands ciphertext through ``format.crypto`` and ``compression``.
 
 In practice ``mode`` is ``COMPRESS|CHUNK_CRC`` (``0x03``), plus
 ``VAULT_ENCRYPT`` (``0x83``) for an encrypted bucket, but readers test each
-bit rather than assume it (FORMAT-SPEC.md: Header & mode bits).
+bit rather than assume it (FORMAT-SPEC.md: Bucket header).
 """
 
 from __future__ import annotations
@@ -32,11 +32,9 @@ from .const import (
 from .headers import MAGIC, parse_index_header, verify_crc32
 from .redundancy import redundancy_size
 
-_SPEC = "FORMAT-SPEC.md §4"
-
 MODE_COMPRESS = 0x01
 MODE_CHUNK_CRC = 0x02
-# 0x04-0x40 are reserved bits, unset in practice (FORMAT-SPEC.md: Header & mode bits).
+# 0x04-0x40 are reserved bits, unset in practice (FORMAT-SPEC.md: Bucket header).
 MODE_BUCKET_PARITY = 0x04
 MODE_ENCRYPT = 0x08  # the non-VaultKey DATA_KEY scheme
 MODE_LOGIC_LOCALITY = 0x10
@@ -64,7 +62,7 @@ SizeStore values (``BucketIndex``, ``BucketReader``) without building
 
 @dataclasses.dataclass(frozen=True, slots=True)
 class BucketFileHeader:
-    """Parsed ``.buk`` header (FORMAT-SPEC.md: Header & mode bits)."""
+    """Parsed ``.buk`` header (FORMAT-SPEC.md: Bucket header)."""
 
     major: int
     minor: int
@@ -73,7 +71,7 @@ class BucketFileHeader:
     chunk_size_crc: int
     crc_of_chunk_crc: int
     """CRC32 over the whole ChunkCrcStore trailer (FORMAT-SPEC.md:
-    ChunkCrcStore & Redundancy); not needed to read a chunk, checked when
+    ChunkCrcStore); not needed to read a chunk, checked when
     the trailer is loaded (``parse_chunk_crc_store``'s ``verify_crc``)."""
 
     @property
@@ -84,7 +82,7 @@ class BucketFileHeader:
     def is_vault_encrypted(self) -> bool:
         """The only reliable signal that this bucket's chunks are encrypted;
         ``repo_info``'s ``encrypt_algorithm`` says nothing about an individual
-        bucket (FORMAT-SPEC.md: Header & mode bits)."""
+        bucket (FORMAT-SPEC.md: Bucket header)."""
         return bool(self.mode & MODE_VAULT_ENCRYPT)
 
 
@@ -96,7 +94,7 @@ def parse_bucket_header(data: bytes) -> BucketFileHeader:
         DataCorruptError: A magic or header-CRC mismatch.
         UnsupportedVersionError: ``major`` is above 3.
     """
-    header = parse_index_header(data, expect_magic=MAGIC["bucket"], max_major=_MAJOR_VAULT, spec=_SPEC)
+    header = parse_index_header(data, expect_magic=MAGIC["bucket"], max_major=_MAJOR_VAULT)
     mode, chunk_num, chunk_size_crc = struct.unpack(">III", data[_OFF_MODE : _OFF_MODE + 12])
     (crc_of_chunk_crc,) = struct.unpack(">I", data[_OFF_CRC_OF_CHUNK_CRC : _OFF_CRC_OF_CHUNK_CRC + 4])
     return BucketFileHeader(
@@ -237,11 +235,11 @@ def parse_size_store(data: bytes, chunk_num: int, *, verify_crc: int | None = No
     """
     tight_len = chunk_size_store_tight_length(chunk_num)
     if len(data) < tight_len:
-        raise FormatError(f"SizeStore data too short: {len(data)} bytes < {tight_len}", spec=_SPEC)
+        raise FormatError(f"SizeStore data too short: {len(data)} bytes < {tight_len}")
     tight = data[:tight_len]
 
     if verify_crc is not None:
-        verify_crc32(tight, verify_crc, label="SizeStore", spec=_SPEC)
+        verify_crc32(tight, verify_crc, label="SizeStore")
 
     # Decoded a field at a time across every group (each field's bytes are a
     # strided slice, translate()d in C), never a record at a time: per-record
@@ -258,7 +256,7 @@ def parse_size_store(data: bytes, chunk_num: int, *, verify_crc: int | None = No
     del types[chunk_num:]
     if types.translate(None, _KNOWN_COMPRESS_TYPE_BYTES):
         chunk_idx = next(i for i, value in enumerate(types) if value not in COMPRESS_TYPE_BY_VALUE)
-        raise DataCorruptError(f"unknown CompressType {types[chunk_idx]} at chunk {chunk_idx}", spec=_SPEC)
+        raise DataCorruptError(f"unknown CompressType {types[chunk_idx]} at chunk {chunk_idx}")
     compress_types = array.array("B", types)
     stored_lens = array.array("H")
     stored_lens.frombytes(_native_u16(lows, highs))
@@ -279,7 +277,7 @@ class ChunkLocator(NamedTuple):
 @dataclasses.dataclass(frozen=True, slots=True, eq=False)
 class BucketIndex(Sequence[SizeStoreEntry]):
     """One bucket's per-chunk SizeStore entries and data locations, as
-    parallel ``array.array`` columns (FORMAT-SPEC.md: SizeStore, Physical
+    parallel ``array.array`` columns (FORMAT-SPEC.md: SizeStore, Bucket
     layout). A ``Sequence[SizeStoreEntry]``; ``locator(i)`` is chunk ``i``'s
     byte range. Hot loops read the columns directly; they are shared, so
     never mutate them.
@@ -321,7 +319,7 @@ class BucketIndex(Sequence[SizeStoreEntry]):
     def uncompressed(cls, chunk_num: int) -> BucketIndex:
         """The uncompressed layout's index: every chunk ``CompressType.NONE``,
         ``FIXED_CHUNK_LENGTH`` apart from ``RESERVED_LENG`` (FORMAT-SPEC.md:
-        Header & mode bits). Current writers never produce it."""
+        Bucket header). Current writers never produce it."""
         return cls.of(
             array.array("B", bytes(chunk_num)), array.array("H", bytes(2 * chunk_num)), data_start=RESERVED_LENG
         )
@@ -386,7 +384,7 @@ def expected_bucket_size(header: BucketFileHeader, index: BucketIndex) -> int:
 
 def chunk_crc_store_region(header: BucketFileHeader, index: BucketIndex) -> tuple[int, int]:
     """Byte ``(offset, length)`` of the ChunkCrcStore trailer (FORMAT-SPEC.md:
-    ChunkCrcStore & Redundancy) within the bucket file — immediately after the chunk-data
+    ChunkCrcStore) within the bucket file — immediately after the chunk-data
     region, one 4-byte entry per non-empty chunk.
 
     Raises:
@@ -399,7 +397,7 @@ def chunk_crc_store_region(header: BucketFileHeader, index: BucketIndex) -> tupl
 
 def parse_chunk_crc_store(data: bytes, non_empty: int, *, verify_crc: int | None = None) -> tuple[int, ...]:
     """Decode the ChunkCrcStore trailer: one big-endian 4-byte ciphertext
-    CRC32 per non-empty chunk (FORMAT-SPEC.md: ChunkCrcStore & Redundancy), computed at
+    CRC32 per non-empty chunk (FORMAT-SPEC.md: ChunkCrcStore), computed at
     write time over each chunk's *stored* bytes (after compression and
     encryption, if any) — not a plaintext check.
 
@@ -417,8 +415,8 @@ def parse_chunk_crc_store(data: bytes, non_empty: int, *, verify_crc: int | None
     """
     length = CHUNK_CRC_SIZE * non_empty
     if len(data) < length:
-        raise FormatError(f"ChunkCrcStore trailer too short: {len(data)} bytes < {length}", spec=_SPEC)
+        raise FormatError(f"ChunkCrcStore trailer too short: {len(data)} bytes < {length}")
     trailer = data[:length]
     if verify_crc is not None:
-        verify_crc32(trailer, verify_crc, label="ChunkCrcStore", spec=_SPEC)
+        verify_crc32(trailer, verify_crc, label="ChunkCrcStore")
     return struct.unpack(f">{non_empty}I", trailer) if non_empty else ()

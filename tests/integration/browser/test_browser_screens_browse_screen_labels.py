@@ -205,13 +205,15 @@ def _all_node_labels(node: TreeNode[object]) -> set[str]:
     return labels
 
 
-#: A GWS domain label, by shape: the domain is anonymized (unlike an M365
-#: tenant_id), so the shape holds both replaying and recording fresh. At
-#: least one letter is required so a dotted-quad IP label elsewhere in the
-#: tree never matches.
+#: A GWS domain label, by shape (the domain is anonymized). At least one
+#: letter is required so a dotted-quad IP label elsewhere in the tree never
+#: matches.
 _DOMAIN_RE = re.compile(
     r"^(?=[a-z0-9.-]*[a-z])[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)+$"
 )
+
+#: An M365 tenant label, by shape: the tenant_id is an anonymized GUID.
+_TENANT_RE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
 
 
 def test_workload_type_groups_use_proper_gws_and_m365_vendor_names_replayed(
@@ -246,7 +248,7 @@ def test_workload_type_groups_use_proper_gws_and_m365_vendor_names_replayed(
     assert {"FS", "VM", "Google Workspace", "Microsoft 365"} <= root_labels, root_labels
     assert not ({"Mail", "Chat", "SharePoint"} & root_labels), root_labels
 
-    assert "87c467dd-ac00-45d8-babb-e2b0787e2d13" in all_labels, all_labels
+    assert any(_TENANT_RE.match(label) for label in all_labels), all_labels
     assert any(_DOMAIN_RE.match(label) for label in all_labels), all_labels
 
     assert {"Mail", "Shared Drives", "Contacts", "Calendars", "Drives"} <= all_labels, all_labels

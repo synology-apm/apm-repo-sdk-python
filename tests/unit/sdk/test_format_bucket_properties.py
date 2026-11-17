@@ -49,7 +49,7 @@ def test_size_store_round_trips(entries: list[tuple[int, int]], with_crc: bool) 
 )
 def test_size_store_names_the_first_unknown_type(entries: list[tuple[int, int]]) -> None:
     position = next(i for i, (type_value, _) in enumerate(entries) if type_value in _UNKNOWN_TYPES)
-    with pytest.raises(DataCorruptError, match=f"unknown CompressType {entries[position][0]} at chunk {position} "):
+    with pytest.raises(DataCorruptError, match=f"unknown CompressType {entries[position][0]} at chunk {position}$"):
         parse_size_store(encode_size_store(entries), len(entries))
 
 

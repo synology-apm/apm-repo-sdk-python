@@ -395,7 +395,7 @@ class TestVmVsPcPsDispatch:
 
     async def test_pc_with_a_real_but_target_db_less_meta_dir_is_still_pcps(self, tmp_path: Path) -> None:
         """A PC/PS version whose meta directory landed with only
-        ``snapshot_info.json`` (FORMAT-SPEC.md: Landing directory layout) is still PC/PS, not
+        ``snapshot_info.json`` (FORMAT-SPEC.md: Metadata directory) is still PC/PS, not
         VM."""
         store, layout = write_repo_info_and_vault_key_db(tmp_path)
         write_file_map(tmp_path / "db" / "file_map", [])
@@ -546,7 +546,7 @@ class TestPcPsFallback:
 
     async def test_fid_registered_but_absent_from_file_meta_surfaces_a_diagnostic_node(self, tmp_path: Path) -> None:
         """A fid registered in ``copy_target_file`` with no row in
-        ``file_meta``'s resolved generation (FORMAT-SPEC.md: Multi-generation selection) surfaces
+        ``file_meta``'s resolved generation (FORMAT-SPEC.md: Generation selection) surfaces
         as a diagnostic node, not a silent empty list."""
         store, layout = write_repo_info_and_vault_key_db(tmp_path)
         write_file_map(tmp_path / "db" / "file_map", [])

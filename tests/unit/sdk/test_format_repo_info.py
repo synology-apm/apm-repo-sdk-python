@@ -1,6 +1,6 @@
 """Unit tests for ``synology_apm_repo.sdk.format.repo_info``
-(``tests/integration/sdk/test_format_repo_info.py`` parses real samples'
-files)."""
+(``tests/integration/sdk/test_format_repo_info.py`` parses the recorded
+fixtures' files)."""
 
 from __future__ import annotations
 

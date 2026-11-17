@@ -123,7 +123,7 @@ touch buckets, chunks, or crypto directly. The second shared primitive is
 Pure `bytes → dataclass` / `bytes → bytes` functions: header parsing, chunk-map
 decoding, SizeStore bit-unpacking, compression, AES-CTR/GCM crypto. This is the
 only layer that has to track the on-disk spec bit-for-bit, and the easiest to
-test with synthetic bytes (no real sample needed). Nothing here is async —
+test with synthetic bytes (no backup data needed). Nothing here is async —
 there is no I/O to wait on.
 
 `compression.iter_decompressed_zstd()` yields decompressed pieces
@@ -478,14 +478,14 @@ only these five modules, so whatever a frontend needs is public for any
 other frontend too; `scripts/check_sdk_import_boundary.py` (run by
 `make test`) enforces it.
 
-**Repository/Catalog naming follows FORMAT-SPEC.md §2.1's canonical
-mapping** (`Repository` = one opened bucket or vault, `Catalog` = one
-connection within it). This distinction matters because the two backends' physical
+**Repository/Catalog naming follows the storage shape** (FORMAT-SPEC.md:
+Repository root): `Repository` = one opened bucket or vault, `Catalog` = one
+connection within it. This distinction matters because the two backends' physical
 shapes genuinely differ: a vault's several `db/connection_config` rows
 share one physical dedup pool (one `Pool`/`Composition`/`db`, opened
 once), while an object-storage bucket's several sibling `<repo-id>`
 directories are each an independent physical dedup pool of their own
-(FORMAT-SPEC.md §2.1) — `Repository` opens one
+(FORMAT-SPEC.md: Repository root) — `Repository` opens one
 `DedupRepo` for a vault, or one per sibling repo-id for object
 storage, lazily, and hides that difference
 entirely: `Repository.catalogs() -> list[Catalog]` is the one, uniform
@@ -743,9 +743,9 @@ own.
   `units/node_ref.py` instead, since they're address logic, not display
   formatting.)
 - **`ApmRepoError.safe_message`** (`errors.py`) — the message alone, with the
-  `ref=`/`spec=` tags `str(exc)` appends stripped, so the same exception can
+  `ref=` tag `str(exc)` appends stripped, so the same exception can
   render two ways: full detail, or that detail stripped down. Only the CLI's
   `cli/errors.py::friendly_message()` picks between the two, gated on
-  `--verbose`. The TUI always renders plain `str(exc)`, `ref=`/`spec=` tags
+  `--verbose`. The TUI always renders plain `str(exc)`, `ref=` tag
   included, whatever the `d` toggle says — the one deliberate exception to
   the Presentation rule above.
